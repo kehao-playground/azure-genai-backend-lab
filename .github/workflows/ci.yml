@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        # Python version comes from .python-version; no separate setup-python needed.
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy
+      - name: Pytest
+        run: uv run pytest
+      - name: Behave
+        run: uv run behave
+      - name: Export OpenAPI
+        run: uv run python tools/export_openapi.py
+      - name: OpenAPI drift check
+        run: git diff --exit-code docs/openapi/openapi.yaml
+
+  site:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build Astro site
+        run: npm run build

@@ -1,0 +1,7 @@
+POST http://127.0.0.1:8000/api/v1/rag
+Content-Type: application/json
+
+{
+  "question": "What is this project?",
+  "tenant_id": "local-test"
+}

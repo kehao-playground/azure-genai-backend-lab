@@ -1,0 +1,7 @@
+POST http://127.0.0.1:8000/api/v1/chat
+Content-Type: application/json
+
+{
+  "message": "Hello",
+  "conversation_id": "local-test"
+}

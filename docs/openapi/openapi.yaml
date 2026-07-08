@@ -1,0 +1,220 @@
+openapi: 3.1.0
+info:
+  title: Azure GenAI Backend Lab
+  description: Production-minded Azure GenAI backend patterns with Python and FastAPI.
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      tags:
+      - health
+      summary: Health Check
+      operationId: health_check_health_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/v1/chat:
+    post:
+      tags:
+      - chat
+      summary: Chat
+      operationId: chat_api_v1_chat_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/chat/stream:
+    post:
+      tags:
+      - streaming
+      summary: Stream Chat
+      operationId: stream_chat_api_v1_chat_stream_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StreamingChatRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/rag:
+    post:
+      tags:
+      - rag
+      summary: Rag
+      operationId: rag_api_v1_rag_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RagRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RagResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    ChatRequest:
+      properties:
+        message:
+          type: string
+          minLength: 1
+          title: Message
+        conversation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Conversation Id
+      type: object
+      required:
+      - message
+      title: ChatRequest
+    ChatResponse:
+      properties:
+        message:
+          type: string
+          title: Message
+        correlation_id:
+          type: string
+          title: Correlation Id
+      type: object
+      required:
+      - message
+      - correlation_id
+      title: ChatResponse
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    HealthResponse:
+      properties:
+        status:
+          type: string
+          title: Status
+        service:
+          type: string
+          title: Service
+      type: object
+      required:
+      - status
+      - service
+      title: HealthResponse
+    RagRequest:
+      properties:
+        question:
+          type: string
+          minLength: 1
+          title: Question
+        tenant_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tenant Id
+      type: object
+      required:
+      - question
+      title: RagRequest
+    RagResponse:
+      properties:
+        answer:
+          type: string
+          title: Answer
+        sources:
+          items:
+            type: string
+          type: array
+          title: Sources
+        correlation_id:
+          type: string
+          title: Correlation Id
+      type: object
+      required:
+      - answer
+      - sources
+      - correlation_id
+      title: RagResponse
+    StreamingChatRequest:
+      properties:
+        message:
+          type: string
+          minLength: 1
+          title: Message
+        conversation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Conversation Id
+      type: object
+      required:
+      - message
+      title: StreamingChatRequest
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+        input:
+          title: Input
+        ctx:
+          type: object
+          title: Context
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
