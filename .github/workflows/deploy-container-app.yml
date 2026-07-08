@@ -1,0 +1,14 @@
+name: Deploy Container App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Placeholder
+        run: |
+          echo "Azure Container Apps deployment will be implemented later."
+          echo "Use GitHub OIDC and environment approvals before enabling real deployment."

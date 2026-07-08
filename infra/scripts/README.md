@@ -1,0 +1,11 @@
+# Scripts
+
+| Script | Purpose | Status |
+|---|---|---|
+| `create-budget-alert.sh` | Subscription budget (US$20) with alerts — run first | working |
+| `create-resource-group.sh` | Create the demo resource group | working |
+| `teardown.sh` | Delete the demo resource group and everything in it | working |
+| `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
+| `configure-apim.sh` | APIM Consumption tier setup | placeholder (Day 10) |
+
+All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
