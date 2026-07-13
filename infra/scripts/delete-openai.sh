@@ -3,20 +3,24 @@
 # Cognitive Services accounts are soft-deleted; without a purge the name
 # stays reserved and quota stays allocated for 48 hours.
 # Required env vars:
+#   AZ_SUBSCRIPTION_ID - target subscription (never rely on the default az context)
 #   AZ_RESOURCE_GROUP  - resource group name (e.g. rg-azgenai-lab)
 #   AZ_LOCATION        - Azure region of the account (e.g. japaneast)
 #   AZ_OPENAI_NAME     - Azure OpenAI account name (e.g. aoai-azgenai-lab)
 set -euo pipefail
 
+: "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID (default az context may point at the wrong subscription)}"
 : "${AZ_RESOURCE_GROUP:?Set AZ_RESOURCE_GROUP (e.g. rg-azgenai-lab)}"
 : "${AZ_LOCATION:?Set AZ_LOCATION (e.g. japaneast)}"
 : "${AZ_OPENAI_NAME:?Set AZ_OPENAI_NAME (e.g. aoai-azgenai-lab)}"
 
 az cognitiveservices account delete \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
   --name "$AZ_OPENAI_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP"
 
 az cognitiveservices account purge \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
   --name "$AZ_OPENAI_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --location "$AZ_LOCATION"
