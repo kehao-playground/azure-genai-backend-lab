@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,9 +11,10 @@ class Settings(BaseSettings):
     app_env: str = "local"
     log_level: str = "INFO"
 
+    # v1 GA API (2025-08): plain OpenAI client against <endpoint>/openai/v1/, no api-version
     azure_openai_endpoint: str | None = None
+    azure_openai_api_key: SecretStr | None = None
     azure_openai_deployment_name: str | None = None
-    azure_openai_api_version: str = "2025-01-01-preview"
 
     azure_search_endpoint: str | None = None
     azure_search_index_name: str | None = None
