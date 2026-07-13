@@ -2,13 +2,16 @@
 # Create a subscription-level budget with alert thresholds.
 # Run this BEFORE creating any billable resource.
 # Required env vars:
-#   AZ_BUDGET_AMOUNT   - monthly cap in USD (default: 20)
+#   AZ_SUBSCRIPTION_ID - target subscription (never rely on the default az context)
 #   AZ_ALERT_EMAIL     - email address for alert notifications
+# Optional env vars:
+#   AZ_BUDGET_AMOUNT   - monthly cap in USD (default: 20)
 set -euo pipefail
 
+: "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID (default az context may point at the wrong subscription)}"
 : "${AZ_ALERT_EMAIL:?Set AZ_ALERT_EMAIL}"
 AZ_BUDGET_AMOUNT="${AZ_BUDGET_AMOUNT:-20}"
-SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+SUBSCRIPTION_ID="$AZ_SUBSCRIPTION_ID"
 
 az consumption budget create \
   --budget-name "azgenai-lab-monthly" \

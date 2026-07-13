@@ -11,3 +11,5 @@
 | `configure-apim.sh` | APIM Consumption tier setup | placeholder (Day 10) |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
+
+Every script requires `AZ_SUBSCRIPTION_ID` and passes `--subscription` explicitly on each az call. The default az context is shared mutable state — an `az login` in another terminal can silently repoint it, which is exactly how you delete resources in the wrong subscription.
