@@ -60,7 +60,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     404: {"content": _ENVELOPE_CONTENT, "description": "Unknown conversation_id"},
     422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},
-    500: {"content": _ENVELOPE_CONTENT, "description": "Service misconfiguration"},
+    500: {
+        "content": _ENVELOPE_CONTENT,
+        "description": "Service misconfiguration or storage failure",
+    },
     502: {"content": _ENVELOPE_CONTENT, "description": "Upstream LLM service failure"},
     503: {"content": _ENVELOPE_CONTENT, "description": "Upstream capacity exhausted"},
     504: {"content": _ENVELOPE_CONTENT, "description": "Upstream timeout"},
@@ -82,7 +85,11 @@ _STREAM_RESPONSES: dict[int | str, dict[str, Any]] = {
             "X-Conversation-Id": {
                 "description": (
                     "The conversation this stream belongs to; send it as "
-                    "conversation_id on the next turn."
+                    "conversation_id on the next turn. On a first turn the id "
+                    "is provisional: the turn commits only with a keepable "
+                    "terminal (`message.done` completed or max_output_tokens) "
+                    "— after `error`, content_filter/other, or a disconnect, "
+                    "discard it and start a new conversation."
                 ),
                 "schema": {"type": "string"},
             }
@@ -99,8 +106,10 @@ class StreamingChatRequest(BaseModel):
         default=None,
         description=(
             "Continues an existing conversation. Omit to start a new one; the "
-            "id comes back in the X-Conversation-Id response header. Unknown "
-            "ids are rejected with 404 conversation_not_found."
+            "id comes back in the X-Conversation-Id response header "
+            "(provisional until a keepable message.done — see the 200 header "
+            "description). Unknown ids are rejected with 404 "
+            "conversation_not_found."
         ),
     )
 

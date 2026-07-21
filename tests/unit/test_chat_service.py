@@ -17,16 +17,17 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
-from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
+    _fake_output_item,
     build_chat_service,
 )
 
 
-def user_messages(*texts: str) -> list[Message]:
-    return [Message(role="user", content=text) for text in texts]
+def user_items(*texts: str) -> list[ReplayItem]:
+    return [{"role": "user", "content": text} for text in texts]
 
 
 def test_default_settings_build_fake_service() -> None:
@@ -36,14 +37,15 @@ def test_default_settings_build_fake_service() -> None:
 
 
 async def test_fake_service_never_calls_azure() -> None:
-    result = await FakeChatService().complete(user_messages("hello"))
+    result = await FakeChatService().complete(user_items("hello"))
 
     assert result.message == "[fake-llm] hello"
     assert result.model == "fake"
+    assert result.replay_items == (_fake_output_item("[fake-llm] hello"),)
 
 
 async def test_fake_service_makes_received_history_visible() -> None:
-    result = await FakeChatService().complete(user_messages("one", "two", "three"))
+    result = await FakeChatService().complete(user_items("one", "two", "three"))
 
     assert result.message == "[fake-llm] three (history=2)"
 
@@ -79,13 +81,30 @@ def test_real_client_uses_configured_timeout_not_sdk_default() -> None:
     assert service._client.max_retries == 2
 
 
+class StubOutputItem:
+    """Mimics an SDK output item: only model_dump is used at the boundary."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        return dict(self._payload)
+
+
+REASONING_ITEM = {"type": "reasoning", "encrypted_content": "opaque-blob"}
+
+
 class StubResponses:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
-        return SimpleNamespace(output_text="pong", model="gpt-5-mini-2025-08-07")
+        return SimpleNamespace(
+            output_text="pong",
+            model="gpt-5-mini-2025-08-07",
+            output=[StubOutputItem(REASONING_ITEM)],
+        )
 
 
 def make_stub_client() -> tuple[AsyncOpenAI, StubResponses]:
@@ -94,35 +113,35 @@ def make_stub_client() -> tuple[AsyncOpenAI, StubResponses]:
     return cast(AsyncOpenAI, client), responses
 
 
-async def test_real_service_sends_deployment_name_and_role_content_history() -> None:
+async def test_real_service_sends_deployment_name_and_replay_items_verbatim() -> None:
     client, responses = make_stub_client()
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
-    result = await service.complete(
-        [
-            Message(role="user", content="hello"),
-            Message(role="assistant", content="hi"),
-            Message(role="user", content="again"),
-        ]
-    )
-
-    assert responses.calls[0]["model"] == "chat-mini"
-    assert responses.calls[0]["input"] == [
+    replay_context = [
         {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi"},
+        REASONING_ITEM,
         {"role": "user", "content": "again"},
     ]
+    result = await service.complete(replay_context)
+
+    assert responses.calls[0]["model"] == "chat-mini"
+    assert responses.calls[0]["input"] == replay_context
     assert result.message == "pong"
     assert result.model == "gpt-5-mini-2025-08-07"
+    # The response's output items come back as the next turn's replay context.
+    assert result.replay_items == (REASONING_ITEM,)
 
 
-async def test_real_service_never_stores_responses_upstream() -> None:
+async def test_real_service_never_stores_and_requests_encrypted_reasoning() -> None:
     client, responses = make_stub_client()
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
-    await service.complete(user_messages("hello"))
+    await service.complete(user_items("hello"))
 
     assert responses.calls[0]["store"] is False
+    # store=False + reasoning model: without this include, replayed history
+    # silently loses reasoning context (review r01 finding 1).
+    assert responses.calls[0]["include"] == ["reasoning.encrypted_content"]
 
 
 def make_status_error(
@@ -173,7 +192,7 @@ async def test_sdk_errors_are_translated_at_the_adapter_boundary(
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
     with pytest.raises(expected) as excinfo:
-        await service.complete(user_messages("hello"))
+        await service.complete(user_items("hello"))
 
     assert excinfo.value.upstream_detail  # original text kept for the log, not the client
     assert excinfo.value.__cause__ is sdk_error

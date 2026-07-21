@@ -6,7 +6,7 @@ from behave import given, then, when
 from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
-from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
@@ -28,10 +28,10 @@ class ScriptedChatService:
         self._script = script
         self._open_error = open_error
 
-    async def complete(self, messages: Sequence[Message]) -> ChatResult:
-        return ChatResult(message=f"[scripted] {messages[-1].content}")
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        return ChatResult(message=f"[scripted] {items[-1].get('content')}")
 
-    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
         if self._open_error is not None:
             raise self._open_error
 
