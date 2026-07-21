@@ -86,12 +86,68 @@ paths:
         required: true
       responses:
         '200':
-          description: Successful Response
+          description: "Server-Sent Events stream. Event vocabulary: `message.delta`\
+            \ (`{text}`), `message.done` (`{status, incomplete_reason?, correlation_id}`),\
+            \ `error` (the error envelope). Exactly one terminal event (`message.done`\
+            \ or `error`) ends a normally closed stream; clients must treat EOF without\
+            \ a terminal as a failure and must ignore unknown event names. OpenAPI\
+            \ cannot express these ordering invariants \u2014 the BDD feature `streaming_response.feature`\
+            \ is the executable contract."
           content:
             application/json:
               schema: {}
+            text/event-stream:
+              schema:
+                type: string
+              example: 'event: message.delta
+
+                data: {"text": "pon"}
+
+
+                event: message.delta
+
+                data: {"text": "g"}
+
+
+                event: message.done
+
+                data: {"status": "completed", "correlation_id": "..."}
+
+
+                '
         '422':
           description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '400':
+          description: 'Input rejected before the stream starts: content filter or
+            invalid input'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Service misconfiguration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '502':
+          description: Upstream LLM service failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Upstream capacity exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '504':
+          description: Upstream timeout
           content:
             application/json:
               schema:
@@ -242,6 +298,8 @@ components:
           - type: string
           - type: 'null'
           title: Conversation Id
+          description: Reserved for conversation state (Day 7); accepted but ignored
+            today.
       type: object
       required:
       - message
