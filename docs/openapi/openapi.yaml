@@ -94,8 +94,6 @@ paths:
             \ cannot express these ordering invariants \u2014 the BDD feature `streaming_response.feature`\
             \ is the executable contract."
           content:
-            application/json:
-              schema: {}
             text/event-stream:
               schema:
                 type: string
@@ -118,38 +116,38 @@ paths:
         '422':
           description: Validation Error
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '400':
           description: 'Input rejected before the stream starts: content filter or
             invalid input'
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '500':
           description: Service misconfiguration
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '502':
           description: Upstream LLM service failure
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '503':
           description: Upstream capacity exhausted
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '504':
           description: Upstream timeout
           content:
-            application/json:
+            text/event-stream:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/rag:
