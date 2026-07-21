@@ -87,7 +87,16 @@ class ConversationChatService:
             entry = _LockEntry()
             self._locks[conversation_id] = entry
         entry.refs += 1
-        await entry.lock.acquire()
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            # A waiter cancelled in the queue never reaches the caller's
+            # _release(): drop its reference here, without releasing a lock
+            # it never acquired (review r06 finding 1).
+            entry.refs -= 1
+            if entry.refs == 0:
+                del self._locks[conversation_id]
+            raise
 
     def _release(self, conversation_id: str) -> None:
         entry = self._locks[conversation_id]
