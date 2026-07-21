@@ -42,10 +42,15 @@ def test_chat_accepts_reserved_conversation_id(client: TestClient) -> None:
     assert response.status_code == 200
 
 
-def test_chat_rejects_empty_message(client: TestClient) -> None:
+def test_chat_rejects_empty_message_with_error_envelope(client: TestClient) -> None:
     response = client.post("/api/v1/chat", json={"message": ""})
 
     assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert "message" in body["error"]["message"]
+    assert body["correlation_id"]
+    assert "detail" not in body  # no FastAPI default shape leaking through
 
 
 class RaisingChatService:
