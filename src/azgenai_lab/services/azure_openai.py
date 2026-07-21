@@ -13,13 +13,13 @@ Fake vs. real is selected once in :func:`build_chat_service`; handlers depend
 only on the :class:`ChatService` protocol.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import openai
 from openai import AsyncOpenAI, AsyncStream
-from openai.types.responses import ResponseStreamEvent
+from openai.types.responses import ResponseInputParam, ResponseStreamEvent
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
@@ -31,6 +31,7 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
+from azgenai_lab.models.chat import Message
 
 
 @dataclass(frozen=True)
@@ -66,24 +67,44 @@ ChatStreamEvent = TextDelta | StreamDone
 
 
 class ChatService(Protocol):
-    async def complete(self, message: str) -> ChatResult: ...
+    """One inference call over the full message history (oldest first)."""
 
-    async def open_stream(self, message: str) -> AsyncIterator[ChatStreamEvent]: ...
+    async def complete(self, messages: Sequence[Message]) -> ChatResult: ...
+
+    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]: ...
+
+
+def _fake_reply(messages: Sequence[Message]) -> str:
+    # The history marker makes state visible to contract tests: a fake can't
+    # answer "what did I say earlier?", but it can prove the history arrived.
+    last = messages[-1].content
+    if len(messages) == 1:
+        return f"[fake-llm] {last}"
+    return f"[fake-llm] {last} (history={len(messages) - 1})"
 
 
 class FakeChatService:
     """Deterministic stand-in so development and tests never touch Azure."""
 
-    async def complete(self, message: str) -> ChatResult:
-        return ChatResult(message=f"[fake-llm] {message}", model="fake")
+    async def complete(self, messages: Sequence[Message]) -> ChatResult:
+        return ChatResult(message=_fake_reply(messages), model="fake")
 
-    async def open_stream(self, message: str) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
+        reply = _fake_reply(messages)
+
         async def stream() -> AsyncIterator[ChatStreamEvent]:
             yield TextDelta("[fake-llm] ")
-            yield TextDelta(message)
+            yield TextDelta(reply.removeprefix("[fake-llm] "))
             yield StreamDone(status="completed")
 
         return stream()
+
+
+def _to_input(messages: Sequence[Message]) -> ResponseInputParam:
+    # Explicit projection: only role/content cross this boundary, whatever
+    # fields Message grows later. The cast is because our role is a validated
+    # str, not the SDK's Literal union.
+    return cast(ResponseInputParam, [{"role": m.role, "content": m.content} for m in messages])
 
 
 def _translate_upstream_error(exc: openai.OpenAIError) -> UpstreamError:
@@ -159,18 +180,18 @@ class AzureOpenAIChatService:
         self._client = client
         self._deployment_name = deployment_name
 
-    async def complete(self, message: str) -> ChatResult:
+    async def complete(self, messages: Sequence[Message]) -> ChatResult:
         try:
             response = await self._client.responses.create(
                 model=self._deployment_name,  # still the deployment name
-                input=message,
-                store=False,  # state ownership stays with us (Day 7)
+                input=_to_input(messages),
+                store=False,  # state ownership stays with us: ConversationStore (Day 7)
             )
         except openai.OpenAIError as exc:
             raise _translate_upstream_error(exc) from exc
         return ChatResult(message=response.output_text, model=response.model)
 
-    async def open_stream(self, message: str) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
         # Eager open: this await is the two-phase error boundary. Failures here
         # (401/429/timeout…) raise before any byte reaches the client, so they
         # keep their HTTP status codes; only failures after this point are
@@ -178,8 +199,8 @@ class AzureOpenAIChatService:
         try:
             stream = await self._client.responses.create(
                 model=self._deployment_name,  # still the deployment name
-                input=message,
-                store=False,  # state ownership stays with us (Day 7)
+                input=_to_input(messages),
+                store=False,  # state ownership stays with us: ConversationStore (Day 7)
                 stream=True,
             )
         except openai.OpenAIError as exc:

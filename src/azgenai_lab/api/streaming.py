@@ -29,9 +29,10 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from azgenai_lab.api.chat import get_chat_service
+from azgenai_lab.api.chat import conversation_not_found, get_conversation_service
 from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError
-from azgenai_lab.services.azure_openai import ChatService, StreamDone, TextDelta
+from azgenai_lab.services.azure_openai import StreamDone, TextDelta
+from azgenai_lab.services.conversation import ConversationChatService, ConversationNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
         "content": _ENVELOPE_CONTENT,
         "description": "Input rejected before the stream starts: content filter or invalid input",
     },
+    404: {"content": _ENVELOPE_CONTENT, "description": "Unknown conversation_id"},
     422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},
     500: {"content": _ENVELOPE_CONTENT, "description": "Service misconfiguration"},
     502: {"content": _ENVELOPE_CONTENT, "description": "Upstream LLM service failure"},
@@ -76,6 +78,15 @@ _STREAM_RESPONSES: dict[int | str, dict[str, Any]] = {
             "express these ordering invariants — the BDD feature "
             "`streaming_response.feature` is the executable contract."
         ),
+        "headers": {
+            "X-Conversation-Id": {
+                "description": (
+                    "The conversation this stream belongs to; send it as "
+                    "conversation_id on the next turn."
+                ),
+                "schema": {"type": "string"},
+            }
+        },
         "content": {"text/event-stream": {"schema": {"type": "string"}, "example": _SSE_EXAMPLE}},
     },
     **_ERROR_RESPONSES,
@@ -86,7 +97,11 @@ class StreamingChatRequest(BaseModel):
     message: str = Field(min_length=1)
     conversation_id: str | None = Field(
         default=None,
-        description="Reserved for conversation state (Day 7); accepted but ignored today.",
+        description=(
+            "Continues an existing conversation. Omit to start a new one; the "
+            "id comes back in the X-Conversation-Id response header. Unknown "
+            "ids are rejected with 404 conversation_not_found."
+        ),
     )
 
 
@@ -145,11 +160,18 @@ async def _render_sse(
 async def stream_chat(
     payload: StreamingChatRequest,
     request: Request,
-    service: Annotated[ChatService, Depends(get_chat_service)],
+    service: Annotated[ConversationChatService, Depends(get_conversation_service)],
 ) -> EventStreamResponse:
     # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
-    events = await service.open_stream(payload.message)
+    try:
+        conversation_id, events = await service.open_stream(
+            payload.message, payload.conversation_id
+        )
+    except ConversationNotFoundError:
+        raise conversation_not_found() from None
+    # The id travels as a header because it must reach the client before the
+    # body: SSE consumers read it at response time, not from an event.
     return EventStreamResponse(
         _render_sse(events, request.state.correlation_id),
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "no-cache", "X-Conversation-Id": conversation_id},
     )

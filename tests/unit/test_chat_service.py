@@ -17,11 +17,16 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
+from azgenai_lab.models.chat import Message
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
     build_chat_service,
 )
+
+
+def user_messages(*texts: str) -> list[Message]:
+    return [Message(role="user", content=text) for text in texts]
 
 
 def test_default_settings_build_fake_service() -> None:
@@ -31,10 +36,16 @@ def test_default_settings_build_fake_service() -> None:
 
 
 async def test_fake_service_never_calls_azure() -> None:
-    result = await FakeChatService().complete("hello")
+    result = await FakeChatService().complete(user_messages("hello"))
 
     assert result.message == "[fake-llm] hello"
     assert result.model == "fake"
+
+
+async def test_fake_service_makes_received_history_visible() -> None:
+    result = await FakeChatService().complete(user_messages("one", "two", "three"))
+
+    assert result.message == "[fake-llm] three (history=2)"
 
 
 def test_real_service_requires_endpoint_key_and_deployment() -> None:
@@ -83,14 +94,24 @@ def make_stub_client() -> tuple[AsyncOpenAI, StubResponses]:
     return cast(AsyncOpenAI, client), responses
 
 
-async def test_real_service_sends_deployment_name_as_model() -> None:
+async def test_real_service_sends_deployment_name_and_role_content_history() -> None:
     client, responses = make_stub_client()
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
-    result = await service.complete("hello")
+    result = await service.complete(
+        [
+            Message(role="user", content="hello"),
+            Message(role="assistant", content="hi"),
+            Message(role="user", content="again"),
+        ]
+    )
 
     assert responses.calls[0]["model"] == "chat-mini"
-    assert responses.calls[0]["input"] == "hello"
+    assert responses.calls[0]["input"] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "again"},
+    ]
     assert result.message == "pong"
     assert result.model == "gpt-5-mini-2025-08-07"
 
@@ -99,7 +120,7 @@ async def test_real_service_never_stores_responses_upstream() -> None:
     client, responses = make_stub_client()
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
-    await service.complete("hello")
+    await service.complete(user_messages("hello"))
 
     assert responses.calls[0]["store"] is False
 
@@ -152,7 +173,7 @@ async def test_sdk_errors_are_translated_at_the_adapter_boundary(
     service = AzureOpenAIChatService(client, deployment_name="chat-mini")
 
     with pytest.raises(expected) as excinfo:
-        await service.complete("hello")
+        await service.complete(user_messages("hello"))
 
     assert excinfo.value.upstream_detail  # original text kept for the log, not the client
     assert excinfo.value.__cause__ is sdk_error
