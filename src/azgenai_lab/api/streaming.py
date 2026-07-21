@@ -82,6 +82,13 @@ class StreamingChatRequest(BaseModel):
     )
 
 
+class EventStreamResponse(StreamingResponse):
+    """Declares text/event-stream at the class level so OpenAPI documents the
+    200 with the real media type instead of an application/json placeholder."""
+
+    media_type = "text/event-stream"
+
+
 def _sse(event: str, data: dict[str, Any]) -> str:
     # ensure_ascii=False: SSE is UTF-8 by spec; keep CJK output readable.
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -126,16 +133,15 @@ async def _render_sse(
     yield _error_event(fallback.code, fallback.message, correlation_id)
 
 
-@router.post("/chat/stream", responses=_STREAM_RESPONSES)
+@router.post("/chat/stream", response_class=EventStreamResponse, responses=_STREAM_RESPONSES)
 async def stream_chat(
     payload: StreamingChatRequest,
     request: Request,
     service: Annotated[ChatService, Depends(get_chat_service)],
-) -> StreamingResponse:
+) -> EventStreamResponse:
     # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
     events = await service.open_stream(payload.message)
-    return StreamingResponse(
+    return EventStreamResponse(
         _render_sse(events, request.state.correlation_id),
-        media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
