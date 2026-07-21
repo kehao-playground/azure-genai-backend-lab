@@ -1,10 +1,24 @@
 import logging
 
 from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = logging.getLogger(__name__)
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorEnvelope(BaseModel):
+    """The one error shape every non-2xx response uses (Day 3 contract)."""
+
+    error: ErrorDetail
+    correlation_id: str | None
 
 
 class UpstreamError(Exception):
@@ -70,6 +84,22 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": error, "correlation_id": correlation_id},
+    )
+
+
+async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, RequestValidationError)
+    message = "; ".join(
+        f"{'.'.join(str(loc) for loc in error['loc'] if loc != 'body')}: {error['msg']}"
+        for error in exc.errors()
+    )
+    correlation_id = getattr(request.state, "correlation_id", None)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {"code": "validation_error", "message": message},
+            "correlation_id": correlation_id,
+        },
     )
 
 

@@ -41,7 +41,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/chat/stream:
     post:
       tags:
@@ -65,7 +65,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/rag:
     post:
       tags:
@@ -90,7 +90,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+                $ref: '#/components/schemas/ErrorEnvelope'
 components:
   schemas:
     ChatRequest:
@@ -123,15 +123,34 @@ components:
       - message
       - correlation_id
       title: ChatResponse
-    HTTPValidationError:
+    ErrorDetail:
       properties:
-        detail:
-          items:
-            $ref: '#/components/schemas/ValidationError'
-          type: array
-          title: Detail
+        code:
+          type: string
+          title: Code
+        message:
+          type: string
+          title: Message
       type: object
-      title: HTTPValidationError
+      required:
+      - code
+      - message
+      title: ErrorDetail
+    ErrorEnvelope:
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
+        correlation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Correlation Id
+      type: object
+      required:
+      - error
+      - correlation_id
+      title: ErrorEnvelope
+      description: The one error shape every non-2xx response uses (Day 3 contract).
     HealthResponse:
       properties:
         status:
@@ -194,29 +213,3 @@ components:
       required:
       - message
       title: StreamingChatRequest
-    ValidationError:
-      properties:
-        loc:
-          items:
-            anyOf:
-            - type: string
-            - type: integer
-          type: array
-          title: Location
-        msg:
-          type: string
-          title: Message
-        type:
-          type: string
-          title: Error Type
-        input:
-          title: Input
-        ctx:
-          type: object
-          title: Context
-      type: object
-      required:
-      - loc
-      - msg
-      - type
-      title: ValidationError
