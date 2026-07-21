@@ -1,16 +1,14 @@
-from fastapi.testclient import TestClient
+import os
 
-from azgenai_lab.api.chat import get_chat_service
-from azgenai_lab.main import app
-from azgenai_lab.services.azure_openai import FakeChatService
+# Must run before the app import below: BDD contract runs never depend on the
+# local .env or shell environment (review r01 fix 2).
+os.environ["USE_FAKE_LLM"] = "true"
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from azgenai_lab.main import app  # noqa: E402
 
 
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]
-    # BDD contract runs always use the fake adapter, whatever the local .env says.
-    app.dependency_overrides[get_chat_service] = FakeChatService
     context.client = TestClient(app)
     context.response = None
-
-
-def after_scenario(context, scenario):  # type: ignore[no-untyped-def]
-    app.dependency_overrides.clear()

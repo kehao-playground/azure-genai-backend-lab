@@ -15,10 +15,14 @@ class ErrorDetail(BaseModel):
 
 
 class ErrorEnvelope(BaseModel):
-    """The one error shape every non-2xx response uses (Day 3 contract)."""
+    """The one error shape every non-2xx response uses (Day 3 contract).
+
+    ``correlation_id`` is non-optional: the correlation middleware runs outside
+    every exception handler, so an envelope without it is a bug, not a case.
+    """
 
     error: ErrorDetail
-    correlation_id: str | None
+    correlation_id: str
 
 
 class UpstreamError(Exception):
@@ -47,11 +51,19 @@ class ConfigurationError(UpstreamError):
 
 
 class ContentFilteredError(UpstreamError):
-    """The prompt was blocked by the content filter — the one upstream 4xx the client owns."""
+    """The prompt was blocked by the content filter — a client-owned upstream 4xx."""
 
     status_code = 400
     code = "content_filtered"
     message = "The message was blocked by the content filter."
+
+
+class InvalidInputError(UpstreamError):
+    """The upstream model rejected the input itself (e.g. context length) — client-owned."""
+
+    status_code = 400
+    code = "invalid_input"
+    message = "The upstream model rejected the input (for example, it exceeds the context window)."
 
 
 class UpstreamThrottledError(UpstreamError):
@@ -80,7 +92,7 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
         error = exc.detail
     else:
         error = {"code": "http_error", "message": str(exc.detail)}
-    correlation_id = getattr(request.state, "correlation_id", None)
+    correlation_id: str = request.state.correlation_id
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": error, "correlation_id": correlation_id},
@@ -93,7 +105,7 @@ async def validation_error_handler(request: Request, exc: Exception) -> JSONResp
         f"{'.'.join(str(loc) for loc in error['loc'] if loc != 'body')}: {error['msg']}"
         for error in exc.errors()
     )
-    correlation_id = getattr(request.state, "correlation_id", None)
+    correlation_id: str = request.state.correlation_id
     return JSONResponse(
         status_code=422,
         content={
@@ -105,7 +117,7 @@ async def validation_error_handler(request: Request, exc: Exception) -> JSONResp
 
 async def upstream_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, UpstreamError)
-    correlation_id = getattr(request.state, "correlation_id", None)
+    correlation_id: str = request.state.correlation_id
     logger.warning(
         "upstream failure code=%s correlation_id=%s detail=%s",
         exc.code,

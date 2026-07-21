@@ -1,17 +1,20 @@
-from collections.abc import Generator
+import os
 
-import pytest
-from fastapi.testclient import TestClient
+# Must run before the app import below: the chat service is built at import
+# time (fail fast in production) and the test suite must never depend on the
+# local .env or shell environment (review r01 fix 2).
+os.environ["USE_FAKE_LLM"] = "true"
 
-from azgenai_lab.api.chat import get_chat_service
-from azgenai_lab.main import app
-from azgenai_lab.services.azure_openai import FakeChatService
+from collections.abc import Generator  # noqa: E402
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from azgenai_lab.main import app  # noqa: E402
 
 
 @pytest.fixture
 def client() -> Generator[TestClient]:
-    # Tests always run against the fake adapter, whatever the local .env says.
-    app.dependency_overrides[get_chat_service] = FakeChatService
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
