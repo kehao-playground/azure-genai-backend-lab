@@ -14,13 +14,12 @@ only on the :class:`ChatService` protocol.
 """
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Protocol
 
 import openai
 from openai import AsyncOpenAI
 
-from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
@@ -101,9 +100,3 @@ def build_chat_service(settings: Settings) -> ChatService:
         timeout=settings.llm_timeout_seconds,  # default 30s, not the SDK's 600s
     )
     return AzureOpenAIChatService(client, settings.azure_openai_deployment_name)
-
-
-@lru_cache
-def get_chat_service() -> ChatService:
-    """FastAPI dependency: one service (and one HTTP client) per process."""
-    return build_chat_service(get_settings())

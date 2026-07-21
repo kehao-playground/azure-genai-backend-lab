@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from azgenai_lab.api.chat import get_chat_service
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
@@ -10,7 +11,6 @@ from azgenai_lab.core.errors import (
     UpstreamTimeoutError,
 )
 from azgenai_lab.main import app
-from azgenai_lab.services.azure_openai import get_chat_service
 
 
 def test_chat_returns_reply_and_correlation_id(client: TestClient) -> None:
