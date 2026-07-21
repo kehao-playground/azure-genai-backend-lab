@@ -11,3 +11,15 @@ def step_response_status_code(context, status_code: int) -> None:  # type: ignor
 def step_response_json_error(context, error: str) -> None:  # type: ignore[no-untyped-def]
     assert context.response is not None
     assert context.response.json()["error"]["code"] == error
+
+
+@then('the response JSON should contain a non-empty "{field}"')
+def step_response_json_non_empty_field(context, field: str) -> None:  # type: ignore[no-untyped-def]
+    assert context.response is not None
+    assert context.response.json()[field]
+
+
+@then('the response JSON should contain a "{field}"')
+def step_response_json_field(context, field: str) -> None:  # type: ignore[no-untyped-def]
+    assert context.response is not None
+    assert field in context.response.json()
