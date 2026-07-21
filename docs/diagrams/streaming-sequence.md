@@ -38,3 +38,11 @@ Terminal guarantee: when the client stays connected and the stream ends
 normally, it receives exactly one terminal event; EOF without a terminal must
 be treated as a failure. On client disconnect the adapter closes the upstream
 stream in a `finally` block.
+
+Conversation state (Day 7) wraps this flow without changing it: the
+conversation is resolved before the eager open (an unknown `conversation_id`
+is a pre-stream 404), the issued id travels in the `X-Conversation-Id`
+response header, and the turn commits to the `ConversationStore` just before
+the `message.done` terminal is delivered — `error`, `content_filter`/`other`,
+and disconnects commit nothing (see
+[Conversation Turn Lifecycle](../state-models/conversation-session-fsm.md)).

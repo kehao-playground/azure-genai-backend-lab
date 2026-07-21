@@ -22,7 +22,7 @@ def test_suite_survives_hostile_local_env() -> None:
             sys.executable,
             "-m",
             "pytest",
-            "tests/unit/test_chat_api.py::test_chat_returns_reply_and_correlation_id",
+            "tests/unit/test_chat_api.py::test_chat_returns_reply_conversation_and_correlation_id",
             "-q",
         ],
         env=env,

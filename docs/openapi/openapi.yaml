@@ -48,6 +48,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Unknown conversation_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '500':
           description: Service misconfiguration
           content:
@@ -93,6 +99,12 @@ paths:
             \ a terminal as a failure and must ignore unknown event names. OpenAPI\
             \ cannot express these ordering invariants \u2014 the BDD feature `streaming_response.feature`\
             \ is the executable contract."
+          headers:
+            X-Conversation-Id:
+              description: The conversation this stream belongs to; send it as conversation_id
+                on the next turn.
+              schema:
+                type: string
           content:
             text/event-stream:
               schema:
@@ -116,6 +128,12 @@ paths:
         '400':
           description: 'Input rejected before the stream starts: content filter or
             invalid input'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Unknown conversation_id
           content:
             application/json:
               schema:
@@ -188,8 +206,9 @@ components:
           - type: string
           - type: 'null'
           title: Conversation Id
-          description: Reserved for conversation state (Day 7); accepted but ignored
-            today.
+          description: Continues an existing conversation. Omit to start a new one;
+            the response returns the id to send on the next turn. Unknown ids are
+            rejected with 404 conversation_not_found.
       type: object
       required:
       - message
@@ -199,12 +218,16 @@ components:
         message:
           type: string
           title: Message
+        conversation_id:
+          type: string
+          title: Conversation Id
         correlation_id:
           type: string
           title: Correlation Id
       type: object
       required:
       - message
+      - conversation_id
       - correlation_id
       title: ChatResponse
     ErrorDetail:
@@ -296,8 +319,9 @@ components:
           - type: string
           - type: 'null'
           title: Conversation Id
-          description: Reserved for conversation state (Day 7); accepted but ignored
-            today.
+          description: Continues an existing conversation. Omit to start a new one;
+            the id comes back in the X-Conversation-Id response header. Unknown ids
+            are rejected with 404 conversation_not_found.
       type: object
       required:
       - message

@@ -1,10 +1,10 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from azgenai_lab.core.errors import ErrorEnvelope
-from azgenai_lab.services.azure_openai import ChatService
+from azgenai_lab.services.conversation import ConversationChatService, ConversationNotFoundError
 
 router = APIRouter(tags=["chat"])
 
@@ -12,6 +12,7 @@ router = APIRouter(tags=["chat"])
 # status code is documented here so the OpenAPI drift check guards it.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Input rejected: content filter or invalid input"},
+    404: {"model": ErrorEnvelope, "description": "Unknown conversation_id"},
     500: {"model": ErrorEnvelope, "description": "Service misconfiguration"},
     502: {"model": ErrorEnvelope, "description": "Upstream LLM service failure"},
     503: {"model": ErrorEnvelope, "description": "Upstream capacity exhausted"},
@@ -19,22 +20,41 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
-def get_chat_service(request: Request) -> ChatService:
+def get_conversation_service(request: Request) -> ConversationChatService:
     """Resolve the app-wide service built once at startup (fail fast on bad config)."""
-    service: ChatService = request.app.state.chat_service
+    service: ConversationChatService = request.app.state.conversation_service
     return service
+
+
+def conversation_not_found() -> HTTPException:
+    """404 through the shared envelope. "Unknown" deliberately covers both
+    never-issued and lost ids: the in-memory store forgets on restart, and a
+    persistent store will expire conversations — the client reaction (start a
+    new conversation) is the same."""
+    return HTTPException(
+        status_code=404,
+        detail={
+            "code": "conversation_not_found",
+            "message": "Unknown conversation_id; start a new conversation by omitting it.",
+        },
+    )
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     conversation_id: str | None = Field(
         default=None,
-        description="Reserved for conversation state (Day 7); accepted but ignored today.",
+        description=(
+            "Continues an existing conversation. Omit to start a new one; the "
+            "response returns the id to send on the next turn. Unknown ids are "
+            "rejected with 404 conversation_not_found."
+        ),
     )
 
 
 class ChatResponse(BaseModel):
     message: str
+    conversation_id: str
     correlation_id: str
 
 
@@ -42,7 +62,14 @@ class ChatResponse(BaseModel):
 async def chat(
     payload: ChatRequest,
     request: Request,
-    service: Annotated[ChatService, Depends(get_chat_service)],
+    service: Annotated[ConversationChatService, Depends(get_conversation_service)],
 ) -> ChatResponse:
-    result = await service.complete(payload.message)
-    return ChatResponse(message=result.message, correlation_id=request.state.correlation_id)
+    try:
+        conversation_id, result = await service.complete(payload.message, payload.conversation_id)
+    except ConversationNotFoundError:
+        raise conversation_not_found() from None
+    return ChatResponse(
+        message=result.message,
+        conversation_id=conversation_id,
+        correlation_id=request.state.correlation_id,
+    )

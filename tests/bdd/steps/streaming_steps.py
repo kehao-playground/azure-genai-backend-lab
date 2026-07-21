@@ -1,17 +1,20 @@
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 from behave import given, then, when
 
-from azgenai_lab.api.chat import get_chat_service
+from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
+from azgenai_lab.models.chat import Message
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
     StreamDone,
     TextDelta,
 )
+from azgenai_lab.services.conversation import ConversationChatService
+from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 
 class ScriptedChatService:
@@ -25,10 +28,10 @@ class ScriptedChatService:
         self._script = script
         self._open_error = open_error
 
-    async def complete(self, message: str) -> ChatResult:
-        return ChatResult(message=f"[scripted] {message}")
+    async def complete(self, messages: Sequence[Message]) -> ChatResult:
+        return ChatResult(message=f"[scripted] {messages[-1].content}")
 
-    async def open_stream(self, message: str) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
         if self._open_error is not None:
             raise self._open_error
 
@@ -42,7 +45,9 @@ class ScriptedChatService:
 
 
 def _override(service: ScriptedChatService) -> None:
-    app.dependency_overrides[get_chat_service] = lambda: service
+    # The orchestrator stays real: only the LLM boundary is scripted.
+    wrapped = ConversationChatService(service, InMemoryConversationStore())
+    app.dependency_overrides[get_conversation_service] = lambda: wrapped
 
 
 def _sse_events(text: str) -> list[tuple[str, dict[str, object]]]:
@@ -65,7 +70,7 @@ def _terminals(events: list[tuple[str, dict[str, object]]]) -> list[tuple[str, d
 
 @given("a valid streaming chat request")
 def step_valid_streaming_request(context) -> None:  # type: ignore[no-untyped-def]
-    context.payload = {"message": "Hello", "conversation_id": "local-test"}
+    context.payload = {"message": "Hello"}
 
 
 @given("a streaming chat request with an empty message")

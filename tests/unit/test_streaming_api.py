@@ -7,20 +7,23 @@ EOF without one is itself reported as an ``error`` event.
 """
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 from fastapi.testclient import TestClient
 from httpx import Response
 
-from azgenai_lab.api.chat import get_chat_service
+from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
+from azgenai_lab.models.chat import Message
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
     StreamDone,
     TextDelta,
 )
+from azgenai_lab.services.conversation import ConversationChatService
+from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 
 def sse_events(response: Response) -> list[tuple[str, dict[str, object]]]:
@@ -49,10 +52,10 @@ class ScriptedChatService:
         self._script = script
         self._open_error = open_error
 
-    async def complete(self, message: str) -> ChatResult:
-        return ChatResult(message=f"[scripted] {message}")
+    async def complete(self, messages: Sequence[Message]) -> ChatResult:
+        return ChatResult(message=f"[scripted] {messages[-1].content}")
 
-    async def open_stream(self, message: str) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
         if self._open_error is not None:
             raise self._open_error
 
@@ -66,7 +69,9 @@ class ScriptedChatService:
 
 
 def override(service: ScriptedChatService) -> None:
-    app.dependency_overrides[get_chat_service] = lambda: service
+    # The orchestrator stays real: only the LLM boundary is scripted.
+    wrapped = ConversationChatService(service, InMemoryConversationStore())
+    app.dependency_overrides[get_conversation_service] = lambda: wrapped
 
 
 def post_stream(client: TestClient) -> Response:
@@ -78,6 +83,7 @@ def test_successful_stream_ends_with_exactly_one_done(client: TestClient) -> Non
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-conversation-id"]
 
     events = sse_events(response)
     deltas = [data for name, data in events if name == "message.delta"]
@@ -164,6 +170,32 @@ def test_incomplete_done_carries_the_reason(client: TestClient) -> None:
     assert data["incomplete_reason"] == "content_filter"
 
 
+def test_stream_follow_up_turn_carries_the_history(client: TestClient) -> None:
+    first = client.post("/api/v1/chat", json={"message": "ping"})
+    conversation_id = first.json()["conversation_id"]
+
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"message": "again", "conversation_id": conversation_id},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-conversation-id"] == conversation_id
+    deltas = [data for name, data in sse_events(response) if name == "message.delta"]
+    assert "".join(str(d["text"]) for d in deltas) == "[fake-llm] again (history=2)"
+
+
+def test_stream_unknown_conversation_id_maps_to_404_envelope(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={"message": "ping", "conversation_id": "never-issued"},
+    )
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "conversation_not_found"
+
+
 def test_validation_error_uses_the_envelope(client: TestClient) -> None:
     response = client.post("/api/v1/chat/stream", json={"message": ""})
 
@@ -184,7 +216,7 @@ def test_openapi_media_types_match_runtime(client: TestClient) -> None:
     responses = app.openapi()["paths"]["/api/v1/chat/stream"]["post"]["responses"]
 
     assert set(responses["200"]["content"]) == {"text/event-stream"}
-    for status in ("400", "422", "500", "502", "503", "504"):
+    for status in ("400", "404", "422", "500", "502", "503", "504"):
         content = responses[status]["content"]
         assert set(content) == {"application/json"}, f"{status}: {set(content)}"
         ref = content["application/json"]["schema"]["$ref"]

@@ -1,7 +1,9 @@
+from collections.abc import Sequence
+
 import pytest
 from fastapi.testclient import TestClient
 
-from azgenai_lab.api.chat import get_chat_service
+from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
@@ -12,14 +14,18 @@ from azgenai_lab.core.errors import (
     UpstreamTimeoutError,
 )
 from azgenai_lab.main import app
+from azgenai_lab.models.chat import Message
+from azgenai_lab.services.conversation import ConversationChatService
+from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 
-def test_chat_returns_reply_and_correlation_id(client: TestClient) -> None:
+def test_chat_returns_reply_conversation_and_correlation_id(client: TestClient) -> None:
     response = client.post("/api/v1/chat", json={"message": "ping"})
 
     assert response.status_code == 200
     body = response.json()
     assert body["message"] == "[fake-llm] ping"
+    assert body["conversation_id"]
     assert body["correlation_id"]
     assert response.headers["x-correlation-id"] == body["correlation_id"]
 
@@ -35,12 +41,30 @@ def test_chat_echoes_provided_correlation_id(client: TestClient) -> None:
     assert response.json()["correlation_id"] == "test-id-123"
 
 
-def test_chat_accepts_reserved_conversation_id(client: TestClient) -> None:
-    response = client.post(
-        "/api/v1/chat", json={"message": "ping", "conversation_id": "future-day-07"}
+def test_chat_follow_up_turn_carries_the_history(client: TestClient) -> None:
+    first = client.post("/api/v1/chat", json={"message": "ping"})
+    conversation_id = first.json()["conversation_id"]
+
+    second = client.post(
+        "/api/v1/chat", json={"message": "again", "conversation_id": conversation_id}
     )
 
-    assert response.status_code == 200
+    assert second.status_code == 200
+    body = second.json()
+    # user+assistant from turn 1 = 2 prior messages seen by the (fake) model.
+    assert body["message"] == "[fake-llm] again (history=2)"
+    assert body["conversation_id"] == conversation_id
+
+
+def test_chat_unknown_conversation_id_maps_to_404_envelope(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/chat", json={"message": "ping", "conversation_id": "never-issued"}
+    )
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "conversation_not_found"
+    assert body["correlation_id"]
 
 
 def test_chat_rejects_empty_message_with_error_envelope(client: TestClient) -> None:
@@ -58,8 +82,14 @@ class RaisingChatService:
     def __init__(self, error: UpstreamError) -> None:
         self._error = error
 
-    async def complete(self, message: str) -> object:
+    async def complete(self, messages: Sequence[Message]) -> object:
         raise self._error
+
+
+def override_with_raising(error: UpstreamError) -> None:
+    # The orchestrator stays real: only the LLM boundary fails.
+    service = ConversationChatService(RaisingChatService(error), InMemoryConversationStore())  # type: ignore[arg-type]
+    app.dependency_overrides[get_conversation_service] = lambda: service
 
 
 @pytest.mark.parametrize(
@@ -76,7 +106,7 @@ class RaisingChatService:
 def test_upstream_errors_map_to_error_envelope(
     client: TestClient, error: UpstreamError, status_code: int, code: str
 ) -> None:
-    app.dependency_overrides[get_chat_service] = lambda: RaisingChatService(error)
+    override_with_raising(error)
 
     response = client.post("/api/v1/chat", json={"message": "ping"})
 
@@ -90,4 +120,4 @@ def test_upstream_errors_map_to_error_envelope(
 def test_openapi_documents_the_error_contract() -> None:
     responses = app.openapi()["paths"]["/api/v1/chat"]["post"]["responses"]
 
-    assert {"200", "400", "422", "500", "502", "503", "504"} <= set(responses)
+    assert {"200", "400", "404", "422", "500", "502", "503", "504"} <= set(responses)
