@@ -19,6 +19,7 @@ Fake vs. real is selected once in :func:`build_chat_service`; handlers depend
 only on the :class:`ChatService` protocol.
 """
 
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -28,6 +29,7 @@ from openai import AsyncOpenAI, AsyncStream
 from openai.types.responses import ResponseInputParam, ResponseStreamEvent
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.correlation import correlation_id_var
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
@@ -39,6 +41,22 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
+
+logger = logging.getLogger(__name__)
+
+
+def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
+    # Attribution over metrics: incidents must be able to answer "which
+    # prompt version was live on this request?" without asking git.
+    logger.info(
+        "llm call (streaming=%s)",
+        streaming,
+        extra={
+            "prompt_name": prompt.name if prompt else None,
+            "prompt_version": prompt.version if prompt else None,
+            "correlation_id": correlation_id_var.get(),
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -123,10 +141,12 @@ class FakeChatService:
         self._prompt = prompt
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        _log_llm_call(self._prompt, streaming=False)
         reply = _fake_reply(items, self._prompt)
         return ChatResult(message=reply, model="fake", replay_items=(_fake_output_item(reply),))
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
+        _log_llm_call(self._prompt, streaming=True)
         reply = _fake_reply(items, self._prompt)
 
         async def stream() -> AsyncIterator[ChatStreamEvent]:
@@ -231,6 +251,7 @@ class AzureOpenAIChatService:
         self._prompt = prompt
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        _log_llm_call(self._prompt, streaming=False)
         try:
             response = await self._client.responses.create(
                 model=self._deployment_name,  # still the deployment name
@@ -252,6 +273,7 @@ class AzureOpenAIChatService:
         )
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
+        _log_llm_call(self._prompt, streaming=True)
         # Eager open: this await is the two-phase error boundary. Failures here
         # (401/429/timeout…) raise before any byte reaches the client, so they
         # keep their HTTP status codes; only failures after this point are
