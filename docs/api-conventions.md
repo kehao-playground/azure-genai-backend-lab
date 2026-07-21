@@ -38,9 +38,14 @@ Failures before the stream starts keep their HTTP status codes (the envelope app
 
 The LLM API is stateless (`store=False` upstream); conversation history is owned by this application behind the `ConversationStore` protocol (Day 7):
 
-- `POST /api/v1/chat` and `POST /api/v1/chat/stream` accept an optional `conversation_id`. Omitting it starts a new conversation; the id comes back in the JSON body (`/chat`) or in the `X-Conversation-Id` response header (`/chat/stream` — a header because SSE clients need it at response time, not from an event).
+- `POST /api/v1/chat` and `POST /api/v1/chat/stream` accept an optional `conversation_id`. Omitting it starts a new conversation; the id comes back in the JSON body (`/chat`) or in the `X-Conversation-Id` response header (`/chat/stream` — a header because SSE clients need it at response time, not from an event). On a first streaming turn that header id is **provisional**: it becomes real only with a keepable terminal (`message.done` completed or `max_output_tokens`); after `error`, `content_filter`/`other`, or a disconnect the client must discard it.
 - Unknown ids are rejected with `404 conversation_not_found` through the envelope. "Unknown" covers never-issued, expired, and lost-on-restart ids alike; the client reaction is the same — start a new conversation.
-- A turn (user message + assistant reply) commits atomically only after a reply the client keeps: non-streaming success, stream `completed`, or `incomplete`/`max_output_tokens`. Failed turns, `content_filter`/`other` truncations, and client disconnects leave no trace, so retries cannot corrupt history. The executable contract is `tests/bdd/features/conversation_state.feature`.
+- Each committed turn stores two representations: the visible transcript (user + assistant messages) and the provider **replay items** — the user input item plus every response output item, including encrypted reasoning items (`include=["reasoning.encrypted_content"]`). The replay items, not the transcript, are what the next request resends: with `store=False` and a reasoning model, replaying only visible text silently drops reasoning context.
+- A turn commits atomically only after a reply the client keeps: non-streaming success, stream `completed`, or `incomplete`/`max_output_tokens`. Failed turns, `content_filter`/`other` truncations, and disconnects **before the upstream terminal is consumed** leave no trace, so retries cannot corrupt history. Once the terminal is consumed, the commit happens whether or not delivery of `message.done` can be proven — the one-way invariant is that a client which received `message.done` can rely on the history existing. An empty non-streaming reply maps to `502 upstream_error`, never a 200 carrying an id that does not exist.
+- Turns on one conversation are serialized (per-conversation critical section); a persistent store must provide equivalent conditional-write semantics across replicas, and its `append` must be all-or-nothing.
+- Storage failures map to `500 storage_error` (envelope) before a response is out, or an SSE `error` terminal after the 200. By that point inference has been billed; retrying repeats it.
+
+The executable contract is `tests/bdd/features/conversation_state.feature` plus `tests/unit/test_conversation_service.py`.
 
 ## Correlation ID
 

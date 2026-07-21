@@ -26,7 +26,8 @@ class ErrorEnvelope(BaseModel):
 
 
 class UpstreamError(Exception):
-    """Upstream LLM failure translated into the client-facing error contract.
+    """Backend dependency failure translated into the client-facing error
+    contract — the LLM upstream and, since Day 7, conversation storage.
 
     Adapters raise these instead of leaking SDK exceptions, so the API layer
     never imports the SDK. ``upstream_detail`` may contain endpoint or
@@ -64,6 +65,21 @@ class InvalidInputError(UpstreamError):
     status_code = 400
     code = "invalid_input"
     message = "The upstream model rejected the input (for example, it exceeds the context window)."
+
+
+class StorageError(UpstreamError):
+    """Conversation storage failed — our dependency, not the client's fault.
+
+    Raised after inference has already happened (and been billed): the reply
+    exists but could not be committed. Mapping it through the shared error
+    machinery keeps both contracts intact — HTTP 500 envelope before a
+    response is returned, SSE ``error`` terminal after a 200 (review r01
+    finding 3). Retrying such a failure repeats inference and billing.
+    """
+
+    status_code = 500
+    code = "storage_error"
+    message = "Conversation storage failed; the turn was not saved."
 
 
 class UpstreamThrottledError(UpstreamError):

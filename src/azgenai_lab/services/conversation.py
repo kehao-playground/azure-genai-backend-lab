@@ -1,23 +1,42 @@
 """Conversation orchestration: history in, one turn out (Day 7).
 
 Owning conversation state (``store=False``) means this layer decides what
-enters the history. The rule is turn-commit: the user message and the
-assistant reply are appended together, only after the LLM call produced a
-usable reply — a failed turn leaves no trace, so retrying it cannot
-duplicate or corrupt history.
+enters the history. The rule is turn-commit: the user input and the reply
+context are appended together, only after the LLM call produced a reply the
+client keeps — a failed turn leaves no trace, so retrying it cannot
+duplicate or corrupt history. A turn is committed at two fidelities: the
+visible transcript (``Message``) and the provider replay items that the next
+request must resend verbatim, including encrypted reasoning items.
 
 For streams the turn commits when the terminal event arrives and the Day 6
 contract says the client keeps the text: ``completed`` and ``incomplete``
 with reason ``max_output_tokens`` commit; ``content_filter`` / ``other``
 (the client must discard the text) and mid-stream errors do not. A client
-disconnect aborts the turn uncommitted.
+disconnect **before the upstream terminal is consumed** aborts the turn
+uncommitted; once the terminal is consumed the commit happens whether or not
+``message.done`` provably reached the client — no transport can prove
+delivery across a dying socket. The one-way invariant is: if the client
+received ``message.done``, the history it implies already exists.
+
+Turns on the same conversation are serialized with a per-conversation lock:
+read → inference → commit is one critical section, so parallel requests
+cannot both build on the same stale snapshot and record a causally false
+history. A persistent store must provide the equivalent (conditional writes)
+across replicas.
+
+Storage failures surface as :class:`StorageError` (HTTP 500 envelope before
+a response is out, SSE ``error`` terminal after a 200). By then inference
+has already been billed; retrying repeats it.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.errors import StorageError, UpstreamServiceError
 from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import Conversation, ReplayItem
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatService,
@@ -37,70 +56,116 @@ class ConversationNotFoundError(Exception):
         self.conversation_id = conversation_id
 
 
+def _user_item(message: str) -> ReplayItem:
+    return {"role": "user", "content": message}
+
+
 class ConversationChatService:
     def __init__(self, chat_service: ChatService, store: ConversationStore) -> None:
         self._chat_service = chat_service
         self._store = store
+        # One lock per conversation id; lives as long as this (in-memory
+        # scoped) service instance, like the demo store itself.
+        self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _resolve_history(self, conversation_id: str | None) -> tuple[str, list[Message]]:
-        if conversation_id is None:
-            # The id is issued here, but the conversation exists only once its
-            # first turn commits — a failed first call leaves nothing behind.
-            return str(uuid4()), []
-        conversation = await self._store.get(conversation_id)
+    def _lock_for(self, conversation_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(conversation_id, asyncio.Lock())
+
+    async def _load(self, provided_id: str | None, resolved_id: str) -> Conversation:
+        if provided_id is None:
+            # The id is issued by the caller path, but the conversation exists
+            # only once its first turn commits — a failed first call leaves
+            # nothing behind.
+            return Conversation(id=resolved_id)
+        try:
+            conversation = await self._store.get(provided_id)
+        except Exception as exc:
+            raise StorageError(str(exc)) from exc
         if conversation is None:
-            raise ConversationNotFoundError(conversation_id)
-        return conversation_id, conversation.messages
+            raise ConversationNotFoundError(provided_id)
+        return conversation
+
+    async def _commit(
+        self,
+        conversation_id: str,
+        turns: list[Message],
+        replay_items: list[ReplayItem],
+    ) -> None:
+        try:
+            await self._store.append(conversation_id, turns, replay_items)
+        except Exception as exc:
+            raise StorageError(str(exc)) from exc
 
     async def complete(self, message: str, conversation_id: str | None) -> tuple[str, ChatResult]:
-        resolved_id, history = await self._resolve_history(conversation_id)
-        user_message = Message(role="user", content=message)
-        result = await self._chat_service.complete([*history, user_message])
-        # An empty reply is nothing worth keeping (and Message forbids empty
-        # content); return it to the client but don't commit the turn.
-        if result.message:
-            await self._store.append(
+        resolved_id = conversation_id or str(uuid4())
+        async with self._lock_for(resolved_id):
+            conversation = await self._load(conversation_id, resolved_id)
+            user_item = _user_item(message)
+            result = await self._chat_service.complete([*conversation.replay_items, user_item])
+            if not result.message:
+                # A 200 with a freshly issued id that resolves to 404 next
+                # turn would break the contract; an empty reply is an
+                # upstream failure, not a turn (review r01 finding 4).
+                raise UpstreamServiceError("upstream returned an empty reply")
+            await self._commit(
                 resolved_id,
-                [user_message, Message(role="assistant", content=result.message)],
+                [
+                    Message(role="user", content=message),
+                    Message(role="assistant", content=result.message),
+                ],
+                [user_item, *result.replay_items],
             )
         return resolved_id, result
 
     async def open_stream(
         self, message: str, conversation_id: str | None
     ) -> tuple[str, AsyncIterator[ChatStreamEvent]]:
-        resolved_id, history = await self._resolve_history(conversation_id)
-        user_message = Message(role="user", content=message)
-        # Eager await preserved: pre-stream failures raise here, before any
-        # byte reaches the client — the Day 6 two-phase boundary passes
-        # through this layer intact.
-        events = await self._chat_service.open_stream([*history, user_message])
-        return resolved_id, self._commit_on_done(resolved_id, user_message, events)
+        resolved_id = conversation_id or str(uuid4())
+        lock = self._lock_for(resolved_id)
+        await lock.acquire()
+        try:
+            conversation = await self._load(conversation_id, resolved_id)
+            user_item = _user_item(message)
+            # Eager await preserved: pre-stream failures raise here, before
+            # any byte reaches the client — the Day 6 two-phase boundary
+            # passes through this layer intact.
+            events = await self._chat_service.open_stream([*conversation.replay_items, user_item])
+        except BaseException:
+            lock.release()
+            raise
+        return resolved_id, self._commit_on_done(resolved_id, message, user_item, events, lock)
 
     async def _commit_on_done(
         self,
         conversation_id: str,
-        user_message: Message,
+        message: str,
+        user_item: ReplayItem,
         events: AsyncIterator[ChatStreamEvent],
+        lock: asyncio.Lock,
     ) -> AsyncIterator[ChatStreamEvent]:
         parts: list[str] = []
-        async for event in events:
-            if isinstance(event, StreamDone):
-                text = "".join(parts)
-                keeps_text = event.status == "completed" or (
-                    event.incomplete_reason == "max_output_tokens"
-                )
-                if text and keeps_text:
-                    # Commit before the terminal is delivered: when the client
-                    # sees message.done, the history it implies already exists.
-                    await self._store.append(
-                        conversation_id,
-                        [user_message, Message(role="assistant", content=text)],
+        try:
+            async for event in events:
+                if isinstance(event, StreamDone):
+                    keeps_text = event.status == "completed" or (
+                        event.incomplete_reason == "max_output_tokens"
                     )
+                    if keeps_text:
+                        text = "".join(parts)
+                        turns = [Message(role="user", content=message)]
+                        if text:
+                            turns.append(Message(role="assistant", content=text))
+                        # Commit before the terminal is delivered: when the
+                        # client sees message.done, the history it implies
+                        # already exists.
+                        await self._commit(conversation_id, turns, [user_item, *event.replay_items])
+                    yield event
+                    return
+                if isinstance(event, TextDelta):
+                    parts.append(event.text)
                 yield event
-                return
-            if isinstance(event, TextDelta):
-                parts.append(event.text)
-            yield event
+        finally:
+            lock.release()
 
 
 def build_conversation_service(settings: Settings) -> ConversationChatService:

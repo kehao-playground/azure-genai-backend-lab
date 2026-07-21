@@ -20,7 +20,7 @@ from azgenai_lab.core.errors import (
     UpstreamServiceError,
     UpstreamThrottledError,
 )
-from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     ChatStreamEvent,
@@ -34,21 +34,23 @@ async def collect(events: AsyncIterator[ChatStreamEvent]) -> list[ChatStreamEven
     return [event async for event in events]
 
 
-def user_messages(*texts: str) -> list[Message]:
-    return [Message(role="user", content=text) for text in texts]
+def user_items(*texts: str) -> list[ReplayItem]:
+    return [{"role": "user", "content": text} for text in texts]
 
 
 async def test_fake_stream_yields_deltas_then_done() -> None:
-    events = await collect(await FakeChatService().open_stream(user_messages("hello")))
+    events = await collect(await FakeChatService().open_stream(user_items("hello")))
 
     deltas = [e for e in events if isinstance(e, TextDelta)]
     assert len(deltas) >= 2
     assert "".join(d.text for d in deltas) == "[fake-llm] hello"
-    assert events[-1] == StreamDone(status="completed")
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].status == "completed"
+    assert events[-1].replay_items  # the fake supplies replay context too
 
 
 async def test_fake_stream_makes_received_history_visible() -> None:
-    events = await collect(await FakeChatService().open_stream(user_messages("one", "two")))
+    events = await collect(await FakeChatService().open_stream(user_items("one", "two")))
 
     deltas = [e for e in events if isinstance(e, TextDelta)]
     assert "".join(d.text for d in deltas) == "[fake-llm] two (history=1)"
@@ -94,37 +96,62 @@ def make_service(
     return AzureOpenAIChatService(cast(AsyncOpenAI, client), "chat-mini"), responses
 
 
+class StubOutputItem:
+    """Mimics an SDK output item: only model_dump is used at the boundary."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        return dict(self._payload)
+
+
+REASONING_ITEM = {"type": "reasoning", "encrypted_content": "opaque-blob"}
+
+
 def delta(text: str) -> Any:
     return SimpleNamespace(type="response.output_text.delta", delta=text)
 
 
-def completed() -> Any:
-    return SimpleNamespace(type="response.completed")
+def completed(output: list[Any] | None = None) -> Any:
+    return SimpleNamespace(type="response.completed", response=SimpleNamespace(output=output or []))
 
 
 def incomplete(reason: str) -> Any:
     return SimpleNamespace(
         type="response.incomplete",
-        response=SimpleNamespace(incomplete_details=SimpleNamespace(reason=reason)),
+        response=SimpleNamespace(incomplete_details=SimpleNamespace(reason=reason), output=[]),
     )
 
 
 async def test_real_stream_is_requested_with_store_false() -> None:
     service, responses = make_service(StubUpstreamStream([delta("pong"), completed()]))
 
-    await collect(await service.open_stream(user_messages("ping")))
+    await collect(await service.open_stream(user_items("ping")))
 
     call = responses.calls[0]
     assert call["model"] == "chat-mini"
     assert call["input"] == [{"role": "user", "content": "ping"}]
     assert call["store"] is False
+    assert call["include"] == ["reasoning.encrypted_content"]
     assert call["stream"] is True
+
+
+async def test_terminal_event_carries_the_response_output_as_replay_items() -> None:
+    service, _ = make_service(
+        StubUpstreamStream([delta("pong"), completed(output=[StubOutputItem(REASONING_ITEM)])])
+    )
+
+    events = await collect(await service.open_stream(user_items("ping")))
+
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].replay_items == (REASONING_ITEM,)
 
 
 async def test_real_stream_translates_deltas_and_completed() -> None:
     service, _ = make_service(StubUpstreamStream([delta("po"), delta("ng"), completed()]))
 
-    events = await collect(await service.open_stream(user_messages("ping")))
+    events = await collect(await service.open_stream(user_items("ping")))
 
     assert events == [TextDelta("po"), TextDelta("ng"), StreamDone(status="completed")]
 
@@ -133,7 +160,7 @@ async def test_real_stream_ignores_unknown_event_types() -> None:
     noise = SimpleNamespace(type="response.output_item.added")
     service, _ = make_service(StubUpstreamStream([noise, delta("pong"), completed()]))
 
-    events = await collect(await service.open_stream(user_messages("ping")))
+    events = await collect(await service.open_stream(user_items("ping")))
 
     assert events == [TextDelta("pong"), StreamDone(status="completed")]
 
@@ -149,7 +176,7 @@ async def test_real_stream_ignores_unknown_event_types() -> None:
 async def test_real_stream_maps_incomplete_reasons(upstream_reason: str, our_reason: str) -> None:
     service, _ = make_service(StubUpstreamStream([delta("po"), incomplete(upstream_reason)]))
 
-    events = await collect(await service.open_stream(user_messages("ping")))
+    events = await collect(await service.open_stream(user_items("ping")))
 
     assert events[-1] == StreamDone(status="incomplete", incomplete_reason=our_reason)
 
@@ -162,7 +189,7 @@ async def test_pre_stream_throttling_raises_before_iteration() -> None:
     # The failure must surface at open_stream (before any byte is sent to the
     # client), not on first iteration — this is the two-phase error boundary.
     with pytest.raises(UpstreamThrottledError):
-        await service.open_stream(user_messages("ping"))
+        await service.open_stream(user_items("ping"))
 
 
 async def test_failed_event_raises_upstream_error_mid_stream() -> None:
@@ -172,7 +199,7 @@ async def test_failed_event_raises_upstream_error_mid_stream() -> None:
     )
     service, _ = make_service(StubUpstreamStream([delta("po"), failed]))
 
-    events = await service.open_stream(user_messages("ping"))
+    events = await service.open_stream(user_items("ping"))
     received: list[ChatStreamEvent] = []
     with pytest.raises(UpstreamServiceError):
         async for event in events:
@@ -185,7 +212,7 @@ async def test_error_event_raises_upstream_error_mid_stream() -> None:
     error_event = SimpleNamespace(type="error", code="server_error", message="boom")
     service, _ = make_service(StubUpstreamStream([error_event]))
 
-    events = await service.open_stream(user_messages("ping"))
+    events = await service.open_stream(user_items("ping"))
     with pytest.raises(UpstreamError):
         await collect(events)
 
@@ -197,7 +224,7 @@ async def test_sdk_exception_mid_stream_is_translated() -> None:
         )
     )
 
-    events = await service.open_stream(user_messages("ping"))
+    events = await service.open_stream(user_items("ping"))
     with pytest.raises(UpstreamError):
         await collect(events)
 
@@ -206,7 +233,7 @@ async def test_upstream_stream_closed_when_consumer_stops_early() -> None:
     stream = StubUpstreamStream([delta("a"), delta("b"), completed()])
     service, _ = make_service(stream)
 
-    events = await service.open_stream(user_messages("ping"))
+    events = await service.open_stream(user_items("ping"))
     async for _ in events:
         break  # client disconnected after the first delta
     await events.aclose()  # type: ignore[attr-defined]
@@ -218,6 +245,6 @@ async def test_upstream_stream_closed_after_normal_completion() -> None:
     stream = StubUpstreamStream([delta("a"), completed()])
     service, _ = make_service(stream)
 
-    await collect(await service.open_stream(user_messages("ping")))
+    await collect(await service.open_stream(user_items("ping")))
 
     assert stream.closed

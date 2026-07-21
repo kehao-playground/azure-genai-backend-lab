@@ -14,9 +14,9 @@ sequenceDiagram
     else omitted
         API->>API: issue new conversation_id
     end
-    API->>LLM: Responses API: full history + new user message
+    API->>LLM: Responses API: replay items (incl. encrypted reasoning) + new user input
     LLM-->>API: assistant reply
-    API->>Store: append(user message, assistant reply)
+    API->>Store: append(transcript turn + replay items)
     Note over API,Store: turn-commit: both messages together,\nonly after success
     API-->>Client: ChatResponse {message, conversation_id, correlation_id}
 ```

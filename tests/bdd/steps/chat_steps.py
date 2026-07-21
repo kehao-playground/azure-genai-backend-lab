@@ -5,7 +5,7 @@ from behave import given, when
 from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import InvalidInputError
 from azgenai_lab.main import app
-from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.conversation import ConversationChatService
 
 
@@ -22,7 +22,7 @@ def step_empty_chat_request(context) -> None:  # type: ignore[no-untyped-def]
 class RejectingChatService:
     """Stands in for the adapter after it translated an upstream input rejection."""
 
-    async def complete(self, messages: Sequence[Message]) -> object:
+    async def complete(self, items: Sequence[ReplayItem]) -> object:
         raise InvalidInputError("upstream detail")
 
 

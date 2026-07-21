@@ -16,9 +16,11 @@ from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import Message
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
+    FakeChatService,
     StreamDone,
     TextDelta,
 )
@@ -52,10 +54,10 @@ class ScriptedChatService:
         self._script = script
         self._open_error = open_error
 
-    async def complete(self, messages: Sequence[Message]) -> ChatResult:
-        return ChatResult(message=f"[scripted] {messages[-1].content}")
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        return ChatResult(message=f"[scripted] {items[-1].get('content')}")
 
-    async def open_stream(self, messages: Sequence[Message]) -> AsyncIterator[ChatStreamEvent]:
+    async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
         if self._open_error is not None:
             raise self._open_error
 
@@ -194,6 +196,52 @@ def test_stream_unknown_conversation_id_maps_to_404_envelope(client: TestClient)
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("application/json")
     assert response.json()["error"]["code"] == "conversation_not_found"
+
+
+def test_provisional_id_after_content_filter_resolves_to_404(client: TestClient) -> None:
+    """First-turn header id is provisional: a discarded terminal commits nothing."""
+    override(
+        ScriptedChatService(
+            [TextDelta("par"), StreamDone(status="incomplete", incomplete_reason="content_filter")]
+        )
+    )
+
+    stream_response = post_stream(client)
+    provisional_id = stream_response.headers["x-conversation-id"]
+
+    follow_up = client.post(
+        "/api/v1/chat/stream",
+        json={"message": "again", "conversation_id": provisional_id},
+    )
+
+    assert follow_up.status_code == 404
+    assert follow_up.json()["error"]["code"] == "conversation_not_found"
+
+
+class FailingStore(InMemoryConversationStore):
+    async def append(
+        self,
+        conversation_id: str,
+        turns: Sequence[Message],
+        replay_items: Sequence[ReplayItem],
+    ) -> None:
+        raise RuntimeError("disk on fire")
+
+
+def test_store_failure_mid_stream_ends_with_storage_error_terminal(client: TestClient) -> None:
+    service = ConversationChatService(FakeChatService(), FailingStore())
+    app.dependency_overrides[get_conversation_service] = lambda: service
+
+    response = post_stream(client)
+
+    assert response.status_code == 200  # commit failure happens after the 200
+    events = sse_events(response)
+    assert events[-1][0] == "error"
+    error = events[-1][1]["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "storage_error"
+    assert "disk on fire" not in response.text
+    assert sum(1 for name, _ in events if name in ("message.done", "error")) == 1
 
 
 def test_validation_error_uses_the_envelope(client: TestClient) -> None:

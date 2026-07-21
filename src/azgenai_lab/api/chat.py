@@ -13,7 +13,7 @@ router = APIRouter(tags=["chat"])
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Input rejected: content filter or invalid input"},
     404: {"model": ErrorEnvelope, "description": "Unknown conversation_id"},
-    500: {"model": ErrorEnvelope, "description": "Service misconfiguration"},
+    500: {"model": ErrorEnvelope, "description": "Service misconfiguration or storage failure"},
     502: {"model": ErrorEnvelope, "description": "Upstream LLM service failure"},
     503: {"model": ErrorEnvelope, "description": "Upstream capacity exhausted"},
     504: {"model": ErrorEnvelope, "description": "Upstream timeout"},
