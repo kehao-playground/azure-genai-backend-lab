@@ -12,3 +12,7 @@ from azgenai_lab.main import app  # noqa: E402
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]
     context.client = TestClient(app)
     context.response = None
+
+
+def after_scenario(context, scenario):  # type: ignore[no-untyped-def]
+    app.dependency_overrides.clear()
