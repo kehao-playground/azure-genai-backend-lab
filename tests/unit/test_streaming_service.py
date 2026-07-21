@@ -21,6 +21,7 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
 )
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     ChatStreamEvent,
@@ -28,6 +29,8 @@ from azgenai_lab.services.azure_openai import (
     StreamDone,
     TextDelta,
 )
+
+PROMPT = PromptTemplate(name="default_chat", version=1, description="d", text="You are T.")
 
 
 async def collect(events: AsyncIterator[ChatStreamEvent]) -> list[ChatStreamEvent]:
@@ -93,7 +96,7 @@ def make_service(
 ) -> tuple[AzureOpenAIChatService, StubResponses]:
     responses = StubResponses(stream)
     client = SimpleNamespace(responses=responses)
-    return AzureOpenAIChatService(cast(AsyncOpenAI, client), "chat-mini"), responses
+    return AzureOpenAIChatService(cast(AsyncOpenAI, client), "chat-mini", prompt=PROMPT), responses
 
 
 class StubOutputItem:
@@ -248,3 +251,18 @@ async def test_upstream_stream_closed_after_normal_completion() -> None:
     await collect(await service.open_stream(user_items("ping")))
 
     assert stream.closed
+
+
+async def test_fake_stream_marks_prompt_delivery() -> None:
+    service = FakeChatService(prompt=PROMPT)
+    events = [e async for e in await service.open_stream([{"role": "user", "content": "ping"}])]
+    text = "".join(e.text for e in events if isinstance(e, TextDelta))
+    assert "(prompt=default_chat@1)" in text
+
+
+async def test_real_stream_sends_prompt_as_instructions() -> None:
+    service, responses = make_service(StubUpstreamStream([delta("pong"), completed()]))
+
+    await collect(await service.open_stream(user_items("ping")))
+
+    assert responses.calls[0]["instructions"] == PROMPT.text

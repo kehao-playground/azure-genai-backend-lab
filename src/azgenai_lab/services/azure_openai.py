@@ -38,6 +38,7 @@ from azgenai_lab.core.errors import (
     UpstreamTimeoutError,
 )
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 
 
 @dataclass(frozen=True)
@@ -90,13 +91,21 @@ class ChatService(Protocol):
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]: ...
 
 
-def _fake_reply(items: Sequence[ReplayItem]) -> str:
+def _fake_reply(items: Sequence[ReplayItem], prompt: PromptTemplate | None) -> str:
     # The history marker makes state visible to contract tests: a fake can't
     # answer "what did I say earlier?", but it can prove the history arrived.
     last = str(items[-1].get("content", ""))
-    if len(items) == 1:
-        return f"[fake-llm] {last}"
-    return f"[fake-llm] {last} (history={len(items) - 1})"
+    reply = f"[fake-llm] {last}"
+    markers = []
+    if len(items) > 1:
+        markers.append(f"history={len(items) - 1}")
+    if prompt is not None:
+        # Proves through the API that instructions were on the call — the
+        # fake can't obey a system prompt, but it can prove it arrived.
+        markers.append(f"prompt={prompt.name}@{prompt.version}")
+    if markers:
+        reply += f" ({', '.join(markers)})"
+    return reply
 
 
 def _fake_output_item(text: str) -> ReplayItem:
@@ -110,12 +119,15 @@ def _fake_output_item(text: str) -> ReplayItem:
 class FakeChatService:
     """Deterministic stand-in so development and tests never touch Azure."""
 
+    def __init__(self, prompt: PromptTemplate | None = None) -> None:
+        self._prompt = prompt
+
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
-        reply = _fake_reply(items)
+        reply = _fake_reply(items, self._prompt)
         return ChatResult(message=reply, model="fake", replay_items=(_fake_output_item(reply),))
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
-        reply = _fake_reply(items)
+        reply = _fake_reply(items, self._prompt)
 
         async def stream() -> AsyncIterator[ChatStreamEvent]:
             yield TextDelta("[fake-llm] ")
@@ -213,15 +225,18 @@ async def _translate_stream(
 
 
 class AzureOpenAIChatService:
-    def __init__(self, client: AsyncOpenAI, deployment_name: str) -> None:
+    def __init__(self, client: AsyncOpenAI, deployment_name: str, prompt: PromptTemplate) -> None:
         self._client = client
         self._deployment_name = deployment_name
+        self._prompt = prompt
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         try:
             response = await self._client.responses.create(
                 model=self._deployment_name,  # still the deployment name
                 input=_to_input(items),
+                # system prompt travels per call, never in history (Day 8)
+                instructions=self._prompt.text,
                 store=False,  # state ownership stays with us: ConversationStore (Day 7)
                 # Stateless multi-turn with a reasoning model: without this,
                 # reasoning items come back without content and the replayed
@@ -245,6 +260,8 @@ class AzureOpenAIChatService:
             stream = await self._client.responses.create(
                 model=self._deployment_name,  # still the deployment name
                 input=_to_input(items),
+                # system prompt travels per call, never in history (Day 8)
+                instructions=self._prompt.text,
                 store=False,  # state ownership stays with us: ConversationStore (Day 7)
                 include=["reasoning.encrypted_content"],  # see complete()
                 stream=True,
@@ -256,8 +273,10 @@ class AzureOpenAIChatService:
 
 def build_chat_service(settings: Settings) -> ChatService:
     """Composition point: the only place that decides fake vs. real."""
+    # Fail fast: a malformed template must kill startup, not the first request.
+    prompt = load_prompt("default_chat")
     if settings.use_fake_llm:
-        return FakeChatService()
+        return FakeChatService(prompt=prompt)
     if not (
         settings.azure_openai_endpoint
         and settings.azure_openai_api_key
@@ -273,4 +292,4 @@ def build_chat_service(settings: Settings) -> ChatService:
         timeout=settings.llm_timeout_seconds,  # per attempt (default 30s), not end-to-end
         max_retries=settings.llm_max_retries,  # explicit policy; the SDK default is 2
     )
-    return AzureOpenAIChatService(client, settings.azure_openai_deployment_name)
+    return AzureOpenAIChatService(client, settings.azure_openai_deployment_name, prompt)
