@@ -14,6 +14,7 @@ from azgenai_lab.core.errors import (
     upstream_error_handler,
     validation_error_handler,
 )
+from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.services.conversation import build_conversation_service
 
 # Documents the real 422 shape: validation errors go through the envelope too.
@@ -24,6 +25,11 @@ _VALIDATION_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    # Must run before any request handling: without this, configure_logging()
+    # is defined but never called, so INFO logs (including the per-LLM-call
+    # prompt_name/prompt_version/correlation_id line) are silently dropped
+    # under a plain `uvicorn` run.
+    configure_logging(settings.log_level)
     app = FastAPI(
         title="Azure GenAI Backend Lab",
         description="Production-minded Azure GenAI backend patterns with Python and FastAPI.",
