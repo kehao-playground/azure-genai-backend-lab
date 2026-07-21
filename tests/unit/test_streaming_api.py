@@ -90,7 +90,7 @@ def test_successful_stream_ends_with_exactly_one_done(client: TestClient) -> Non
     events = sse_events(response)
     deltas = [data for name, data in events if name == "message.delta"]
     assert len(deltas) >= 2
-    assert "".join(str(d["text"]) for d in deltas) == "[fake-llm] Hello"
+    assert "".join(str(d["text"]) for d in deltas) == "[fake-llm] Hello (prompt=default_chat@1)"
 
     terminals = [(name, data) for name, data in events if name in ("message.done", "error")]
     assert len(terminals) == 1
@@ -184,7 +184,8 @@ def test_stream_follow_up_turn_carries_the_history(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.headers["x-conversation-id"] == conversation_id
     deltas = [data for name, data in sse_events(response) if name == "message.delta"]
-    assert "".join(str(d["text"]) for d in deltas) == "[fake-llm] again (history=2)"
+    expected = "[fake-llm] again (history=2, prompt=default_chat@1)"
+    assert "".join(str(d["text"]) for d in deltas) == expected
 
 
 def test_stream_unknown_conversation_id_maps_to_404_envelope(client: TestClient) -> None:

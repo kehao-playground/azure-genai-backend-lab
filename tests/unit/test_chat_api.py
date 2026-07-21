@@ -26,7 +26,7 @@ def test_chat_returns_reply_conversation_and_correlation_id(client: TestClient) 
 
     assert response.status_code == 200
     body = response.json()
-    assert body["message"] == "[fake-llm] ping"
+    assert body["message"] == "[fake-llm] ping (prompt=default_chat@1)"
     assert body["conversation_id"]
     assert body["correlation_id"]
     assert response.headers["x-correlation-id"] == body["correlation_id"]
@@ -54,7 +54,7 @@ def test_chat_follow_up_turn_carries_the_history(client: TestClient) -> None:
     assert second.status_code == 200
     body = second.json()
     # user+assistant from turn 1 = 2 prior messages seen by the (fake) model.
-    assert body["message"] == "[fake-llm] again (history=2)"
+    assert body["message"] == "[fake-llm] again (history=2, prompt=default_chat@1)"
     assert body["conversation_id"] == conversation_id
 
 

@@ -18,6 +18,7 @@ from azgenai_lab.core.errors import (
     UpstreamTimeoutError,
 )
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
@@ -25,9 +26,15 @@ from azgenai_lab.services.azure_openai import (
     build_chat_service,
 )
 
+PROMPT = PromptTemplate(name="default_chat", version=1, description="d", text="You are T.")
+
 
 def user_items(*texts: str) -> list[ReplayItem]:
     return [{"role": "user", "content": text} for text in texts]
+
+
+def make_settings(**overrides: Any) -> Settings:
+    return Settings(_env_file=None, **overrides)
 
 
 def test_default_settings_build_fake_service() -> None:
@@ -115,7 +122,7 @@ def make_stub_client() -> tuple[AsyncOpenAI, StubResponses]:
 
 async def test_real_service_sends_deployment_name_and_replay_items_verbatim() -> None:
     client, responses = make_stub_client()
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini")
+    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
 
     replay_context = [
         {"role": "user", "content": "hello"},
@@ -134,7 +141,7 @@ async def test_real_service_sends_deployment_name_and_replay_items_verbatim() ->
 
 async def test_real_service_never_stores_and_requests_encrypted_reasoning() -> None:
     client, responses = make_stub_client()
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini")
+    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
 
     await service.complete(user_items("hello"))
 
@@ -189,10 +196,37 @@ async def test_sdk_errors_are_translated_at_the_adapter_boundary(
         raise sdk_error
 
     responses.create = raise_sdk_error  # type: ignore[method-assign]
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini")
+    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
 
     with pytest.raises(expected) as excinfo:
         await service.complete(user_items("hello"))
 
     assert excinfo.value.upstream_detail  # original text kept for the log, not the client
     assert excinfo.value.__cause__ is sdk_error
+
+
+async def test_fake_marks_prompt_delivery() -> None:
+    service = FakeChatService(prompt=PROMPT)
+    result = await service.complete([{"role": "user", "content": "ping"}])
+    assert "(prompt=default_chat@1)" in result.message
+
+
+async def test_fake_without_prompt_keeps_legacy_output() -> None:
+    service = FakeChatService()
+    result = await service.complete([{"role": "user", "content": "ping"}])
+    assert result.message == "[fake-llm] ping"
+
+
+async def test_build_chat_service_wires_prompt() -> None:
+    service = build_chat_service(make_settings(use_fake_llm=True))
+    result = await service.complete([{"role": "user", "content": "ping"}])
+    assert "(prompt=default_chat@1)" in result.message
+
+
+async def test_real_service_sends_prompt_as_instructions() -> None:
+    client, responses = make_stub_client()
+    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
+
+    await service.complete(user_items("hello"))
+
+    assert responses.calls[0]["instructions"] == PROMPT.text

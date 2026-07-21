@@ -13,7 +13,7 @@ Feature: Conversation state
     Given a conversation with one completed turn
     When I submit a follow-up message in the same conversation
     Then the response status code should be 200
-    And the reply should include the marker "(history=2)"
+    And the reply should include the marker "history=2"
 
   Scenario: An unknown conversation id maps to the error envelope
     Given a chat request with an unknown conversation id
@@ -30,11 +30,11 @@ Feature: Conversation state
     When the upstream model recovers
     And I submit a follow-up message in the same conversation
     Then the response status code should be 200
-    And the reply should include the marker "(history=2)"
+    And the reply should include the marker "history=2"
 
   Scenario: A streaming turn continues the same conversation
     Given a conversation with one completed turn
     When I stream a follow-up message in the same conversation
     Then the response status code should be 200
     And the streaming response should include header "X-Conversation-Id"
-    And the streamed text should include the marker "(history=2)"
+    And the streamed text should include the marker "history=2"
