@@ -11,3 +11,11 @@ Feature: Chat API contract
     When I submit the request to the chat endpoint
     Then the response status code should be 422
     And the response JSON should contain error "validation_error"
+
+  Scenario: Upstream input rejection maps to the error envelope
+    Given a valid chat request
+    And the upstream model rejects the input
+    When I submit the request to the chat endpoint
+    Then the response status code should be 400
+    And the response JSON should contain error "invalid_input"
+    And the response JSON should contain a "correlation_id"
