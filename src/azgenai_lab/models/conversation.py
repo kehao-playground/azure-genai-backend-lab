@@ -31,3 +31,5 @@ class Conversation(BaseModel):
     id: str
     messages: list[Message] = Field(default_factory=list)
     replay_items: list[ReplayItem] = Field(default_factory=list)
+    # Number of committed turns; the token a conditional append must present.
+    revision: int = 0

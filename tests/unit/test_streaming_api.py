@@ -224,6 +224,7 @@ class FailingStore(InMemoryConversationStore):
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
+        expected_revision: int,
     ) -> None:
         raise RuntimeError("disk on fire")
 

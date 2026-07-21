@@ -72,6 +72,7 @@ class FailingStore(InMemoryConversationStore):
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
+        expected_revision: int,
     ) -> None:
         raise RuntimeError("disk on fire")
 
@@ -191,6 +192,7 @@ async def test_concurrent_turns_on_one_conversation_are_serialized() -> None:
     lengths = sorted(len(received) for received in spy.received[1:])
     assert lengths == [3, 5]  # the second turn saw the first turn's commit
     assert len(await history(store, conversation_id)) == 6
+    assert service._locks == {}  # every lock entry released and removed
 
 
 async def test_stream_completed_commits_transcript_and_replay() -> None:
@@ -322,3 +324,25 @@ async def test_stream_follow_up_replays_prior_output_items() -> None:
         _fake_output_item("pong"),
         {"role": "user", "content": "two"},
     ]
+
+
+async def test_lock_registry_does_not_grow_on_unknown_ids() -> None:
+    spy = SpyChatService()
+    service, _ = make_service(spy)
+
+    for n in range(1000):
+        with pytest.raises(ConversationNotFoundError):
+            await service.complete("hi", f"never-issued-{n}")
+
+    assert service._locks == {}  # probing unknown ids leaves no entries behind
+
+
+async def test_lock_registry_is_empty_after_normal_turns_and_streams() -> None:
+    spy = SpyChatService(stream_script=[TextDelta("pong"), done(status="completed")])
+    service, _ = make_service(spy)
+
+    conversation_id, _ = await service.complete("one", None)
+    _, events = await service.open_stream("two", conversation_id)
+    _ = [event async for event in events]
+
+    assert service._locks == {}
