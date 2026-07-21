@@ -346,3 +346,29 @@ async def test_lock_registry_is_empty_after_normal_turns_and_streams() -> None:
     _ = [event async for event in events]
 
     assert service._locks == {}
+
+
+async def test_cancelled_waiter_does_not_leak_a_lock_entry() -> None:
+    spy = SpyChatService()
+    service, _ = make_service(spy)
+    conversation_id = "held"
+
+    # A holder owns the lock while a second request queues behind it, then
+    # gets cancelled before ever acquiring — the production shape of a
+    # client dropping a request stuck behind a slow turn.
+    await service._acquire(conversation_id)
+    waiter = asyncio.create_task(service._acquire(conversation_id))
+    await asyncio.sleep(0)  # let the waiter enqueue on the lock
+    assert service._locks[conversation_id].refs == 2
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    # The cancelled waiter dropped its reference and did not release the
+    # lock it never held; the holder's entry survives until it releases.
+    assert service._locks[conversation_id].refs == 1
+    assert service._locks[conversation_id].lock.locked()
+
+    service._release(conversation_id)
+    assert service._locks == {}
