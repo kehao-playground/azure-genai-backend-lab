@@ -30,7 +30,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from azgenai_lab.api.chat import get_chat_service
-from azgenai_lab.core.errors import ErrorEnvelope, UpstreamError, UpstreamServiceError
+from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError
 from azgenai_lab.services.azure_openai import ChatService, StreamDone, TextDelta
 
 logger = logging.getLogger(__name__)
@@ -43,17 +43,25 @@ _SSE_EXAMPLE = (
     'event: message.done\ndata: {"status": "completed", "correlation_id": "..."}\n\n'
 )
 
+# The response_class media_type (text/event-stream) would otherwise leak onto
+# these documented error responses (review r03): errors here are plain JSON
+# envelopes, so their content is declared explicitly instead of via ``model``.
+_ENVELOPE_CONTENT: dict[str, Any] = {
+    "application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}
+}
+
 # Same upstream mapping as /chat, but on this endpoint it only applies before
 # the stream starts; after the 200, failures arrive as SSE ``error`` events.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {
-        "model": ErrorEnvelope,
+        "content": _ENVELOPE_CONTENT,
         "description": "Input rejected before the stream starts: content filter or invalid input",
     },
-    500: {"model": ErrorEnvelope, "description": "Service misconfiguration"},
-    502: {"model": ErrorEnvelope, "description": "Upstream LLM service failure"},
-    503: {"model": ErrorEnvelope, "description": "Upstream capacity exhausted"},
-    504: {"model": ErrorEnvelope, "description": "Upstream timeout"},
+    422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},
+    500: {"content": _ENVELOPE_CONTENT, "description": "Service misconfiguration"},
+    502: {"content": _ENVELOPE_CONTENT, "description": "Upstream LLM service failure"},
+    503: {"content": _ENVELOPE_CONTENT, "description": "Upstream capacity exhausted"},
+    504: {"content": _ENVELOPE_CONTENT, "description": "Upstream timeout"},
 }
 
 _STREAM_RESPONSES: dict[int | str, dict[str, Any]] = {

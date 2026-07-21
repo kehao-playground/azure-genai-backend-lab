@@ -40,7 +40,10 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(chat.router, prefix="/api/v1", responses=_VALIDATION_RESPONSES)
-    app.include_router(streaming.router, prefix="/api/v1", responses=_VALIDATION_RESPONSES)
+    # The streaming router declares its own 422 (with explicit application/json
+    # content): merging the shared model-based entry here would re-attach the
+    # route's text/event-stream media type to it (review r03).
+    app.include_router(streaming.router, prefix="/api/v1")
     app.include_router(rag.router, prefix="/api/v1", responses=_VALIDATION_RESPONSES)
 
     @app.get("/", include_in_schema=False)
