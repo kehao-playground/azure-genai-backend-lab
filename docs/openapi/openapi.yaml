@@ -113,41 +113,41 @@ paths:
 
 
                 '
-        '422':
-          description: Validation Error
-          content:
-            text/event-stream:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
         '400':
           description: 'Input rejected before the stream starts: content filter or
             invalid input'
           content:
-            text/event-stream:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '500':
           description: Service misconfiguration
           content:
-            text/event-stream:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '502':
           description: Upstream LLM service failure
           content:
-            text/event-stream:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '503':
           description: Upstream capacity exhausted
           content:
-            text/event-stream:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '504':
           description: Upstream timeout
           content:
-            text/event-stream:
+            application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/rag:

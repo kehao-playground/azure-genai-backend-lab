@@ -168,6 +168,24 @@ def test_validation_error_uses_the_envelope(client: TestClient) -> None:
     response = client.post("/api/v1/chat/stream", json={"message": ""})
 
     assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
     body = response.json()
     assert body["error"]["code"] == "validation_error"
     assert body["correlation_id"]
+
+
+def test_openapi_media_types_match_runtime(client: TestClient) -> None:
+    """Semantic contract: only the 200 streams; every error is a JSON envelope.
+
+    The drift check alone can't catch this — it happily preserves a wrong
+    schema. This pins media types to what the runtime actually sends
+    (review r03: response_class media_type leaked onto the error responses).
+    """
+    responses = app.openapi()["paths"]["/api/v1/chat/stream"]["post"]["responses"]
+
+    assert set(responses["200"]["content"]) == {"text/event-stream"}
+    for status in ("400", "422", "500", "502", "503", "504"):
+        content = responses[status]["content"]
+        assert set(content) == {"application/json"}, f"{status}: {set(content)}"
+        ref = content["application/json"]["schema"]["$ref"]
+        assert ref == "#/components/schemas/ErrorEnvelope", f"{status}: {ref}"

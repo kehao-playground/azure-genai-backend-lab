@@ -32,7 +32,7 @@ Streaming endpoints use Server-Sent Events with an owned vocabulary — upstream
 - `message.done` — `{"status": "completed" | "incomplete", "incomplete_reason"?, "correlation_id"}`, sole success terminal;
 - `error` — the error envelope above, verbatim, sole failure terminal.
 
-Failures before the stream starts keep their HTTP status codes (the envelope applies as usual); failures after the 200 travel as an `error` event. A normally closed stream ends with exactly one terminal event; clients must treat EOF without a terminal as a failure and must ignore unknown event names (future events are additive). Ordering and cardinality invariants are enforced by `tests/bdd/features/streaming_response.feature`.
+Failures before the stream starts keep their HTTP status codes (the envelope applies as usual); failures after the 200 travel as an `error` event. A normally closed stream ends with exactly one terminal event; clients must treat EOF without a terminal as a failure and must ignore unknown event names (future events are additive). Ordering and cardinality invariants are enforced by `tests/bdd/features/streaming_response.feature` together with the streaming unit tests (the EOF-without-terminal fallback and nothing-after-terminal rules live in `tests/unit/test_streaming_api.py`).
 
 ## Correlation ID
 
