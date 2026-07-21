@@ -104,6 +104,8 @@ components:
           - type: string
           - type: 'null'
           title: Conversation Id
+          description: Reserved for conversation state (Day 7); accepted but ignored
+            today.
       type: object
       required:
       - message

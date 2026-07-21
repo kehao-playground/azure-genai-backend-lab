@@ -1,19 +1,34 @@
-"""Azure OpenAI chat adapter (v1 GA API).
+"""Azure OpenAI chat adapter (v1 GA API, Responses API).
 
 Uses the plain ``openai.AsyncOpenAI`` client against ``<endpoint>/openai/v1/`` —
 no ``api-version`` and no Azure-specific client since the v1 GA API (2025-08).
 The ``model`` argument is the *deployment name*, not the model name.
+
+Calls go through the Responses API with ``store=False``: conversation state
+stays in this application (Day 7), not in Azure's default 30-day retention.
+SDK exceptions are translated into :class:`UpstreamError` subclasses at this
+boundary, so the API layer never imports ``openai``.
 
 Fake vs. real is selected once in :func:`build_chat_service`; handlers depend
 only on the :class:`ChatService` protocol.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Protocol
 
+import openai
 from openai import AsyncOpenAI
 
-from azgenai_lab.core.config import Settings
+from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.core.errors import (
+    ConfigurationError,
+    ContentFilteredError,
+    UpstreamError,
+    UpstreamServiceError,
+    UpstreamThrottledError,
+    UpstreamTimeoutError,
+)
 
 
 @dataclass(frozen=True)
@@ -33,20 +48,38 @@ class FakeChatService:
         return ChatResult(message=f"[fake-llm] {message}", model="fake")
 
 
+def _translate_upstream_error(exc: openai.OpenAIError) -> UpstreamError:
+    if isinstance(exc, openai.APITimeoutError):
+        return UpstreamTimeoutError(str(exc))
+    if isinstance(exc, openai.RateLimitError):
+        return UpstreamThrottledError(str(exc))
+    if isinstance(
+        exc,
+        openai.AuthenticationError | openai.PermissionDeniedError | openai.NotFoundError,
+    ):
+        return ConfigurationError(str(exc))
+    if isinstance(exc, openai.BadRequestError):
+        if exc.code == "content_filter":
+            return ContentFilteredError(str(exc))
+        return ConfigurationError(str(exc))
+    return UpstreamServiceError(str(exc))
+
+
 class AzureOpenAIChatService:
     def __init__(self, client: AsyncOpenAI, deployment_name: str) -> None:
         self._client = client
         self._deployment_name = deployment_name
 
     async def complete(self, message: str) -> ChatResult:
-        response = await self._client.chat.completions.create(
-            model=self._deployment_name,
-            messages=[{"role": "user", "content": message}],
-        )
-        return ChatResult(
-            message=response.choices[0].message.content or "",
-            model=response.model,
-        )
+        try:
+            response = await self._client.responses.create(
+                model=self._deployment_name,  # still the deployment name
+                input=message,
+                store=False,  # state ownership stays with us (Day 7)
+            )
+        except openai.OpenAIError as exc:
+            raise _translate_upstream_error(exc) from exc
+        return ChatResult(message=response.output_text, model=response.model)
 
 
 def build_chat_service(settings: Settings) -> ChatService:
@@ -65,5 +98,12 @@ def build_chat_service(settings: Settings) -> ChatService:
     client = AsyncOpenAI(
         api_key=settings.azure_openai_api_key.get_secret_value(),
         base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
+        timeout=settings.llm_timeout_seconds,  # default 30s, not the SDK's 600s
     )
     return AzureOpenAIChatService(client, settings.azure_openai_deployment_name)
+
+
+@lru_cache
+def get_chat_service() -> ChatService:
+    """FastAPI dependency: one service (and one HTTP client) per process."""
+    return build_chat_service(get_settings())

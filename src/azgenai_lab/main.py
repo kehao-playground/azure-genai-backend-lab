@@ -4,7 +4,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from azgenai_lab.api import chat, health, rag, streaming
 from azgenai_lab.core.config import get_settings
 from azgenai_lab.core.correlation import correlation_id_middleware
-from azgenai_lab.core.errors import http_exception_handler
+from azgenai_lab.core.errors import (
+    UpstreamError,
+    http_exception_handler,
+    upstream_error_handler,
+)
 
 
 def create_app() -> FastAPI:
@@ -17,6 +21,7 @@ def create_app() -> FastAPI:
 
     app.middleware("http")(correlation_id_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(UpstreamError, upstream_error_handler)
 
     app.include_router(health.router)
     app.include_router(chat.router, prefix="/api/v1")
