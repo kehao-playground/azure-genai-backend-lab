@@ -23,6 +23,7 @@ from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
+    InvalidInputError,
     UpstreamError,
     UpstreamServiceError,
     UpstreamThrottledError,
@@ -60,7 +61,11 @@ def _translate_upstream_error(exc: openai.OpenAIError) -> UpstreamError:
     if isinstance(exc, openai.BadRequestError):
         if exc.code == "content_filter":
             return ContentFilteredError(str(exc))
-        return ConfigurationError(str(exc))
+        if exc.code == "context_length_exceeded":
+            return InvalidInputError(str(exc))
+        # Unknown 400: don't guess whose fault it is — neither "fix your input"
+        # nor "we are misconfigured" is provable. Log it, report upstream failure.
+        return UpstreamServiceError(str(exc))
     return UpstreamServiceError(str(exc))
 
 
@@ -97,6 +102,7 @@ def build_chat_service(settings: Settings) -> ChatService:
     client = AsyncOpenAI(
         api_key=settings.azure_openai_api_key.get_secret_value(),
         base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
-        timeout=settings.llm_timeout_seconds,  # default 30s, not the SDK's 600s
+        timeout=settings.llm_timeout_seconds,  # per attempt (default 30s), not end-to-end
+        max_retries=settings.llm_max_retries,  # explicit policy; the SDK default is 2
     )
     return AzureOpenAIChatService(client, settings.azure_openai_deployment_name)

@@ -11,6 +11,7 @@ from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
+    InvalidInputError,
     UpstreamError,
     UpstreamServiceError,
     UpstreamThrottledError,
@@ -64,6 +65,7 @@ def test_real_client_uses_configured_timeout_not_sdk_default() -> None:
 
     assert isinstance(service, AzureOpenAIChatService)
     assert service._client.timeout == 30.0
+    assert service._client.max_retries == 2
 
 
 class StubResponses:
@@ -126,7 +128,11 @@ TIMEOUT_REQUEST = httpx.Request("POST", "https://example.openai.azure.com/openai
             make_status_error(openai.BadRequestError, 400, code="content_filter"),
             ContentFilteredError,
         ),
-        (make_status_error(openai.BadRequestError, 400), ConfigurationError),
+        (
+            make_status_error(openai.BadRequestError, 400, code="context_length_exceeded"),
+            InvalidInputError,
+        ),
+        (make_status_error(openai.BadRequestError, 400), UpstreamServiceError),
         (make_status_error(openai.InternalServerError, 500), UpstreamServiceError),
         (
             openai.APIConnectionError(message="boom", request=TIMEOUT_REQUEST),

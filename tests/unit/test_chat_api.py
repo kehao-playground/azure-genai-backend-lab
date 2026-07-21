@@ -5,6 +5,7 @@ from azgenai_lab.api.chat import get_chat_service
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
+    InvalidInputError,
     UpstreamError,
     UpstreamServiceError,
     UpstreamThrottledError,
@@ -66,6 +67,7 @@ class RaisingChatService:
     [
         (ConfigurationError("secret detail"), 500, "configuration_error"),
         (ContentFilteredError("secret detail"), 400, "content_filtered"),
+        (InvalidInputError("secret detail"), 400, "invalid_input"),
         (UpstreamThrottledError("secret detail"), 503, "upstream_throttled"),
         (UpstreamTimeoutError("secret detail"), 504, "upstream_timeout"),
         (UpstreamServiceError("secret detail"), 502, "upstream_error"),
@@ -83,3 +85,9 @@ def test_upstream_errors_map_to_error_envelope(
     assert body["error"]["code"] == code
     assert body["correlation_id"]
     assert "secret detail" not in response.text  # upstream detail never reaches the client
+
+
+def test_openapi_documents_the_error_contract() -> None:
+    responses = app.openapi()["paths"]["/api/v1/chat"]["post"]["responses"]
+
+    assert {"200", "400", "422", "500", "502", "503", "504"} <= set(responses)

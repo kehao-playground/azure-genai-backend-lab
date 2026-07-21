@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     azure_openai_deployment_name: str | None = None
 
     llm_timeout_seconds: float = 30.0
+    llm_max_retries: int = 2
 
     azure_search_endpoint: str | None = None
     azure_search_index_name: str | None = None
