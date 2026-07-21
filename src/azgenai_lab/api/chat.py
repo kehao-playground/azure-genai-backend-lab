@@ -3,9 +3,15 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
-from azgenai_lab.services.azure_openai import ChatService, get_chat_service
+from azgenai_lab.services.azure_openai import ChatService
 
 router = APIRouter(tags=["chat"])
+
+
+def get_chat_service(request: Request) -> ChatService:
+    """Resolve the app-wide service built once at startup (fail fast on bad config)."""
+    service: ChatService = request.app.state.chat_service
+    return service
 
 
 class ChatRequest(BaseModel):

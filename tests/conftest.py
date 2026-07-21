@@ -3,8 +3,9 @@ from collections.abc import Generator
 import pytest
 from fastapi.testclient import TestClient
 
+from azgenai_lab.api.chat import get_chat_service
 from azgenai_lab.main import app
-from azgenai_lab.services.azure_openai import FakeChatService, get_chat_service
+from azgenai_lab.services.azure_openai import FakeChatService
 
 
 @pytest.fixture

@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 
+from azgenai_lab.api.chat import get_chat_service
 from azgenai_lab.main import app
-from azgenai_lab.services.azure_openai import FakeChatService, get_chat_service
+from azgenai_lab.services.azure_openai import FakeChatService
 
 
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]

@@ -9,6 +9,7 @@ from azgenai_lab.core.errors import (
     http_exception_handler,
     upstream_error_handler,
 )
+from azgenai_lab.services.azure_openai import build_chat_service
 
 
 def create_app() -> FastAPI:
@@ -18,6 +19,9 @@ def create_app() -> FastAPI:
         description="Production-minded Azure GenAI backend patterns with Python and FastAPI.",
         version="0.1.0",
     )
+
+    # Built at startup, not per request: misconfiguration crashes here, not on request #1.
+    app.state.chat_service = build_chat_service(settings)
 
     app.middleware("http")(correlation_id_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
