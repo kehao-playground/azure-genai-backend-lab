@@ -1,0 +1,36 @@
+<!--
+  APIM policy for the GenAI passthrough API (API scope).
+  Applied by infra/scripts/configure-apim.sh via the Management API.
+
+  What it does, in order:
+  - rate-limit: per-subscription-key call throttle. This is the only rate-limit
+    policy available on the Consumption tier (rate-limit-by-key, quota-by-key and
+    llm-token-limit are NOT supported there — checked 2026-07). Counters are kept
+    per gateway instance, so the limit is approximate spike protection, not
+    accounting.
+  - authentication-managed-identity: the gateway fetches an Entra token for the
+    Azure OpenAI backend with its own system-assigned identity. No API key is
+    stored anywhere in this configuration.
+  - Authorization override + api-key delete: whatever credential the client sent
+    is replaced; client credentials terminate at the gateway.
+-->
+<policies>
+    <inbound>
+        <base />
+        <rate-limit calls="5" renewal-period="60" />
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" output-token-variable-name="msi-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-token"])</value>
+        </set-header>
+        <set-header name="api-key" exists-action="delete" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

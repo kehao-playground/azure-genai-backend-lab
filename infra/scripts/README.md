@@ -8,7 +8,8 @@
 | `delete-openai.sh` | Delete and purge the Azure OpenAI account | working |
 | `teardown.sh` | Delete the demo resource group and everything in it | working |
 | `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
-| `configure-apim.sh` | APIM Consumption tier setup | placeholder (Day 10) |
+| `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
+| `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
