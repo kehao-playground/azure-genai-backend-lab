@@ -100,9 +100,9 @@ paths:
         '200':
           description: "Server-Sent Events stream. Event vocabulary: `message.delta`\
             \ (`{text}`), `message.done` (`{status, incomplete_reason?, usage?, correlation_id}`;\
-            \ `usage` carries the turn's billed input/output/total tokens), `error`\
-            \ (the error envelope). Exactly one terminal event (`message.done` or\
-            \ `error`) ends a normally closed stream; clients must treat EOF without\
+            \ `usage` carries the turn's provider-reported input/output/total tokens),\
+            \ `error` (the error envelope). Exactly one terminal event (`message.done`\
+            \ or `error`) ends a normally closed stream; clients must treat EOF without\
             \ a terminal as a failure and must ignore unknown event names. OpenAPI\
             \ cannot express these ordering invariants \u2014 the BDD feature `streaming_response.feature`\
             \ is the executable contract."

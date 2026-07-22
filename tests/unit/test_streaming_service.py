@@ -158,7 +158,7 @@ async def test_real_stream_is_requested_with_store_false() -> None:
     assert call["stream"] is True
 
 
-async def test_terminal_event_carries_the_billed_usage() -> None:
+async def test_terminal_event_carries_the_reported_usage() -> None:
     from types import SimpleNamespace as NS
 
     usage = NS(input_tokens=20, output_tokens=7, total_tokens=27)

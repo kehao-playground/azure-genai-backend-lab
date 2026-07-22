@@ -4,14 +4,15 @@ Two mechanisms, one goal — bounded spend:
 
 - Per-call output cap: ``max_output_tokens`` travels on every upstream call
   (asserted in the adapter tests).
-- Per-conversation lifetime budget: a post-paid ledger of billed tokens,
+- Per-conversation lifetime budget: a post-paid ledger of provider-reported tokens,
   committed atomically with each turn; the check runs *before* inference so an
   exhausted conversation costs nothing further upstream, and rejection maps to
   429 ``token_budget_exceeded`` through the shared envelope.
 
-The ledger records committed turns only: a failed turn is billed upstream but
-leaves no trace here — that gap is a deliberate consequence of turn-commit
-semantics (Day 7) and is asserted, not hidden.
+The ledger records committed turns only: a failed turn may have incurred
+billable processing upstream but leaves no trace here — that gap is a
+deliberate consequence of turn-commit semantics (Day 7) and is asserted, not
+hidden; the invoice and Cost Management meters remain the authority.
 """
 
 import pytest
@@ -50,7 +51,7 @@ async def test_fake_usage_is_history_proportional() -> None:
 # --- ledger: usage commits with the turn, atomically ---
 
 
-async def test_committed_turns_accumulate_billed_tokens() -> None:
+async def test_committed_turns_accumulate_reported_tokens() -> None:
     service, store = make_service(budget=None)
 
     conversation_id, _ = await service.complete("one", None)
@@ -95,7 +96,7 @@ async def test_failed_turn_leaves_no_ledger_trace() -> None:
 
     conversation = await store.get(conversation_id)
     assert conversation is not None
-    # The failed turn was billed upstream, but turn-commit semantics win:
+    # The failed turn may have incurred billable processing, but turn-commit wins:
     # nothing — transcript, replay items, or tokens — entered the log.
     assert conversation.total_tokens == 15
 

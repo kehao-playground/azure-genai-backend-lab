@@ -152,8 +152,9 @@ class StreamDone:
     status: Literal["completed", "incomplete"]
     incomplete_reason: IncompleteReason | None = None
     replay_items: tuple[ReplayItem, ...] = ()
-    # Billed tokens for the whole stream, from the terminal response's usage
-    # block — deltas carry no usage; only the terminal settles the bill.
+    # Provider-reported tokens for the whole stream, from the terminal
+    # response's usage block — deltas carry no usage; only the terminal
+    # reports the turn's count.
     usage: TokenUsage | None = None
 
 
@@ -319,7 +320,7 @@ async def _translate_stream(
             elif event.type == "response.incomplete":
                 details = event.response.incomplete_details
                 mapped = _map_incomplete_reason(details.reason if details else None)
-                # Incomplete is still billed: the meter ran up to the cutoff.
+                # Incomplete still consumed tokens: the meter ran to the cutoff.
                 usage = _extract_usage(event.response.usage)
                 _log_llm_usage(usage)
                 yield StreamDone(

@@ -22,11 +22,11 @@ This usage signal is for attribution and guardrails, not accounting: it is not a
 | `max_output_tokens` per call (`LLM_MAX_OUTPUT_TOKENS`, default 1000) | one reply | `incomplete`/`max_output_tokens` on both endpoints — streaming via `message.done`, non-streaming via the `status`/`incomplete_reason` response fields; the client keeps the partial text (Day 6 rule) |
 | Per-conversation lifetime budget (`CONVERSATION_TOKEN_BUDGET`, default 50000) | one conversation | `429 token_budget_exceeded` before inference — costs nothing upstream |
 
-The budget is a post-paid ledger: billed usage accumulates atomically with each committed turn, and the check runs between turns. A single turn can therefore overshoot the line by up to one call's worth of tokens — bounded by `max_output_tokens` plus the history that turn replays. Reject-vs-truncate-vs-degrade: this backend rejects at the conversation level and truncates at the reply level; degrade (switching to a cheaper model near the line) is deliberately out of scope.
+The budget is a post-paid ledger: provider-reported usage accumulates atomically with each committed turn, and the check runs between turns. A single turn can therefore overshoot the line by up to one call's worth of tokens — bounded by `max_output_tokens` plus the history that turn replays. Reject-vs-truncate-vs-degrade: this backend rejects at the conversation level and truncates at the reply level; degrade (switching to a cheaper model near the line) is deliberately out of scope.
 
 ## Known gaps (disclosed, not hidden)
 
-- A failed turn (upstream error, discarded `content_filter` text, disconnect) is billed upstream but never enters the ledger — turn-commit semantics (Day 7) win over billing completeness. The same paths produce no `llm usage` log line either (there is no usage-bearing terminal to read): a missing line is not zero cost, and reconciliation belongs to Cost Management.
+- A failed turn (upstream error, discarded `content_filter` text, disconnect) may have incurred billable processing upstream but never enters the ledger — turn-commit semantics (Day 7) win over accounting completeness. The same paths produce no `llm usage` log line either (there is no usage-bearing terminal to read): a missing line is not zero cost, and reconciliation belongs to Cost Management.
 - The ledger is per conversation, not per user: there is no identity until Day 19. Per-user and per-feature quotas belong behind authentication.
 - Log lines are attribution, not metrics: aggregation (spend per day, per prompt version) is a Cost Management / Application Insights job (Day 27), not grep's.
 
