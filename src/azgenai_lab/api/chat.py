@@ -1,4 +1,4 @@
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -78,8 +78,27 @@ class ChatResponse(BaseModel):
     usage: TokenUsage | None = Field(
         default=None,
         description=(
-            "Billed tokens for this turn as reported upstream; null only if "
-            "the provider omitted its usage block."
+            "Provider-reported tokens for this turn — a request-level usage "
+            "signal for attribution and guardrails, not a billing record; "
+            "null only if the provider omitted its usage block."
+        ),
+    )
+    status: Literal["completed", "incomplete"] = Field(
+        default="completed",
+        description=(
+            "Mirror of the stream terminal: `incomplete` means the reply was "
+            "truncated — see incomplete_reason for what the client may keep."
+        ),
+    )
+    incomplete_reason: Literal["max_output_tokens", "content_filter", "other"] | None = Field(
+        default=None,
+        description=(
+            "Set only when status is `incomplete`. Same client rules as the "
+            "Day 6 SSE vocabulary: keep the partial text for "
+            "`max_output_tokens`; discard or mask it for `content_filter`; "
+            "treat it as unusable for `other`. For `content_filter`/`other` "
+            "the turn is not committed — on a first turn the returned "
+            "conversation_id never comes into existence."
         ),
     )
 
@@ -101,4 +120,6 @@ async def chat(
         conversation_id=conversation_id,
         correlation_id=request.state.correlation_id,
         usage=result.usage,
+        status=result.status,
+        incomplete_reason=result.incomplete_reason,
     )

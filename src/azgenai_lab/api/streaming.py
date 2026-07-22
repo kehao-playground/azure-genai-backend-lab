@@ -162,7 +162,7 @@ async def _render_sse(
                 if event.usage is not None:
                     # Additive field (Day 9): clients that predate it must
                     # ignore unknown fields, per the Day 6 contract.
-                    data["usage"] = event.usage.model_dump()
+                    data["usage"] = event.usage.model_dump(exclude_none=True)
                 yield _sse("message.done", data)
                 return  # terminal sent: no further event may follow
     except UpstreamError as exc:

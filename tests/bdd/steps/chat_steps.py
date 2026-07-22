@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 
-from behave import given, when
+from behave import given, then, when
 
 from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import InvalidInputError
@@ -43,3 +43,26 @@ def step_upstream_recovers(context) -> None:  # type: ignore[no-untyped-def]
 @when("I submit the request to the chat endpoint")
 def step_submit_chat_request(context) -> None:  # type: ignore[no-untyped-def]
     context.response = context.client.post("/api/v1/chat", json=context.payload)
+
+
+class TruncatingChatService:
+    """Stands in for the adapter after upstream hit max_output_tokens."""
+
+    async def complete(self, items: Sequence[ReplayItem]) -> object:
+        from azgenai_lab.services.azure_openai import ChatResult
+
+        return ChatResult(message="par", status="incomplete", incomplete_reason="max_output_tokens")
+
+
+@given("the upstream truncates the reply at the output token cap")
+def step_upstream_truncates(context) -> None:  # type: ignore[no-untyped-def]
+    store = app.state.conversation_service._store
+    service = ConversationChatService(TruncatingChatService(), store)  # type: ignore[arg-type]
+    app.dependency_overrides[get_conversation_service] = lambda: service
+
+
+@then('the response JSON should report status "{status}" with reason "{reason}"')
+def step_response_status_and_reason(context, status: str, reason: str) -> None:  # type: ignore[no-untyped-def]
+    body = context.response.json()
+    assert body["status"] == status
+    assert body["incomplete_reason"] == reason

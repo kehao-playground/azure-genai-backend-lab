@@ -120,6 +120,9 @@ class StubResponses:
             model="gpt-5-mini-2025-08-07",
             output=[StubOutputItem(REASONING_ITEM)],
             usage=SimpleNamespace(input_tokens=12, output_tokens=3, total_tokens=15),
+            status="completed",
+            incomplete_details=None,
+            error=None,
         )
 
 

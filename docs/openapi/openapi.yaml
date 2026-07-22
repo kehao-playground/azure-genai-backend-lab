@@ -245,8 +245,32 @@ components:
           anyOf:
           - $ref: '#/components/schemas/TokenUsage'
           - type: 'null'
-          description: Billed tokens for this turn as reported upstream; null only
-            if the provider omitted its usage block.
+          description: "Provider-reported tokens for this turn \u2014 a request-level\
+            \ usage signal for attribution and guardrails, not a billing record; null\
+            \ only if the provider omitted its usage block."
+        status:
+          type: string
+          enum:
+          - completed
+          - incomplete
+          title: Status
+          description: "Mirror of the stream terminal: `incomplete` means the reply\
+            \ was truncated \u2014 see incomplete_reason for what the client may keep."
+          default: completed
+        incomplete_reason:
+          anyOf:
+          - type: string
+            enum:
+            - max_output_tokens
+            - content_filter
+            - other
+          - type: 'null'
+          title: Incomplete Reason
+          description: "Set only when status is `incomplete`. Same client rules as\
+            \ the Day 6 SSE vocabulary: keep the partial text for `max_output_tokens`;\
+            \ discard or mask it for `content_filter`; treat it as unusable for `other`.\
+            \ For `content_filter`/`other` the turn is not committed \u2014 on a first\
+            \ turn the returned conversation_id never comes into existence."
       type: object
       required:
       - message
@@ -364,20 +388,21 @@ components:
           type: integer
           minimum: 0.0
           title: Total Tokens
+        reasoning_tokens:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Reasoning Tokens
       type: object
       required:
       - input_tokens
       - output_tokens
       - total_tokens
       title: TokenUsage
-      description: 'Token counts as billed upstream, reported by the Responses API
-        (Day 9).
-
-
-        This is metering, not estimation: the numbers come from the provider''s
-
-        ``usage`` block, the same numbers the invoice is built from. ``input_tokens``
-
-        covers the full replay context (history grows it every turn), so it is the
-
-        number that dominates conversation cost.'
+      description: "Provider-reported token counts from the Responses API ``usage``\
+        \ block (Day 9).\n\nThis is metering, not estimation \u2014 but it is a request-level\
+        \ usage signal\nfor attribution and guardrails, not a billing record: the\
+        \ invoice and Cost\nManagement meter records remain the source of truth, and\
+        \ no per-request\n1:1 reconciliation against them is implied. ``input_tokens``\
+        \ covers the\nfull replay context, which grows every turn."

@@ -12,12 +12,13 @@ class Message(BaseModel):
 
 
 class TokenUsage(BaseModel):
-    """Token counts as billed upstream, reported by the Responses API (Day 9).
+    """Provider-reported token counts from the Responses API ``usage`` block (Day 9).
 
-    This is metering, not estimation: the numbers come from the provider's
-    ``usage`` block, the same numbers the invoice is built from. ``input_tokens``
-    covers the full replay context (history grows it every turn), so it is the
-    number that dominates conversation cost.
+    This is metering, not estimation — but it is a request-level usage signal
+    for attribution and guardrails, not a billing record: the invoice and Cost
+    Management meter records remain the source of truth, and no per-request
+    1:1 reconciliation against them is implied. ``input_tokens`` covers the
+    full replay context, which grows every turn.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -25,3 +26,6 @@ class TokenUsage(BaseModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
+    # Hidden reasoning tokens, from usage.output_tokens_details — a subset of
+    # output_tokens. None when the provider omits the detail.
+    reasoning_tokens: int | None = Field(default=None, ge=0)
