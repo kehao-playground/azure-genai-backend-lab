@@ -20,6 +20,6 @@ Concurrency: read → inference → commit is one per-conversation critical sect
 
 Because failed turns leave no trace, retrying a turn cannot duplicate or corrupt history, and a `conversation_id` issued on a failed first turn simply never comes into existence (the streaming header id is provisional for exactly this reason).
 
-Each committed turn also appends its billed token usage to the conversation's ledger, in the same all-or-nothing `append` (Day 9). The ledger is what the `Resolving → Rejected` budget transition reads: the check runs before inference, so an exhausted conversation costs nothing further upstream. A failed turn is billed upstream but leaves no ledger trace — turn-commit semantics win over billing completeness.
+Each committed turn also appends its provider-reported token usage to the conversation's ledger, in the same all-or-nothing `append` (Day 9). The ledger is what the `Resolving → Rejected` budget transition reads: the check runs before inference, so an exhausted conversation costs nothing further upstream. A failed turn may have incurred billable processing upstream but leaves no ledger trace — turn-commit semantics win over accounting completeness.
 
 Enforced by `tests/unit/test_conversation_service.py` and `tests/bdd/features/conversation_state.feature`.
