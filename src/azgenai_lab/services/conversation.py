@@ -179,21 +179,28 @@ class ConversationChatService:
             self._check_budget(conversation)
             user_item = _user_item(message)
             result = await self._chat_service.complete([*conversation.replay_items, user_item])
-            if not result.message:
+            if result.status == "completed" and not result.message:
                 # A 200 with a freshly issued id that resolves to 404 next
                 # turn would break the contract; an empty reply is an
                 # upstream failure, not a turn (review r01 finding 4).
                 raise UpstreamServiceError("upstream returned an empty reply")
-            await self._commit(
-                resolved_id,
-                [
-                    Message(role="user", content=message),
-                    Message(role="assistant", content=result.message),
-                ],
-                [user_item, *result.replay_items],
-                expected_revision=conversation.revision,
-                usage_tokens=result.usage.total_tokens if result.usage else 0,
-            )
+            # Same keep/discard rule as the stream terminal (Day 6): completed
+            # and incomplete/max_output_tokens commit; content_filter and
+            # other are replies the client must discard, so the log must not
+            # keep them either — the turn leaves no trace and a first-turn id
+            # never comes into existence.
+            keeps = result.status == "completed" or result.incomplete_reason == "max_output_tokens"
+            if keeps:
+                turns = [Message(role="user", content=message)]
+                if result.message:
+                    turns.append(Message(role="assistant", content=result.message))
+                await self._commit(
+                    resolved_id,
+                    turns,
+                    [user_item, *result.replay_items],
+                    expected_revision=conversation.revision,
+                    usage_tokens=result.usage.total_tokens if result.usage else 0,
+                )
         finally:
             self._release(resolved_id)
         return resolved_id, result

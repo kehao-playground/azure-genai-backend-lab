@@ -19,3 +19,11 @@ Feature: Chat API contract
     Then the response status code should be 400
     And the response JSON should contain error "invalid_input"
     And the response JSON should contain a "correlation_id"
+
+  Scenario: Truncated reply is reported as incomplete, not disguised as success
+    Given a valid chat request
+    And the upstream truncates the reply at the output token cap
+    When I submit the request to the chat endpoint
+    Then the response status code should be 200
+    And the response JSON should report status "incomplete" with reason "max_output_tokens"
+    And the response JSON should contain a non-empty "message"

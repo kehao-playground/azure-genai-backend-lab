@@ -71,21 +71,27 @@ def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
 
 
 def _log_llm_usage(usage: TokenUsage | None) -> None:
-    # Cost attribution lives in the same place as prompt attribution (Day 8):
-    # one log line per billed call, joinable on correlation_id. These are the
-    # provider-reported numbers the invoice is built from, not an estimate.
+    # Cost attribution lives in the same place as prompt attribution (Day 8),
+    # joinable on correlation_id. Scope honestly stated: this line exists only
+    # for calls that returned a usage-bearing terminal (non-streaming success,
+    # stream completed/incomplete). Failed events, SDK exceptions and client
+    # disconnects may still have incurred billable processing upstream with no
+    # line here — reconciliation against Cost Management is the authority.
     if usage is None:
         return
     correlation_id = correlation_id_var.get()
     logger.info(
-        "llm usage input_tokens=%s output_tokens=%s total_tokens=%s correlation_id=%s",
+        "llm usage input_tokens=%s output_tokens=%s reasoning_tokens=%s total_tokens=%s "
+        "correlation_id=%s",
         usage.input_tokens,
         usage.output_tokens,
+        usage.reasoning_tokens,
         usage.total_tokens,
         correlation_id,
         extra={
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
             "total_tokens": usage.total_tokens,
             "correlation_id": correlation_id,
         },
@@ -95,10 +101,13 @@ def _log_llm_usage(usage: TokenUsage | None) -> None:
 def _extract_usage(usage: Any) -> TokenUsage | None:
     if usage is None:
         return None
+    details = getattr(usage, "output_tokens_details", None)
+    reasoning = getattr(details, "reasoning_tokens", None) if details is not None else None
     return TokenUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
+        reasoning_tokens=reasoning,
     )
 
 
@@ -109,9 +118,14 @@ class ChatResult:
     # The response's output items (assistant messages, encrypted reasoning,
     # future tool calls) as opaque dicts — the replay context for the next turn.
     replay_items: tuple[ReplayItem, ...] = ()
-    # Billed tokens for this call, as reported upstream; None only when the
-    # provider omitted the usage block.
+    # Provider-reported tokens for this call; None only when the provider
+    # omitted the usage block.
     usage: TokenUsage | None = None
+    # Non-streaming mirror of the stream terminal (Day 9 review r01 finding 2):
+    # an incomplete response is a truncation the client must be told about,
+    # never disguised as normal success.
+    status: Literal["completed", "incomplete"] = "completed"
+    incomplete_reason: "IncompleteReason | None" = None
 
 
 IncompleteReason = Literal["max_output_tokens", "content_filter", "other"]
@@ -193,6 +207,7 @@ def _fake_usage(items: Sequence[ReplayItem]) -> TokenUsage:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
+        reasoning_tokens=0,  # the fake never reasons; 0 proves the field is wired
     )
 
 
@@ -263,6 +278,14 @@ def _translate_upstream_error(exc: openai.OpenAIError) -> UpstreamError:
     return UpstreamServiceError(str(exc))
 
 
+def _map_incomplete_reason(reason: str | None) -> IncompleteReason:
+    if reason == "max_output_tokens":
+        return "max_output_tokens"
+    if reason == "content_filter":
+        return "content_filter"
+    return "other"
+
+
 def _translate_failed_event(code: str | None, detail: str) -> UpstreamError:
     """``response.failed`` / ``error`` arrive as typed events, not exceptions."""
     if code == "rate_limit_exceeded":
@@ -295,12 +318,7 @@ async def _translate_stream(
                 return
             elif event.type == "response.incomplete":
                 details = event.response.incomplete_details
-                reason = details.reason if details else None
-                mapped: IncompleteReason
-                if reason == "max_output_tokens" or reason == "content_filter":
-                    mapped = reason
-                else:
-                    mapped = "other"
+                mapped = _map_incomplete_reason(details.reason if details else None)
                 # Incomplete is still billed: the meter ran up to the cutoff.
                 usage = _extract_usage(event.response.usage)
                 _log_llm_usage(usage)
@@ -357,8 +375,25 @@ class AzureOpenAIChatService:
             )
         except openai.OpenAIError as exc:
             raise _translate_upstream_error(exc) from exc
+        # Non-streaming responses carry the same terminal states as streams;
+        # ignoring response.status here would disguise a truncated reply as
+        # normal success (Day 9 review r01 finding 2).
+        if response.status == "failed":
+            error = response.error
+            detail = f"{error.code}: {error.message}" if error else "response failed"
+            raise _translate_failed_event(error.code if error else None, detail)
         usage = _extract_usage(response.usage)
         _log_llm_usage(usage)
+        if response.status == "incomplete":
+            details = response.incomplete_details
+            return ChatResult(
+                message=response.output_text,
+                model=response.model,
+                replay_items=_dump_output_items(response.output),
+                usage=usage,
+                status="incomplete",
+                incomplete_reason=_map_incomplete_reason(details.reason if details else None),
+            )
         return ChatResult(
             message=response.output_text,
             model=response.model,

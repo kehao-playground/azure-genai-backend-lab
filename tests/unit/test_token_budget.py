@@ -42,7 +42,9 @@ def make_service(
 async def test_fake_usage_is_history_proportional() -> None:
     result = await FakeChatService().complete([{"role": "user", "content": "hi"}])
 
-    assert result.usage == TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+    assert result.usage == TokenUsage(
+        input_tokens=10, output_tokens=5, total_tokens=15, reasoning_tokens=0
+    )
 
 
 # --- ledger: usage commits with the turn, atomically ---
@@ -168,6 +170,7 @@ def test_chat_response_carries_usage(client: TestClient) -> None:
         "input_tokens": 10,
         "output_tokens": 5,
         "total_tokens": 15,
+        "reasoning_tokens": 0,
     }
 
 
@@ -191,7 +194,10 @@ def test_streaming_message_done_carries_usage(client: TestClient) -> None:
     response = client.post("/api/v1/chat/stream", json={"message": "ping"})
 
     assert response.status_code == 200
-    assert '"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}' in response.text
+    assert (
+        '"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, '
+        '"reasoning_tokens": 0}' in response.text
+    )
 
 
 def test_streaming_exhausted_conversation_maps_to_429_envelope(client: TestClient) -> None:
