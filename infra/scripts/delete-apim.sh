@@ -15,7 +15,9 @@ set -euo pipefail
 : "${AZ_APIM_NAME:?Set AZ_APIM_NAME}"
 
 # Role assignments on other resources are not removed by deleting the service;
-# drop any assignment held by this instance's identity first.
+# drop any assignment held by this instance's identity first. Filter by
+# principalId instead of --assignee: the assignee path does a graph lookup
+# that fails for identities mid-deletion and leaves orphans (hit live 2026-07).
 APIM_PRINCIPAL_ID="$(az apim show \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
@@ -23,9 +25,9 @@ APIM_PRINCIPAL_ID="$(az apim show \
   --query identity.principalId --output tsv 2>/dev/null || true)"
 if [ -n "$APIM_PRINCIPAL_ID" ]; then
   for ASSIGNMENT_ID in $(az role assignment list \
-      --assignee "$APIM_PRINCIPAL_ID" \
-      --scope "/subscriptions/$AZ_SUBSCRIPTION_ID" \
-      --query '[].id' --output tsv); do
+      --subscription "$AZ_SUBSCRIPTION_ID" \
+      --all \
+      --query "[?principalId=='$APIM_PRINCIPAL_ID'].id" --output tsv); do
     az role assignment delete --ids "$ASSIGNMENT_ID"
   done
 fi
