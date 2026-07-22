@@ -2,6 +2,7 @@
 which request (correlation id). This is the runtime half of prompt version
 management — git knows the history, the log knows what was live."""
 
+import hashlib
 import io
 import logging
 
@@ -11,7 +12,14 @@ from azgenai_lab.core.correlation import correlation_id_var
 from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.azure_openai import FakeChatService
 
-PROMPT = PromptTemplate(name="default_chat", version=1, description="d", text="You are T.")
+_TEXT = "You are T."
+PROMPT = PromptTemplate(
+    name="default_chat",
+    version=1,
+    description="d",
+    text=_TEXT,
+    sha256=hashlib.sha256(_TEXT.encode("utf-8")).hexdigest(),
+)
 
 # Same format string as configure_logging() — extras aren't rendered by it, so
 # the fields the article/incident responders grep for must be in the message
@@ -59,4 +67,5 @@ async def test_complete_renders_prompt_identity_in_log_line() -> None:
     line = stream.getvalue()
     assert "prompt_name=default_chat" in line
     assert "prompt_version=1" in line
+    assert f"prompt_sha256={PROMPT.sha256[:12]}" in line
     assert "cid-123" in line

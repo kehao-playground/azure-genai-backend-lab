@@ -50,16 +50,20 @@ def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
     # prompt version was live on this request?" without asking git.
     prompt_name = prompt.name if prompt else None
     prompt_version = prompt.version if prompt else None
+    prompt_sha256 = prompt.sha256 if prompt else None
+    prompt_sha256_prefix = prompt_sha256[:12] if prompt_sha256 else None
     correlation_id = correlation_id_var.get()
     logger.info(
-        "llm call streaming=%s prompt_name=%s prompt_version=%s correlation_id=%s",
+        "llm call streaming=%s prompt_name=%s prompt_version=%s prompt_sha256=%s correlation_id=%s",
         streaming,
         prompt_name,
         prompt_version,
+        prompt_sha256_prefix,
         correlation_id,
         extra={
             "prompt_name": prompt_name,
             "prompt_version": prompt_version,
+            "prompt_sha256": prompt_sha256,
             "correlation_id": correlation_id,
         },
     )
