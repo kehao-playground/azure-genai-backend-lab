@@ -18,8 +18,8 @@ sequenceDiagram
         API-->>Client: 429 token_budget_exceeded (no upstream call)
     end
     API->>LLM: Responses API: replay items (incl. encrypted reasoning) + new user input, max_output_tokens
-    LLM-->>API: assistant reply + usage {input, output, total}
+    LLM-->>API: reply + status (completed | incomplete) + usage {input, output, reasoning, total}
     API->>Store: append(transcript turn + replay items + usage tokens)
     Note over API,Store: turn-commit: messages and token ledger together,\nonly after success
-    API-->>Client: ChatResponse {message, conversation_id, correlation_id, usage}
+    API-->>Client: ChatResponse {message, conversation_id, correlation_id, usage, status, incomplete_reason?}
 ```
