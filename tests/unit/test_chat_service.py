@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -26,7 +27,14 @@ from azgenai_lab.services.azure_openai import (
     build_chat_service,
 )
 
-PROMPT = PromptTemplate(name="default_chat", version=1, description="d", text="You are T.")
+_PROMPT_TEXT = "You are T."
+PROMPT = PromptTemplate(
+    name="default_chat",
+    version=1,
+    description="d",
+    text=_PROMPT_TEXT,
+    sha256=hashlib.sha256(_PROMPT_TEXT.encode("utf-8")).hexdigest(),
+)
 
 
 def user_items(*texts: str) -> list[ReplayItem]:
