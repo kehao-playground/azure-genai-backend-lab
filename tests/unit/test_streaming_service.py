@@ -104,7 +104,12 @@ def make_service(
 ) -> tuple[AzureOpenAIChatService, StubResponses]:
     responses = StubResponses(stream)
     client = SimpleNamespace(responses=responses)
-    return AzureOpenAIChatService(cast(AsyncOpenAI, client), "chat-mini", prompt=PROMPT), responses
+    return (
+        AzureOpenAIChatService(
+            cast(AsyncOpenAI, client), "chat-mini", prompt=PROMPT, max_output_tokens=1000
+        ),
+        responses,
+    )
 
 
 class StubOutputItem:
@@ -124,14 +129,18 @@ def delta(text: str) -> Any:
     return SimpleNamespace(type="response.output_text.delta", delta=text)
 
 
-def completed(output: list[Any] | None = None) -> Any:
-    return SimpleNamespace(type="response.completed", response=SimpleNamespace(output=output or []))
+def completed(output: list[Any] | None = None, usage: Any = None) -> Any:
+    return SimpleNamespace(
+        type="response.completed", response=SimpleNamespace(output=output or [], usage=usage)
+    )
 
 
 def incomplete(reason: str) -> Any:
     return SimpleNamespace(
         type="response.incomplete",
-        response=SimpleNamespace(incomplete_details=SimpleNamespace(reason=reason), output=[]),
+        response=SimpleNamespace(
+            incomplete_details=SimpleNamespace(reason=reason), output=[], usage=None
+        ),
     )
 
 
@@ -145,7 +154,21 @@ async def test_real_stream_is_requested_with_store_false() -> None:
     assert call["input"] == [{"role": "user", "content": "ping"}]
     assert call["store"] is False
     assert call["include"] == ["reasoning.encrypted_content"]
+    assert call["max_output_tokens"] == 1000  # Day 9: per-call output cap
     assert call["stream"] is True
+
+
+async def test_terminal_event_carries_the_billed_usage() -> None:
+    from types import SimpleNamespace as NS
+
+    usage = NS(input_tokens=20, output_tokens=7, total_tokens=27)
+    service, _ = make_service(StubUpstreamStream([delta("pong"), completed(usage=usage)]))
+
+    events = await collect(await service.open_stream(user_items("ping")))
+
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].usage is not None
+    assert events[-1].usage.total_tokens == 27
 
 
 async def test_terminal_event_carries_the_response_output_as_replay_items() -> None:

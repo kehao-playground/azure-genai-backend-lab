@@ -54,6 +54,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          description: Conversation token budget exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '500':
           description: Service misconfiguration or storage failure
           content:
@@ -93,9 +99,10 @@ paths:
       responses:
         '200':
           description: "Server-Sent Events stream. Event vocabulary: `message.delta`\
-            \ (`{text}`), `message.done` (`{status, incomplete_reason?, correlation_id}`),\
-            \ `error` (the error envelope). Exactly one terminal event (`message.done`\
-            \ or `error`) ends a normally closed stream; clients must treat EOF without\
+            \ (`{text}`), `message.done` (`{status, incomplete_reason?, usage?, correlation_id}`;\
+            \ `usage` carries the turn's billed input/output/total tokens), `error`\
+            \ (the error envelope). Exactly one terminal event (`message.done` or\
+            \ `error`) ends a normally closed stream; clients must treat EOF without\
             \ a terminal as a failure and must ignore unknown event names. OpenAPI\
             \ cannot express these ordering invariants \u2014 the BDD feature `streaming_response.feature`\
             \ is the executable contract."
@@ -143,6 +150,13 @@ paths:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '422':
           description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          description: Conversation token budget exhausted (checked before the stream
+            starts)
           content:
             application/json:
               schema:
@@ -227,6 +241,12 @@ components:
         correlation_id:
           type: string
           title: Correlation Id
+        usage:
+          anyOf:
+          - $ref: '#/components/schemas/TokenUsage'
+          - type: 'null'
+          description: Billed tokens for this turn as reported upstream; null only
+            if the provider omitted its usage block.
       type: object
       required:
       - message
@@ -330,3 +350,34 @@ components:
       required:
       - message
       title: StreamingChatRequest
+    TokenUsage:
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0.0
+          title: Input Tokens
+        output_tokens:
+          type: integer
+          minimum: 0.0
+          title: Output Tokens
+        total_tokens:
+          type: integer
+          minimum: 0.0
+          title: Total Tokens
+      type: object
+      required:
+      - input_tokens
+      - output_tokens
+      - total_tokens
+      title: TokenUsage
+      description: 'Token counts as billed upstream, reported by the Responses API
+        (Day 9).
+
+
+        This is metering, not estimation: the numbers come from the provider''s
+
+        ``usage`` block, the same numbers the invoice is built from. ``input_tokens``
+
+        covers the full replay context (history grows it every turn), so it is the
+
+        number that dominates conversation cost.'

@@ -5,6 +5,7 @@ Wire vocabulary — ours, not the upstream's:
 - ``message.delta``  ``{"text": "..."}``
 - ``message.done``   ``{"status": "completed" | "incomplete",
   "incomplete_reason"?: "max_output_tokens" | "content_filter" | "other",
+  "usage"?: {"input_tokens", "output_tokens", "total_tokens"},
   "correlation_id": "..."}``
 - ``error``          the Day 3 error envelope, verbatim
 
@@ -29,10 +30,18 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from azgenai_lab.api.chat import conversation_not_found, get_conversation_service
+from azgenai_lab.api.chat import (
+    conversation_not_found,
+    get_conversation_service,
+    token_budget_exceeded,
+)
 from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError
 from azgenai_lab.services.azure_openai import StreamDone, TextDelta
-from azgenai_lab.services.conversation import ConversationChatService, ConversationNotFoundError
+from azgenai_lab.services.conversation import (
+    ConversationChatService,
+    ConversationNotFoundError,
+    TokenBudgetExceededError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     404: {"content": _ENVELOPE_CONTENT, "description": "Unknown conversation_id"},
     422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},
+    429: {
+        "content": _ENVELOPE_CONTENT,
+        "description": "Conversation token budget exhausted (checked before the stream starts)",
+    },
     500: {
         "content": _ENVELOPE_CONTENT,
         "description": "Service misconfiguration or storage failure",
@@ -74,7 +87,8 @@ _STREAM_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": (
             "Server-Sent Events stream. Event vocabulary: `message.delta` "
             "(`{text}`), `message.done` (`{status, incomplete_reason?, "
-            "correlation_id}`), `error` (the error envelope). Exactly one "
+            "usage?, correlation_id}`; `usage` carries the turn's billed "
+            "input/output/total tokens), `error` (the error envelope). Exactly one "
             "terminal event (`message.done` or `error`) ends a normally "
             "closed stream; clients must treat EOF without a terminal as a "
             "failure and must ignore unknown event names. OpenAPI cannot "
@@ -145,6 +159,10 @@ async def _render_sse(
                 data: dict[str, Any] = {"status": event.status, "correlation_id": correlation_id}
                 if event.status == "incomplete":
                     data["incomplete_reason"] = event.incomplete_reason or "other"
+                if event.usage is not None:
+                    # Additive field (Day 9): clients that predate it must
+                    # ignore unknown fields, per the Day 6 contract.
+                    data["usage"] = event.usage.model_dump()
                 yield _sse("message.done", data)
                 return  # terminal sent: no further event may follow
     except UpstreamError as exc:
@@ -178,6 +196,8 @@ async def stream_chat(
         )
     except ConversationNotFoundError:
         raise conversation_not_found() from None
+    except TokenBudgetExceededError:
+        raise token_budget_exceeded() from None
     # The id travels as a header because it must reach the client before the
     # body: SSE consumers read it at response time, not from an event.
     return EventStreamResponse(

@@ -6,6 +6,7 @@ A conversation is an append-only log owned by the backend (`store=False` upstrea
 stateDiagram-v2
     [*] --> Resolving: request with optional conversation_id
     Resolving --> Rejected: unknown id (404, log untouched)
+    Resolving --> Rejected: token budget exhausted (429, no upstream call)
     Resolving --> InFlight: replay items + new user input sent upstream
     InFlight --> Committed: reply the client keeps
     InFlight --> Discarded: failure or discarded reply
@@ -18,5 +19,7 @@ A reply "the client keeps" (per the Day 6 SSE contract): non-streaming success, 
 Concurrency: read → inference → commit is one per-conversation critical section, so parallel turns on the same id cannot both build on a stale snapshot and record a causally false order. The commit itself is conditional — it presents the revision read at the start of the turn, and a stale revision is rejected (`ConversationConflictError`), which is the contract a multi-replica persistent adapter enforces natively. Storage failures surface as `storage_error` (HTTP 500 envelope, or SSE `error` after the 200); the store's `append` is required to be all-or-nothing (prepare-then-publish: anything that can fail happens before the first mutation).
 
 Because failed turns leave no trace, retrying a turn cannot duplicate or corrupt history, and a `conversation_id` issued on a failed first turn simply never comes into existence (the streaming header id is provisional for exactly this reason).
+
+Each committed turn also appends its billed token usage to the conversation's ledger, in the same all-or-nothing `append` (Day 9). The ledger is what the `Resolving → Rejected` budget transition reads: the check runs before inference, so an exhausted conversation costs nothing further upstream. A failed turn is billed upstream but leaves no ledger trace — turn-commit semantics win over billing completeness.
 
 Enforced by `tests/unit/test_conversation_service.py` and `tests/bdd/features/conversation_state.feature`.

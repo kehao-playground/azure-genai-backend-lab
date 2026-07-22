@@ -39,6 +39,7 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
+from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 
@@ -69,6 +70,38 @@ def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
     )
 
 
+def _log_llm_usage(usage: TokenUsage | None) -> None:
+    # Cost attribution lives in the same place as prompt attribution (Day 8):
+    # one log line per billed call, joinable on correlation_id. These are the
+    # provider-reported numbers the invoice is built from, not an estimate.
+    if usage is None:
+        return
+    correlation_id = correlation_id_var.get()
+    logger.info(
+        "llm usage input_tokens=%s output_tokens=%s total_tokens=%s correlation_id=%s",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        correlation_id,
+        extra={
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "correlation_id": correlation_id,
+        },
+    )
+
+
+def _extract_usage(usage: Any) -> TokenUsage | None:
+    if usage is None:
+        return None
+    return TokenUsage(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+    )
+
+
 @dataclass(frozen=True)
 class ChatResult:
     message: str
@@ -76,6 +109,9 @@ class ChatResult:
     # The response's output items (assistant messages, encrypted reasoning,
     # future tool calls) as opaque dicts — the replay context for the next turn.
     replay_items: tuple[ReplayItem, ...] = ()
+    # Billed tokens for this call, as reported upstream; None only when the
+    # provider omitted the usage block.
+    usage: TokenUsage | None = None
 
 
 IncompleteReason = Literal["max_output_tokens", "content_filter", "other"]
@@ -102,6 +138,9 @@ class StreamDone:
     status: Literal["completed", "incomplete"]
     incomplete_reason: IncompleteReason | None = None
     replay_items: tuple[ReplayItem, ...] = ()
+    # Billed tokens for the whole stream, from the terminal response's usage
+    # block — deltas carry no usage; only the terminal settles the bill.
+    usage: TokenUsage | None = None
 
 
 ChatStreamEvent = TextDelta | StreamDone
@@ -144,6 +183,19 @@ def _fake_output_item(text: str) -> ReplayItem:
     }
 
 
+def _fake_usage(items: Sequence[ReplayItem]) -> TokenUsage:
+    # Deterministic and history-proportional: tests can prove the usage
+    # pipeline is wired (and that input grows with the replay context)
+    # without a tokenizer.
+    input_tokens = 10 * len(items)
+    output_tokens = 5
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
+
+
 class FakeChatService:
     """Deterministic stand-in so development and tests never touch Azure."""
 
@@ -153,16 +205,27 @@ class FakeChatService:
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         _log_llm_call(self._prompt, streaming=False)
         reply = _fake_reply(items, self._prompt)
-        return ChatResult(message=reply, model="fake", replay_items=(_fake_output_item(reply),))
+        usage = _fake_usage(items)
+        _log_llm_usage(usage)
+        return ChatResult(
+            message=reply,
+            model="fake",
+            replay_items=(_fake_output_item(reply),),
+            usage=usage,
+        )
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
         _log_llm_call(self._prompt, streaming=True)
         reply = _fake_reply(items, self._prompt)
+        usage = _fake_usage(items)
 
         async def stream() -> AsyncIterator[ChatStreamEvent]:
             yield TextDelta("[fake-llm] ")
             yield TextDelta(reply.removeprefix("[fake-llm] "))
-            yield StreamDone(status="completed", replay_items=(_fake_output_item(reply),))
+            _log_llm_usage(usage)
+            yield StreamDone(
+                status="completed", replay_items=(_fake_output_item(reply),), usage=usage
+            )
 
         return stream()
 
@@ -222,9 +285,12 @@ async def _translate_stream(
             if event.type == "response.output_text.delta":
                 yield TextDelta(event.delta)
             elif event.type == "response.completed":
+                usage = _extract_usage(event.response.usage)
+                _log_llm_usage(usage)
                 yield StreamDone(
                     status="completed",
                     replay_items=_dump_output_items(event.response.output),
+                    usage=usage,
                 )
                 return
             elif event.type == "response.incomplete":
@@ -235,10 +301,14 @@ async def _translate_stream(
                     mapped = reason
                 else:
                     mapped = "other"
+                # Incomplete is still billed: the meter ran up to the cutoff.
+                usage = _extract_usage(event.response.usage)
+                _log_llm_usage(usage)
                 yield StreamDone(
                     status="incomplete",
                     incomplete_reason=mapped,
                     replay_items=_dump_output_items(event.response.output),
+                    usage=usage,
                 )
                 return
             elif event.type == "response.failed":
@@ -255,10 +325,17 @@ async def _translate_stream(
 
 
 class AzureOpenAIChatService:
-    def __init__(self, client: AsyncOpenAI, deployment_name: str, prompt: PromptTemplate) -> None:
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        deployment_name: str,
+        prompt: PromptTemplate,
+        max_output_tokens: int,
+    ) -> None:
         self._client = client
         self._deployment_name = deployment_name
         self._prompt = prompt
+        self._max_output_tokens = max_output_tokens
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         _log_llm_call(self._prompt, streaming=False)
@@ -273,13 +350,20 @@ class AzureOpenAIChatService:
                 # reasoning items come back without content and the replayed
                 # history loses reasoning context (review r01 finding 1).
                 include=["reasoning.encrypted_content"],
+                # Hard per-call output cap (Day 9): an unbounded reply is the
+                # fastest way to burn budget. Hitting it yields an incomplete
+                # response, not an error.
+                max_output_tokens=self._max_output_tokens,
             )
         except openai.OpenAIError as exc:
             raise _translate_upstream_error(exc) from exc
+        usage = _extract_usage(response.usage)
+        _log_llm_usage(usage)
         return ChatResult(
             message=response.output_text,
             model=response.model,
             replay_items=_dump_output_items(response.output),
+            usage=usage,
         )
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
@@ -296,6 +380,7 @@ class AzureOpenAIChatService:
                 instructions=self._prompt.text,
                 store=False,  # state ownership stays with us: ConversationStore (Day 7)
                 include=["reasoning.encrypted_content"],  # see complete()
+                max_output_tokens=self._max_output_tokens,  # see complete()
                 stream=True,
             )
         except openai.OpenAIError as exc:
@@ -324,4 +409,9 @@ def build_chat_service(settings: Settings) -> ChatService:
         timeout=settings.llm_timeout_seconds,  # per attempt (default 30s), not end-to-end
         max_retries=settings.llm_max_retries,  # explicit policy; the SDK default is 2
     )
-    return AzureOpenAIChatService(client, settings.azure_openai_deployment_name, prompt)
+    return AzureOpenAIChatService(
+        client,
+        settings.azure_openai_deployment_name,
+        prompt,
+        max_output_tokens=settings.llm_max_output_tokens,
+    )

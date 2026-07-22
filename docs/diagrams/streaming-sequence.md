@@ -12,7 +12,10 @@ sequenceDiagram
     participant LLM as Azure OpenAI (Responses API)
 
     Client->>API: POST /api/v1/chat/stream
-    API->>LLM: responses.create(stream=True) — eager open
+    alt token ledger >= CONVERSATION_TOKEN_BUDGET
+        API-->>Client: HTTP 429 token_budget_exceeded (no upstream call)
+    end
+    API->>LLM: responses.create(stream=True, max_output_tokens) — eager open
     alt upstream fails before the stream starts
         LLM-->>API: SDK exception (401 / 429 / timeout ...)
         API-->>Client: HTTP 4xx/5xx + error envelope (Day 5 mapping)
@@ -24,7 +27,7 @@ sequenceDiagram
         end
         alt upstream completes or truncates
             LLM-->>API: response.completed / response.incomplete
-            API-->>Client: event: message.done {"status", "incomplete_reason"?, "correlation_id"}
+            API-->>Client: event: message.done {"status", "incomplete_reason"?, "usage"?, "correlation_id"}
         else upstream fails mid-stream
             LLM-->>API: response.failed / error event / SDK exception
             API-->>Client: event: error {error envelope}
@@ -49,3 +52,8 @@ the turn — transcript plus provider replay items — commits to the
 terminal is consumed commit nothing; a storage failure after the 200 becomes
 an SSE `error` terminal with code `storage_error` (see
 [Conversation Turn Lifecycle](../state-models/conversation-session-fsm.md)).
+
+Token budget (Day 9) also wraps the flow without changing it: the ledger
+check happens with the conversation lookup, before the eager open — an
+exhausted conversation is always a plain HTTP 429, never a mid-stream
+failure. The terminal's `usage` block commits to the ledger with the turn.
