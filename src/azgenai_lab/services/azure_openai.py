@@ -128,8 +128,8 @@ def _fake_reply(items: Sequence[ReplayItem], prompt: PromptTemplate | None) -> s
     if len(items) > 1:
         markers.append(f"history={len(items) - 1}")
     if prompt is not None:
-        # Proves through the API that instructions were on the call — the
-        # fake can't obey a system prompt, but it can prove it arrived.
+        # Proves through the API that the composition path carried the
+        # prompt into the adapter — the fake never talks to Azure.
         markers.append(f"prompt={prompt.name}@{prompt.version}")
     if markers:
         reply += f" ({', '.join(markers)})"
