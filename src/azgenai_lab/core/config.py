@@ -18,6 +18,15 @@ class Settings(BaseSettings):
 
     llm_timeout_seconds: float = 30.0
     llm_max_retries: int = 2
+    # Hard cap per call, passed as max_output_tokens on every request: an
+    # unbounded reply is the single fastest way to burn budget. Streams that
+    # hit it end with message.done incomplete/max_output_tokens (Day 6).
+    llm_max_output_tokens: int = 1000
+    # Per-conversation lifetime budget in billed tokens (input + output across
+    # all committed turns). Checked before inference: an exhausted conversation
+    # is rejected with 429 token_budget_exceeded without touching the upstream.
+    # None disables the guardrail.
+    conversation_token_budget: int | None = 50_000
 
     azure_search_endpoint: str | None = None
     azure_search_index_name: str | None = None

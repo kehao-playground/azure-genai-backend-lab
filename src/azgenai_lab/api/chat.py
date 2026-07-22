@@ -4,7 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from azgenai_lab.core.errors import ErrorEnvelope
-from azgenai_lab.services.conversation import ConversationChatService, ConversationNotFoundError
+from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.services.conversation import (
+    ConversationChatService,
+    ConversationNotFoundError,
+    TokenBudgetExceededError,
+)
 
 router = APIRouter(tags=["chat"])
 
@@ -13,6 +18,7 @@ router = APIRouter(tags=["chat"])
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Input rejected: content filter or invalid input"},
     404: {"model": ErrorEnvelope, "description": "Unknown conversation_id"},
+    429: {"model": ErrorEnvelope, "description": "Conversation token budget exhausted"},
     500: {"model": ErrorEnvelope, "description": "Service misconfiguration or storage failure"},
     502: {"model": ErrorEnvelope, "description": "Upstream LLM service failure"},
     503: {"model": ErrorEnvelope, "description": "Upstream capacity exhausted"},
@@ -40,6 +46,19 @@ def conversation_not_found() -> HTTPException:
     )
 
 
+def token_budget_exceeded() -> HTTPException:
+    """429 through the shared envelope. The budget is per conversation and
+    does not replenish over time, so there is no Retry-After: the remedy is a
+    new conversation, not waiting."""
+    return HTTPException(
+        status_code=429,
+        detail={
+            "code": "token_budget_exceeded",
+            "message": ("This conversation's token budget is exhausted; start a new conversation."),
+        },
+    )
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     conversation_id: str | None = Field(
@@ -56,6 +75,13 @@ class ChatResponse(BaseModel):
     message: str
     conversation_id: str
     correlation_id: str
+    usage: TokenUsage | None = Field(
+        default=None,
+        description=(
+            "Billed tokens for this turn as reported upstream; null only if "
+            "the provider omitted its usage block."
+        ),
+    )
 
 
 @router.post("/chat", response_model=ChatResponse, responses=_ERROR_RESPONSES)
@@ -68,8 +94,11 @@ async def chat(
         conversation_id, result = await service.complete(payload.message, payload.conversation_id)
     except ConversationNotFoundError:
         raise conversation_not_found() from None
+    except TokenBudgetExceededError:
+        raise token_budget_exceeded() from None
     return ChatResponse(
         message=result.message,
         conversation_id=conversation_id,
         correlation_id=request.state.correlation_id,
+        usage=result.usage,
     )

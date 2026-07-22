@@ -38,7 +38,9 @@ async def test_get_unknown_conversation_returns_none() -> None:
 async def test_append_then_get_roundtrip() -> None:
     store = InMemoryConversationStore()
 
-    await store.append("c1", [user("hi"), assistant("hello")], items("hi", "hello"), 0)
+    await store.append(
+        "c1", [user("hi"), assistant("hello")], items("hi", "hello"), 0, usage_tokens=0
+    )
 
     conversation = await store.get("c1")
     assert conversation is not None
@@ -53,9 +55,9 @@ async def test_append_then_get_roundtrip() -> None:
 
 async def test_append_extends_existing_history_in_order() -> None:
     store = InMemoryConversationStore()
-    await store.append("c1", [user("one"), assistant("1")], items("one"), 0)
+    await store.append("c1", [user("one"), assistant("1")], items("one"), 0, usage_tokens=0)
 
-    await store.append("c1", [user("two"), assistant("2")], items("two"), 1)
+    await store.append("c1", [user("two"), assistant("2")], items("two"), 1, usage_tokens=0)
 
     conversation = await store.get("c1")
     assert conversation is not None
@@ -66,11 +68,11 @@ async def test_append_extends_existing_history_in_order() -> None:
 
 async def test_stale_revision_is_rejected_and_commits_nothing() -> None:
     store = InMemoryConversationStore()
-    await store.append("c1", [user("one"), assistant("1")], items("one"), 0)
+    await store.append("c1", [user("one"), assistant("1")], items("one"), 0, usage_tokens=0)
 
     # A writer that read revision 0 lost the race: reject, don't interleave.
     with pytest.raises(ConversationConflictError):
-        await store.append("c1", [user("two"), assistant("2")], items("two"), 0)
+        await store.append("c1", [user("two"), assistant("2")], items("two"), 0, usage_tokens=0)
 
     conversation = await store.get("c1")
     assert conversation is not None
@@ -88,7 +90,7 @@ async def test_failed_append_is_all_or_nothing() -> None:
     poisoned: list[ReplayItem] = [{"role": "user", "content": Uncopyable()}]
 
     with pytest.raises(RuntimeError):
-        await store.append("c1", [user("hello"), assistant("hi")], poisoned, 0)
+        await store.append("c1", [user("hello"), assistant("hi")], poisoned, 0, usage_tokens=0)
 
     # Nothing may survive a failed append — no transcript half, no revision bump.
     assert await store.get("c1") is None
@@ -96,7 +98,7 @@ async def test_failed_append_is_all_or_nothing() -> None:
 
 async def test_get_hands_out_a_copy_not_the_internal_state() -> None:
     store = InMemoryConversationStore()
-    await store.append("c1", [user("hi"), assistant("hello")], items("hi"), 0)
+    await store.append("c1", [user("hi"), assistant("hello")], items("hi"), 0, usage_tokens=0)
 
     leaked = await store.get("c1")
     assert leaked is not None
@@ -112,7 +114,7 @@ async def test_get_hands_out_a_copy_not_the_internal_state() -> None:
 async def test_messages_are_frozen_so_aliases_cannot_rewrite_history() -> None:
     store = InMemoryConversationStore()
     appended = user("hi")
-    await store.append("c1", [appended, assistant("hello")], items("hi"), 0)
+    await store.append("c1", [appended, assistant("hello")], items("hi"), 0, usage_tokens=0)
 
     with pytest.raises(pydantic.ValidationError):
         appended.content = "rewritten"  # type: ignore[misc]
@@ -125,7 +127,7 @@ async def test_messages_are_frozen_so_aliases_cannot_rewrite_history() -> None:
 async def test_appended_replay_items_are_copied_not_aliased() -> None:
     store = InMemoryConversationStore()
     caller_items = items("hi")
-    await store.append("c1", [user("hi"), assistant("hello")], caller_items, 0)
+    await store.append("c1", [user("hi"), assistant("hello")], caller_items, 0, usage_tokens=0)
 
     caller_items[0]["content"] = "rewritten"
 

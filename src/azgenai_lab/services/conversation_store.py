@@ -50,6 +50,7 @@ class ConversationStore(Protocol):
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
+        usage_tokens: int,
     ) -> None: ...
 
 
@@ -58,6 +59,7 @@ class InMemoryConversationStore:
         self._messages: dict[str, list[Message]] = {}
         self._replay_items: dict[str, list[ReplayItem]] = {}
         self._revisions: dict[str, int] = {}
+        self._token_totals: dict[str, int] = {}
 
     async def get(self, conversation_id: str) -> Conversation | None:
         messages = self._messages.get(conversation_id)
@@ -71,6 +73,7 @@ class InMemoryConversationStore:
             messages=list(messages),
             replay_items=copy.deepcopy(self._replay_items.get(conversation_id, [])),
             revision=self._revisions.get(conversation_id, 0),
+            total_tokens=self._token_totals.get(conversation_id, 0),
         )
 
     async def append(
@@ -79,6 +82,7 @@ class InMemoryConversationStore:
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
+        usage_tokens: int,
     ) -> None:
         current = self._revisions.get(conversation_id, 0)
         if expected_revision != current:
@@ -91,6 +95,11 @@ class InMemoryConversationStore:
         self._messages.setdefault(conversation_id, []).extend(prepared_turns)
         self._replay_items.setdefault(conversation_id, []).extend(prepared_replay)
         self._revisions[conversation_id] = current + 1
+        # The ledger commits with the turn: usage is part of the same
+        # all-or-nothing append, never a separate write that can drift.
+        self._token_totals[conversation_id] = (
+            self._token_totals.get(conversation_id, 0) + usage_tokens
+        )
 
 
 def build_conversation_store(settings: Settings) -> ConversationStore:

@@ -60,6 +60,22 @@ class ConversationNotFoundError(Exception):
         self.conversation_id = conversation_id
 
 
+class TokenBudgetExceededError(Exception):
+    """The conversation's lifetime token budget is exhausted (Day 9).
+
+    Raised *before* inference: the whole point of the guardrail is that an
+    exhausted conversation costs nothing further upstream. This is a policy
+    rejection owned by this service, not an upstream failure — the client's
+    remedy is to start a new conversation, not to retry this one.
+    """
+
+    def __init__(self, conversation_id: str, spent: int, budget: int) -> None:
+        super().__init__(f"conversation {conversation_id}: spent {spent} of {budget} tokens")
+        self.conversation_id = conversation_id
+        self.spent = spent
+        self.budget = budget
+
+
 def _user_item(message: str) -> ReplayItem:
     return {"role": "user", "content": message}
 
@@ -73,9 +89,15 @@ class _LockEntry:
 
 
 class ConversationChatService:
-    def __init__(self, chat_service: ChatService, store: ConversationStore) -> None:
+    def __init__(
+        self,
+        chat_service: ChatService,
+        store: ConversationStore,
+        token_budget: int | None = None,
+    ) -> None:
         self._chat_service = chat_service
         self._store = store
+        self._token_budget = token_budget
         # Reference-counted per-conversation locks: an entry exists only while
         # a request holds or awaits it, so probing unknown ids cannot grow the
         # registry unboundedly (review r04 finding 3).
@@ -119,15 +141,30 @@ class ConversationChatService:
             raise ConversationNotFoundError(provided_id)
         return conversation
 
+    def _check_budget(self, conversation: Conversation) -> None:
+        # Post-paid ledger, pre-paid gate: the check reads what committed turns
+        # actually billed, so it can only fire *between* turns — a single turn
+        # can still overshoot the line by up to one call's worth of tokens
+        # (bounded by max_output_tokens plus the history the turn replays).
+        if self._token_budget is None:
+            return
+        if conversation.total_tokens >= self._token_budget:
+            raise TokenBudgetExceededError(
+                conversation.id, conversation.total_tokens, self._token_budget
+            )
+
     async def _commit(
         self,
         conversation_id: str,
         turns: list[Message],
         replay_items: list[ReplayItem],
         expected_revision: int,
+        usage_tokens: int,
     ) -> None:
         try:
-            await self._store.append(conversation_id, turns, replay_items, expected_revision)
+            await self._store.append(
+                conversation_id, turns, replay_items, expected_revision, usage_tokens
+            )
         except Exception as exc:
             # Includes ConversationConflictError: under the per-process lock a
             # stale revision can only mean a cross-replica race this demo
@@ -139,6 +176,7 @@ class ConversationChatService:
         await self._acquire(resolved_id)
         try:
             conversation = await self._load(conversation_id, resolved_id)
+            self._check_budget(conversation)
             user_item = _user_item(message)
             result = await self._chat_service.complete([*conversation.replay_items, user_item])
             if not result.message:
@@ -154,6 +192,7 @@ class ConversationChatService:
                 ],
                 [user_item, *result.replay_items],
                 expected_revision=conversation.revision,
+                usage_tokens=result.usage.total_tokens if result.usage else 0,
             )
         finally:
             self._release(resolved_id)
@@ -166,6 +205,9 @@ class ConversationChatService:
         await self._acquire(resolved_id)
         try:
             conversation = await self._load(conversation_id, resolved_id)
+            # Budget rejection is pre-stream by design: it raises before any
+            # byte reaches the client, so it travels as an HTTP envelope.
+            self._check_budget(conversation)
             user_item = _user_item(message)
             # Eager await preserved: pre-stream failures raise here, before
             # any byte reaches the client — the Day 6 two-phase boundary
@@ -206,6 +248,7 @@ class ConversationChatService:
                             turns,
                             [user_item, *event.replay_items],
                             expected_revision=expected_revision,
+                            usage_tokens=event.usage.total_tokens if event.usage else 0,
                         )
                     yield event
                     return
@@ -218,4 +261,8 @@ class ConversationChatService:
 
 def build_conversation_service(settings: Settings) -> ConversationChatService:
     """Composition point: the chat adapter wrapped with app-owned state."""
-    return ConversationChatService(build_chat_service(settings), build_conversation_store(settings))
+    return ConversationChatService(
+        build_chat_service(settings),
+        build_conversation_store(settings),
+        token_budget=settings.conversation_token_budget,
+    )

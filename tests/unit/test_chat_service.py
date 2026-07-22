@@ -119,6 +119,7 @@ class StubResponses:
             output_text="pong",
             model="gpt-5-mini-2025-08-07",
             output=[StubOutputItem(REASONING_ITEM)],
+            usage=SimpleNamespace(input_tokens=12, output_tokens=3, total_tokens=15),
         )
 
 
@@ -130,7 +131,9 @@ def make_stub_client() -> tuple[AsyncOpenAI, StubResponses]:
 
 async def test_real_service_sends_deployment_name_and_replay_items_verbatim() -> None:
     client, responses = make_stub_client()
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
+    service = AzureOpenAIChatService(
+        client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000
+    )
 
     replay_context = [
         {"role": "user", "content": "hello"},
@@ -149,7 +152,9 @@ async def test_real_service_sends_deployment_name_and_replay_items_verbatim() ->
 
 async def test_real_service_never_stores_and_requests_encrypted_reasoning() -> None:
     client, responses = make_stub_client()
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
+    service = AzureOpenAIChatService(
+        client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000
+    )
 
     await service.complete(user_items("hello"))
 
@@ -157,6 +162,24 @@ async def test_real_service_never_stores_and_requests_encrypted_reasoning() -> N
     # store=False + reasoning model: without this include, replayed history
     # silently loses reasoning context (review r01 finding 1).
     assert responses.calls[0]["include"] == ["reasoning.encrypted_content"]
+    # Day 9: the per-call output cap travels on every request.
+    assert responses.calls[0]["max_output_tokens"] == 1000
+
+
+async def test_real_service_reports_billed_usage() -> None:
+    client, _ = make_stub_client()
+    service = AzureOpenAIChatService(
+        client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000
+    )
+
+    result = await service.complete(user_items("hello"))
+
+    assert result.usage is not None
+    assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens) == (
+        12,
+        3,
+        15,
+    )
 
 
 def make_status_error(
@@ -204,7 +227,9 @@ async def test_sdk_errors_are_translated_at_the_adapter_boundary(
         raise sdk_error
 
     responses.create = raise_sdk_error  # type: ignore[method-assign]
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
+    service = AzureOpenAIChatService(
+        client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000
+    )
 
     with pytest.raises(expected) as excinfo:
         await service.complete(user_items("hello"))
@@ -233,7 +258,9 @@ async def test_build_chat_service_wires_prompt() -> None:
 
 async def test_real_service_sends_prompt_as_instructions() -> None:
     client, responses = make_stub_client()
-    service = AzureOpenAIChatService(client, deployment_name="chat-mini", prompt=PROMPT)
+    service = AzureOpenAIChatService(
+        client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000
+    )
 
     await service.complete(user_items("hello"))
 

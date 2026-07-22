@@ -29,7 +29,7 @@ Validation errors (HTTP 422) use the envelope too: a `RequestValidationError` ha
 Streaming endpoints use Server-Sent Events with an owned vocabulary — upstream event names never reach clients (Day 6):
 
 - `message.delta` — `{"text"}`, one increment of output text;
-- `message.done` — `{"status": "completed" | "incomplete", "incomplete_reason"?, "correlation_id"}`, sole success terminal;
+- `message.done` — `{"status": "completed" | "incomplete", "incomplete_reason"?, "usage"?, "correlation_id"}`, sole success terminal (`usage` added in Day 9 — an additive change clients must tolerate);
 - `error` — the error envelope above, verbatim, sole failure terminal.
 
 Failures before the stream starts keep their HTTP status codes (the envelope applies as usual); failures after the 200 travel as an `error` event. A normally closed stream ends with exactly one terminal event; clients must treat EOF without a terminal as a failure and must ignore unknown event names (future events are additive). Ordering and cardinality invariants are enforced by `tests/bdd/features/streaming_response.feature` together with the streaming unit tests (the EOF-without-terminal fallback and nothing-after-terminal rules live in `tests/unit/test_streaming_api.py`).
@@ -46,6 +46,19 @@ The LLM API is stateless (`store=False` upstream); conversation history is owned
 - Storage failures map to `500 storage_error` (envelope) before a response is out, or an SSE `error` terminal after the 200. By that point inference has been billed; retrying repeats it.
 
 The executable contract is `tests/bdd/features/conversation_state.feature` plus `tests/unit/test_conversation_service.py`.
+
+## Token usage and budget (Day 9)
+
+Cost is metered, not estimated: every turn reports the provider-billed token counts, and a per-conversation budget is enforced before inference.
+
+- `POST /api/v1/chat` responses carry `usage: {input_tokens, output_tokens, total_tokens}` (nullable — only if the provider omitted its usage block). Streaming turns report the same object on the `message.done` terminal; deltas never carry usage because only the terminal response settles the bill.
+- Every upstream call sends `max_output_tokens` (config `LLM_MAX_OUTPUT_TOKENS`, default 1000). A capped stream ends with `message.done` `incomplete`/`max_output_tokens` — the Day 6 contract, now enforced rather than theoretical.
+- Each conversation has a lifetime budget in billed tokens (`CONVERSATION_TOKEN_BUDGET`, default 50000; `None` in code disables the guardrail). The ledger accumulates with each committed turn (atomically, in the same `append`), and the check runs **before** inference: an exhausted conversation is rejected with `429 token_budget_exceeded` through the envelope — for streams, before the stream starts, so it is always a plain HTTP response. The budget does not replenish; there is no `Retry-After`. The remedy is a new conversation.
+- Known gap, by design: a failed turn is billed upstream but leaves no ledger trace — turn-commit semantics (Day 7) win over billing completeness. The authoritative spend record is Azure Cost Management, not this ledger; the ledger exists to bound spend, not to account for it.
+
+Per-call usage is also logged (`llm usage input_tokens=… output_tokens=… total_tokens=… correlation_id=…`), joinable with the prompt-attribution line (Day 8) on `correlation_id`.
+
+The executable contract is `tests/bdd/features/token_budget_guardrail.feature` plus `tests/unit/test_token_budget.py`.
 
 ## Correlation ID
 
