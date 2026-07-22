@@ -30,7 +30,7 @@ probing unknown ids cannot grow the registry.
 
 Storage failures surface as :class:`StorageError` (HTTP 500 envelope before
 a response is out, SSE ``error`` terminal after a 200). By then inference
-has already been billed; retrying repeats it.
+may already have incurred billable processing; retrying repeats it.
 """
 
 import asyncio
@@ -143,7 +143,7 @@ class ConversationChatService:
 
     def _check_budget(self, conversation: Conversation) -> None:
         # Post-paid ledger, pre-paid gate: the check reads what committed turns
-        # actually billed, so it can only fire *between* turns — a single turn
+        # actually reported, so it can only fire *between* turns — a single turn
         # can still overshoot the line by up to one call's worth of tokens
         # (bounded by max_output_tokens plus the history the turn replays).
         if self._token_budget is None:

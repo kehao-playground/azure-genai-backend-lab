@@ -1,9 +1,10 @@
 Feature: Token budget guardrail
-  Billed token usage is reported on every turn, and a per-conversation
-  budget is enforced before inference: an exhausted conversation is
-  rejected without spending anything further upstream.
+  Provider-reported token usage is surfaced on every turn that returns a
+  usage-bearing terminal, and a per-conversation budget is enforced before
+  inference: an exhausted conversation is rejected without spending
+  anything further upstream.
 
-  Scenario: A chat turn reports its billed token usage
+  Scenario: A chat turn surfaces its provider-reported token usage
     Given a valid chat request
     When I submit the request to the chat endpoint
     Then the response status code should be 200

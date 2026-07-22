@@ -70,7 +70,7 @@ class InvalidInputError(UpstreamError):
 class StorageError(UpstreamError):
     """Conversation storage failed — our dependency, not the client's fault.
 
-    Raised after inference has already happened (and been billed): the reply
+    Raised after inference has already happened (and consumed tokens): the reply
     exists but could not be committed. Mapping it through the shared error
     machinery keeps both contracts intact — HTTP 500 envelope before a
     response is returned, SSE ``error`` terminal after a 200 (review r01

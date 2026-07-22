@@ -169,7 +169,7 @@ async def test_real_service_never_stores_and_requests_encrypted_reasoning() -> N
     assert responses.calls[0]["max_output_tokens"] == 1000
 
 
-async def test_real_service_reports_billed_usage() -> None:
+async def test_real_service_reports_provider_usage() -> None:
     client, _ = make_stub_client()
     service = AzureOpenAIChatService(
         client, deployment_name="chat-mini", prompt=PROMPT, max_output_tokens=1000

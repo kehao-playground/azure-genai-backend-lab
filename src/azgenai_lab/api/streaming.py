@@ -87,7 +87,7 @@ _STREAM_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": (
             "Server-Sent Events stream. Event vocabulary: `message.delta` "
             "(`{text}`), `message.done` (`{status, incomplete_reason?, "
-            "usage?, correlation_id}`; `usage` carries the turn's billed "
+            "usage?, correlation_id}`; `usage` carries the turn's provider-reported "
             "input/output/total tokens), `error` (the error envelope). Exactly one "
             "terminal event (`message.done` or `error`) ends a normally "
             "closed stream; clients must treat EOF without a terminal as a "

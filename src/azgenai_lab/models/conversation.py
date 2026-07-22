@@ -33,8 +33,10 @@ class Conversation(BaseModel):
     replay_items: list[ReplayItem] = Field(default_factory=list)
     # Number of committed turns; the token a conditional append must present.
     revision: int = 0
-    # Billed tokens accumulated across committed turns (Day 9): the ledger the
-    # budget guardrail reads. Failed turns are billed upstream but leave no
-    # trace here — turn-commit semantics win over billing completeness, and
-    # the gap is disclosed rather than papered over.
+    # Provider-reported tokens accumulated across committed turns (Day 9):
+    # the ledger the budget guardrail reads. Failed turns may have incurred
+    # billable processing upstream but leave no trace here — turn-commit
+    # semantics win over accounting completeness (the invoice and Cost
+    # Management meters are the authority), and the gap is disclosed rather
+    # than papered over.
     total_tokens: int = 0
