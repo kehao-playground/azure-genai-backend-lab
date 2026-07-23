@@ -12,7 +12,11 @@ flowchart TB
     end
     subgraph query["Query pipeline (online: every query that needs RAG)"]
         direction LR
-        Q[User question] --> QE[Embed query<br/>same embedding model] --> R[Retrieve<br/>hybrid: text + vector, + rerank] --> G[Augment<br/>top-K chunks into prompt] --> L[Generate<br/>LLM answer]
+        Q[User question] --> T[Text query<br/>BM25]
+        Q --> QE[Embed query<br/>same embedding model] --> V[Vector query]
+        T --> F[RRF fusion<br/>+ rerank]
+        V --> F
+        F --> G[Augment<br/>top-K chunks into prompt] --> L[Generate<br/>LLM answer]
     end
-    E -.serves retrieval.-> R
+    E -.serves retrieval.-> F
 ```
