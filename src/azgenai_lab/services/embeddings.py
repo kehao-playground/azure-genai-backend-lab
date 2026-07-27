@@ -200,16 +200,18 @@ class AzureOpenAIEmbeddingClient:
             # deployment is broken, and no chunk is at fault.
             raise ConfigurationError(str(exc)) from exc
         except openai.BadRequestError as exc:
-            raise EmbeddingRejectedError(
-                str(exc), request_id=getattr(exc, "request_id", None)
-            ) from exc
+            raise EmbeddingRejectedError(str(exc), request_id=exc.request_id) from exc
         except openai.RateLimitError as exc:
             raise UpstreamThrottledError(str(exc)) from exc
         except openai.APITimeoutError as exc:
             raise UpstreamTimeoutError(str(exc)) from exc
-        except openai.APIStatusError as exc:
-            raise UpstreamServiceError(str(exc)) from exc
-        except openai.APIConnectionError as exc:
+        # Catch-all: subsumes APIStatusError (any status not already mapped
+        # above), APIConnectionError, and the rest of OpenAIError's subtree —
+        # e.g. APIResponseValidationError, raised when a 2xx response body
+        # fails schema validation (a gateway mangling the body, or an
+        # upstream shape change). Nothing SDK-specific may escape this
+        # boundary, so this must stay last and unconditional.
+        except openai.OpenAIError as exc:
             raise UpstreamServiceError(str(exc)) from exc
 
         logger.info(
