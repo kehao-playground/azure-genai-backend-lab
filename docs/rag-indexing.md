@@ -15,11 +15,13 @@ walks a document's headings, builds a `heading_path` for each one (the document 
 enclosing heading, joined by `" > "`), and treats each section's prose as one candidate chunk. Only
 a section that does not fit `chunk_max_chars` is broken up further, and only then by the largest
 available natural boundary: paragraph break first, sentence boundary second, and a hard character
-cut as the last resort when no sentence boundary is close enough. The CJK sentence terminators
-`。！？` are recognized alongside `.!?`, and the boundary check does not assume whitespace between
-sentences — Chinese text has none, so a whitespace-based splitter would treat an entire paragraph
-as one unbreakable word. That degradation order is exercised only in test fixtures; the shipped
-corpus is English (see `services/document_loader.py`), and no CJK appears in this document either.
+cut as the last resort when no sentence boundary is close enough. The ideographic full stop and the
+fullwidth exclamation and question marks (U+3002, U+FF01, U+FF1F) are recognized as sentence
+terminators alongside `.!?`, and the boundary check does not assume whitespace between sentences —
+Chinese text has none, so a whitespace-based splitter would treat an entire paragraph as one
+unbreakable word. The CJK terminators are exercised only in test fixtures; the shipped corpus is
+English (see `data/sample-docs/`). The paragraph→sentence→hard-cut degradation order itself applies
+to both writing systems and is not test-only.
 
 Section boundaries make citations meaningful. A chunk that always starts and ends on a Markdown
 section boundary lets a citation point at "document, section" instead of "document, byte offset
@@ -37,10 +39,19 @@ prose) is still findable through the `heading_path` of "Refund window > Standard
 implicit preamble section — text before the first heading — follows the same rule and is kept only
 when it has something to say.
 
+An H1 that repeats the document title is also dropped, rather than kept as a nested heading segment
+(`_sections` in `services/chunking.py`). An author writing `# Returns Policy` as the very first line
+of the body would reasonably expect that heading to become part of `heading_path` like any other —
+instead it is recognized as restating the title (already the mandatory first segment of every
+`heading_path`) and is treated as structure, not as a section of its own. Without this, a document
+whose body opens with its own title as an H1 would end up with a `heading_path` of `"Returns Policy
+> Returns Policy"` for its first section, a duplication with no informational value.
+
 ## The overlap contract
 
 Overlap exists to carry a little context forward when a section is split into more than one
-chunk. Four rules define it precisely (from the header of `services/chunking.py`):
+chunk. Four rules define it precisely (derived from `_apply_overlap`, the `packed_budget` comment,
+and `_sentence_aligned_tail` in `services/chunking.py`):
 
 1. **Overlap only occurs within one oversized section that has been split into multiple pieces.**
    Two adjacent sections that each fit the budget on their own never get an overlap between them —
@@ -56,12 +67,48 @@ chunk. Four rules define it precisely (from the header of `services/chunking.py`
    character cut (`_sentence_aligned_tail` in `services/chunking.py`).
 
 Rule 4 is a deliberate divergence from Azure AI Search's built-in Text Split skill, whose
-`pageOverlapLength` parameter takes a fixed number of trailing characters regardless of where a
-sentence ends ([chunk documents](https://learn.microsoft.com/en-us/azure/search/vector-search-how-to-chunk-documents),
-checked 2026-07) — which routinely opens the next chunk mid-sentence. Since this splitter is
-structural everywhere else (section boundaries, then paragraph, then sentence), its overlap is
-structural too: a chunk should never open on a sentence fragment when a sentence boundary was
-available to align to.
+`pageOverlapLength` parameter "defines how many characters from the end of the previous page are
+included at the start of the next page" — a fixed count, regardless of where a sentence ends
+([chunk documents](https://learn.microsoft.com/en-us/azure/search/vector-search-how-to-chunk-documents),
+checked 2026-07). The page does not itself characterize how often that opens a chunk mid-sentence;
+that a fixed-count tail routinely lands inside a sentence is this project's own inference from the
+mechanism described. Since this splitter is structural everywhere else (section boundaries, then
+paragraph, then sentence), its overlap is structural too: a chunk should never open on a sentence
+fragment when a sentence boundary was available to align to.
+
+Packing a split section's pieces applies one budget number to all of them, including the first
+piece — even though the first piece never receives an overlap tail from a predecessor. That leaves
+the first piece deliberately under-packed by `overlap + 2` characters relative to what it could
+actually hold, the two characters being the `"\n\n"` join every later piece reserves room for
+(`packed_budget` in `_split_section`, `services/chunking.py`). The alternative — computing a larger
+budget just for the first piece — would mean two budget numbers to reason about instead of one; the
+cost accepted here is a few characters of headroom left unused in the first piece, in exchange for
+one budget number governing every piece uniformly.
+
+## Chunking failure modes
+
+`chunk_markdown` can refuse to chunk a document outright, by raising `ChunkingError`
+(`services/chunking.py`), in two situations:
+
+- **A heading path alone leaves no room for prose.** `budget = max_chars - len(heading_path) -
+  len(_EMBEDDING_JOIN)` can reach zero or below before any content is even considered, if a
+  document nests headings deeply enough relative to `chunk_max_chars`. No prose could ever fit in a
+  negative or zero budget, so this is a hard failure rather than a silently empty chunk.
+- **Overlap could never advance.** When a section's prose must be split and the packed budget left
+  after reserving room for the overlap tail (`packed_budget = budget - overlap -
+  len(_PARAGRAPH_JOIN)`) is zero or below, a sliding window could never make forward progress: each
+  piece would be no larger than the overlap it repeats from the last one. This is caught and raised
+  before it can surface as an infinite loop.
+
+Both are authoring-time risks, not just configuration risks: a document with deeply nested headings
+can trigger the first one even with `chunk_max_chars` and `chunk_overlap_chars` left at their
+defaults, simply by nesting sections more deeply than the budget allows.
+
+`Settings` (`core/config.py`) refuses to start at all when `chunk_overlap_chars * 2 >=
+chunk_max_chars`. This is the same "overlap could never advance" hazard, caught one layer earlier —
+at configuration load, before any document is chunked — for the general case where the configured
+overlap is so large relative to the max that no section, regardless of its heading depth, could
+ever leave room to advance.
 
 ## Sizes are characters, not tokens
 
@@ -304,15 +351,19 @@ That rule constrains the *final* `chunk_id`, not the authored `doc_id` — a dis
 gets right in two stages:
 
 1. **`doc_id` is capped at 64 characters** (`DOC_ID_MAX_LENGTH` in `models/rag.py`) and checked
-   against the same character-set rule. A document key limit of 1,024 characters is generous for a
-   computer-generated identifier, but `doc_id` is authored by a person in front matter; holding it
-   to a human scale (64 characters) means a naming mistake surfaces immediately as an authoring
+   against the same character-set rule. The cap exists *precisely so* the derived `chunk_id` fits
+   inside the service's 1,024-character limit without the code ever having to compute a residual
+   budget: a document key limit of 1,024 characters is generous for a computer-generated
+   identifier, but `doc_id` is authored by a person in front matter, so authored ids are held to a
+   human scale (64 characters) instead — a naming mistake surfaces immediately as an authoring
    error, not as a capacity problem discovered later.
-2. **The derived `chunk_id` is validated again, in full**, inside `Chunk.__post_init__`
-   (`validate_document_key`, shared with `parent_id`). This catches what stage 1 alone cannot: a
-   `doc_id` that is itself a legal, maximum-length key (1,024 characters) would produce a `chunk_id`
-   five characters longer once `-0000` is appended — an illegal key that stage-1 validation, run
-   only against `doc_id`, would never see.
+2. **`chunk_id` and `parent_id` are validated again, in full**, inside `Chunk.__post_init__`
+   (`validate_document_key`). This runs on *every* `Chunk`, whether or not it was produced by
+   `chunk_markdown` via the loader — a `Chunk` built directly in a test, or by some future caller
+   that bypasses the loader, still gets checked. Under the loader path, stage 1's 64-character cap
+   already keeps `doc_id` far short of anything that could push a derived `chunk_id` past 1,024
+   characters, so stage 2 is a defense-in-depth check for that path, not the layer catching a
+   length violation there — it earns its keep for callers that skip the loader.
 
 Validating both stages against the same rule set — rather than trusting front matter — means a bad
 key is caught at load or chunk time, not the first time it is uploaded to a live service.
@@ -413,7 +464,7 @@ replacing. **This window is scoped to the single-index, no-alias strategy used i
 is not an inherent limitation of Azure AI Search. An index alias pointed at a generation-suffixed
 index (build the new index fully, then repoint the alias) would let readers see either the fully
 old or fully new state and nothing in between; that is the production escape from this window, and
-it is out of scope here (see the non-goals in the design record). Within this repo's strategy, the
+implementing it is out of scope for this milestone. Within this repo's strategy, the
 choice being made is deliberate: a document that briefly shows duplicate content is recoverable by
 a re-run, while a document that briefly shows *no* content is not an acceptable failure mode.
 
@@ -426,10 +477,22 @@ in the pipeline, and with different response shapes:
 | | Embedding request rejection | Search indexing failure |
 |---|---|---|
 | Timing | Embed stage, **before** any mutation to the index | **After** chunks have been uploaded to Search |
-| Response shape | One request-level error object for the whole batch — no per-input index or status | One `status` / `statusCode` entry per document, in the batch response's `value` array |
+| Response shape | One request-level error object for the whole batch — no per-input index or status (observed; see below) | One `status` / `statusCode` entry per document, in the batch response's `value` array (documented; see [Per-document status codes](#per-document-status-codes)) |
 | Can it name the offending chunk? | No — a 400 on a 36-input batch cannot say which input caused it | Yes — each document's own entry names it |
 | Owning module | `services/embeddings.py` (`EmbeddingRejectedError`) | `services/indexing_results.py` (`classify()`) |
 | Retryable? | No — `EmbeddingRejectedError.retryable = False`; a 400 means resending the same request cannot succeed | Depends on `statusCode` (see the table in [Failure handling](#failure-handling)) |
+
+The embeddings row's response shape is not backed by a Microsoft Learn page that documents the
+error contract itself — unlike the indexing row, which is cited in [Per-document status
+codes](#per-document-status-codes). It is this project's observed behavior: the `openai` SDK raises
+a single `openai.BadRequestError` per rejected call, carrying one message and one `request_id` and
+no per-input index or status array, and `AzureOpenAIEmbeddingClient.embed()` (`services/embeddings.py`)
+maps exactly that shape into `EmbeddingRejectedError` — there is no per-input field anywhere in the
+exception to preserve even if the code wanted to. The embeddings how-to page's troubleshooting
+guidance for a `400` response — "check the request body, each input's token count, the number of
+inputs, and the aggregate token count" ([embeddings how-to](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/embeddings),
+checked 2026-07) — is consistent with a request-level failure but does not itself state that the
+response carries no per-input detail, so it is not cited as establishing that claim.
 
 When an embeddings request is rejected, `embed_chunks()` in `services/embeddings.py` logs every
 `chunk_id` that was in the failed batch alongside the upstream `request_id`, then raises
@@ -440,9 +503,10 @@ batching](#embedding-model-and-batching)), a person can find it by inspection, a
 search is treated as separate, out-of-scope work.
 
 An earlier review round rejected routing the embedding 400 through `services/indexing_results.py`'s
-per-document classification table. That table exists to interpret a shape the embeddings API never
-returns — a per-document `status`/`statusCode` array — so forcing a request-level rejection through
-it would either fabricate a document-level status that was never reported, or silently discard the
-one thing the embeddings failure actually carries: the full list of chunk ids that were in the
-batch. Keeping the two failures in separate modules, with separate vocabularies, is what keeps a
-reader — or an on-call engineer — able to tell which surface a given failure came from.
+per-document classification table. That table exists to interpret a shape the embeddings API is not
+observed to return — a per-document `status`/`statusCode` array (see the observed-versus-documented
+note above) — so forcing a request-level rejection through it would either fabricate a
+document-level status that was never reported, or silently discard the one thing the embeddings
+failure actually carries: the full list of chunk ids that were in the batch. Keeping the two
+failures in separate modules, with separate vocabularies, is what keeps a reader — or an on-call
+engineer — able to tell which surface a given failure came from.
