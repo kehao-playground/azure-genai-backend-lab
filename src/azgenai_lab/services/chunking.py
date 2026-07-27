@@ -2,7 +2,7 @@
 
 Structure first: a chunk is a Markdown section, so a citation can name a
 section a reader recognises. Only a section that will not fit is broken up,
-and then by the largest natural boundary available (Task 7).
+and then by the largest natural boundary available.
 
 Everything here is a pure function of its arguments. No I/O, no settings
 lookups, no clock — the same document and parameters always produce the same
@@ -11,11 +11,15 @@ chunks, which is what makes chunk ids stable.
 
 import re
 
-from azgenai_lab.models.rag import Chunk, SourceDocument, make_chunk_id
+from azgenai_lab.models.rag import (
+    EMBEDDING_JOIN,
+    HEADING_SEPARATOR,
+    Chunk,
+    SourceDocument,
+    make_chunk_id,
+)
 
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
-_HEADING_SEPARATOR = " > "
-_EMBEDDING_JOIN = "\n\n"
 
 # Sentence terminators for both writing systems, plus any trailing closing
 # punctuation. Chinese has no inter-word spaces, so a whitespace-based splitter
@@ -72,7 +76,7 @@ def _sections(document: SourceDocument) -> list[tuple[str, str]]:
         if not prose:
             return
         if stack:
-            path = _HEADING_SEPARATOR.join([document.title, *(text for _, text in stack)])
+            path = HEADING_SEPARATOR.join([document.title, *(text for _, text in stack)])
         else:
             path = document.title
         sections.append((path, prose))
@@ -100,7 +104,7 @@ def chunk_markdown(
 ) -> list[Chunk]:
     chunks: list[Chunk] = []
     for heading_path, prose in _sections(document):
-        budget = max_chars - len(heading_path) - len(_EMBEDDING_JOIN)
+        budget = max_chars - len(heading_path) - len(EMBEDDING_JOIN)
         if budget <= 0:
             # The heading path alone does not fit max_chars; no prose could
             # ever fit either.
@@ -109,7 +113,8 @@ def chunk_markdown(
             # This section must be split (its prose overflows budget), but a
             # sliding window could never advance: each piece would be no
             # bigger than the overlap it repeats from the last one. Fail fast
-            # here rather than let that surface as a Task 7 infinite-loop bug.
+            # here rather than let that surface as an infinite loop in
+            # `_split_section`.
             raise _budget_error(document.doc_id, heading_path, budget, max_chars, overlap_chars)
         for piece in _split_section(prose, budget=budget, overlap=overlap_chars):
             chunks.append(

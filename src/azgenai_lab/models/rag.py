@@ -13,8 +13,13 @@ from azgenai_lab.models.search_index import validate_document_key
 # is a naming mistake, not a capacity problem.
 DOC_ID_MAX_LENGTH = 64
 
-_HEADING_SEPARATOR = " > "
-_EMBEDDING_JOIN = "\n\n"
+# Public, not module-private: `services/chunking.py` imports both to build
+# `heading_path` and to size its budget against the same join `Chunk` uses to
+# build `embedding_input`. This module owns them because it owns
+# `embedding_input`; a leading underscore would misstate that they are meant
+# to cross that boundary.
+HEADING_SEPARATOR = " > "
+EMBEDDING_JOIN = "\n\n"
 
 
 class Citation(BaseModel):
@@ -63,7 +68,7 @@ class Chunk:
         # character prefix: title "Return" against path "Returns Policy > ..."
         # is a mismatch, and a substring check would wave it through.
         if self.heading_path != self.title and not self.heading_path.startswith(
-            self.title + _HEADING_SEPARATOR
+            self.title + HEADING_SEPARATOR
         ):
             raise ValueError(
                 f"heading_path {self.heading_path!r} must begin with the document title "
@@ -73,7 +78,7 @@ class Chunk:
 
     @property
     def embedding_input(self) -> str:
-        return f"{self.heading_path}{_EMBEDDING_JOIN}{self.content}"
+        return f"{self.heading_path}{EMBEDDING_JOIN}{self.content}"
 
 
 def make_chunk_id(parent_id: str, ordinal: int) -> str:
