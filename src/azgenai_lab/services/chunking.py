@@ -20,6 +20,13 @@ _EMBEDDING_JOIN = "\n\n"
 # Sentence terminators for both writing systems, plus any trailing closing
 # punctuation. Chinese has no inter-word spaces, so a whitespace-based splitter
 # would treat a whole paragraph as one token and never split it.
+#
+# The trailing `\s*` is allowed to match zero characters, which is what lets
+# this fire between two CJK characters with no space between them. The same
+# leniency means "99.9%" or "e.g." reads as a sentence boundary too — a false
+# positive this splitter accepts, since the worst it does is move a boundary
+# to a slightly different point inside a paragraph that was already too big
+# to be one chunk.
 _SENTENCE_END = re.compile(r"[.!?。！？]['\"”’」』)）]*\s*")
 _PARAGRAPH_JOIN = "\n\n"
 
@@ -122,11 +129,22 @@ def chunk_markdown(
 
 def _split_section(prose: str, *, budget: int, overlap: int) -> list[str]:
     if len(prose) <= budget:
+        # Fast path: the section already fits, so it is returned untouched.
+        # The paragraph-stripping and "\n\n" re-joining below only happen to
+        # sections that get split — a chunk's whitespace is either the
+        # author's, verbatim, or a side effect of splitting, never both for
+        # the same chunk. That asymmetry is accepted rather than normalising
+        # every section, so an unsplit chunk is exactly what the author wrote.
         return [prose]
 
     # Pieces are packed to leave room for the overlap tail that will be
     # prepended to every piece after the first, so the finished chunk still
-    # fits the budget.
+    # fits the budget. This one budget is applied uniformly to every piece,
+    # including pieces[0], even though the first piece never receives an
+    # overlap tail and so is under-packed by `overlap + len(_PARAGRAPH_JOIN)`
+    # characters relative to what it could actually hold. That waste is
+    # accepted deliberately: a single budget number governing every piece is
+    # worth more than reclaiming the last fraction of the first chunk.
     packed_budget = budget - overlap - len(_PARAGRAPH_JOIN) if overlap else budget
     if packed_budget <= 0:
         raise ChunkingError(
@@ -210,9 +228,10 @@ def _apply_overlap(pieces: list[str], *, overlap: int) -> list[str]:
 def _sentence_aligned_tail(text: str, limit: int) -> str:
     """The longest suffix of ``text`` that fits ``limit`` and starts a sentence.
 
-    The service's own splitter takes a fixed number of trailing characters,
-    which routinely opens the next chunk mid-sentence. Since this splitter is
-    structural everywhere else, its overlap is structural too.
+    Azure AI Search's built-in Text Split skill takes a fixed number of
+    trailing characters for its overlap, which routinely opens the next chunk
+    mid-sentence. Since this splitter is structural everywhere else, its
+    overlap is structural too.
     """
     if len(text) <= limit:
         return text

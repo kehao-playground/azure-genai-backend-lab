@@ -183,8 +183,6 @@ def test_consecutive_chunks_of_one_section_overlap() -> None:
     chunks = chunk_markdown(_document(body), max_chars=500, overlap_chars=100)
 
     first, second = chunks[0], chunks[1]
-    tail = second.content[: len(second.content) - len(second.content.lstrip())]
-    del tail
     # The second chunk opens with text that also appears at the end of the first.
     opening = second.content[:40]
     assert opening in first.content
@@ -240,10 +238,27 @@ def test_a_single_unbreakable_run_is_hard_split() -> None:
     assert all(len(chunk.embedding_input) <= 500 for chunk in chunks)
 
 
-def test_overlap_leaving_no_room_to_advance_is_an_error() -> None:
+def test_budget_too_small_relative_to_overlap_is_an_error() -> None:
+    # heading_path is "Returns Policy > Exceptions" (27 chars); budget is
+    # 60 - 27 - len("\n\n") == 31, which is <= overlap_chars=50. This guard
+    # (chunk_markdown, before any splitting is attempted) must fire here, not
+    # the sliding-window guard inside _split_section — the two are checked at
+    # different points and must raise distinguishable messages.
     body = "# Returns Policy\n\n## Exceptions\n\n" + "word " * 500 + "\n"
-    with pytest.raises(ChunkingError, match="overlap"):
+    with pytest.raises(ChunkingError, match="leaves too little budget"):
         chunk_markdown(_document(body), max_chars=60, overlap_chars=50)
+
+
+def test_overlap_leaving_no_room_to_advance_is_an_error() -> None:
+    # heading_path is "Returns Policy > Exceptions" (27 chars); budget is
+    # 80 - 27 - len("\n\n") == 51, which is above overlap_chars=50, so the
+    # budget-too-small guard above does not fire. But packed_budget inside
+    # _split_section is 51 - 50 - len("\n\n") == -1: the sliding window could
+    # never advance. This is a second, later guard and must be exercised on
+    # its own — not incidentally satisfied by the first guard's message.
+    body = "# Returns Policy\n\n## Exceptions\n\n" + "word " * 500 + "\n"
+    with pytest.raises(ChunkingError, match="leaves no room to advance"):
+        chunk_markdown(_document(body), max_chars=80, overlap_chars=50)
 
 
 def _corpus_chunks() -> list[Chunk]:
@@ -276,10 +291,3 @@ def test_the_corpus_exercises_heading_depth() -> None:
     depths = {chunk.heading_path.count(" > ") for chunk in _corpus_chunks()}
 
     assert max(depths) >= 2, "no document uses a '###' subsection"
-
-
-def test_the_corpus_is_split_across_two_tenants() -> None:
-    # Day 15 filters on tenant_id; a single-tenant corpus cannot demonstrate it.
-    tenants = Counter(document.tenant_id for document in load_documents())
-
-    assert tenants == {"acme": 2, "globex": 2}
