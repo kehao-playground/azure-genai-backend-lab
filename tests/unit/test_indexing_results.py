@@ -102,3 +102,13 @@ def test_a_duplicate_key_blocks_the_delete() -> None:
     results = [_result("a", 503), _result("a", 201)]
 
     assert may_delete_stale(results, expected_keys={"a"}) is False
+
+
+def test_a_duplicate_key_blocks_the_delete_even_if_every_result_succeeded() -> None:
+    # Isolates the dedup check from the success check above: two *successful*
+    # results for the same key must still block, since a batch is only
+    # supposed to report on each document once and a repeat is itself a sign
+    # something about the response cannot be trusted.
+    results = [_result("a", 201), _result("a", 200)]
+
+    assert may_delete_stale(results, expected_keys={"a"}) is False
