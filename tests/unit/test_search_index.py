@@ -4,12 +4,16 @@ Document keys are validated here rather than at upload time because a bad key
 is an authoring mistake, and Day 13 is the wrong place to discover it.
 """
 
+from typing import Any
+
 import pytest
 
 from azgenai_lab.models.search_index import (
     DOCUMENT_KEY_MAX_LENGTH,
     EMBEDDING_DIMENSIONS,
+    INDEX_NAME,
     DocumentKeyError,
+    to_index_definition,
     validate_document_key,
 )
 
@@ -51,3 +55,74 @@ def test_rejects_keys_over_the_length_limit() -> None:
 def test_error_names_the_offending_field() -> None:
     with pytest.raises(DocumentKeyError, match="chunk_id"):
         validate_document_key("_bad", field="chunk_id")
+
+
+def _field(name: str) -> dict[str, Any]:
+    fields = to_index_definition()["fields"]
+    return next(field for field in fields if field["name"] == name)
+
+
+def test_index_has_exactly_one_key_field() -> None:
+    keys = [field["name"] for field in to_index_definition()["fields"] if field.get("key")]
+    assert keys == ["chunk_id"]
+
+
+def test_index_name_is_stable() -> None:
+    assert INDEX_NAME == "azgenai-lab-chunks"
+
+
+def test_all_expected_fields_are_present() -> None:
+    names = {field["name"] for field in to_index_definition()["fields"]}
+    assert names == {
+        "chunk_id",
+        "parent_id",
+        "title",
+        "heading_path",
+        "content",
+        "doc_type",
+        "tenant_id",
+        "effective_date",
+        "content_vector",
+    }
+
+
+def test_vector_field_keeps_its_source_copy() -> None:
+    # stored=False is irreversible and silently drops vectors on a partial
+    # update. If this assertion ever fails, read the docstring before changing
+    # it: the storage saving is not worth the failure mode.
+    vector = _field("content_vector")
+    assert vector["stored"] is True
+    assert vector["retrievable"] is False
+
+
+def test_vector_field_obeys_the_service_constraints() -> None:
+    vector = _field("content_vector")
+    assert vector["type"] == "Collection(Edm.Single)"
+    assert vector["searchable"] is True
+    assert vector["filterable"] is False
+    assert vector["sortable"] is False
+    assert vector["facetable"] is False
+    assert vector["dimensions"] == EMBEDDING_DIMENSIONS
+
+
+def test_tenant_id_is_filterable_for_day_15() -> None:
+    assert _field("tenant_id")["filterable"] is True
+
+
+def test_effective_date_is_filterable_and_sortable() -> None:
+    effective_date = _field("effective_date")
+    assert effective_date["type"] == "Edm.DateTimeOffset"
+    assert effective_date["filterable"] is True
+    assert effective_date["sortable"] is True
+
+
+def test_vector_profile_referenced_by_the_vector_field_exists() -> None:
+    definition = to_index_definition()
+    profile_names = {profile["name"] for profile in definition["vectorSearch"]["profiles"]}
+    assert _field("content_vector")["vectorSearchProfile"] in profile_names
+
+
+def test_vector_algorithm_uses_cosine_for_azure_openai_embeddings() -> None:
+    algorithms = to_index_definition()["vectorSearch"]["algorithms"]
+    assert algorithms[0]["kind"] == "hnsw"
+    assert algorithms[0]["hnswParameters"]["metric"] == "cosine"

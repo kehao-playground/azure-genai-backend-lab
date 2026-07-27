@@ -1,0 +1,111 @@
+{
+  "name": "azgenai-lab-chunks",
+  "fields": [
+    {
+      "name": "chunk_id",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false,
+      "key": true
+    },
+    {
+      "name": "parent_id",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false
+    },
+    {
+      "name": "title",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": true,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false
+    },
+    {
+      "name": "heading_path",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": true,
+      "filterable": false,
+      "sortable": false,
+      "facetable": false
+    },
+    {
+      "name": "content",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": true,
+      "filterable": false,
+      "sortable": false,
+      "facetable": false,
+      "analyzer": "en.microsoft"
+    },
+    {
+      "name": "doc_type",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": true
+    },
+    {
+      "name": "tenant_id",
+      "type": "Edm.String",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false
+    },
+    {
+      "name": "effective_date",
+      "type": "Edm.DateTimeOffset",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": true,
+      "facetable": false
+    },
+    {
+      "name": "content_vector",
+      "type": "Collection(Edm.Single)",
+      "searchable": true,
+      "filterable": false,
+      "sortable": false,
+      "facetable": false,
+      "stored": true,
+      "retrievable": false,
+      "dimensions": 1536,
+      "vectorSearchProfile": "chunk-vector-profile"
+    }
+  ],
+  "vectorSearch": {
+    "algorithms": [
+      {
+        "name": "chunk-hnsw",
+        "kind": "hnsw",
+        "hnswParameters": {
+          "m": 4,
+          "efConstruction": 400,
+          "efSearch": 500,
+          "metric": "cosine"
+        }
+      }
+    ],
+    "profiles": [
+      {
+        "name": "chunk-vector-profile",
+        "algorithm": "chunk-hnsw"
+      }
+    ]
+  }
+}
