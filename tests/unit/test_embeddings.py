@@ -12,7 +12,13 @@ from openai.types import Embedding
 from openai.types.create_embedding_response import CreateEmbeddingResponse, Usage
 
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import ConfigurationError, UpstreamError, UpstreamServiceError
+from azgenai_lab.core.errors import (
+    ConfigurationError,
+    UpstreamError,
+    UpstreamServiceError,
+    UpstreamThrottledError,
+    UpstreamTimeoutError,
+)
 from azgenai_lab.models.rag import Chunk, make_chunk_id
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 from azgenai_lab.services.embeddings import (
@@ -82,10 +88,18 @@ async def test_the_embedded_text_is_the_embedding_input() -> None:
 
 
 async def test_vectors_are_returned_in_chunk_order() -> None:
-    vectors = await embed_chunks(FakeEmbeddingClient(), _chunks(3))
+    # `FakeEmbeddingClient` is deterministic (a hash of the input text), so
+    # each position's vector must match embedding that chunk's own
+    # `embedding_input` in isolation. A reversed (or otherwise shuffled) list
+    # would pass a length-and-width-only check but fail this one.
+    chunks = _chunks(3)
+
+    vectors = await embed_chunks(FakeEmbeddingClient(), chunks)
 
     assert len(vectors) == 3
-    assert all(len(vector) == EMBEDDING_DIMENSIONS for vector in vectors)
+    for index, chunk in enumerate(chunks):
+        expected = (await FakeEmbeddingClient().embed([chunk.embedding_input]))[0]
+        assert vectors[index] == expected
 
 
 async def test_no_chunks_means_no_request() -> None:
@@ -355,4 +369,53 @@ async def test_credential_and_deployment_failures_are_configuration_errors(
     monkeypatch.setattr(client._client.embeddings, "create", _raise)  # type: ignore[attr-defined]
 
     with pytest.raises(ConfigurationError):
+        await client.embed(["text"])
+
+
+async def test_rate_limit_becomes_upstream_throttled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Our quota problem, not the corpus's fault — and it must be caught by
+    # the specific `openai.RateLimitError` handler, not fall through to the
+    # trailing `openai.OpenAIError` catch-all (see the ordering comment above
+    # `AzureOpenAIEmbeddingClient.embed`).
+    settings = Settings(
+        _env_file=None,
+        use_fake_embeddings=False,
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="secret",
+        azure_openai_embedding_deployment="embed-small",
+    )
+    client = build_embedding_client(settings)
+
+    async def _raise(**kwargs: object) -> None:
+        raise _status_error(openai.RateLimitError, 429)
+
+    monkeypatch.setattr(client._client.embeddings, "create", _raise)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamThrottledError):
+        await client.embed(["text"])
+
+
+async def test_timeout_becomes_upstream_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `openai.APITimeoutError` is not an `APIStatusError` (no response object),
+    # so it must be caught by its own handler ahead of the trailing catch-all.
+    settings = Settings(
+        _env_file=None,
+        use_fake_embeddings=False,
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="secret",
+        azure_openai_embedding_deployment="embed-small",
+    )
+    client = build_embedding_client(settings)
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/embeddings")
+
+    async def _raise(**kwargs: object) -> None:
+        raise openai.APITimeoutError(request=request)
+
+    monkeypatch.setattr(client._client.embeddings, "create", _raise)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamTimeoutError):
         await client.embed(["text"])

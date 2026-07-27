@@ -4,10 +4,12 @@ Document keys are validated here rather than at upload time because a bad key
 is an authoring mistake, and Day 13 is the wrong place to discover it.
 """
 
+import dataclasses
 from typing import Any
 
 import pytest
 
+from azgenai_lab.models.rag import Chunk
 from azgenai_lab.models.search_index import (
     DOCUMENT_KEY_MAX_LENGTH,
     EMBEDDING_DIMENSIONS,
@@ -72,18 +74,14 @@ def test_index_name_is_stable() -> None:
 
 
 def test_all_expected_fields_are_present() -> None:
+    # The eight scalar fields are pinned against `Chunk`'s own dataclass
+    # fields, not a second hand-maintained literal, so a name added to one
+    # side and not the other fails here instead of drifting silently.
+    # `content_vector` has no `Chunk` field (it is derived at embed time), so
+    # it is handled explicitly rather than folded into the comparison.
+    chunk_field_names = {field.name for field in dataclasses.fields(Chunk)}
     names = {field["name"] for field in to_index_definition()["fields"]}
-    assert names == {
-        "chunk_id",
-        "parent_id",
-        "title",
-        "heading_path",
-        "content",
-        "doc_type",
-        "tenant_id",
-        "effective_date",
-        "content_vector",
-    }
+    assert names == chunk_field_names | {"content_vector"}
 
 
 def test_vector_field_keeps_its_source_copy() -> None:

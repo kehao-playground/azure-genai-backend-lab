@@ -175,7 +175,7 @@ def test_the_shipped_corpus_has_a_section_over_the_chunk_max_chars_threshold() -
     assert longest > threshold, (
         f"longest ## section is {longest} characters; expected at least one section "
         f"over the {threshold}-character chunk_max_chars threshold so the oversize "
-        "split path (Task 7) has real data to run against"
+        "split path has real data to run against"
     )
 
 
