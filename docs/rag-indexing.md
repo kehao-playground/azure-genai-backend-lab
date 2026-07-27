@@ -150,13 +150,17 @@ mirrors how Day 8 validates prompt template front matter — fail at load time, 
 
 ## Embedding model and batching
 
-Embeddings come from `text-embedding-3-small`, deployed as `embed-small` (matching the existing
-`chat-mini` naming), called through `AzureOpenAIEmbeddingClient` in `services/embeddings.py` — the
-same v1 GA surface as the chat adapter, but a separate `/embeddings` endpoint billed on its own
-per-token rate, not part of the Responses API. `EMBEDDING_DIMENSIONS = 1536` is a module constant
-in `models/search_index.py`, not a `Settings` field: the index schema, the embeddings request's
-`dimensions` parameter, and the response-length check all read the same constant, so they cannot
-silently disagree at runtime.
+Embeddings come from `text-embedding-3-small`, called through `AzureOpenAIEmbeddingClient` in
+`services/embeddings.py` — the same v1 GA surface as the chat adapter, but a separate
+`/embeddings` endpoint billed on its own per-token rate, not part of the Responses API. The
+deployment name is not hardcoded: `settings.azure_openai_embedding_deployment` supplies it, the
+same way `chat-mini` is supplied for the chat deployment rather than assumed. `embed-small` is
+this project's planned name for that deployment, matching the `chat-mini` naming convention; the
+Azure resource itself is provisioned separately from this milestone's code (Day 4 created
+`chat-mini` in `rg-azgenai-lab`, and the embedding deployment follows the same pattern).
+`EMBEDDING_DIMENSIONS = 1536` is a module constant in `models/search_index.py`, not a `Settings`
+field: the index schema, the embeddings request's `dimensions` parameter, and the response-length
+check all read the same constant, so they cannot silently disagree at runtime.
 
 Three request limits govern batching, all documented on the same page as the token-ceiling figure
 this repo follows
