@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,11 +31,33 @@ class Settings(BaseSettings):
     # guardrail; zero or negative values fail startup validation.
     conversation_token_budget: int | None = Field(default=50_000, gt=0)
 
+    # Chunk sizing is measured in characters, not tokens. Day 9 settled the
+    # series position: meter what the provider reports, do not estimate. The
+    # service's own generally-available text splitter measures characters too
+    # (token splitting is preview only), and the real safety margin is the
+    # embedding model's 8,192-token input ceiling, which 2,000 characters sits
+    # well under in any language.
+    chunk_max_chars: int = Field(default=2000, gt=0)
+    # Overlap applies only within one oversized section (see services/chunking).
+    chunk_overlap_chars: int = Field(default=500, ge=0)
+
+    azure_openai_embedding_deployment: str | None = None
+
     azure_search_endpoint: str | None = None
     azure_search_index_name: str | None = None
 
     use_fake_llm: bool = Field(default=True)
     use_fake_search: bool = Field(default=True)
+    use_fake_embeddings: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def _overlap_must_leave_room_to_advance(self) -> "Settings":
+        if self.chunk_overlap_chars * 2 >= self.chunk_max_chars:
+            raise ValueError(
+                "chunk_overlap_chars must be less than half of chunk_max_chars "
+                f"(got {self.chunk_overlap_chars} against {self.chunk_max_chars})"
+            )
+        return self
 
 
 @lru_cache
