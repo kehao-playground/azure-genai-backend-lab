@@ -58,7 +58,10 @@ class EmbeddingRejectedError(UpstreamError):
     status_code = 500
     code = "embedding_rejected"
     message = "The embedding request was rejected by the upstream model."
-    # Local to this class on purpose; see the note at the head of Task 9.
+    # `retryable` is not part of `UpstreamError`'s shared taxonomy — it exists
+    # only on this subclass, because `embed_chunks()`'s stage gate is the only
+    # caller that needs a programmatic retry/no-retry answer rather than a
+    # human reading the log line.
     retryable = False
 
     def __init__(
@@ -237,7 +240,6 @@ __all__ = [
     "EmbeddingClient",
     "EmbeddingRejectedError",
     "FakeEmbeddingClient",
-    "UpstreamError",
     "build_embedding_client",
     "embed_chunks",
 ]
