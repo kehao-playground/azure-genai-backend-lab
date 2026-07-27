@@ -8,9 +8,11 @@ from datetime import date
 import httpx
 import openai
 import pytest
+from openai.types import Embedding
+from openai.types.create_embedding_response import CreateEmbeddingResponse, Usage
 
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import ConfigurationError, UpstreamError
+from azgenai_lab.core.errors import ConfigurationError, UpstreamError, UpstreamServiceError
 from azgenai_lab.models.rag import Chunk, make_chunk_id
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 from azgenai_lab.services.embeddings import (
@@ -121,14 +123,18 @@ async def test_fake_embeddings_differ_between_different_texts() -> None:
 
 
 def _status_error(
-    error_cls: type[openai.APIStatusError], status_code: int
+    error_cls: type[openai.APIStatusError],
+    status_code: int,
+    *,
+    request_id: str | None = None,
 ) -> openai.APIStatusError:
     # Same construction the chat adapter's tests use: the SDK reads
     # response.request and response.status_code during __init__, so a real
     # httpx.Response is required — passing response=None raises AttributeError
     # before the code under test is reached.
     request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/embeddings")
-    response = httpx.Response(status_code, request=request)
+    headers = {"x-request-id": request_id} if request_id is not None else None
+    response = httpx.Response(status_code, request=request, headers=headers)
     return error_cls("boom", response=response, body=None)
 
 
@@ -137,13 +143,31 @@ class _RejectingClient:
         raise EmbeddingRejectedError(upstream_detail="input too long", request_id="req-1")
 
 
+class _RejectingOnSecondBatchClient:
+    """The first batch succeeds; the second is rejected. Pins that a rejected
+    batch's chunk ids are scoped to *that* batch, not to the whole call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls += 1
+        if self.calls == 2:
+            raise EmbeddingRejectedError(upstream_detail="input too long", request_id="req-1")
+        return [[0.0] * EMBEDDING_DIMENSIONS for _ in texts]
+
+
 async def test_rejection_names_every_chunk_in_the_failed_batch() -> None:
-    chunks = _chunks(3)
+    # 37 chunks split into a batch of MAX_BATCH_INPUTS (36) and a batch of 1;
+    # only the second batch rejects. A call-scoped (rather than batch-scoped)
+    # implementation would report all 37 chunk ids here instead of just the
+    # failing batch's single chunk.
+    chunks = _chunks(MAX_BATCH_INPUTS + 1)
 
     with pytest.raises(EmbeddingRejectedError) as excinfo:
-        await embed_chunks(_RejectingClient(), chunks)
+        await embed_chunks(_RejectingOnSecondBatchClient(), chunks)
 
-    assert excinfo.value.chunk_ids == tuple(chunk.chunk_id for chunk in chunks)
+    assert excinfo.value.chunk_ids == (chunks[-1].chunk_id,)
     assert excinfo.value.request_id == "req-1"
 
 
@@ -219,12 +243,86 @@ async def test_bad_request_from_the_sdk_becomes_a_rejection(
     client = build_embedding_client(settings)
 
     async def _raise(**kwargs: object) -> None:
-        raise _status_error(openai.BadRequestError, 400)
+        raise _status_error(openai.BadRequestError, 400, request_id="req-abc")
 
     monkeypatch.setattr(client._client.embeddings, "create", _raise)  # type: ignore[attr-defined]
 
-    with pytest.raises(EmbeddingRejectedError):
+    with pytest.raises(EmbeddingRejectedError) as excinfo:
         await client.embed(["text"])
+
+    assert excinfo.value.request_id == "req-abc"
+
+
+async def test_an_unmapped_openai_error_does_not_escape_the_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # APIResponseValidationError inherits APIError -> OpenAIError but is
+    # neither an APIStatusError nor an APIConnectionError, so it exercises
+    # the catch-all: it's raised when a 2xx response body fails validation
+    # against CreateEmbeddingResponse (e.g. a gateway mangling the body, or
+    # an upstream shape change). It must come out as an UpstreamError
+    # subclass, not escape raw past this boundary.
+    settings = Settings(
+        _env_file=None,
+        use_fake_embeddings=False,
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="secret",
+        azure_openai_embedding_deployment="embed-small",
+    )
+    client = build_embedding_client(settings)
+
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/embeddings")
+    response = httpx.Response(200, request=request)
+
+    async def _raise(**kwargs: object) -> None:
+        raise openai.APIResponseValidationError(response=response, body=None)
+
+    monkeypatch.setattr(client._client.embeddings, "create", _raise)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamServiceError):
+        await client.embed(["text"])
+
+
+async def test_the_real_adapter_returns_vectors_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        use_fake_embeddings=False,
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="secret",
+        azure_openai_embedding_deployment="embed-small",
+    )
+    client = build_embedding_client(settings)
+
+    vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    response = CreateEmbeddingResponse(
+        data=[
+            Embedding(embedding=vectors[0], index=0, object="embedding"),
+            Embedding(embedding=vectors[1], index=1, object="embedding"),
+        ],
+        model="embed-small",
+        object="list",
+        usage=Usage(prompt_tokens=12, total_tokens=12),
+    )
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.embeddings"):
+        result = await client.embed(["one", "two"])
+
+    assert result == vectors
+    # Pins the INFO line's field names against a future SDK rename, and
+    # confirms no secret (the API key) leaks into the log line.
+    assert "embed-small" in caplog.text
+    assert "inputs=2" in caplog.text
+    assert "prompt_tokens=12" in caplog.text
+    assert "total_tokens=12" in caplog.text
+    assert "secret" not in caplog.text
 
 
 @pytest.mark.parametrize(
