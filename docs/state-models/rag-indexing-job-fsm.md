@@ -26,7 +26,16 @@ stateDiagram-v2
 ```
 
 `FailedBeforeMutation` is safe to retry from scratch: nothing about this document changed in the
-index. `FailedPendingRerun` means the document is left with its old chunks and some or all of its
-new chunks both present — recoverable, since upload is an upsert and delete-stale operates on a
-set difference, but not yet in a clean state. Both failure states are re-runnable; neither leaves
-the index without queryable content for the document in question.
+index. `FailedPendingRerun` covers more than one shape of partial completion: an `Uploading` failure
+where the request never landed leaves the old chunks intact and **zero** new chunks written; an
+`Uploading` failure where the batch response came back partial (a 207) leaves the old chunks intact
+plus whichever new chunks succeeded; and a `DeletingStale` failure leaves every new chunk written
+alongside whichever old chunks the delete step had not yet reached. All of these are re-runnable,
+since upload is an upsert and delete-stale operates on a set difference — but none of them is yet in
+a clean state.
+
+Both failure states are re-runnable, but only a document that already had chunks from a prior
+successful run is guaranteed to keep serving queryable content while a re-run is pending. For a
+document being indexed for the first time — no prior chunks — a `FailedPendingRerun` during
+`Uploading` can leave that document with no queryable content at all: there are no old chunks to
+fall back on, and the new chunks that failed are not indexed.
