@@ -26,7 +26,7 @@ They differ in everything that matters operationally:
 | Debugging surface | chunk & index contents | query embedding, retrieval results & prompt |
 | Cost driver | embedding calls + index storage (scales with data) | query embedding + search + LLM calls (scales with traffic) |
 
-This decomposition drives the Part 3 milestone order: Day 12 builds the indexing side (chunking, embeddings, index schema), Day 13 the retrieval side (search modes), Day 14 wires the query pipeline into the API.
+This decomposition drives the Part 3 milestone order: [Day 12](rag-indexing.md) builds the indexing side (chunking, embeddings, index schema), Day 13 the retrieval side (search modes), Day 14 wires the query pipeline into the API.
 
 ## Why RAG and not fine-tuning
 
