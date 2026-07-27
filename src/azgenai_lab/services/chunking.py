@@ -17,6 +17,12 @@ _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
 _HEADING_SEPARATOR = " > "
 _EMBEDDING_JOIN = "\n\n"
 
+# Sentence terminators for both writing systems, plus any trailing closing
+# punctuation. Chinese has no inter-word spaces, so a whitespace-based splitter
+# would treat a whole paragraph as one token and never split it.
+_SENTENCE_END = re.compile(r"[.!?。！？]['\"”’」』)）]*\s*")
+_PARAGRAPH_JOIN = "\n\n"
+
 
 class ChunkingError(Exception):
     """A document cannot be chunked under the given parameters."""
@@ -115,5 +121,104 @@ def chunk_markdown(
 
 
 def _split_section(prose: str, *, budget: int, overlap: int) -> list[str]:
-    """Task 7 replaces this with real splitting."""
-    return [prose]
+    if len(prose) <= budget:
+        return [prose]
+
+    # Pieces are packed to leave room for the overlap tail that will be
+    # prepended to every piece after the first, so the finished chunk still
+    # fits the budget.
+    packed_budget = budget - overlap - len(_PARAGRAPH_JOIN) if overlap else budget
+    if packed_budget <= 0:
+        raise ChunkingError(
+            f"overlap of {overlap} characters leaves no room to advance within a "
+            f"content budget of {budget} characters"
+        )
+
+    units: list[str] = []
+    for paragraph in prose.split(_PARAGRAPH_JOIN):
+        stripped = paragraph.strip()
+        if stripped:
+            units.extend(_split_unit(stripped, packed_budget))
+
+    pieces: list[str] = []
+    current = ""
+    for unit in units:
+        candidate = f"{current}{_PARAGRAPH_JOIN}{unit}" if current else unit
+        if len(candidate) <= packed_budget:
+            current = candidate
+            continue
+        if current:
+            pieces.append(current)
+        current = unit
+    if current:
+        pieces.append(current)
+
+    return _apply_overlap(pieces, overlap=overlap)
+
+
+def _split_unit(unit: str, limit: int) -> list[str]:
+    """Break one paragraph down until every part fits, sentences first."""
+    if len(unit) <= limit:
+        return [unit]
+
+    parts: list[str] = []
+    current = ""
+    for sentence in _sentences(unit):
+        candidate = current + sentence
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current.strip():
+            parts.append(current.strip())
+        current = ""
+        if len(sentence) <= limit:
+            current = sentence
+            continue
+        # No sentence boundary is close enough: cut at the limit. This is the
+        # only place a chunk boundary carries no meaning, and it is recorded
+        # here rather than pretended away.
+        for start in range(0, len(sentence), limit):
+            parts.append(sentence[start : start + limit].strip())
+    if current.strip():
+        parts.append(current.strip())
+    return [part for part in parts if part]
+
+
+def _sentences(text: str) -> list[str]:
+    sentences: list[str] = []
+    start = 0
+    for match in _SENTENCE_END.finditer(text):
+        sentences.append(text[start : match.end()])
+        start = match.end()
+    if start < len(text):
+        sentences.append(text[start:])
+    return sentences
+
+
+def _apply_overlap(pieces: list[str], *, overlap: int) -> list[str]:
+    if overlap <= 0 or len(pieces) < 2:
+        return pieces
+    result = [pieces[0]]
+    # pieces[:-1] and pieces[1:] are the same length; zipping pieces against
+    # pieces[1:] under strict=True raises after the last pair.
+    for previous, piece in zip(pieces[:-1], pieces[1:], strict=True):
+        tail = _sentence_aligned_tail(previous, overlap)
+        result.append(f"{tail}{_PARAGRAPH_JOIN}{piece}" if tail else piece)
+    return result
+
+
+def _sentence_aligned_tail(text: str, limit: int) -> str:
+    """The longest suffix of ``text`` that fits ``limit`` and starts a sentence.
+
+    The service's own splitter takes a fixed number of trailing characters,
+    which routinely opens the next chunk mid-sentence. Since this splitter is
+    structural everywhere else, its overlap is structural too.
+    """
+    if len(text) <= limit:
+        return text
+    window_start = len(text) - limit
+    for match in _SENTENCE_END.finditer(text, window_start):
+        if match.end() < len(text):
+            return text[match.end() :]
+        break
+    return text[window_start:]
