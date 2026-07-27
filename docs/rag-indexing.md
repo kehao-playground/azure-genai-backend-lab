@@ -45,7 +45,10 @@ of the body would reasonably expect that heading to become part of `heading_path
 instead it is recognized as restating the title (already the mandatory first segment of every
 `heading_path`) and is treated as structure, not as a section of its own. Without this, a document
 whose body opens with its own title as an H1 would end up with a `heading_path` of `"Returns Policy
-> Returns Policy"` for its first section, a duplication with no informational value.
+> Returns Policy"` for its first section, a duplication with no informational value. The match is
+exact string equality against `title`, though: `# Returns Policy.` (trailing punctuation) or `#
+returns policy` (a case variant) is *not* recognized as restating the title, and becomes a nested
+heading segment like any other.
 
 ## The overlap contract
 
@@ -87,28 +90,45 @@ one budget number governing every piece uniformly.
 
 ## Chunking failure modes
 
-`chunk_markdown` can refuse to chunk a document outright, by raising `ChunkingError`
-(`services/chunking.py`), in two situations:
+`ChunkingError` can be raised in three places (`services/chunking.py`), two of them in
+`chunk_markdown` itself and one a level deeper, in `_split_section`:
 
-- **A heading path alone leaves no room for prose.** `budget = max_chars - len(heading_path) -
-  len(_EMBEDDING_JOIN)` can reach zero or below before any content is even considered, if a
-  document nests headings deeply enough relative to `chunk_max_chars`. No prose could ever fit in a
-  negative or zero budget, so this is a hard failure rather than a silently empty chunk.
-- **Overlap could never advance.** When a section's prose must be split and the packed budget left
-  after reserving room for the overlap tail (`packed_budget = budget - overlap -
-  len(_PARAGRAPH_JOIN)`) is zero or below, a sliding window could never make forward progress: each
-  piece would be no larger than the overlap it repeats from the last one. This is caught and raised
-  before it can surface as an infinite loop.
+- **A heading path alone leaves no room for prose** (`chunk_markdown`, `budget <= 0`). `budget =
+  max_chars - len(heading_path) - len(_EMBEDDING_JOIN)` can reach zero or below before any content
+  is even considered. No prose could ever fit in a negative or zero budget, so this is a hard
+  failure rather than a silently empty chunk.
+- **Overlap could never advance, caught early** (`chunk_markdown`, `len(prose) > budget and budget
+  <= overlap_chars`). When a section must be split because its prose overflows `budget`, and
+  `budget` itself is no larger than `overlap_chars`, a sliding window could never make forward
+  progress: each piece would be no larger than the overlap it repeats from the last one. This is
+  caught and raised here, before `_split_section` is ever called, rather than let it surface as an
+  infinite loop.
+- **The same hazard, caught again on a two-character-narrower margin** (`_split_section`,
+  `packed_budget <= 0`, where `packed_budget = budget - overlap - len(_PARAGRAPH_JOIN)`). This is
+  not a duplicate of the guard above: `packed_budget <= 0` is equivalent to `budget <= overlap +
+  2`, two characters looser than the `budget <= overlap_chars` threshold `chunk_markdown` checks.
+  A `budget` of exactly `overlap_chars + 1` or `overlap_chars + 2` slips past the first guard (it
+  is greater than `overlap_chars`) but still cannot advance once the `"\n\n"` join is accounted
+  for, and is caught here instead.
 
-Both are authoring-time risks, not just configuration risks: a document with deeply nested headings
-can trigger the first one even with `chunk_max_chars` and `chunk_overlap_chars` left at their
-defaults, simply by nesting sections more deeply than the budget allows.
+These are authoring-time risks, not just configuration risks. The trigger is heading *text length*,
+not nesting *depth*: `_HEADING` (`^(#{1,6})...`) recognizes at most six heading levels, and the
+stack that builds `heading_path` holds at most one entry per level (it pops every entry at or below
+an incoming level before pushing), so a `heading_path` never exceeds seven segments — the title
+plus six headings — regardless of how deeply a document nests. At the defaults (`chunk_max_chars =
+2000`, `chunk_overlap_chars = 500`), the first guard needs `len(heading_path) >= 1998`; with six
+`" > "` separators (3 characters each) accounting for 18 of those characters, the remaining 1,980
+characters spread over 7 segments average out to roughly 283 characters *per segment*. The second
+guard needs only `len(heading_path) >= 1498`, or roughly 211 characters per segment. Six levels of
+ordinarily short headings (a few dozen characters each) fall far short of either threshold; what
+actually triggers these guards at the defaults is a title or heading written as long, unbroken
+prose — not depth by itself, even at the maximum depth the format supports.
 
 `Settings` (`core/config.py`) refuses to start at all when `chunk_overlap_chars * 2 >=
 chunk_max_chars`. This is the same "overlap could never advance" hazard, caught one layer earlier —
 at configuration load, before any document is chunked — for the general case where the configured
-overlap is so large relative to the max that no section, regardless of its heading depth, could
-ever leave room to advance.
+overlap is so large relative to the max that no section, however short or long its heading path,
+could ever leave room to advance.
 
 ## Sizes are characters, not tokens
 
