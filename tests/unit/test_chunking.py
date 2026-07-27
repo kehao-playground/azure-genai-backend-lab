@@ -48,7 +48,6 @@ def test_each_in_budget_section_becomes_one_chunk() -> None:
 
     assert [chunk.heading_path for chunk in chunks] == [
         "Returns Policy",
-        "Returns Policy > Refund window",
         "Returns Policy > Refund window > Standard purchases",
         "Returns Policy > Refund window > Promotional purchases",
         "Returns Policy > Exceptions",
@@ -116,3 +115,28 @@ def test_heading_path_too_long_for_the_budget_is_an_error() -> None:
     body = "# Returns Policy\n\n## " + "x" * 300 + "\n\nText.\n"
     with pytest.raises(ChunkingError, match="heading path"):
         chunk_markdown(_document(body), max_chars=320, overlap_chars=100)
+
+
+def test_small_prose_fits_even_when_budget_is_at_or_below_overlap() -> None:
+    # heading_path is "Returns Policy > " + "H" * 77 (94 chars); budget is
+    # 100 - 94 - len("\n\n") == 4, which is below overlap_chars=10. The guard
+    # must not fire on that arithmetic alone: "Hi" (2 chars) fits comfortably
+    # inside budget=4, so no split is ever needed for this section.
+    body = "# Returns Policy\n\n## " + "H" * 77 + "\n\nHi\n"
+    chunks = chunk_markdown(_document(body), max_chars=100, overlap_chars=10)
+
+    assert len(chunks) == 1
+    assert chunks[0].content == "Hi"
+
+
+def test_heading_level_skip_produces_a_correct_heading_path() -> None:
+    # "## Section" has no prose of its own before "#### Detail" skips a
+    # level (no "###" in between); it is dropped like any other prose-less
+    # heading, but the stack still records it so it survives as a breadcrumb
+    # segment in "Detail"'s heading_path.
+    body = "# Returns Policy\n\n## Section\n\n#### Detail\n\nDeep content.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        "Returns Policy > Section > Detail",
+    ]
