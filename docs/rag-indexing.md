@@ -94,7 +94,7 @@ one budget number governing every piece uniformly.
 `chunk_markdown` itself and one a level deeper, in `_split_section`:
 
 - **A heading path alone leaves no room for prose** (`chunk_markdown`, `budget <= 0`). `budget =
-  max_chars - len(heading_path) - len(_EMBEDDING_JOIN)` can reach zero or below before any content
+  max_chars - len(heading_path) - len(EMBEDDING_JOIN)` can reach zero or below before any content
   is even considered. No prose could ever fit in a negative or zero budget, so this is a hard
   failure rather than a silently empty chunk.
 - **Overlap could never advance, caught early** (`chunk_markdown`, `len(prose) > budget and budget
@@ -109,7 +109,10 @@ one budget number governing every piece uniformly.
   2`, two characters looser than the `budget <= overlap_chars` threshold `chunk_markdown` checks.
   A `budget` of exactly `overlap_chars + 1` or `overlap_chars + 2` slips past the first guard (it
   is greater than `overlap_chars`) but still cannot advance once the `"\n\n"` join is accounted
-  for, and is caught here instead.
+  for, and is caught here instead. The equivalence assumes `overlap_chars > 0`: when it is `0`,
+  `packed_budget` is simply `budget` (`_split_section` skips the subtraction), which the first
+  guard has already proven positive by the time `_split_section` runs — so on that branch this
+  guard cannot fire at all.
 
 These are authoring-time risks, not just configuration risks. The trigger is heading *text length*,
 not nesting *depth*: `_HEADING` (`^(#{1,6})...`) recognizes at most six heading levels, and the
@@ -125,10 +128,17 @@ actually triggers these guards at the defaults is a title or heading written as 
 prose — not depth by itself, even at the maximum depth the format supports.
 
 `Settings` (`core/config.py`) refuses to start at all when `chunk_overlap_chars * 2 >=
-chunk_max_chars`. This is the same "overlap could never advance" hazard, caught one layer earlier —
-at configuration load, before any document is chunked — for the general case where the configured
-overlap is so large relative to the max that no section, however short or long its heading path,
-could ever leave room to advance.
+chunk_max_chars`. This guards the same "overlap could never advance" hazard, at the level of the
+configured *values* themselves, for the general case where the configured overlap is so large
+relative to the max that no section, however short or long its heading path, could ever leave room
+to advance.
+
+What this validator does not yet do is intercept an actual chunking call: `chunk_markdown` takes
+`max_chars` and `overlap_chars` as explicit arguments, and nothing on this branch calls it with
+`settings.chunk_max_chars` / `settings.chunk_overlap_chars` — no caller wires the two together yet.
+So today the validator rejects an illegal *configuration* at startup; it does not, and cannot yet,
+reject an illegal *document* before it is chunked. Closing that gap is a matter of a future caller
+passing `Settings` values into `chunk_markdown`, not a change to the validator itself.
 
 ## Sizes are characters, not tokens
 
@@ -192,7 +202,7 @@ One consequence follows from combining the two: the character budget that
 `chunk_max_chars` enforces applies to `embedding_input`, not to `content` alone. A document with a
 deep heading hierarchy has a shorter prose budget than one with a shallow one, because the
 `heading_path` prefix and the `"\n\n"` join both count against the same ceiling
-(`chunk_markdown`'s `budget = max_chars - len(heading_path) - len(_EMBEDDING_JOIN)`). Applying the
+(`chunk_markdown`'s `budget = max_chars - len(heading_path) - len(EMBEDDING_JOIN)`). Applying the
 limit to `content` instead would let a deeply nested chunk's actual embedding request silently
 exceed the ceiling.
 
@@ -207,13 +217,23 @@ onto every `Chunk` derived from it:
 | `title` | front matter `title` | Also the mandatory first segment of every chunk's `heading_path`. |
 | `doc_type` | front matter `doc_type` | Free text; facetable in the index for scoping retrieval by document category. |
 | `tenant_id` | front matter `tenant_id` | **Reserved for Day 15.** The field is populated and filterable now so that Day 15's multi-tenant filtering has something to filter on; no filtering logic exists yet. |
-| `effective_date` | front matter `effective_date` (YAML date) | Filterable and sortable, so a stale document's chunks can be excluded from being treated as a current answer. |
+| `effective_date` | front matter `effective_date` (YAML date) | Filterable and sortable, so a stale document's chunks can be excluded from being treated as a current answer. **Open contract gap** — see below. |
 | `heading_path` | derived during chunking | Always starts with `title`; see [Embedding input versus citation text](#embedding-input-versus-citation-text). |
 | `content` | derived during chunking | The citation text; see above. |
 
 Front-matter parsing is strict and closed-set (`_REQUIRED_FIELDS` in `document_loader.py`): all
 five fields are required, no unknown field is tolerated, and `doc_id` must match the filename. This
 mirrors how Day 8 validates prompt template front matter — fail at load time, not at index time.
+
+**`effective_date` has no closed path from producer to schema.** `SourceDocument.effective_date`
+and `Chunk.effective_date` (`models/rag.py`) are both typed `datetime.date`, copied through
+verbatim. The index field, though, is `Edm.DateTimeOffset` (see [Index schema](#index-schema)),
+which wants an ISO-8601 timestamp with a time component and an offset — `2026-01-15T00:00:00Z`, not
+`date.isoformat()`'s `2026-01-15`. Nothing on this branch serializes a `Chunk` into an index
+document, so nothing is broken today; `effective_date` is simply the one metadata field whose
+contract does not close within this milestone's deliverable. Deciding what time and offset a bare
+date should serialize to belongs to Day 13's `to_index_document()`, not here — recorded as an open
+seam rather than papered over.
 
 ## Embedding model and batching
 
@@ -284,6 +304,29 @@ one search document:
 | `effective_date` | `Edm.DateTimeOffset` | filterable, sortable | Keeps an expired document from being treated as a current answer. |
 | `content_vector` | `Collection(Edm.Single)` | searchable, `stored: true`, `retrievable: false`, `dimensions: 1536` | The vector side of hybrid search; see [`stored` is the vector's only backup](#stored-is-the-vectors-only-backup). |
 
+**Two sources of truth name the index.** `INDEX_NAME = "azgenai-lab-chunks"` (`models/search_index.py`)
+is a hard-coded constant, using the same constant-over-setting reasoning as `EMBEDDING_DIMENSIONS`
+(see [Embedding model and batching](#embedding-model-and-batching)) — a setting is precisely a
+mechanism for letting two things that must agree disagree at runtime. But `core/config.py` also
+carries a pre-existing `azure_search_index_name: str | None = None` setting, which predates this
+milestone and is untouched here. The two are not reconciled: the exported schema always pins the
+name `INDEX_NAME` defines, the setting is currently read by no code path, and this milestone lands
+on the opposite side from `EMBEDDING_DIMENSIONS` — constant, not setting — without having said so
+until now. Reconciling them (or deciding the index name should stay a constant and the setting
+should go away) is a Day 13 decision; it is recorded here as an open seam, not a resolved rule.
+
+**`en.microsoft` is the one schema choice this document does not defend on its own terms.**
+`content`'s analyzer (`models/search_index.py`) is hard-coded to `en.microsoft` — an
+English-specific analyzer — while the rationale above only justifies *that* `content` is
+searchable, not *which* language it assumes. That silence matters here specifically because this
+project's chunker treats CJK sentence-boundary handling as a headline feature (see [Chunking
+strategy](#chunking-strategy)): a reader who indexes Chinese documents through this schema inherits
+`en.microsoft` with no warning anywhere in this document. Changing it later is exactly [row
+4](#four-irreversible-decisions)'s drop-and-rebuild cost — an analyzer reassignment on an existing
+field is not a lighter change than any other field-attribute change. A related, previously
+undocumented asymmetry: `heading_path` is `searchable` with the service's default analyzer while
+`content`, derived from the same source document, uses `en.microsoft`.
+
 `vectorSearch` defines one `hnsw` algorithm (`metric: cosine`, matching Azure OpenAI embeddings)
 and one profile that `content_vector` references.
 
@@ -338,7 +381,7 @@ change your mind?
 | 1 | Chunk boundaries (chunking strategy or `chunk_max_chars`/`chunk_overlap_chars`) | Citations point at different text than what was originally linked; already-published source links may no longer match what a reader sees. |
 | 2 | Metadata field set | Adding a field needs no rebuild — existing documents get a `null` until the next reindex backfills it (a rebuild-free change per the reindex how-to page). Changing a field's *attributes* (`searchable`/`filterable`/`sortable`/`facetable`, analyzer assignment, data type) needs a drop and full rebuild. |
 | 3 | Embedding model or dimensions | A different model or a different dimension count is a different embedding space — old and new vectors are not comparable, so every chunk must be re-embedded. |
-| 4 | Index schema field definitions (name, type, `searchable`/`filterable`/`sortable`/`facetable`, analyzer assignment) | Drop and rebuild the index, then reload every document into it. |
+| 4 | Index schema field definitions (name, type, `searchable`/`filterable`/`sortable`/`facetable`, analyzer assignment) | Drop and rebuild the index, then reload every document into it. This is the cost of `content`'s hard-coded `en.microsoft` analyzer too: it is an English-specific choice made with no language warning anywhere in this document, even though this project's own chunker treats CJK sentence handling as a headline feature (see [Index schema](#index-schema)). |
 
 Row 4 carries a distinction worth stating precisely, because it is easy to overstate: **a schema
 rebuild always requires reloading every document, but it requires re-embedding only when the
