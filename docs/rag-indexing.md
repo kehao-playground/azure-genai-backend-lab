@@ -300,15 +300,16 @@ Front-matter parsing is strict and closed-set (`_REQUIRED_FIELDS` in `document_l
 five fields are required, no unknown field is tolerated, and `doc_id` must match the filename. This
 mirrors how Day 8 validates prompt template front matter — fail at load time, not at index time.
 
-**`effective_date` crosses a type boundary between producer and schema.** `SourceDocument.effective_date`
-and `Chunk.effective_date` (`models/rag.py`) are both typed `datetime.date`, copied through
-verbatim. The index field, though, is `Edm.DateTimeOffset` (see [Index schema](#index-schema)),
-which takes an ISO-8601 timestamp rather than a bare calendar date — `2026-01-15T00:00:00Z`, not
-`date.isoformat()`'s `2026-01-15`. Day 13 settled it. The source data is date-only, so this project *defines* the field as a UTC
-calendar date and encodes it at UTC midnight — `2026-01-15T00:00:00Z`. The offset is a domain
-decision, not something `Edm.DateTimeOffset` derives for us: the type requires an offset and we
-choose which one. `Chunk.to_index_document()` performs the encoding, and every range filter over
-this field must use UTC date boundaries or it will silently shift by a day. See
+**`effective_date` crosses a type boundary between producer and schema.**
+`SourceDocument.effective_date` and `Chunk.effective_date` (`models/rag.py`) are both typed
+`datetime.date`, copied through verbatim. The index field, though, is `Edm.DateTimeOffset` (see
+[Index schema](#index-schema)), which takes an ISO-8601 timestamp rather than a bare calendar
+date — `2026-01-15T00:00:00Z`, not `date.isoformat()`'s `2026-01-15`. Day 13 settled it. The
+source data is date-only, so this project *defines* the field as a UTC calendar date and encodes
+it at UTC midnight — `2026-01-15T00:00:00Z`. The offset is a domain decision, not something
+`Edm.DateTimeOffset` derives for us: the type requires an offset and we choose which one.
+`Chunk.to_index_document()` performs the encoding, and every range filter over this field must
+use UTC date boundaries or it will silently shift by a day. See
 [rag-retrieval.md](rag-retrieval.md).
 
 ## Embedding model and batching
@@ -380,14 +381,16 @@ one search document:
 | `effective_date` | `Edm.DateTimeOffset` | filterable, sortable | Keeps an expired document from being treated as a current answer. |
 | `content_vector` | `Collection(Edm.Single)` | searchable, `stored: true`, `retrievable: false`, `dimensions: 1536` | The vector side of hybrid search; see [`stored` is the vector's only backup](#stored-is-the-vectors-only-backup). |
 
-**The index name has one source of truth.** `INDEX_NAME = "azgenai-lab-chunks"` (`models/search_index.py`)
-is a hard-coded constant, using the same constant-over-setting reasoning as `EMBEDDING_DIMENSIONS`
-(see [Embedding model and batching](#embedding-model-and-batching)) — a setting is precisely a
-mechanism for letting two things that must agree disagree at runtime. Day 13 settled it: the setting is gone. `INDEX_NAME` is the only source of truth, and
-`.env.example` no longer publishes a conflicting `AZURE_SEARCH_INDEX_NAME=documents` — which had
-already drifted from the constant, making this a demonstrated failure rather than a hypothetical
-one. Per-environment naming, when it is eventually needed, arrives as an index alias with the same
-alias name in every environment and the endpoint providing the isolation, not as a settings knob.
+**The index name has one source of truth.** `INDEX_NAME = "azgenai-lab-chunks"`
+(`models/search_index.py`) is a hard-coded constant, using the same constant-over-setting
+reasoning as `EMBEDDING_DIMENSIONS` (see [Embedding model and
+batching](#embedding-model-and-batching)) — a setting is precisely a mechanism for letting two
+things that must agree disagree at runtime. Day 13 settled it: the setting is gone. `INDEX_NAME`
+is the only source of truth, and `.env.example` no longer publishes a conflicting
+`AZURE_SEARCH_INDEX_NAME=documents` — which had already drifted from the constant, making this a
+demonstrated failure rather than a hypothetical one. Per-environment naming, when it is
+eventually needed, arrives as an index alias with the same alias name in every environment and
+the endpoint providing the isolation, not as a settings knob.
 
 **`en.microsoft` is the one schema choice this document does not defend on its own terms.**
 `content`'s analyzer (`models/search_index.py`) is hard-coded to `en.microsoft` — an

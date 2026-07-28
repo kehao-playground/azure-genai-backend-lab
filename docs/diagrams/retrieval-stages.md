@@ -30,8 +30,10 @@ flowchart TD
 ```
 
 The dead-end edge out of the reranker is deliberate: the semantic ranker
-"can't rerun the query over the entire corpus" — it only reorders whatever
-candidate generation already produced. If the right chunk was never recalled
+"can't rerun the query over the entire corpus" ([semantic ranking
+overview](https://learn.microsoft.com/en-us/azure/search/semantic-search-overview),
+checked 2026-07) — it only reorders whatever candidate generation already
+produced. If the right chunk was never recalled
 by BM25 or the vector query, no amount of reranking finds it; the fix is
 `vector_k` or the text query, not `HYBRID_SEMANTIC`. See [Retrieval is three
 stages that fail separately](../rag-retrieval.md#retrieval-is-three-stages-that-fail-separately).
