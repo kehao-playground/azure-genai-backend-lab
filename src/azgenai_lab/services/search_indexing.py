@@ -240,3 +240,73 @@ async def run_indexing_with_retry(
                 error_message=last_error or "indexing retries exhausted",
             )
     return terminal
+
+
+# The service returns 50 results by default and at most 1,000 per page.
+ENUMERATION_PAGE_SIZE = 1_000
+
+PostSearch = Callable[[dict[str, Any]], Coroutine[Any, Any, list[str]]]
+
+
+class EnumerationError(UpstreamError):
+    """Enumeration could not be trusted, so it stopped instead of guessing."""
+
+    status_code = 500
+    code = "enumeration_failed"
+    message = "Listing the indexed chunks of a document failed."
+
+
+def escape_odata_literal(value: str) -> str:
+    """Escape a value for an OData string literal (a single quote doubles)."""
+    return value.replace("'", "''")
+
+
+async def list_indexed_chunk_ids(post_search: PostSearch, parent_id: str) -> list[str]:
+    """List every ``chunk_id`` currently indexed under ``parent_id``.
+
+    Pages with ``orderby`` plus a strict ``gt`` range filter rather than
+    ``skip``: ``skip`` shifts when the index changes underneath the walk, so a
+    concurrent write can make it repeat or miss rows. The cursor removes that
+    displacement — it does **not** provide snapshot isolation, and it is not
+    what makes concurrent replacement safe. That is the critical section's job.
+
+    Two conditions abort rather than continue, because both mean the walk has
+    lost its footing: a key already seen, and a cursor that failed to advance.
+    Continuing past either risks an unbounded loop, and this list decides what
+    gets deleted.
+    """
+    literal = escape_odata_literal(parent_id)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    cursor: str | None = None
+
+    while True:
+        expression = f"parent_id eq '{literal}'"
+        if cursor is not None:
+            expression = f"{expression} and chunk_id gt '{escape_odata_literal(cursor)}'"
+        page = await post_search(
+            {
+                "search": "*",
+                "filter": expression,
+                "select": "chunk_id",
+                "orderby": "chunk_id asc",
+                "top": ENUMERATION_PAGE_SIZE,
+            }
+        )
+        if not page:
+            return ordered
+
+        for chunk_id in page:
+            if chunk_id in seen:
+                raise EnumerationError(
+                    f"chunk_id {chunk_id!r} was repeated while paging {parent_id!r}"
+                )
+            seen.add(chunk_id)
+            ordered.append(chunk_id)
+
+        next_cursor = max(page)
+        if cursor is not None and next_cursor <= cursor:
+            raise EnumerationError(
+                f"cursor did not advance past {cursor!r} while paging {parent_id!r}"
+            )
+        cursor = next_cursor
