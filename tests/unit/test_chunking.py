@@ -173,10 +173,12 @@ def test_every_embedding_input_respects_the_maximum() -> None:
 TAB_INDENTED_BLOCK = "\t\tdef handler():\n\t\t    return 1"
 
 
-def test_the_fast_path_returns_a_section_verbatim() -> None:
+def test_the_fast_path_preserves_interior_whitespace() -> None:
     # A section that fits its budget is never handed to `_split_section`'s
-    # paragraph-stripping code at all, so whitespace-significant content —
-    # here, tab-indented code — survives exactly as written.
+    # paragraph-stripping code, so whitespace-significant content in the
+    # *interior* of the section — here, tab-indented code — survives exactly
+    # as written. The section's own edges are a separate matter: see
+    # `test_a_section_is_stripped_at_its_edges_on_both_paths`.
     body = (
         "# Returns Policy\n\n## Exceptions\n\n"
         "See the sample handler below.\n\n"
@@ -189,14 +191,30 @@ def test_the_fast_path_returns_a_section_verbatim() -> None:
     assert TAB_INDENTED_BLOCK in chunks[0].content
 
 
+def test_a_section_is_stripped_at_its_edges_on_both_paths() -> None:
+    # `_sections` strips each section as a whole before `_split_section` ever
+    # sees it, so whitespace at the very start or end of a section is gone on
+    # BOTH paths. Pinned here because the honest version of the whitespace
+    # contract is easy to overstate: no path returns a byte-identical copy of
+    # the source, not even the fast one.
+    body = "# Returns Policy\n\n## Exceptions\n\n\t\tindented first line\n\nplain second.   \n"
+    chunks = chunk_markdown(_document(body), max_chars=4000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    content = chunks[0].content
+    assert content.startswith("indented first line")
+    assert not content.startswith("\t")
+    assert content.endswith("plain second.")
+
+
 def test_the_split_path_strips_paragraph_leading_whitespace() -> None:
     # This documents a known, accepted loss — it is not an endorsement. Once
     # a section must be split, every paragraph is `.strip()`-ed before being
     # repacked (see `_split_section`'s docstring), so a paragraph's leading
     # whitespace does not survive. This makes the split path unsuitable for
     # whitespace-significant material such as indented code or tables; only
-    # the fast path (`test_the_fast_path_returns_a_section_verbatim`) is
-    # verbatim.
+    # the fast path (`test_the_fast_path_preserves_interior_whitespace`)
+    # keeps interior whitespace.
     filler_before = "Filler prose before the example. " * 6
     filler_after = "Filler prose after the example continues on. " * 6
     body = (

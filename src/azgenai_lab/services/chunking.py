@@ -218,34 +218,38 @@ def chunk_markdown(
 def _split_section(prose: str, *, budget: int, overlap: int) -> list[str]:
     """Split ``prose`` into pieces of at most ``budget`` characters, if needed.
 
-    Whitespace guarantee, stated precisely because it is asymmetric:
+    Whitespace guarantee, in three tiers. State it precisely or not at all:
+    "the chunk holds the original text" is the kind of claim that is almost
+    true and therefore misleads.
 
-    - **Fast path** (``prose`` already fits ``budget``): returned untouched.
-      The chunk is byte-identical to what the author wrote, whitespace
-      included.
-    - **Split path** (``prose`` must be broken up): normalised, not
-      preserved. Every paragraph is stripped of leading and trailing
-      whitespace; paragraph separators are collapsed to exactly one
-      ``"\\n\\n"``, so a run of three or more newlines becomes one blank
-      line; and each hard-split fragment (see ``_split_unit``) is stripped
-      at both ends too. The resulting guarantee is only that every
-      **non-whitespace** character of the source appears in at least one
-      chunk — not that any chunk is byte-identical to the source.
+    1. **Every section, both paths.** ``_sections`` strips each section as a
+       whole before it ever reaches this function, so whitespace at the very
+       start or end of a section is already gone. A section whose first line
+       is indented arrives here without that indentation.
+    2. **Fast path** (``prose`` already fits ``budget``): returned untouched
+       from here on, so *interior* whitespace is exactly what the author
+       wrote — but see tier 1 for the edges.
+    3. **Split path** (``prose`` must be broken up): normalised, not
+       preserved. Every paragraph is stripped of leading and trailing
+       whitespace; paragraph separators are collapsed to exactly one
+       ``"\\n\\n"``, so a run of three or more newlines becomes one blank
+       line; and each hard-split fragment (see ``_split_unit``) is stripped
+       at both ends too. The resulting guarantee is only that every
+       **non-whitespace** character of the source appears in at least one
+       chunk.
 
-    A chunk's whitespace is therefore either the author's, verbatim, or a
-    side effect of splitting, never both for the same chunk. This makes the
-    split path unsuitable for whitespace-significant material — indented
-    code, tables — since a section large enough to need splitting cannot
-    keep that formatting intact. Only a section within budget (the fast
-    path) is safe for such content.
+    So no tier promises a byte-identical copy of the source. This makes the
+    splitter unsuitable for whitespace-significant material — indented code,
+    tables — and a section large enough to need splitting is worse still,
+    since tier 3 also rewrites the gaps between its paragraphs.
     """
     if len(prose) <= budget:
         # Fast path: the section already fits, so it is returned untouched.
         # The paragraph-stripping and "\n\n" re-joining below only happen to
-        # sections that get split — a chunk's whitespace is either the
-        # author's, verbatim, or a side effect of splitting, never both for
-        # the same chunk. That asymmetry is accepted rather than normalising
-        # every section, so an unsplit chunk is exactly what the author wrote.
+        # sections that get split — a chunk's interior whitespace is either
+        # the author's, verbatim, or a side effect of splitting, never both
+        # for the same chunk. That asymmetry is accepted rather than
+        # normalising every section.
         return [prose]
 
     # Pieces are packed to leave room for the overlap tail that will be
