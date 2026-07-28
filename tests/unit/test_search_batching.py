@@ -31,6 +31,58 @@ def test_document_count_ceiling_is_honoured() -> None:
     assert len(batches[1].keys) == 1
 
 
+def test_document_count_ceiling_lands_exactly_without_splitting() -> None:
+    # Pins the count guard's own boundary: a batch that reaches exactly
+    # MAX_BATCH_DOCUMENTS documents must not be split, and only the next
+    # document past it starts a second batch. The test above only checks
+    # MAX_BATCH_DOCUMENTS + 1, which would stay green even if the guard were
+    # loosened by one and let 1,001 documents share a single batch.
+    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS), "upload"))
+    assert len(batches) == 1
+    assert batches[0].keys == tuple(f"doc-{i:05d}" for i in range(MAX_BATCH_DOCUMENTS))
+
+    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS + 1), "upload"))
+    assert len(batches) == 2
+    assert len(batches[0].keys) == MAX_BATCH_DOCUMENTS
+    assert len(batches[1].keys) == 1
+
+
+def test_byte_ceiling_lands_exactly_without_splitting() -> None:
+    # Pins the byte guard's own boundary: a request that serializes to
+    # exactly MAX_REQUEST_BYTES must travel as one batch, not split one
+    # document early. Existing byte-ceiling coverage only pushes well past
+    # the limit, which would stay green even if the guard were tightened to
+    # split on reaching the ceiling rather than on exceeding it.
+    #
+    # The padding needed is derived from the module's own output, not
+    # assumed: probe an unpadded two-document batch to learn the fixed
+    # overhead (wrapper, quotes, keys, the separating comma), then pad one
+    # document's `content` field with plain ASCII up to the ceiling -- each
+    # extra character adds exactly one byte to the encoded batch, with no
+    # escaping to account for.
+    probe = next(iter(serialize_batches(_documents(2, filler=""), "upload")))
+    overhead = len(probe.body)
+    pad = MAX_REQUEST_BYTES - overhead
+
+    documents = [
+        {"chunk_id": "doc-00000", "content": "a" * pad},
+        {"chunk_id": "doc-00001", "content": ""},
+    ]
+    batches = list(serialize_batches(documents, "upload"))
+    assert len(batches) == 1
+    assert len(batches[0].body) == MAX_REQUEST_BYTES
+    assert batches[0].keys == ("doc-00000", "doc-00001")
+
+    documents_over = [
+        {"chunk_id": "doc-00000", "content": "a" * (pad + 1)},
+        {"chunk_id": "doc-00001", "content": ""},
+    ]
+    batches_over = list(serialize_batches(documents_over, "upload"))
+    assert len(batches_over) == 2
+    assert batches_over[0].keys == ("doc-00000",)
+    assert batches_over[1].keys == ("doc-00001",)
+
+
 def test_byte_ceiling_splits_before_the_count_ceiling_does() -> None:
     # Documents carrying vectors hit the 16 MB payload limit well before the
     # 1,000-document limit. Batching by count alone writes a 400.
