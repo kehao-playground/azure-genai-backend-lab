@@ -57,9 +57,15 @@ def load_document(path: Path) -> SourceDocument:
         value = meta[field]
         if not isinstance(value, str) or not value.strip():
             raise SourceDocumentError(f"{path.name}: {field} must be a non-empty string")
-    if not isinstance(meta["effective_date"], date):
+    # datetime is a subclass of date, so isinstance(..., date) would also
+    # accept a YAML timestamp. The exact-type check is intentional: this
+    # field is date-only, and the schema field it eventually feeds
+    # (Edm.DateTimeOffset) is a separate seam that a future reader must not
+    # paper over here by relaxing this back to isinstance.
+    if type(meta["effective_date"]) is not date:
         raise SourceDocumentError(
-            f"{path.name}: effective_date must be a YAML date (YYYY-MM-DD)"
+            f"{path.name}: effective_date must be a YAML date (YYYY-MM-DD), "
+            "not a timestamp"
         )
 
     doc_id: str = meta["doc_id"]

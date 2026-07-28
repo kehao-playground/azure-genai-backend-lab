@@ -87,6 +87,30 @@ def test_effective_date_must_be_a_date(tmp_path: Path) -> None:
         load_document(_write(tmp_path, "returns-policy.md", content))
 
 
+def test_a_yaml_timestamp_effective_date_is_rejected(tmp_path: Path) -> None:
+    # datetime is a subclass of date, so isinstance alone would let a
+    # timestamp through a field that documents itself as date-only.
+    content = VALID.replace(
+        "effective_date: 2026-01-15", "effective_date: 2026-01-15T12:34:56Z"
+    )
+    with pytest.raises(SourceDocumentError, match="effective_date"):
+        load_document(_write(tmp_path, "returns-policy.md", content))
+
+
+def test_a_timezone_naive_yaml_timestamp_is_rejected(tmp_path: Path) -> None:
+    content = VALID.replace(
+        "effective_date: 2026-01-15", "effective_date: 2026-01-15 12:34:56"
+    )
+    with pytest.raises(SourceDocumentError, match="effective_date"):
+        load_document(_write(tmp_path, "returns-policy.md", content))
+
+
+def test_a_plain_yaml_date_is_still_accepted(tmp_path: Path) -> None:
+    document = load_document(_write(tmp_path, "returns-policy.md", VALID))
+
+    assert document.effective_date == date(2026, 1, 15)
+
+
 def test_empty_body_is_rejected(tmp_path: Path) -> None:
     content = VALID.split("---\n\n")[0] + "---\n\n"
     with pytest.raises(SourceDocumentError, match="body"):
