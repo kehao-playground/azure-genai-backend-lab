@@ -160,6 +160,21 @@ def _sections(document: SourceDocument) -> list[tuple[str, str]]:
 def chunk_markdown(
     document: SourceDocument, *, max_chars: int, overlap_chars: int
 ) -> list[Chunk]:
+    # Contract violations about the parameters themselves, not about this
+    # document: caller bugs, so ValueError, checked before any work and
+    # mirroring `Settings._overlap_must_leave_room_to_advance` exactly.
+    # `Settings` fails at startup; this fails at the call, since it has no
+    # production caller yet.
+    if max_chars <= 0:
+        raise ValueError(f"max_chars must be positive (got {max_chars})")
+    if overlap_chars < 0:
+        raise ValueError(f"overlap_chars must not be negative (got {overlap_chars})")
+    if overlap_chars * 2 >= max_chars:
+        raise ValueError(
+            "overlap_chars must be less than half of max_chars "
+            f"(got {overlap_chars} against {max_chars})"
+        )
+
     chunks: list[Chunk] = []
     for heading_path, prose in _sections(document):
         budget = max_chars - len(heading_path) - len(EMBEDDING_JOIN)

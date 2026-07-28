@@ -239,26 +239,31 @@ def test_a_single_unbreakable_run_is_hard_split() -> None:
 
 
 def test_budget_too_small_relative_to_overlap_is_an_error() -> None:
-    # heading_path is "Returns Policy > Exceptions" (27 chars); budget is
-    # 60 - 27 - len("\n\n") == 31, which is <= overlap_chars=50. This guard
-    # (chunk_markdown, before any splitting is attempted) must fire here, not
-    # the sliding-window guard inside _split_section — the two are checked at
-    # different points and must raise distinguishable messages.
-    body = "# Returns Policy\n\n## Exceptions\n\n" + "word " * 500 + "\n"
+    # heading_path is "Returns Policy > " (17 chars) + "H" * 250 (250 chars)
+    # == 267 chars; budget is 320 - 267 - len("\n\n") == 51, which is
+    # <= overlap_chars=100. This guard (chunk_markdown, before any splitting
+    # is attempted) must fire here, not the sliding-window guard inside
+    # _split_section — the two are checked at different points and must
+    # raise distinguishable messages. Prose is 100 chars, comfortably above
+    # the 51-char budget, so the guard's `len(prose) > budget` condition
+    # holds.
+    body = "# Returns Policy\n\n## " + "H" * 250 + "\n\n" + "word " * 20 + "\n"
     with pytest.raises(ChunkingError, match="leaves too little budget"):
-        chunk_markdown(_document(body), max_chars=60, overlap_chars=50)
+        chunk_markdown(_document(body), max_chars=320, overlap_chars=100)
 
 
 def test_overlap_leaving_no_room_to_advance_is_an_error() -> None:
-    # heading_path is "Returns Policy > Exceptions" (27 chars); budget is
-    # 80 - 27 - len("\n\n") == 51, which is above overlap_chars=50, so the
-    # budget-too-small guard above does not fire. But packed_budget inside
-    # _split_section is 51 - 50 - len("\n\n") == -1: the sliding window could
-    # never advance. This is a second, later guard and must be exercised on
-    # its own — not incidentally satisfied by the first guard's message.
-    body = "# Returns Policy\n\n## Exceptions\n\n" + "word " * 500 + "\n"
+    # heading_path is "Returns Policy > " (17 chars) + "H" * 200 (200 chars)
+    # == 217 chars; budget is 320 - 217 - len("\n\n") == 101, which is above
+    # overlap_chars=100, so the budget-too-small guard above does not fire.
+    # But packed_budget inside _split_section is 101 - 100 - len("\n\n") ==
+    # -1: the sliding window could never advance. This is a second, later
+    # guard and must be exercised on its own — not incidentally satisfied by
+    # the first guard's message. Prose is 125 chars, above the 101-char
+    # budget, so the fast path in `_split_section` is skipped.
+    body = "# Returns Policy\n\n## " + "H" * 200 + "\n\n" + "word " * 25 + "\n"
     with pytest.raises(ChunkingError, match="leaves no room to advance"):
-        chunk_markdown(_document(body), max_chars=80, overlap_chars=50)
+        chunk_markdown(_document(body), max_chars=320, overlap_chars=100)
 
 
 def test_hash_comment_inside_backtick_fence_is_not_a_heading() -> None:
@@ -395,3 +400,20 @@ def test_a_document_whose_body_is_only_a_title_heading_is_an_error() -> None:
     body = "# Returns Policy\n"
     with pytest.raises(ChunkingError, match="returns-policy"):
         chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+
+def test_negative_overlap_is_rejected() -> None:
+    with pytest.raises(ValueError, match="overlap_chars"):
+        chunk_markdown(_document("Just prose."), max_chars=2000, overlap_chars=-1)
+
+
+def test_zero_max_chars_is_rejected() -> None:
+    with pytest.raises(ValueError, match="max_chars"):
+        chunk_markdown(_document("Just prose."), max_chars=0, overlap_chars=0)
+
+
+def test_overlap_at_or_above_half_of_max_chars_is_rejected() -> None:
+    with pytest.raises(ValueError, match="overlap_chars"):
+        chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=50)
+    with pytest.raises(ValueError, match="overlap_chars"):
+        chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=60)
