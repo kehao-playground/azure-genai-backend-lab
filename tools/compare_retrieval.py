@@ -44,6 +44,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -59,13 +60,6 @@ from azgenai_lab.models.search_index import SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.embeddings import build_embedding_client
 
-# Below this length a bare label is too likely to collide with an ordinary
-# word in error text (an "ai" or "api"-style label would mangle unrelated
-# text in published evidence). The full-host substitution below has no such
-# risk — a dotted hostname is specific enough not to collide — so only the
-# bare-label substitution is guarded.
-_MIN_BARE_NAME_LENGTH = 6
-
 
 def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
     """Redact a configured endpoint's host and bare service name from ``text``.
@@ -75,14 +69,23 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
     mismatch echoes the full host. Both are resource names this project's
     rules require masking before anything is written to evidence, so this
     runs on every detail before it is added to a table row.
+
+    The bare label is matched on token boundaries rather than as a substring.
+    Service names may be as short as two characters, and a plain ``replace``
+    of a short one would mangle ordinary words in published evidence — while
+    a length floor would leave short names unredacted, which is worse than a
+    uniform failure because the surrounding output still looks scrubbed.
+    Azure Search names are lowercase letters, digits and dashes, so a match
+    bounded by that character class replaces the name and nothing else.
     """
     if not endpoint:
         return text
     host = urlparse(endpoint).hostname or endpoint
     scrubbed = text.replace(host, placeholder)
     bare_name = host.split(".")[0]
-    if bare_name and bare_name != host and len(bare_name) >= _MIN_BARE_NAME_LENGTH:
-        scrubbed = scrubbed.replace(bare_name, placeholder)
+    if bare_name and bare_name != host:
+        pattern = rf"(?<![0-9a-z-]){re.escape(bare_name)}(?![0-9a-z-])"
+        scrubbed = re.sub(pattern, placeholder, scrubbed)
     return scrubbed
 
 
