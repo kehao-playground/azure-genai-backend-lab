@@ -152,6 +152,10 @@ async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:
     with pytest.raises(ValueError, match="no chunks"):
         await replacer.replace("doc", [])
 
+    # Documents the "before sending" claim rather than testing it: with the
+    # guard removed, an empty document sequence still sends nothing, because
+    # `serialize_batches` yields no batches for an empty sequence. The
+    # `pytest.raises` above is what this test actually pins.
     assert sent == []
     assert "doc-0000" in index.keys
 
@@ -220,4 +224,36 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     assert all(isinstance(o, ReplacementOutcome) and o.completed for o in outcomes)
     # Neither job may treat the other document's chunks as stale.
     assert sorted(index.keys) == ["a-0000", "b-0000"]
+    assert replacer.max_concurrent_replacements == 2
+
+
+async def test_two_parents_pin_per_parent_and_overall_concurrency_together() -> None:
+    # Two jobs race the same document, "doc"; a third races "other". Neither
+    # counter alone tells the two-job cases above apart from a regression:
+    # with only same-parent jobs, `max_concurrent_replacements` cannot be
+    # told from a global lock's behaviour without a second, differently
+    # scoped parent in flight; with only different-parent jobs,
+    # `max_concurrent_per_parent` stays 1 whether the lock is missing,
+    # global, or genuinely per-parent, because it is keyed by parent_id and
+    # never sees two same-parent jobs overlap. Three jobs mixing parents is
+    # the smallest case where both properties are exercised at once: the
+    # "doc" jobs must never overlap each other, while the "other" job must
+    # overlap one of them.
+    index = _Index()
+    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+
+    async def yield_control() -> None:
+        # Force a suspension point inside the critical section so two
+        # unlocked jobs would certainly interleave here.
+        await asyncio.sleep(0)
+
+    index.on_search = yield_control
+
+    outcomes = await asyncio.gather(
+        replacer.replace("doc", _documents(["doc-0000", "doc-0001"])),
+        replacer.replace("doc", _documents(["doc-0000", "doc-0001", "doc-0002"])),
+        replacer.replace("other", _documents(["other-0000"], parent="other")),
+    )
+    assert all(isinstance(o, ReplacementOutcome) and o.completed for o in outcomes)
+    assert replacer.max_concurrent_per_parent == 1
     assert replacer.max_concurrent_replacements == 2
