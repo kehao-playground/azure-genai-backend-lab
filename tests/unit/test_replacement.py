@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from azgenai_lab.services.azure_search import SearchRequestRejectedError, SearchUnavailableError
 from azgenai_lab.services.indexing_results import Disposition, IndexingResult, classify
 from azgenai_lab.services.search_indexing import DocumentReplacer, ReplacementOutcome
 
@@ -138,6 +139,48 @@ async def test_first_replacement_for_a_parent_completes_without_deleting() -> No
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
     assert outcome.completed is True
     assert outcome.deleted_keys == ()
+
+
+async def test_enumeration_crash_after_upload_reports_unknown_stale_state() -> None:
+    # The upload already landed and is live. A crash while walking the index
+    # for stale chunks must not read like nothing happened — escaping as a
+    # raised exception would do exactly that. The outcome type is the only
+    # way to say "new chunks are in, old ones might still be there too, and
+    # we cannot say".
+    index = _Index({"doc-0000": "doc"})
+
+    async def crashing_search(_body: dict[str, Any]) -> list[str]:
+        raise SearchUnavailableError("search timed out")
+
+    replacer = DocumentReplacer(index.post_index, crashing_search, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0001"]))
+
+    assert outcome.completed is False
+    assert outcome.stale_state_unknown is True
+    assert outcome.unresolved_stale_ids == ()
+    assert all(r.status for r in outcome.uploaded)
+    # The new chunk is live even though cleanup crashed right after.
+    assert "doc-0001" in index.keys
+
+
+async def test_deletion_rejection_after_upload_reports_unknown_stale_state() -> None:
+    # A permanent (non-retryable) failure on the delete call — not just a
+    # retryable `SearchUnavailableError` — must be caught here too: it leaves
+    # the same "upload landed, cleanup outcome unknown" ambiguity.
+    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+
+    async def rejecting_post(body: bytes) -> list[IndexingResult]:
+        payload = json.loads(body)
+        if payload["value"][0]["@search.action"] == "delete":
+            raise SearchRequestRejectedError("malformed delete batch")
+        return await index.post_index(body)
+
+    replacer = DocumentReplacer(rejecting_post, index.post_search, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is False
+    assert outcome.stale_state_unknown is True
+    assert "doc-0000" in index.keys  # the upload landed
 
 
 async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:

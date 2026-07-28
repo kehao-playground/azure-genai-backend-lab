@@ -166,7 +166,12 @@ async def run_indexing_with_retry(
     by_key = dict(zip(keys_in_order, documents, strict=True))
     terminal: dict[str, IndexingResult] = {}
     outstanding = list(by_key)
-    last_error: str | None = None
+    # Keyed per key, not one shared slot: a synthesized result below must
+    # carry the error from *that key's own batch*, not whichever batch's
+    # request-level failure the loop happened to process last — a key from a
+    # batch that failed with one error must never be reported with a
+    # different batch's message.
+    last_error_by_key: dict[str, str] = {}
 
     for attempt in range(1, MAX_INDEXING_ATTEMPTS + 1):
         if not outstanding:
@@ -184,16 +189,18 @@ async def run_indexing_with_retry(
                 # No per-document verdict exists for *this batch*, so exactly
                 # this batch's keys stay outstanding. Requeuing the whole
                 # attempt would re-send keys an earlier batch already settled.
-                last_error = str(exc.upstream_detail or exc.message)
+                batch_error = str(exc.upstream_detail or exc.message)
                 logger.warning(
                     "indexing request failed attempt=%d/%d action=%s keys=%s detail=%s",
                     attempt,
                     MAX_INDEXING_ATTEMPTS,
                     action,
                     ",".join(batch.keys),
-                    last_error,
+                    batch_error,
                 )
                 still_outstanding.extend(batch.keys)
+                for key in batch.keys:
+                    last_error_by_key[key] = batch_error
                 continue
 
             returned_keys = [result.key for result in results]
@@ -238,7 +245,7 @@ async def run_indexing_with_retry(
                 key=key,
                 status=False,
                 status_code=503,
-                error_message=last_error or "indexing retries exhausted",
+                error_message=last_error_by_key.get(key, "indexing retries exhausted"),
             )
     return terminal
 
@@ -305,6 +312,11 @@ async def list_indexed_chunk_ids(post_search: PostSearch, parent_id: str) -> lis
             seen.add(chunk_id)
             ordered.append(chunk_id)
 
+        # `max()` is Python's ordinal string comparison; the filter above is
+        # server-side OData `gt`. If the two collations ever disagreed, a row
+        # could be skipped without tripping either fail-closed guard in this
+        # loop. Low risk today: chunk_id suffixes are a fixed-width numeric
+        # string, so ordinal and typical collations agree on their order.
         next_cursor = max(page)
         if cursor is not None and next_cursor <= cursor:
             raise EnumerationError(
@@ -319,13 +331,28 @@ class ReplacementOutcome:
 
     ``completed`` is the honest field. Uploading successfully and then failing
     to remove stale chunks leaves the index readable but wrong; reporting that
-    as success would hide it.
+    as success would hide it. A ``completed=True`` result rests on enumerating
+    the index immediately after upload, and Azure AI Search indexing is
+    eventually consistent — a stale chunk from a very recent prior failed run
+    might not yet be queryable at that instant. This fails to the safe side
+    (nothing is deleted that enumeration did not see), not the unsafe one, but
+    ``completed`` is an observation made at one instant, not a guarantee that
+    every stale chunk was caught.
+
+    ``stale_state_unknown`` marks a different, worse case than either of the
+    above: enumeration or deletion crashed outright *after* the upload had
+    already landed, rather than running to completion and reporting a result.
+    The new chunks are live either way, but here nothing observed whether any
+    stale chunk was removed — unlike ``unresolved_stale_ids``, whose entries
+    are stale chunks a normal, uncrashed deletion attempt is known to have
+    left behind.
     """
 
     uploaded: tuple[IndexingResult, ...]
     deleted_keys: tuple[str, ...]
     unresolved_stale_ids: tuple[str, ...]
     completed: bool
+    stale_state_unknown: bool = False
 
 
 class DocumentReplacer:
@@ -451,18 +478,39 @@ class DocumentReplacer:
             )
             return ReplacementOutcome(upload_results, (), (), False)
 
-        indexed = await list_indexed_chunk_ids(self._post_search, parent_id)
-        expected = set(expected_keys)
-        stale = [key for key in indexed if key not in expected]
-        if not stale:
-            return ReplacementOutcome(upload_results, (), (), True)
+        # From here on the upload has already landed and is live. A failure
+        # in the two calls below is not the recoverable "gate blocked, nothing
+        # sent" case above, nor the "every key answered, some deletions
+        # failed" case below — it means enumeration or deletion crashed
+        # outright, so nothing observed whether any stale chunk survived.
+        # Letting that escape as a raised exception would read like nothing
+        # happened, when in fact new chunks are in and old ones might still
+        # be there too. `UpstreamError` is caught broadly rather than just
+        # `EnumerationError`/`SearchUnavailableError`, because a rejected or
+        # misconfigured delete request (`SearchRequestRejectedError`,
+        # `SearchConfigurationError`) leaves exactly the same ambiguity.
+        try:
+            indexed = await list_indexed_chunk_ids(self._post_search, parent_id)
+            expected = set(expected_keys)
+            stale = [key for key in indexed if key not in expected]
+            if not stale:
+                return ReplacementOutcome(upload_results, (), (), True)
 
-        deletions = await run_indexing_with_retry(
-            self._post_index,
-            [{"chunk_id": key} for key in stale],
-            "delete",
-            sleep=self._sleep,
-        )
+            deletions = await run_indexing_with_retry(
+                self._post_index,
+                [{"chunk_id": key} for key in stale],
+                "delete",
+                sleep=self._sleep,
+            )
+        except UpstreamError as exc:
+            logger.error(
+                "stale cleanup crashed parent_id=%s after a successful upload — new "
+                "chunks are live, stale state is unknown: %s",
+                parent_id,
+                exc.upstream_detail or exc.message,
+            )
+            return ReplacementOutcome(upload_results, (), (), False, True)
+
         deleted = tuple(
             key for key in stale if classify(deletions[key]) is Disposition.SUCCEEDED
         )

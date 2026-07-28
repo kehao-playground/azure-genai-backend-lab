@@ -22,7 +22,7 @@ import httpx
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION, to_index_definition
-from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status
+from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status, search_url
 from azgenai_lab.services.indexing_results import IndexingResult
 
 logger = logging.getLogger(__name__)
@@ -35,13 +35,6 @@ def index_url(endpoint: str) -> str:
 def documents_url(endpoint: str) -> str:
     return (
         f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}/docs/index"
-        f"?api-version={SEARCH_API_VERSION}"
-    )
-
-
-def search_documents_url(endpoint: str) -> str:
-    return (
-        f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}/docs/search"
         f"?api-version={SEARCH_API_VERSION}"
     )
 
@@ -82,13 +75,14 @@ class SearchDataPlane:
     def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         if not settings.azure_search_endpoint or not settings.azure_search_admin_key:
             raise ConfigurationError(
-                "azure_search_endpoint and azure_search_admin_key are required "
-                "when use_fake_search is false"
+                "azure_search_endpoint and azure_search_admin_key are required"
             )
         endpoint = settings.azure_search_endpoint
         self._index_url = index_url(endpoint)
         self._documents_url = documents_url(endpoint)
-        self._search_url = search_documents_url(endpoint)
+        # Same URL shape the query-side client builds — `search_url()` is the
+        # one owner of it, imported rather than duplicated here.
+        self._search_url = search_url(endpoint)
         self._headers = {
             "api-key": settings.azure_search_admin_key.get_secret_value(),
             "content-type": "application/json",
@@ -184,7 +178,14 @@ class SearchDataPlane:
         try:
             return response.json()
         except ValueError as exc:
-            raise SearchUnavailableError(f"response body was not JSON: {exc}") from exc
+            # Kept even on this failure path, the same as the query-side
+            # client: it is the one field that correlates a live failure with
+            # the service, and dropping it here just because the body did not
+            # parse would lose it for no reason tied to the failure itself.
+            raise SearchUnavailableError(
+                f"response body was not JSON: {exc}",
+                request_id=response.headers.get("request-id"),
+            ) from exc
 
 
 __all__ = [
@@ -192,5 +193,4 @@ __all__ = [
     "documents_url",
     "index_url",
     "parse_indexing_results",
-    "search_documents_url",
 ]
