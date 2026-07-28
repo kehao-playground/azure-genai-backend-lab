@@ -261,6 +261,93 @@ def test_overlap_leaving_no_room_to_advance_is_an_error() -> None:
         chunk_markdown(_document(body), max_chars=80, overlap_chars=50)
 
 
+def test_hash_comment_inside_backtick_fence_is_not_a_heading() -> None:
+    body = (
+        "## Real section\n"
+        "\n"
+        "Before code.\n"
+        "\n"
+        "```bash\n"
+        "# this is a shell comment\n"
+        "echo ok\n"
+        "```\n"
+        "\n"
+        "After code.\n"
+    )
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert chunks[0].heading_path == "Returns Policy > Real section"
+    assert "```bash" in chunks[0].content
+    assert "# this is a shell comment" in chunks[0].content
+    assert "echo ok" in chunks[0].content
+    assert "After code." in chunks[0].content
+
+
+def test_atx_heading_inside_tilde_fence_is_not_a_heading() -> None:
+    body = (
+        "## Real section\n"
+        "\n"
+        "Before code.\n"
+        "\n"
+        "~~~\n"
+        "## Not a heading\n"
+        "~~~\n"
+        "\n"
+        "After code.\n"
+    )
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert "## Not a heading" in chunks[0].content
+
+
+def test_fence_with_info_string_attributes() -> None:
+    body = (
+        "## Real section\n"
+        "\n"
+        'Before code.\n\n```python title="setup.py"\n# comment\n```\n\nAfter code.\n'
+    )
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+
+
+def test_indented_fence_up_to_three_spaces_opens_a_fence() -> None:
+    body = "## Real section\n\nBefore code.\n\n   ```\n# comment\n   ```\n\nAfter code.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+
+
+def test_longer_fence_closes_only_on_equal_or_longer_run() -> None:
+    body = "## Real section\n\n````\n```\n# comment\n````\n\nAfter code.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert "```" in chunks[0].content
+
+
+def test_unclosed_fence_swallows_the_rest_of_the_document() -> None:
+    body = "## Real section\n\n```\n## Later heading\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert "Later heading" not in chunks[0].heading_path
+
+
+def test_headings_outside_fences_still_split_sections() -> None:
+    body = "## A\n\nAlpha.\n\n```\n# noise\n```\n\n## B\n\nBravo.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        "Returns Policy > A",
+        "Returns Policy > B",
+    ]
+    a_chunk = next(c for c in chunks if c.heading_path.endswith("A"))
+    assert "# noise" in a_chunk.content
+
+
 def _corpus_chunks() -> list[Chunk]:
     return [
         chunk
