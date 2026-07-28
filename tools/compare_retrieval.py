@@ -46,6 +46,13 @@ from azgenai_lab.models.search_index import SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.embeddings import build_embedding_client
 
+# Below this length a bare label is too likely to collide with an ordinary
+# word in error text (an "ai" or "api"-style label would mangle unrelated
+# text in published evidence). The full-host substitution below has no such
+# risk — a dotted hostname is specific enough not to collide — so only the
+# bare-label substitution is guarded.
+_MIN_BARE_NAME_LENGTH = 6
+
 
 def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
     """Redact a configured endpoint's host and bare service name from ``text``.
@@ -61,7 +68,7 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
     host = urlparse(endpoint).hostname or endpoint
     scrubbed = text.replace(host, placeholder)
     bare_name = host.split(".")[0]
-    if bare_name and bare_name != host:
+    if bare_name and bare_name != host and len(bare_name) >= _MIN_BARE_NAME_LENGTH:
         scrubbed = scrubbed.replace(bare_name, placeholder)
     return scrubbed
 
@@ -117,6 +124,27 @@ QUERIES = (
     ),
     Query(6, "What is the parental leave policy?", "absent from corpus", ()),
 )
+
+# Detects the placeholder shape used above — the chunk id starts with an
+# opening angle bracket and ends with a closing one — rather than matching
+# the specific strings, so a real chunk id that happens to reuse one of
+# these words still passes. Written via startswith/endswith, not a regex
+# literal, so this check itself doesn't read as one more placeholder.
+_ANGLE_OPEN = chr(60)
+_ANGLE_CLOSE = chr(62)
+
+
+def _placeholder_query_numbers(queries: Sequence[Query]) -> list[int]:
+    """Query numbers still carrying an unfrozen placeholder chunk id."""
+    return [
+        query.number
+        for query in queries
+        if any(
+            chunk_id.startswith(_ANGLE_OPEN) and chunk_id.endswith(_ANGLE_CLOSE)
+            for chunk_id in query.expected_chunks
+        )
+    ]
+
 
 VECTOR_K_SWEEP = (1, 3, DEFAULT_VECTOR_K)
 
@@ -207,7 +235,9 @@ async def _run(
     the request before it is ever sent — is evidence, not an error. The one
     exception is ``ConfigurationError`` (a bad key, a missing index): our own
     deployment is broken, every remaining call in this run would fail
-    identically, and that is let through so the caller can abort instead of
+    identically, so this still records the one row that call produced —
+    aborting the run must not discard the diagnostic it is aborting because
+    of — flushes it, and then re-raises so the caller can abort instead of
     spending a paid run collecting N copies of the same error — the same rule
     the query-embedding failure path in ``main()`` applies.
     """
@@ -219,9 +249,7 @@ async def _run(
             top=top,
             vector_k=vector_k,
         )
-    except ConfigurationError:
-        raise
-    except (UpstreamError, ValueError) as exc:
+    except (ConfigurationError, UpstreamError, ValueError) as exc:
         # ValueError is `validate_search_arguments()` rejecting the call
         # before any request is sent (empty query text, wrong vector width).
         # It carries none of UpstreamError's diagnostic fields, so its detail
@@ -240,10 +268,19 @@ async def _run(
         detail = _scrub(raw_detail, search_endpoint, "[search-service]")[:160].replace(
             "|", "\\|"
         )
-        return [
+        row = (
             f"| {label} | **{status}** | {request_id} | {latency} | — | — | "
             f"FAILED: {detail} | — | — |"
-        ]
+        )
+        if isinstance(exc, ConfigurationError):
+            # Our own deployment is broken; every remaining call in this run
+            # would fail identically. Write and flush this one row before
+            # aborting — the caller's `evidence.add(*rows)` is never reached
+            # once this propagates, so this is the only chance to keep it.
+            evidence.add(row)
+            evidence.flush()
+            raise
+        return [row]
 
     diagnostics = client.last_diagnostics
     assert diagnostics is not None  # set on every completed round trip
@@ -287,6 +324,16 @@ async def main() -> None:
             "produce evidence that looks real and means nothing. Set "
             "USE_FAKE_EMBEDDINGS=false and provide real Azure OpenAI "
             "embedding credentials before running this tool."
+        )
+    placeholder_numbers = _placeholder_query_numbers(QUERIES)
+    if placeholder_numbers:
+        numbers = ", ".join(f"Q{number}" for number in placeholder_numbers)
+        raise SystemExit(
+            f"QUERIES still has placeholder chunk ids for {numbers} — freeze "
+            "real chunk ids from a chunker run against the live corpus "
+            "before running this comparison. A run against placeholders "
+            "completes normally and reports every pre-registered chunk as "
+            "absent, producing evidence that looks complete and is worthless."
         )
     configure_logging(settings.log_level)
     client = AzureSearchClient(settings)
@@ -426,6 +473,13 @@ async def main() -> None:
             evidence.flush()
         evidence.add("")
         evidence.flush()
+
+    # Added only once the loop above runs to completion — a death partway
+    # through the last query's tables still increments the per-query counter
+    # to the total, so this line, not that counter, is what a finished
+    # artifact needs to say so positively.
+    evidence.add(f"**Run complete — all {len(QUERIES)} queries finished.**")
+    evidence.flush()
 
     print(f"wrote {arguments.out} and {evidence.sidecar}")
 
