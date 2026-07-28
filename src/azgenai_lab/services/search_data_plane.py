@@ -144,8 +144,8 @@ class SearchDataPlane:
         for entry in payload["value"]:
             chunk_id = entry.get("chunk_id") if isinstance(entry, dict) else None
             if not isinstance(chunk_id, str):
-                keys = sorted(entry) if isinstance(entry, dict) else entry
-                raise SearchUnavailableError(f"enumeration result has no chunk_id: keys={keys!r}")
+                shape = sorted(entry) if isinstance(entry, dict) else type(entry).__name__
+                raise SearchUnavailableError(f"enumeration result has no chunk_id: {shape!r}")
             keys.append(chunk_id)
         return keys
 
@@ -157,7 +157,15 @@ class SearchDataPlane:
         extra_headers: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
-        headers = {**self._headers, **extra_headers} if extra_headers else self._headers
+        # Lowercased on both sides: HTTP headers are case-insensitive but a
+        # plain dict merge is not, so an `extra_headers` key differing only in
+        # case from a shared one would duplicate on the wire instead of
+        # replacing it.
+        headers = (
+            {**self._headers, **{key.lower(): value for key, value in extra_headers.items()}}
+            if extra_headers
+            else self._headers
+        )
         try:
             return await self._client.request(method, url, headers=headers, **kwargs)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
@@ -174,3 +182,12 @@ class SearchDataPlane:
             return response.json()
         except ValueError as exc:
             raise SearchUnavailableError(f"response body was not JSON: {exc}") from exc
+
+
+__all__ = [
+    "SearchDataPlane",
+    "documents_url",
+    "index_url",
+    "parse_indexing_results",
+    "search_documents_url",
+]

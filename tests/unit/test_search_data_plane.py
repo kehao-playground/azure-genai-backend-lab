@@ -7,6 +7,8 @@ from pydantic import SecretStr
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError
 from azgenai_lab.services.azure_search import (
+    SearchConfigurationError,
+    SearchError,
     SearchRequestRejectedError,
     SearchUnavailableError,
 )
@@ -69,6 +71,41 @@ async def test_prefer_header_is_sent_only_on_the_index_put() -> None:
 
     assert seen["put_prefer"] == "return=representation"
     assert seen["post_prefer"] is None
+
+
+async def test_extra_headers_replace_rather_than_duplicate_case_insensitively() -> None:
+    # `_send`'s header merge must be case-insensitive: a future caller passing
+    # `extra_headers={"Content-Type": ...}` should replace the shared
+    # `content-type` entry, not add a second copy of it on the wire — HTTP
+    # headers are case-insensitive but a plain dict merge is not.
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type_entries"] = [
+            (name, value) for name, value in request.headers.raw if name.lower() == b"content-type"
+        ]
+        seen["get"] = request.headers.get("content-type")
+        return httpx.Response(200, json={})
+
+    plane = _plane(handler)
+    await plane._send(
+        "POST",
+        "https://example.search.windows.net/x",
+        extra_headers={"Content-Type": "text/plain"},
+    )
+
+    # Exactly one entry: a duplicate would show up as two raw header lines
+    # and `.get()` would return the comma-joined value of both.
+    assert seen["content_type_entries"] == [(b"content-type", b"text/plain")]
+    assert seen["get"] == "text/plain"
+
+
+async def test_create_or_update_index_maps_a_non_2xx_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": {"message": "bad key"}})
+
+    with pytest.raises(SearchConfigurationError):
+        await _plane(handler).create_or_update_index()
 
 
 async def test_delete_index_tolerates_a_missing_index() -> None:
@@ -178,6 +215,28 @@ async def test_indexing_400_is_rejected_not_retried() -> None:
         await _plane(handler).post_index(b"{}")
 
 
+async def test_indexing_404_is_a_configuration_error_not_a_search_error() -> None:
+    # A missing index is a configuration failure, not a transient one:
+    # `SearchConfigurationError` deliberately does not subclass `SearchError`,
+    # so a retry coordinator written as `except SearchError:` will not retry
+    # a call that can never succeed until the index is created.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "no such index"}})
+
+    with pytest.raises(SearchConfigurationError) as caught:
+        await _plane(handler).post_index(b"{}")
+
+    assert not isinstance(caught.value, SearchError)
+
+
+async def test_post_index_rejects_a_non_json_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json")
+
+    with pytest.raises(SearchUnavailableError):
+        await _plane(handler).post_index(b"{}")
+
+
 async def test_indexing_connection_failure_is_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("no route")
@@ -198,7 +257,17 @@ async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
         azure_search_admin_key=SecretStr("k"),
         use_fake_search=False,
     )
-    plane = SearchDataPlane(settings, client=httpx.AsyncClient())
+
+    # `httpx.URL(...)` raises `InvalidURL` at construction, before the
+    # transport is ever consulted — this handler proves that: if it were
+    # reached, the test would fail loudly here rather than pass vacuously
+    # over a real DNS lookup and connection attempt.
+    def unreachable_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport must not be reached: InvalidURL should raise first")
+
+    plane = SearchDataPlane(
+        settings, client=httpx.AsyncClient(transport=httpx.MockTransport(unreachable_handler))
+    )
 
     with pytest.raises(SearchUnavailableError) as caught:
         await plane.post_index(b"{}")
@@ -233,6 +302,21 @@ async def test_post_search_rejects_a_result_without_a_chunk_id() -> None:
 
     with pytest.raises(SearchUnavailableError):
         await _plane(handler).post_search({"search": "*"})
+
+
+async def test_post_search_rejects_a_non_dict_result_without_leaking_it() -> None:
+    # A bare entry in `value` (not an object at all) must not land whole in
+    # `upstream_detail` — that string is log-destined, and the entry's own
+    # text has no place there.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": ["not-a-document"]})
+
+    with pytest.raises(SearchUnavailableError) as caught:
+        await _plane(handler).post_search({"search": "*"})
+
+    detail = caught.value.upstream_detail
+    assert detail is not None
+    assert "not-a-document" not in detail
 
 
 async def test_data_plane_requires_configuration() -> None:
