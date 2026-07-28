@@ -224,7 +224,29 @@ class AzureOpenAIEmbeddingClient:
             response.usage.prompt_tokens,
             response.usage.total_tokens,
         )
-        return [item.embedding for item in response.data]
+
+        data = response.data
+        if len(data) != len(texts):
+            raise UpstreamServiceError(
+                f"embeddings response returned {len(data)} items for {len(texts)} inputs"
+            )
+
+        # `index` is authoritative and positional order is not: the API
+        # returns each item's originating input index precisely so a client
+        # does not have to trust array order. Binding by position instead is
+        # a silent-corruption path — an out-of-order response would pass the
+        # count and dimension checks and still bind every vector to the
+        # wrong chunk. So the indices are validated to be exactly
+        # `range(len(texts))` (no gaps, no repeats) and used to reorder.
+        indices = sorted(item.index for item in data)
+        if indices != list(range(len(texts))):
+            raise UpstreamServiceError(
+                f"embeddings response indices {indices} do not match the "
+                f"expected range(0, {len(texts)})"
+            )
+
+        ordered = sorted(data, key=lambda item: item.index)
+        return [item.embedding for item in ordered]
 
 
 def build_embedding_client(settings: Settings) -> EmbeddingClient:
