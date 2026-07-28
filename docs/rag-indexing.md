@@ -224,16 +224,31 @@ document's subject at all. Folding the heading path into the vector's input solv
 into the displayed `content` would duplicate a heading the reader already sees rendered above the
 citation.
 
-`content` being "the source text" is not the same guarantee for every chunk, though. A section that
-fits inside `chunk_max_chars` on its own (the fast path through `_split_section`,
-`services/chunking.py`) passes through untouched, so its `content` is byte-identical to what the
-author wrote, whitespace included. A section that had to be split loses that: `_split_section`
-strips each paragraph's leading and trailing whitespace and collapses paragraph separators down to a
-single blank line, so the contract for a split chunk is only that every **non-whitespace** character
-of the source survives somewhere in the result — not that the chunk is byte-identical to the source.
-That makes the split path unsuitable for whitespace-significant material such as indented code or
-tables: a section large enough to need splitting cannot keep that formatting intact, and only a
-section within budget (the fast path) is safe for it.
+`content` being "the source text" needs stating carefully, because the almost-true version of this
+claim is the one that misleads. There are three tiers, and **none of them promises a byte-identical
+copy of the source**:
+
+1. **Every section, both paths.** `_sections` (`services/chunking.py`) strips each section as a
+   whole before splitting is even considered, so whitespace at the very start or end of a section
+   is already gone. A section whose first line is indented loses that indentation no matter how
+   small the section is.
+2. **A section that fits `chunk_max_chars`** takes the fast path through `_split_section` and is
+   otherwise untouched, so its *interior* whitespace is exactly what the author wrote.
+3. **A section that had to be split** is normalized further: `_split_section` strips each
+   paragraph's leading and trailing whitespace, collapses paragraph separators to a single blank
+   line, and strips each hard-split fragment at both ends. The contract for a split chunk is only
+   that every **non-whitespace** character of the source survives somewhere in the result.
+
+That makes the splitter unsuitable for whitespace-significant material such as indented code or
+tables, and a section large enough to need splitting is worse still, since tier 3 also rewrites the
+gaps between its paragraphs.
+
+This document previously described only tiers 2 and 3, calling the fast path "byte-identical to what
+the author wrote". Tier 1 was found by running the case rather than reading the code: the section
+source `"\t\tindented first line\n\nplain second paragraph."` comes back as
+`"indented first line\n\nplain second paragraph."` on the fast path. A test now pins tier 1
+specifically, because the coverage test that was supposed to catch this squeezed all whitespace out
+of both sides before comparing and therefore could never have.
 
 `heading_path`'s first segment is always the document title (`"Returns Policy"` on its own, or
 `"Returns Policy > Refund window > Standard purchases"` for a nested section) — enforced in

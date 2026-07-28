@@ -4,6 +4,8 @@ States follow the canonical indexing pipeline in [../rag-overview.md](../rag-ove
 
 Failure is not one terminal state: a failure before any chunk has been written to the index (`LoadingDocuments` through `Embedding`) leaves the index completely untouched, while a failure during or after `Uploading` can leave old and new chunks both present, because the stale-chunk delete step never runs unless every new chunk succeeded first. The `Uploading → DeletingStale` transition is gated on `may_delete_stale()`: only when every expected chunk key came back exactly once, with no unexpected keys and no failures, does deletion of the superseded chunks proceed.
 
+A document that chunks to zero output is one instance of a `Chunking` failure, not a new failure shape: `chunk_markdown` (`services/chunking.py`) raises rather than returning an empty list, so that case routes to `FailedBeforeMutation` like any other pre-`Embedding` failure, instead of reaching `Uploading` with nothing to upload and no expected keys for `may_delete_stale()` to ever open the gate on. See [../rag-indexing.md](../rag-indexing.md#chunking-failure-modes) for why an empty chunk list is unsafe to let through silently.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Pending
