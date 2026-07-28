@@ -6,7 +6,7 @@ Day 11 milestone (docs tier). This document records the RAG design decisions for
 
 RAG (Retrieval-Augmented Generation) lets the model answer over data it was never trained on: before calling the LLM, search a corpus, put the top matches into the prompt, and instruct the model to answer from that context ([Azure Architecture Center RAG guide](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/rag/rag-solution-design-and-evaluation-guide), checked 2026-07).
 
-In backend terms it is a query-then-respond read path — the same shape as "look up the order in the database, then render the response", with the render step replaced by an LLM. The analogy breaks in one place: a database returns what it returns, while an LLM given reference context may still ignore it, distort it, or add to it. RAG downgrades hallucination from *unfalsifiable* to *checkable against retrieved sources*; closing the remaining gap is Day 15's grounding / no-answer work.
+In backend terms it is a query-then-respond read path — the same shape as "look up the order in the database, then render the response", with the render step replaced by an LLM. The analogy breaks in one place: a database returns what it returns, while an LLM given reference context may still ignore it, distort it, or add to it. RAG downgrades hallucination from *unfalsifiable* to *checkable against retrieved sources*; closing the remaining gap is Day 14's grounding / no-answer work.
 
 ## Two pipelines, two lifecycles
 
@@ -53,7 +53,7 @@ The canonical taxonomy is the Seven Failure Points ([Barnett et al., CAIN 2024](
 
 Design consequences adopted here:
 
-- FP1's correct behavior is an honest "no answer" — a contract decision, not a model behavior. It becomes the Day 15 no-answer policy. A feature file (`rag_no_answer_policy.feature`) reserves the topic, but its only scenario currently verifies the 501 placeholder; the executable no-answer contract scenario lands with Day 15.
+- FP1's correct behavior is an honest "no answer" — a contract decision, not a model behavior. It becomes the Day 14 no-answer policy. A feature file (`rag_no_answer_policy.feature`) reserves the topic, but its only scenario currently verifies the 501 placeholder; the executable no-answer contract scenario lands with Day 14.
 - FP1–FP3 happen before the LLM sees the prompt: retrieval is the upstream bottleneck — if the correct context is absent from the prompt, the LLM has little chance of a satisfactory corpus-grounded answer ([Microsoft RAG evaluators](https://learn.microsoft.com/en-us/azure/foundry/concepts/evaluation-evaluators/rag-evaluators), checked 2026-07). Days 8–9 provide the observability *foundation* (correlation ids, prompt provenance, usage); RAG per-stage logging (retrieval mode/count, selected chunk ids and scores, stage latency, context-budget contribution, metadata redaction) does not exist yet and is part of the Day 13/14 DoD — the paper's conclusion is that RAG validation is only feasible in operation.
 
 ## Azure mapping and the classic-vs-agentic choice
