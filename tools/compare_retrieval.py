@@ -88,7 +88,7 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
 
 @dataclass(frozen=True)
 class Query:
-    """Frozen before the run — see Task 17 Step 2.
+    """Frozen before the run, from a local chunker run against the live corpus.
 
     ``expected_chunks`` holds **chunk ids**, not document ids. Matching on the
     document would score "right document, wrong section" as a hit, which is
@@ -106,9 +106,9 @@ class Query:
     expected_chunks: tuple[str, ...]
 
 
-# Filled in from the local chunker run in Task 17 Step 2, BEFORE any query is
-# issued. Leaving a placeholder here and choosing after seeing rankings would
-# make the whole comparison unfalsifiable.
+# Filled in from a local chunker run against the live corpus, before any
+# query is issued. Leaving a placeholder here and choosing after seeing
+# rankings would make the whole comparison unfalsifiable.
 QUERIES = (
     Query(1, "99.9% monthly uptime", "exact literal", ("<service-sla premium tier>",)),
     Query(
