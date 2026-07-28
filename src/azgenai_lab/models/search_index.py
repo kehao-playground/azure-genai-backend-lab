@@ -53,6 +53,14 @@ def validate_document_key(value: str, *, field: str) -> str:
 
 INDEX_NAME = "azgenai-lab-chunks"
 
+# Stable data-plane API version (checked 2026-07). Create-or-Update Index on
+# this version already carries both `semantic` and `vectorSearch`, so nothing
+# here needs a preview version.
+SEARCH_API_VERSION = "2026-04-01"
+
+VECTOR_FIELD = "content_vector"
+SEMANTIC_CONFIGURATION_NAME = "chunk-semantic"
+
 _HNSW_ALGORITHM = "chunk-hnsw"
 _VECTOR_PROFILE = "chunk-vector-profile"
 
@@ -93,11 +101,18 @@ def to_index_definition() -> dict[str, Any]:
     Nothing here is filterable by accident: vector fields cannot be filtered,
     so every query-time restriction — including Day 15's tenant isolation —
     has to ride on a scalar field that exists from the first build.
+
+    A semantic configuration is the cheapest schema change there is: it can be
+    added or updated at any time, with no rebuild and no document reloaded.
     """
     return {
         "name": INDEX_NAME,
         "fields": [
-            _text_field("chunk_id", key=True, filterable=True),
+            # sortable is here for cursor paging, not presentation: stale
+            # enumeration pages with `orderby chunk_id asc` and a `gt` range
+            # filter, and sortable cannot be turned on later without dropping
+            # and rebuilding the index.
+            _text_field("chunk_id", key=True, filterable=True, sortable=True),
             _text_field("parent_id", filterable=True),
             _text_field("title", searchable=True, filterable=True),
             _text_field("heading_path", searchable=True),
@@ -151,5 +166,20 @@ def to_index_definition() -> dict[str, Any]:
                 }
             ],
             "profiles": [{"name": _VECTOR_PROFILE, "algorithm": _HNSW_ALGORITHM}],
+        },
+        "semantic": {
+            "defaultConfiguration": SEMANTIC_CONFIGURATION_NAME,
+            "configurations": [
+                {
+                    "name": SEMANTIC_CONFIGURATION_NAME,
+                    # Priority order matters: summarization trims from the
+                    # tail, so a field listed late can be dropped entirely.
+                    "prioritizedFields": {
+                        "titleField": {"fieldName": "title"},
+                        "prioritizedContentFields": [{"fieldName": "content"}],
+                        "prioritizedKeywordsFields": [{"fieldName": "heading_path"}],
+                    },
+                }
+            ],
         },
     }

@@ -7,7 +7,7 @@
       "retrievable": true,
       "searchable": false,
       "filterable": true,
-      "sortable": false,
+      "sortable": true,
       "facetable": false,
       "key": true
     },
@@ -105,6 +105,29 @@
       {
         "name": "chunk-vector-profile",
         "algorithm": "chunk-hnsw"
+      }
+    ]
+  },
+  "semantic": {
+    "defaultConfiguration": "chunk-semantic",
+    "configurations": [
+      {
+        "name": "chunk-semantic",
+        "prioritizedFields": {
+          "titleField": {
+            "fieldName": "title"
+          },
+          "prioritizedContentFields": [
+            {
+              "fieldName": "content"
+            }
+          ],
+          "prioritizedKeywordsFields": [
+            {
+              "fieldName": "heading_path"
+            }
+          ]
+        }
       }
     ]
   }

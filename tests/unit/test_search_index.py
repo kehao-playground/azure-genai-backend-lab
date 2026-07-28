@@ -14,6 +14,9 @@ from azgenai_lab.models.search_index import (
     DOCUMENT_KEY_MAX_LENGTH,
     EMBEDDING_DIMENSIONS,
     INDEX_NAME,
+    SEARCH_API_VERSION,
+    SEMANTIC_CONFIGURATION_NAME,
+    VECTOR_FIELD,
     DocumentKeyError,
     to_index_definition,
     validate_document_key,
@@ -124,3 +127,39 @@ def test_vector_algorithm_uses_cosine_for_azure_openai_embeddings() -> None:
     algorithms = to_index_definition()["vectorSearch"]["algorithms"]
     assert algorithms[0]["kind"] == "hnsw"
     assert algorithms[0]["hnswParameters"]["metric"] == "cosine"
+
+
+def test_chunk_id_is_sortable_because_stale_enumeration_pages_by_it() -> None:
+    # Cursor paging needs a unique field that is both filterable and sortable,
+    # and sortable cannot be enabled on an existing field — turning it on
+    # later costs a full rebuild.
+    chunk_id = _field("chunk_id")
+    assert chunk_id["key"] is True
+    assert chunk_id["filterable"] is True
+    assert chunk_id["sortable"] is True
+
+
+def test_semantic_configuration_is_declared_and_default() -> None:
+    semantic = to_index_definition()["semantic"]
+    assert semantic["defaultConfiguration"] == SEMANTIC_CONFIGURATION_NAME
+    configuration = semantic["configurations"][0]
+    assert configuration["name"] == SEMANTIC_CONFIGURATION_NAME
+    prioritized = configuration["prioritizedFields"]
+    assert prioritized["titleField"] == {"fieldName": "title"}
+    assert prioritized["prioritizedContentFields"] == [{"fieldName": "content"}]
+    assert prioritized["prioritizedKeywordsFields"] == [{"fieldName": "heading_path"}]
+
+
+def test_semantic_fields_are_searchable_and_retrievable() -> None:
+    # The service requires every field named in a semantic configuration to be
+    # both searchable and retrievable; naming an ineligible field is rejected
+    # at index-creation time.
+    for name in ("title", "content", "heading_path"):
+        field = _field(name)
+        assert field["searchable"] is True, name
+        assert field["retrievable"] is True, name
+
+
+def test_constants_are_pinned() -> None:
+    assert SEARCH_API_VERSION == "2026-04-01"
+    assert VECTOR_FIELD == "content_vector"
