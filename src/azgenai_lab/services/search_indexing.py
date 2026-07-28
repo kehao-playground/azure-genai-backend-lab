@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from azgenai_lab.core.errors import UpstreamError
-from azgenai_lab.services.azure_search import SearchUnavailableError
+from azgenai_lab.services.azure_search import SearchRequestRejectedError, SearchUnavailableError
 from azgenai_lab.services.indexing_results import (
     Disposition,
     IndexingResult,
@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 # the whole request.
 MAX_BATCH_DOCUMENTS = 1_000
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+# Bounded so a permanently sick service cannot spin forever. A module constant
+# rather than a setting: nothing outside the indexing job reads it and no
+# environment has a reason to differ.
+MAX_INDEXING_ATTEMPTS = 3
+_BACKOFF_SECONDS = 1.0
 
 _OPEN = b'{"value":['
 _CLOSE = b"]}"
@@ -106,12 +112,6 @@ def serialize_batches(
         yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys))
 
 
-# Bounded so a permanently sick service cannot spin forever. A module constant
-# rather than a setting: nothing outside the indexing job reads it and no
-# environment has a reason to differ.
-MAX_INDEXING_ATTEMPTS = 3
-_BACKOFF_SECONDS = 1.0
-
 PostBatch = Callable[[bytes], Coroutine[Any, Any, list[IndexingResult]]]
 Sleeper = Callable[[float], Coroutine[Any, Any, None]]
 
@@ -125,11 +125,11 @@ async def run_indexing_with_retry(
 ) -> dict[str, IndexingResult]:
     """Drive one indexing action to a single terminal result per key.
 
-    The rule that makes retrying meaningful, and that Day 12's prose had
-    backwards: *within one final collection* a duplicate key is fail-closed,
-    but *across attempts* a key may legitimately move from a retryable failure
-    to success. An upsert that succeeds has proved the key durable; refusing to
-    record that would make the stale-delete gate unopenable after any retry.
+    The rule that makes retrying meaningful: *within one final collection* a
+    duplicate key is fail-closed, but *across attempts* a key may legitimately
+    move from a retryable failure to success. An upsert that succeeds has
+    proved the key durable; refusing to record that would make the
+    stale-delete gate unopenable after any retry.
 
     Only ``SearchUnavailableError`` is retried. A rejected request and an
     oversized document are permanent and propagate: repeating either just
@@ -138,7 +138,22 @@ async def run_indexing_with_retry(
     failure, and a request-level failure with no per-document answer
     synthesizes one, so the gate stays shut either way.
     """
-    by_key = {str(document["chunk_id"]): document for document in documents}
+    keys_in_order = [str(document["chunk_id"]) for document in documents]
+    seen: set[str] = set()
+    duplicate_keys: set[str] = set()
+    for key in keys_in_order:
+        if key in seen:
+            duplicate_keys.add(key)
+        seen.add(key)
+    if duplicate_keys:
+        # Collapsing these into a dict would keep only the last document under
+        # each key, so the earlier one is silently never sent and its outcome
+        # never reported — the exact erasure `may_delete_stale()` refuses to
+        # perform, one layer upstream of where it can catch it.
+        raise SearchRequestRejectedError(
+            f"duplicate chunk_id in indexing input: {sorted(duplicate_keys)}"
+        )
+    by_key = dict(zip(keys_in_order, documents, strict=True))
     terminal: dict[str, IndexingResult] = {}
     outstanding = list(by_key)
     last_error: str | None = None
@@ -206,7 +221,9 @@ async def run_indexing_with_retry(
 
     for key in outstanding:
         existing = terminal.get(key)
-        if existing is None or classify(existing) is not Disposition.RETRYABLE:
+        # A key still outstanding here can only be retryable or absent —
+        # SUCCEEDED and PERMANENT keys are never left in `outstanding`.
+        if existing is None:
             terminal[key] = IndexingResult(
                 key=key,
                 status=False,

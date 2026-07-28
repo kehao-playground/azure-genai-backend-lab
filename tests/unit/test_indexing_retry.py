@@ -1,8 +1,5 @@
-"""Every key ends with exactly one terminal result.
-
-Day 12 documented the gate as never crediting a retry's later success — which
-would mean a retry could never open it, which would mean retrying was
-pointless. These tests pin the corrected contract.
+"""Every key ends with exactly one terminal result, across however many
+attempts it took.
 """
 
 import json
@@ -15,6 +12,7 @@ from azgenai_lab.services.azure_search import (
 )
 from azgenai_lab.services.indexing_results import Disposition, IndexingResult, classify
 from azgenai_lab.services.search_indexing import (
+    _BACKOFF_SECONDS,
     MAX_BATCH_DOCUMENTS,
     MAX_INDEXING_ATTEMPTS,
     MAX_REQUEST_BYTES,
@@ -46,9 +44,9 @@ def _keys(body: bytes) -> list[str]:
 
 
 async def test_a_transient_failure_that_later_succeeds_ends_as_succeeded() -> None:
-    # The regression test for the contradiction: a retryable failure followed
-    # by a success must settle as one terminal SUCCEEDED result, or the
-    # stale-delete gate can never open after any retry.
+    # A retryable failure followed by a success must settle as one terminal
+    # SUCCEEDED result, or the stale-delete gate can never open after any
+    # retry.
     attempts: list[int] = []
 
     async def post(_body: bytes) -> list[IndexingResult]:
@@ -90,12 +88,17 @@ async def test_exhausted_retries_keep_the_last_retryable_failure() -> None:
     # for the keys it was actually sent, or it trips the "response mentioned
     # keys that were not sent" guard.
     verdicts = {"a": _ok("a"), "b": _retryable("b")}
+    attempts: list[list[str]] = []
 
     async def post(body: bytes) -> list[IndexingResult]:
-        return [verdicts[key] for key in _keys(body)]
+        keys = _keys(body)
+        attempts.append(keys)
+        return [verdicts[key] for key in keys]
 
     results = await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=_no_sleep)
     assert classify(results["b"]) is Disposition.RETRYABLE
+    assert results["b"].error_message == "busy"
+    assert len(attempts) == MAX_INDEXING_ATTEMPTS
 
 
 async def test_request_level_failure_resends_that_batch() -> None:
@@ -131,6 +134,7 @@ async def test_a_failed_batch_does_not_resend_an_earlier_succeeded_batch() -> No
     assert sent[1] == ["k1000"]
     # The retry carries only the failed batch's key.
     assert sent[2] == ["k1000"]
+    assert len(results) == MAX_BATCH_DOCUMENTS + 1
     assert all(classify(r) is Disposition.SUCCEEDED for r in results.values())
 
 
@@ -147,13 +151,20 @@ async def test_request_level_exhaustion_yields_retryable_results_not_silence() -
 
 async def test_attempts_are_bounded() -> None:
     attempts: list[int] = []
+    delays: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        delays.append(seconds)
 
     async def post(_body: bytes) -> list[IndexingResult]:
         attempts.append(1)
         raise SearchUnavailableError("down")
 
-    await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=_no_sleep)
+    await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=sleep)
     assert len(attempts) == MAX_INDEXING_ATTEMPTS
+    # One retry backs off by `_BACKOFF_SECONDS`, the next by double that — a
+    # delay per retry, none before the first attempt.
+    assert delays == [_BACKOFF_SECONDS, _BACKOFF_SECONDS * 2]
 
 
 async def test_an_oversized_document_is_not_retried() -> None:
@@ -199,3 +210,29 @@ async def test_a_rejected_request_is_not_retried() -> None:
     with pytest.raises(SearchRequestRejectedError):
         await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=_no_sleep)
     assert len(attempts) == 1
+
+
+async def test_a_key_missing_from_every_response_stays_outstanding() -> None:
+    # A key that was sent but never mentioned in the response has no verdict.
+    # If it were dropped instead of kept outstanding, it would vanish from the
+    # result entirely rather than end with a terminal result.
+    async def post(body: bytes) -> list[IndexingResult]:
+        return [_ok(key) for key in _keys(body) if key != "b"]
+
+    results = await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=_no_sleep)
+    assert set(results) == {"a", "b"}
+    assert classify(results["b"]) is Disposition.RETRYABLE
+
+
+async def test_duplicate_keys_in_the_input_are_rejected_before_sending() -> None:
+    # Collapsing two documents that share a chunk_id into one upload would
+    # silently drop the earlier one and report nothing about it. That must
+    # fail closed at the boundary, before anything is sent.
+    documents = [{"chunk_id": "a"}, {"chunk_id": "a"}]
+
+    async def post(_body: bytes) -> list[IndexingResult]:
+        raise AssertionError("nothing should be sent")
+
+    with pytest.raises(SearchRequestRejectedError) as exc_info:
+        await run_indexing_with_retry(post, documents, "upload", sleep=_no_sleep)
+    assert "a" in str(exc_info.value.upstream_detail)
