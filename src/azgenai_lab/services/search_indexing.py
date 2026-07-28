@@ -431,14 +431,18 @@ class DocumentReplacer:
         # `upload_results` is built by indexing `uploaded` with
         # `expected_keys` just above, so the only condition `may_delete_stale`
         # can actually fail on *at this call site* is "not every key
-        # succeeded". Its other two guards — no duplicate/unexpected key and
-        # every key answered exactly once — are enforced upstream instead:
-        # duplicates are rejected before anything is sent
-        # (`DuplicateChunkIdError` in `run_indexing_with_retry`), and that
-        # same function raises `SearchUnavailableError` on a repeated or
-        # unexpected key in a response, and synthesizes a terminal result for
-        # every key it returns. Don't simplify those checks there on the
-        # assumption this gate still covers them.
+        # succeeded" — that narrowing itself depends on the `if not
+        # documents` guard above, which already ruled out the empty-
+        # `expected_keys` case this gate would otherwise also have to cover.
+        # Its other two guards — no duplicate/unexpected key and every key
+        # answered exactly once — are enforced upstream instead: duplicates
+        # are rejected before anything is sent (`DuplicateChunkIdError` in
+        # `run_indexing_with_retry`), and that same function raises
+        # `SearchUnavailableError` on a repeated or unexpected key in a
+        # response, and returns a terminal result for every key it was
+        # given — so a key missing from the response is a failure, not an
+        # absence. Don't simplify those checks there on the assumption this
+        # gate still covers them.
         if not may_delete_stale(upload_results, expected_keys=expected_keys):
             logger.warning(
                 "stale deletion blocked parent_id=%s — old and new chunks both remain, "
