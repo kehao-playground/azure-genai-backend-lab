@@ -112,3 +112,13 @@ def test_a_duplicate_key_blocks_the_delete_even_if_every_result_succeeded() -> N
     results = [_result("a", 201), _result("a", 200)]
 
     assert may_delete_stale(results, expected_keys={"a"}) is False
+
+
+def test_duplicate_expected_keys_close_the_gate() -> None:
+    # The "exactly once" promise binds on the expected side too. A caller that
+    # passes a list with a collision (e.g. an upstream chunk-id collision) must
+    # not have that collision silently erased by converting expected_keys to a
+    # set before comparison.
+    results = [IndexingResult("a", True, 201)]
+
+    assert may_delete_stale(results, expected_keys=["a", "a"]) is False

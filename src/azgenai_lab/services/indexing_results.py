@@ -63,7 +63,8 @@ def may_delete_stale(
 ) -> bool:
     """Whether the stale-chunk deletion may proceed.
 
-    True only when every expected key came back exactly once, nothing
+    True only when every expected key occurs exactly once on both sides —
+    the expected keys themselves and the results returned for them — nothing
     unexpected came back, and every one of them succeeded. Any permanent
     failure or exhausted retry stops here: the document is left with old and
     new chunks both present, which is recoverable, rather than with nothing at
@@ -71,13 +72,19 @@ def may_delete_stale(
 
     Every branch here fails closed. Deduplicating by key would let a retry's
     success overwrite an earlier failure for the same document and silently
-    open the gate, so a repeated key is rejected outright rather than resolved.
+    open the gate, so a repeated key is rejected outright rather than resolved
+    — on either side, since collapsing ``expected_keys`` to a set would erase
+    an upstream chunk-id collision just as silently as collapsing the results
+    would.
     """
     if not expected_keys:
+        return False
+    expected = list(expected_keys)
+    if len(expected) != len(set(expected)):
         return False
     keys = [result.key for result in results]
     if len(keys) != len(set(keys)):
         return False
-    if set(keys) != set(expected_keys):
+    if set(keys) != set(expected):
         return False
     return all(classify(result) is Disposition.SUCCEEDED for result in results)
