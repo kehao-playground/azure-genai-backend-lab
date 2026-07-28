@@ -410,6 +410,36 @@ def test_longer_fence_closes_only_on_equal_or_longer_run() -> None:
     assert "```" in chunks[0].content
 
 
+def test_a_backtick_in_the_info_string_leaves_later_hashes_as_headings() -> None:
+    # A known, spec-correct limit, pinned so it stays known. CommonMark says a
+    # backtick fence's info string may not contain a backtick, so this line
+    # opens nothing and the `#` below it is a genuine ATX heading. The fence
+    # machine is right; the consequence still looks exactly like the bug fence
+    # tracking was added to fix, which is why it is documented rather than
+    # silently "fixed" by deviating from the spec.
+    body = "## Real section\n\n```js `x`\n# heading?\n```\n\nafter.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        "Returns Policy > Real section",
+        "Returns Policy > heading?",
+    ]
+
+
+def test_a_hash_inside_an_html_block_becomes_a_heading() -> None:
+    # HTML blocks are not recognised, so this fabricates a breadcrumb. Pinned
+    # because it is the limit most likely to bite a real document, and it had
+    # no coverage even after it was written into the docs.
+    body = "## A\n\n<div>\n# noise\n</div>\n\n## B\n\nBravo.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        "Returns Policy > A",
+        "Returns Policy > noise",
+        "Returns Policy > noise > B",
+    ]
+
+
 def test_a_different_fence_character_does_not_close_an_open_fence() -> None:
     # The other half of the closing rule: a run of the *wrong* character is
     # content, however long. Without this, a backtick fence would be closed by
