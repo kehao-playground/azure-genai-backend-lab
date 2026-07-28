@@ -48,6 +48,29 @@ async def test_create_or_update_index_puts_the_schema() -> None:
     assert b'"chunk-semantic"' in body and b'"content_vector"' in body
 
 
+async def test_prefer_header_is_sent_only_on_the_index_put() -> None:
+    # The REST contract marks `Prefer: return=representation` required on the
+    # index PUT and nothing else. If it migrated into the shared header dict
+    # for convenience, every other call would silently start sending it too.
+    seen: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            seen["put_prefer"] = request.headers.get("prefer")
+            return httpx.Response(201, json={})
+        seen["post_prefer"] = request.headers.get("prefer")
+        return httpx.Response(
+            200, json={"value": [{"key": "a", "status": True, "statusCode": 200}]}
+        )
+
+    plane = _plane(handler)
+    await plane.create_or_update_index()
+    await plane.post_index(b"{}")
+
+    assert seen["put_prefer"] == "return=representation"
+    assert seen["post_prefer"] is None
+
+
 async def test_delete_index_tolerates_a_missing_index() -> None:
     # Teardown must be idempotent: deleting what is already gone is success.
     def handler(request: httpx.Request) -> httpx.Response:
