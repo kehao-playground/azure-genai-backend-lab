@@ -25,6 +25,7 @@ from azgenai_lab.services.indexing_results import (
     IndexingResult,
     classify,
     is_storage_alert,
+    may_delete_stale,
 )
 
 logger = logging.getLogger(__name__)
@@ -310,3 +311,127 @@ async def list_indexed_chunk_ids(post_search: PostSearch, parent_id: str) -> lis
                 f"cursor did not advance past {cursor!r} while paging {parent_id!r}"
             )
         cursor = next_cursor
+
+
+@dataclass(frozen=True)
+class ReplacementOutcome:
+    """What actually happened to one document's chunks.
+
+    ``completed`` is the honest field. Uploading successfully and then failing
+    to remove stale chunks leaves the index readable but wrong; reporting that
+    as success would hide it.
+    """
+
+    uploaded: tuple[IndexingResult, ...]
+    deleted_keys: tuple[str, ...]
+    unresolved_stale_ids: tuple[str, ...]
+    completed: bool
+
+
+class DocumentReplacer:
+    """Replace one document's chunks: upload, gate, enumerate, delete.
+
+    Every step for a given ``parent_id`` runs inside one critical section. Two
+    concurrent replacements of the same document can otherwise each pass their
+    own gate and then delete each other's chunks — with every request
+    returning 200 and every page correct, so no error handling is triggered.
+    That is the failure mode this lock exists for, and it is invisible to
+    monitoring precisely because nothing fails.
+
+    The lock's scope is **this process**. A deployment running more than one
+    worker needs a durable lease, a generation field on the document, or a
+    compare-and-set on that generation; an in-process lock does not span
+    processes and must not be mistaken for one that does.
+    """
+
+    def __init__(
+        self,
+        post_index: PostBatch,
+        post_search: PostSearch,
+        *,
+        sleep: Sleeper = asyncio.sleep,
+    ) -> None:
+        self._post_index = post_index
+        self._post_search = post_search
+        self._sleep = sleep
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._active: dict[str, int] = {}
+        # Peak observed concurrency for any single parent_id. Exposed so the
+        # mutual exclusion can be asserted directly instead of inferred from
+        # surviving keys, which cannot distinguish a legal serialization from
+        # a corrupted one.
+        self.max_concurrent_per_parent = 0
+
+    def _lock_for(self, parent_id: str) -> asyncio.Lock:
+        lock = self._locks.get(parent_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[parent_id] = lock
+        return lock
+
+    async def replace(
+        self, parent_id: str, documents: Sequence[dict[str, Any]]
+    ) -> ReplacementOutcome:
+        async with self._lock_for(parent_id):
+            active = self._active.get(parent_id, 0) + 1
+            self._active[parent_id] = active
+            self.max_concurrent_per_parent = max(self.max_concurrent_per_parent, active)
+            try:
+                return await self._replace(parent_id, documents)
+            finally:
+                self._active[parent_id] -= 1
+
+    async def _replace(
+        self, parent_id: str, documents: Sequence[dict[str, Any]]
+    ) -> ReplacementOutcome:
+        # Checked before anything is sent. Uploading documents belonging to one
+        # parent while enumerating another turns a caller wiring mistake into
+        # deletion: the upload succeeds, the gate passes on the uploaded keys,
+        # and then every chunk of the *named* parent is judged stale and
+        # removed. A mismatch is never a recoverable situation, so nothing goes
+        # out until it is ruled out.
+        for document in documents:
+            owner = document.get("parent_id")
+            if owner != parent_id:
+                raise ValueError(
+                    f"document {document.get('chunk_id')!r} has parent_id {owner!r}, "
+                    f"but replace() was called for {parent_id!r}"
+                )
+        expected_keys = [str(document["chunk_id"]) for document in documents]
+        uploaded = await run_indexing_with_retry(
+            self._post_index, documents, "upload", sleep=self._sleep
+        )
+        upload_results = tuple(uploaded[key] for key in expected_keys)
+
+        if not may_delete_stale(upload_results, expected_keys=expected_keys):
+            logger.warning(
+                "stale deletion blocked parent_id=%s — old and new chunks both remain, "
+                "which is recoverable; a re-run is required",
+                parent_id,
+            )
+            return ReplacementOutcome(upload_results, (), (), False)
+
+        indexed = await list_indexed_chunk_ids(self._post_search, parent_id)
+        expected = set(expected_keys)
+        stale = [key for key in indexed if key not in expected]
+        if not stale:
+            return ReplacementOutcome(upload_results, (), (), True)
+
+        deletions = await run_indexing_with_retry(
+            self._post_index,
+            [{"chunk_id": key} for key in stale],
+            "delete",
+            sleep=self._sleep,
+        )
+        deleted = tuple(
+            key for key in stale if classify(deletions[key]) is Disposition.SUCCEEDED
+        )
+        unresolved = tuple(key for key in stale if key not in set(deleted))
+        if unresolved:
+            logger.error(
+                "stale chunks survived parent_id=%s unresolved=%s — the replacement is "
+                "not complete",
+                parent_id,
+                ",".join(unresolved),
+            )
+        return ReplacementOutcome(upload_results, deleted, unresolved, not unresolved)
