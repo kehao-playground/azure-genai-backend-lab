@@ -217,9 +217,12 @@ discrepancy is recorded here rather than silently resolved, the same way
 
 The chunk-documents page also states that "each token is around four characters of text for
 common OpenAI models" — a ratio for English. It does not hold for Chinese, where one character is
-commonly close to one token. `chunk_max_chars=2000` is comfortably under the 8,192-token ceiling
-for prose in either writing system at the character densities this splitter produces, but the
-project treats the character budget, not this ratio, as the enforced contract; the ratio is not
+commonly close to one token. `chunk_max_chars=2000` measured comfortably under the
+8,192-token ceiling on the two synthetic samples this project actually ran — one English, one
+Chinese — which is a corpus measurement, not a property of "either writing system" (an earlier
+version of this sentence claimed the latter, and the article's corrected wording and this file's own
+batching section both contradict it). The project treats the character budget, not this ratio, as
+the enforced contract; the ratio is not
 asserted anywhere in code.
 
 ## Embedding input versus citation text
@@ -452,7 +455,7 @@ change your mind?
 
 | # | Decision | Cost of changing it |
 |---|---|---|
-| 1 | Chunk boundaries (chunking strategy or `chunk_max_chars`/`chunk_overlap_chars`) | Citations point at different text than what was originally linked; already-published source links may no longer match what a reader sees. |
+| 1 | Chunk boundaries (chunking strategy or `chunk_max_chars`/`chunk_overlap_chars`) | Every document must be re-chunked and **re-embedded**, because the chunk is the unit that was vectorized — see row 4's paragraph below. On top of that cost: citations point at different text than what was originally linked; already-published source links may no longer match what a reader sees. |
 | 2 | Metadata field set | Adding a field needs no rebuild — existing documents get a `null` until the next reindex backfills it (a rebuild-free change per the reindex how-to page). Changing a field's *attributes* (`searchable`/`filterable`/`sortable`/`facetable`, analyzer assignment, data type) needs a drop and full rebuild. |
 | 3 | Embedding model or dimensions | A different model or a different dimension count is a different embedding space — old and new vectors are not comparable, so every chunk must be re-embedded. |
 | 4 | Index schema field definitions (name, type, `searchable`/`filterable`/`sortable`/`facetable`, analyzer assignment) | Drop and rebuild the index, then reload every document into it. This is the cost of `content`'s hard-coded `en.microsoft` analyzer too: it is an English-specific choice made with no language warning anywhere in this document, even though this project's own chunker treats CJK sentence handling as a headline feature (see [Index schema](#index-schema)). |

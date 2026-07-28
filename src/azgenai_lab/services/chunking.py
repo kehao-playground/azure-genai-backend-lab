@@ -11,7 +11,7 @@ blank-line paragraph boundaries, and fenced code blocks (``` ``` ``` or
 ``_sections``, at least; an oversized section is still cut mid-fence by
 ``_split_section``, which knows nothing about Markdown.
 
-Three limits, stated by consequence rather than by name, because "not
+Four limits, stated by consequence rather than by name, because "not
 supported" hides which ones actually hurt:
 
 - **Setext headings** (underlined with ``=`` or ``-``) are not recognised, so
@@ -26,6 +26,16 @@ supported" hides which ones actually hurt:
   ``<div>...</div>`` is read as a real heading, so
   ``"## A\\n\\n<div>\\n# noise\\n</div>\\n\\n## B\\n\\nBravo.\\n"`` yields a
   fabricated breadcrumb ``"... > noise"`` and a nested ``"... > noise > B"``.
+- **A backtick fence whose info string contains a backtick** does not open a
+  fence — CommonMark says it cannot — so the lines after it are ordinary
+  content, and a ``#`` among them becomes a real heading. This is the
+  uncomfortable one: the fence machine is behaving *correctly*, and that
+  correctness reproduces the exact corruption fence tracking was added to
+  prevent. ``"## A\\n\\n```js `x`\\n# heading?\\n```\\n\\nafter.\\n"`` splits into
+  ``"... > A"`` holding the opening line and a fabricated ``"... > heading?"``
+  holding the rest. Behaviour is not changed here, because deviating from
+  CommonMark to paper over an authoring mistake trades a visible surprise for
+  an invisible one. It is pinned by a test so it stays a known limit.
 
 Note what is *not* on that list: a 4-space-indented code block containing a
 ``#`` line is harmless here. Because ``_HEADING`` requires column 0, the
