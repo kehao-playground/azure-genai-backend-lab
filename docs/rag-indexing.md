@@ -304,13 +304,13 @@ mirrors how Day 8 validates prompt template front matter — fail at load time, 
 `SourceDocument.effective_date` and `Chunk.effective_date` (`models/rag.py`) are both typed
 `datetime.date`, copied through verbatim. The index field, though, is `Edm.DateTimeOffset` (see
 [Index schema](#index-schema)), which takes an ISO-8601 timestamp rather than a bare calendar
-date — `2026-01-15T00:00:00Z`, not `date.isoformat()`'s `2026-01-15`. Day 13 settled it. The
+date — `2026-01-15T00:00:00Z`, not `date.isoformat()`'s `2026-01-15`. The
 source data is date-only, so this project *defines* the field as a UTC calendar date and encodes
 it at UTC midnight — `2026-01-15T00:00:00Z`. The offset is a domain decision, not something
 `Edm.DateTimeOffset` derives for us: the type requires an offset and we choose which one.
 `Chunk.to_index_document()` performs the encoding, and every range filter over this field must
-use UTC date boundaries or it will silently shift by a day. See
-[rag-retrieval.md](rag-retrieval.md).
+use UTC date boundaries or it will silently shift by a day. See [the query side of the same
+contract](rag-retrieval.md).
 
 ## Embedding model and batching
 
@@ -385,10 +385,10 @@ one search document:
 (`models/search_index.py`) is a hard-coded constant, using the same constant-over-setting
 reasoning as `EMBEDDING_DIMENSIONS` (see [Embedding model and
 batching](#embedding-model-and-batching)) — a setting is precisely a mechanism for letting two
-things that must agree disagree at runtime. Day 13 settled it: the setting is gone. `INDEX_NAME`
-is the only source of truth, and `.env.example` no longer publishes a conflicting
-`AZURE_SEARCH_INDEX_NAME=documents` — which had already drifted from the constant, making this a
-demonstrated failure rather than a hypothetical one. Per-environment naming, when it is
+things that must agree disagree at runtime. `INDEX_NAME` is the only source of truth, and
+`.env.example` publishes the endpoint and the admin key only — the index name is not an
+environment concern, because a deployment that could name a different index is a deployment that
+could read from one index while writing to another. Per-environment naming, when it is
 eventually needed, arrives as an index alias with the same alias name in every environment and
 the endpoint providing the isolation, not as a settings knob.
 

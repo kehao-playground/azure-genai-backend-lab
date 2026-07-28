@@ -13,8 +13,8 @@ batching that replacement rides on.
 | Fusion | how two candidate lists become one | Reciprocal Rank Fusion (hybrid only) | single-mode queries have no fusion stage |
 | Ranking | the order within the list | semantic ranker (L2) | recall — it only sees what is already on the list |
 
-The service's own documentation is explicit that semantic ranking "can't rerun the query over the
-entire corpus": it reranks the top 50 of an existing result set ([semantic ranking
+The service's own documentation is explicit that semantic ranking cannot "rerun the query over
+the entire corpus": it reranks the top 50 of an existing result set ([semantic ranking
 overview](https://learn.microsoft.com/en-us/azure/search/semantic-search-overview), `ms.date`
 2026-04-24, checked 2026-07). So "should I turn on the semantic ranker?" is answerable only after
 establishing whether the answer is in the candidate set. If it is not, the setting to change is
@@ -107,8 +107,8 @@ message.
 Replacement follows the upload → gate → enumerate → delete ordering and the fail-closed gate
 documented in [Upload-then-delete-stale, gated](rag-indexing.md#upload-then-delete-stale-gated),
 including the cross-attempt rule that lets a retryable failure settle as a success once the
-retried upsert has proved the key durable. Two contracts specific to a *live* search service sit
-on top of that ordering and are new to this document.
+retried upsert has proved the key durable. Three contracts specific to a *live* search service
+sit on top of that ordering and are new to this document.
 
 **A per-`parent_id` critical section.** Two concurrent replacements of one document can each pass
 their own gate and then delete each other's chunks. Every request returns 200, every page of
@@ -134,7 +134,7 @@ batching](rag-indexing.md#embedding-model-and-batching), which bounds a differen
 different endpoint. Two ceilings apply at once: at most 1,000 documents per indexing request, and
 a 16 MB payload limit for the request as a whole ([service
 limits](https://learn.microsoft.com/en-us/azure/search/search-limits-quotas-capacity), `ms.date`
-2026-06-02, checked 2026-07). Documents carrying 1536-dimension vectors reach the byte limit well
+2026-06-02, checked 2026-07). Documents carrying 1536-dimension vectors reach the byte limit
 before the document count limit, so batching by count alone produces a 400 from code that looks
 correct.
 
