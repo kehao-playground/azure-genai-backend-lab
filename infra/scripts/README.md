@@ -6,6 +6,8 @@
 | `create-resource-group.sh` | Create the demo resource group | working |
 | `create-openai.sh` | Azure OpenAI account + mini-model deployment (token-billed, may persist) | working |
 | `delete-openai.sh` | Delete and purge the Azure OpenAI account | working |
+| `create-search.sh` | Create an ephemeral Azure AI Search service (free tier by default, `--sku basic` when needed) | working |
+| `delete-search.sh` | Delete that service only — `teardown.sh` deletes the whole resource group, including the Azure OpenAI resource this series keeps | working |
 | `teardown.sh` | Delete the demo resource group and everything in it | working |
 | `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
