@@ -1,7 +1,8 @@
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.search_index import INDEX_NAME
 
 
 def test_default_settings_use_fake_services() -> None:
@@ -60,3 +61,18 @@ def test_chunk_overlap_may_be_zero() -> None:
 def test_chunk_overlap_rejects_negative(value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, chunk_overlap_chars=value)
+
+
+def test_index_name_is_not_a_setting() -> None:
+    # A setting is precisely the mechanism for letting two things that must
+    # agree disagree at runtime — which is how .env.example came to publish
+    # "documents" against a constant of "azgenai-lab-chunks".
+    assert "azure_search_index_name" not in Settings.model_fields
+    assert INDEX_NAME == "azgenai-lab-chunks"
+
+
+def test_admin_key_is_a_secret() -> None:
+    settings = Settings(_env_file=None, azure_search_admin_key=SecretStr("super-secret"))
+    assert settings.azure_search_admin_key is not None
+    assert "super-secret" not in repr(settings)
+    assert settings.azure_search_admin_key.get_secret_value() == "super-secret"

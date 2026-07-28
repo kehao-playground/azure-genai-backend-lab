@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     azure_openai_embedding_deployment: str | None = None
 
     azure_search_endpoint: str | None = None
-    azure_search_index_name: str | None = None
+    # Admin key: creating an index, uploading and deleting documents all need
+    # management capability. Production should use Microsoft Entra ID / RBAC
+    # with roles split by read/write responsibility; the key keeps the lab's
+    # ephemeral sessions cheap to configure. Never logged, never returned.
+    azure_search_admin_key: SecretStr | None = None
 
     use_fake_llm: bool = Field(default=True)
     use_fake_search: bool = Field(default=True)
