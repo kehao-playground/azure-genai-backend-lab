@@ -216,6 +216,29 @@ def chunk_markdown(
 
 
 def _split_section(prose: str, *, budget: int, overlap: int) -> list[str]:
+    """Split ``prose`` into pieces of at most ``budget`` characters, if needed.
+
+    Whitespace guarantee, stated precisely because it is asymmetric:
+
+    - **Fast path** (``prose`` already fits ``budget``): returned untouched.
+      The chunk is byte-identical to what the author wrote, whitespace
+      included.
+    - **Split path** (``prose`` must be broken up): normalised, not
+      preserved. Every paragraph is stripped of leading and trailing
+      whitespace; paragraph separators are collapsed to exactly one
+      ``"\\n\\n"``, so a run of three or more newlines becomes one blank
+      line; and each hard-split fragment (see ``_split_unit``) is stripped
+      at both ends too. The resulting guarantee is only that every
+      **non-whitespace** character of the source appears in at least one
+      chunk — not that any chunk is byte-identical to the source.
+
+    A chunk's whitespace is therefore either the author's, verbatim, or a
+    side effect of splitting, never both for the same chunk. This makes the
+    split path unsuitable for whitespace-significant material — indented
+    code, tables — since a section large enough to need splitting cannot
+    keep that formatting intact. Only a section within budget (the fast
+    path) is safe for such content.
+    """
     if len(prose) <= budget:
         # Fast path: the section already fits, so it is returned untouched.
         # The paragraph-stripping and "\n\n" re-joining below only happen to
