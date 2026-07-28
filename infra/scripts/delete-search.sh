@@ -16,7 +16,8 @@ set -euo pipefail
 az search service delete \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
-  --name "$AZ_SEARCH_NAME"
+  --name "$AZ_SEARCH_NAME" \
+  --yes
 
 echo "Deleted search service $AZ_SEARCH_NAME."
-echo "A free-tier service cannot be upgraded in place; recreate with --sku basic if needed."
+echo "A free-tier service cannot be upgraded in place; recreate with AZ_SEARCH_SKU=basic if needed."
