@@ -170,7 +170,66 @@ def test_every_embedding_input_respects_the_maximum() -> None:
         assert len(chunk.embedding_input) <= 500
 
 
-def test_no_character_of_the_source_is_lost() -> None:
+TAB_INDENTED_BLOCK = "\t\tdef handler():\n\t\t    return 1"
+
+
+def test_the_fast_path_returns_a_section_verbatim() -> None:
+    # A section that fits its budget is never handed to `_split_section`'s
+    # paragraph-stripping code at all, so whitespace-significant content —
+    # here, tab-indented code — survives exactly as written.
+    body = (
+        "# Returns Policy\n\n## Exceptions\n\n"
+        "See the sample handler below.\n\n"
+        f"{TAB_INDENTED_BLOCK}\n\n"
+        "End of example.\n"
+    )
+    chunks = chunk_markdown(_document(body), max_chars=4000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert TAB_INDENTED_BLOCK in chunks[0].content
+
+
+def test_the_split_path_strips_paragraph_leading_whitespace() -> None:
+    # This documents a known, accepted loss — it is not an endorsement. Once
+    # a section must be split, every paragraph is `.strip()`-ed before being
+    # repacked (see `_split_section`'s docstring), so a paragraph's leading
+    # whitespace does not survive. This makes the split path unsuitable for
+    # whitespace-significant material such as indented code or tables; only
+    # the fast path (`test_the_fast_path_returns_a_section_verbatim`) is
+    # verbatim.
+    filler_before = "Filler prose before the example. " * 6
+    filler_after = "Filler prose after the example continues on. " * 6
+    body = (
+        "# Returns Policy\n\n## Exceptions\n\n"
+        f"{filler_before.strip()}\n\n{TAB_INDENTED_BLOCK}\n\n{filler_after.strip()}\n"
+    )
+    chunks = chunk_markdown(_document(body), max_chars=250, overlap_chars=60)
+
+    assert len(chunks) > 1
+    assert not any(TAB_INDENTED_BLOCK in chunk.content for chunk in chunks)
+    stripped_form = "def handler():\n\t\t    return 1"
+    assert any(stripped_form in chunk.content for chunk in chunks)
+
+
+def test_runs_of_blank_lines_collapse_on_the_split_path() -> None:
+    paragraphs = [
+        " ".join(
+            f"Sentence number {index} is here." for index in range(group * 20, group * 20 + 20)
+        )
+        for group in range(5)
+    ]
+    body = "# Returns Policy\n\n## Exceptions\n\n" + "\n\n\n\n".join(paragraphs) + "\n"
+    chunks = chunk_markdown(_document(body), max_chars=500, overlap_chars=100)
+
+    assert len(chunks) > 1
+    assert not any("\n\n\n" in chunk.content for chunk in chunks)
+
+
+def test_every_non_whitespace_character_of_the_source_survives_splitting() -> None:
+    # This does not claim byte-identical content: the split path normalises
+    # whitespace (see `_split_section`'s docstring), so this only checks the
+    # weaker, honest guarantee — every non-whitespace character still shows
+    # up, in order, somewhere across the chunks.
     body = f"# Returns Policy\n\n## Exceptions\n\n{LONG_SENTENCES}\n"
     chunks = chunk_markdown(_document(body), max_chars=500, overlap_chars=100)
 
