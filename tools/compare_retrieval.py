@@ -21,10 +21,23 @@ the one worth keeping.
 Request bodies are written verbatim to a JSON sidecar — the Markdown shows a
 readable summary with the 1536-float vector elided, which is not replayable on
 its own. The sidecar's SHA-256 is recorded so the pair cannot silently drift.
+Anything written from an upstream error has the search service's name and host
+redacted first, because those bodies name the resource and this evidence is
+published.
+
+Two conditions stop the run before it can spend anything: fake embeddings, and
+pre-registered chunk ids left as placeholders. Either one produces an evidence
+file that looks complete and measures nothing.
 
 Usage:
     uv run python tools/compare_retrieval.py \
-        --top 10 --out ../drafts/assets/day-13/comparison.md
+        --top 25 --out ../drafts/assets/day-13/comparison-free.md
+
+`top` must be at least the corpus chunk count. Below it, a chunk that was
+generated as a candidate but truncated out of the response is indistinguishable
+from one that was never a candidate — which is the distinction the candidate
+generation experiment exists to measure. The output filename names the tier,
+because nothing inside the file records which one produced it.
 """
 
 import argparse
