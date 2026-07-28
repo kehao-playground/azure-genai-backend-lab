@@ -5,6 +5,13 @@ request buffer, per-document 207 parsing, and the mapping from HTTP failures
 to this project's search error vocabulary. `services/search_indexing.py` is
 transport-free above it, which is what lets the orchestration contracts be
 tested without a network and the transport be tested without orchestration.
+
+A 404 from `post_index` (or from `create_or_update_index`/`delete_index`)
+maps, via `map_search_status`, to `SearchConfigurationError` — a missing
+index is a configuration failure, not a transient one. That class
+deliberately does not subclass `SearchError`, so a retry coordinator written
+as `except SearchError:` will not retry it; only `UpstreamError` catches
+both branches.
 """
 
 import logging
@@ -13,7 +20,7 @@ from typing import Any
 import httpx
 
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import ConfigurationError
+from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION, to_index_definition
 from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status
 from azgenai_lab.services.indexing_results import IndexingResult
@@ -127,17 +134,18 @@ class SearchDataPlane:
         for entry in payload["value"]:
             chunk_id = entry.get("chunk_id") if isinstance(entry, dict) else None
             if not isinstance(chunk_id, str):
-                raise SearchUnavailableError(f"enumeration result has no chunk_id: {entry!r}")
+                keys = sorted(entry) if isinstance(entry, dict) else entry
+                raise SearchUnavailableError(f"enumeration result has no chunk_id: keys={keys!r}")
             keys.append(chunk_id)
         return keys
 
     async def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         try:
             return await self._client.request(method, url, headers=self._headers, **kwargs)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise SearchUnavailableError(str(exc)) from exc
 
-    def _error(self, response: httpx.Response) -> Exception:
+    def _error(self, response: httpx.Response) -> UpstreamError:
         return map_search_status(
             response.status_code, response.text[:500], response.headers.get("request-id")
         )

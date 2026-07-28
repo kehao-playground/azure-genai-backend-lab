@@ -56,21 +56,44 @@ async def test_delete_index_tolerates_a_missing_index() -> None:
     await _plane(handler).delete_index()
 
 
+async def test_delete_index_actually_issues_a_delete() -> None:
+    # Ephemeral resources under a self-imposed monthly cap make a silent no-op
+    # the failure mode that shows up as a bill: this pins that a call happens
+    # at all, not just that a 404 from one is tolerated.
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    await _plane(handler).delete_index()
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == (
+        "https://example.search.windows.net/indexes/azgenai-lab-chunks"
+        "?api-version=2026-04-01"
+    )
+
+
 async def test_post_index_sends_the_exact_bytes_it_was_given() -> None:
     # The serialize-once regression, checked where it can actually fail: if a
     # caller handed the Python objects to `json=` instead of passing this
-    # buffer through, the guarded size would not be the transmitted size.
-    body = b'{"value":[{"chunk_id":"a","@search.action":"upload"}]}'
-    seen: dict[str, bytes] = {}
+    # buffer through, the guarded size would not be the transmitted size. The
+    # internal whitespace here does not survive a decode/re-encode round
+    # trip, so this payload — unlike a compact one — actually pins that.
+    body = b'{"value": [ {"chunk_id":"a","@search.action":"upload"} ]}'
+    seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["content"] = request.read()
+        seen["content-type"] = request.headers.get("content-type")
         return httpx.Response(
             200, json={"value": [{"key": "a", "status": True, "statusCode": 200}]}
         )
 
     await _plane(handler).post_index(body)
     assert seen["content"] == body
+    assert seen["content-type"] == "application/json"
 
 
 async def test_post_index_parses_a_207_document_by_document() -> None:
@@ -138,6 +161,30 @@ async def test_indexing_connection_failure_is_unavailable() -> None:
 
     with pytest.raises(SearchUnavailableError):
         await _plane(handler).post_index(b"{}")
+
+
+async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
+    # A soft hyphen pasted into the configured endpoint parses as a URL but
+    # fails IDNA encoding when the request is sent, raising `httpx.InvalidURL`
+    # — which does not derive from `httpx.HTTPError`. Without an explicit arm
+    # for it, it would be the one way a raw transport type crosses this
+    # boundary.
+    settings = Settings(
+        _env_file=None,
+        azure_search_endpoint="https://exa\xadmple.search.windows.net",
+        azure_search_admin_key=SecretStr("k"),
+        use_fake_search=False,
+    )
+    plane = SearchDataPlane(settings, client=httpx.AsyncClient())
+
+    with pytest.raises(SearchUnavailableError) as caught:
+        await plane.post_index(b"{}")
+
+    # Pin the cause, not just the class: a connection failure would also raise
+    # `SearchUnavailableError`. If a future httpx normalised the soft hyphen
+    # away instead of rejecting it, the host would resolve and this test would
+    # otherwise keep passing — vacuously, and over a real network.
+    assert isinstance(caught.value.__cause__, httpx.InvalidURL)
 
 
 async def test_post_search_returns_chunk_ids_in_response_order() -> None:
