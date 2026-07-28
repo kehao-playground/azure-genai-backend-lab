@@ -154,7 +154,23 @@ def test_semantic_fields_are_searchable_and_retrievable() -> None:
     # The service requires every field named in a semantic configuration to be
     # both searchable and retrievable; naming an ineligible field is rejected
     # at index-creation time.
-    for name in ("title", "content", "heading_path"):
+    # The names are read out of the configuration rather than repeated here, so
+    # that pointing the configuration at an ineligible field fails this test
+    # instead of waiting for the service to reject the index.
+    definition = to_index_definition()
+    prioritized = definition["semantic"]["configurations"][0]["prioritizedFields"]
+
+    field_names = set()
+    if "titleField" in prioritized:
+        field_names.add(prioritized["titleField"]["fieldName"])
+    for group in ("prioritizedContentFields", "prioritizedKeywordsFields"):
+        for field in prioritized.get(group, []):
+            field_names.add(field["fieldName"])
+
+    # Without this, a configuration that named no fields would pass vacuously.
+    assert field_names, "the semantic configuration names no fields"
+
+    for name in field_names:
         field = _field(name)
         assert field["searchable"] is True, name
         assert field["retrievable"] is True, name
