@@ -410,6 +410,19 @@ def test_longer_fence_closes_only_on_equal_or_longer_run() -> None:
     assert "```" in chunks[0].content
 
 
+def test_a_different_fence_character_does_not_close_an_open_fence() -> None:
+    # The other half of the closing rule: a run of the *wrong* character is
+    # content, however long. Without this, a backtick fence would be closed by
+    # a tilde line and the heading after it would split the section.
+    body = "## Real section\n\n~~~\n```\n# comment\n~~~\n\nAfter code.\n"
+    chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+    assert len(chunks) == 1
+    assert chunks[0].heading_path == "Returns Policy > Real section"
+    assert "```" in chunks[0].content
+    assert "# comment" in chunks[0].content
+
+
 def test_unclosed_fence_swallows_the_rest_of_the_document() -> None:
     body = "## Real section\n\n```\n## Later heading\n"
     chunks = chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
