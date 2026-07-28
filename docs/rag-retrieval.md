@@ -60,10 +60,11 @@ normalizes them.
 | `HYBRID` | RRF | `None` |
 | `HYBRID_SEMANTIC` | RRF | 0.0–4.0 |
 
-RRF scores are much smaller than similarity scores by construction — the
-service's own example shows the same document scoring 0.839 under pure vector
-search and 0.0328 under hybrid. A low RRF score is not a weak match; it is a
-different scale.
+RRF scores are much smaller than similarity scores by construction. The service's own
+documentation gives cosine vector scores a 0.333–1.00 range, while an RRF score's upper limit is
+"bounded by the number of queries being fused, with each query contributing a maximum of
+approximately `1/k`" — `k` being the RRF constant, 60 by default — an order of magnitude below a
+single-query similarity score. A low RRF score is not a weak match; it is a different scale.
 
 `reranker_score` is the only one with a published meaning: 4.0 answers the
 question completely, 3.0 is relevant but incomplete, 2.0 partially addresses
