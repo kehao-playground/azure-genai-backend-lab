@@ -23,6 +23,22 @@ unbreakable word. The CJK terminators are exercised only in test fixtures; the s
 English (see `data/sample-docs/`). The paragraph→sentence→hard-cut degradation order itself applies
 to both writing systems and is not test-only.
 
+The supported Markdown subset is worth stating precisely, because its edges change what counts as a
+section boundary: ATX headings (`#` through `######`) outside fenced code blocks, blank-line
+paragraph boundaries, and fenced code blocks (opened by three or more `` ` `` or `~` characters, per
+CommonMark) treated as opaque spans that never contribute headings. Setext headings (underlined with
+`=` or `-`), 4-space-indented code blocks, and HTML blocks are **not** recognized — a `#` line inside
+an indented code block is still read as a heading, because indentation alone carries no meaning to
+this splitter.
+
+Fence-awareness is a review fix, not a feature that was there from the start. An earlier version of
+`_sections` (`services/chunking.py`) matched any line starting with `#` regardless of context, so a
+heading marker inside a fenced code block — a shell comment, a Python comment, an example config file
+— was read as a real section boundary, splitting a code sample in two and corrupting the surrounding
+section's `heading_path` and prose. `_sections` now tracks whether it is currently inside a fence,
+line by line, and treats everything between a fence's opening line and its matching closing line as
+content, never as a heading, regardless of what that content starts with.
+
 Section boundaries make citations meaningful. A chunk that always starts and ends on a Markdown
 section boundary lets a citation point at "document, section" instead of "document, byte offset
 N" — the same distinction Azure AI Search draws between fixed-size and variable-sized chunking
@@ -90,7 +106,7 @@ one budget number governing every piece uniformly.
 
 ## Chunking failure modes
 
-`ChunkingError` can be raised in three places (`services/chunking.py`), two of them in
+`ChunkingError` can be raised in four places (`services/chunking.py`), three of them in
 `chunk_markdown` itself and one a level deeper, in `_split_section`:
 
 - **A heading path alone leaves no room for prose** (`chunk_markdown`, `budget <= 0`). `budget =
@@ -113,6 +129,17 @@ one budget number governing every piece uniformly.
   `packed_budget` is simply `budget` (`_split_section` skips the subtraction), which the first
   guard has already proven positive by the time `_split_section` runs — so on that branch this
   guard cannot fire at all.
+- **A document produces zero chunks** (`chunk_markdown`, `if not chunks`, checked once the section
+  loop has finished). This one is not a budget problem like the other three — a document consisting
+  entirely of headings whose only content is deeper headings is otherwise well-formed, but every one
+  of its sections is dropped by the no-prose-no-chunk rule (see [Chunking
+  strategy](#chunking-strategy)), leaving nothing to chunk. `chunk_markdown` raises rather than
+  returning an empty list, because an empty list is dangerous one layer downstream:
+  `may_delete_stale()` (`services/indexing_results.py`) returns `False` unconditionally when
+  `expected_keys` is empty, so a document that chunked to nothing would never pass the delete-stale
+  gate — its previous run's chunks would stay searchable indefinitely, with nothing having visibly
+  failed. "Delete every chunk this document has" remains an operation a caller must ask for
+  explicitly; `chunk_markdown` does not infer it from an empty result.
 
 These are authoring-time risks, not just configuration risks. The trigger is heading *text length*,
 not nesting *depth*: `_HEADING` (`^(#{1,6})...`) recognizes at most six heading levels, and the
@@ -127,18 +154,24 @@ ordinarily short headings (a few dozen characters each) fall far short of either
 actually triggers these guards at the defaults is a title or heading written as long, unbroken
 prose — not depth by itself, even at the maximum depth the format supports.
 
-`Settings` (`core/config.py`) refuses to start at all when `chunk_overlap_chars * 2 >=
-chunk_max_chars`. This guards the same "overlap could never advance" hazard, at the level of the
+`Settings` (`core/config.py`) refuses to start at all when `chunk_max_chars <= 0`,
+`chunk_overlap_chars < 0`, or `chunk_overlap_chars * 2 >= chunk_max_chars`. The last of these guards
+the same "overlap could never advance" hazard as the two guards above, at the level of the
 configured *values* themselves, for the general case where the configured overlap is so large
 relative to the max that no section, however short or long its heading path, could ever leave room
 to advance.
 
-What this validator does not yet do is intercept an actual chunking call: `chunk_markdown` takes
-`max_chars` and `overlap_chars` as explicit arguments, and nothing on this branch calls it with
-`settings.chunk_max_chars` / `settings.chunk_overlap_chars` — no caller wires the two together yet.
-So today the validator rejects an illegal *configuration* at startup; it does not, and cannot yet,
-reject an illegal *document* before it is chunked. Closing that gap is a matter of a future caller
-passing `Settings` values into `chunk_markdown`, not a change to the validator itself.
+`chunk_markdown` checks the same three conditions itself, at the top of the function, raising
+`ValueError` immediately rather than letting a bad `max_chars`/`overlap_chars` pair surface later as
+a confusing budget error or an infinite loop deeper in the call. This duplicates `Settings` on
+purpose, not by oversight: `chunk_markdown` takes `max_chars` and `overlap_chars` as plain arguments,
+and nothing on this branch calls it with `settings.chunk_max_chars` / `settings.chunk_overlap_chars`
+— no caller wires the two together yet. Until that caller exists, the two validators protect
+different things. `Settings` rejects an illegal *configuration*, once, at startup. `chunk_markdown`
+rejects an illegal *call*, every time, regardless of where its arguments came from — a test, a future
+caller, or any value that was never `Settings`-validated at all. Wiring a real caller's `Settings`
+values into `chunk_markdown` is future work; when it lands, both validators still do useful, distinct
+work — one at startup, one at the call — rather than one making the other redundant.
 
 ## Sizes are characters, not tokens
 
@@ -190,6 +223,17 @@ that section's topic has no way to prefer it — the section's own prose alone m
 document's subject at all. Folding the heading path into the vector's input solves that; folding it
 into the displayed `content` would duplicate a heading the reader already sees rendered above the
 citation.
+
+`content` being "the source text" is not the same guarantee for every chunk, though. A section that
+fits inside `chunk_max_chars` on its own (the fast path through `_split_section`,
+`services/chunking.py`) passes through untouched, so its `content` is byte-identical to what the
+author wrote, whitespace included. A section that had to be split loses that: `_split_section`
+strips each paragraph's leading and trailing whitespace and collapses paragraph separators down to a
+single blank line, so the contract for a split chunk is only that every **non-whitespace** character
+of the source survives somewhere in the result — not that the chunk is byte-identical to the source.
+That makes the split path unsuitable for whitespace-significant material such as indented code or
+tables: a section large enough to need splitting cannot keep that formatting intact, and only a
+section within budget (the fast path) is safe for it.
 
 `heading_path`'s first segment is always the document title (`"Returns Policy"` on its own, or
 `"Returns Policy > Refund window > Standard purchases"` for a nested section) — enforced in
@@ -519,19 +563,49 @@ need multiple batches per document set.
 
 Because upload is an upsert and delete-stale operates on a set difference, the entire replacement
 sequence can be re-run safely after a failure: re-running step 2 re-uploads the same new chunks
-without duplicating them, and step 4 recomputes which stale chunks remain. A failed run leaves the
-index queryable throughout — never with a gap — because the old chunks are only ever removed after
-the gate confirms the new ones are all present.
+without duplicating them, and step 4 recomputes which stale chunks remain. For a document that
+already has a successful prior generation in the index, a failed run cannot leave that document
+with *no* queryable content, because the old chunks are only ever removed after the gate confirms
+the new ones are all present. That guarantee is narrower than it might sound, in two ways.
 
-The residual risk this strategy accepts is duplication, not loss: between step 2 completing and
-step 4 completing, a query can retrieve both the new chunk for a section and the stale chunk it is
-replacing. **This window is scoped to the single-index, no-alias strategy used in this repo** — it
-is not an inherent limitation of Azure AI Search. An index alias pointed at a generation-suffixed
-index (build the new index fully, then repoint the alias) would let readers see either the fully
-old or fully new state and nothing in between; that is the production escape from this window, and
-implementing it is out of scope for this milestone. Within this repo's strategy, the
-choice being made is deliberate: a document that briefly shows duplicate content is recoverable by
-a re-run, while a document that briefly shows *no* content is not an acceptable failure mode.
+First, a `200`/`201` is a durability guarantee, not a queryability guarantee. The reindex how-to
+page — already cited above for [per-document status codes](#per-document-status-codes) — states
+this plainly: "Status code 200 is returned for a successful response, meaning that all items have
+been stored durably and will start to be indexed. Indexing runs in the background and makes new
+documents available (that is, queryable and searchable) a few seconds after the indexing operation
+completed. The specific delay depends on the load on the service."
+([update or rebuild an index](https://learn.microsoft.com/en-us/azure/search/search-howto-reindex#responses),
+checked 2026-07). So an uploaded chunk's `200`/`201` proves the write landed, not that it is
+retrievable yet — deleting the corresponding stale chunk immediately after the gate opens can still
+produce a brief query-visible gap for that chunk, even when every upload in the batch succeeded.
+What upload-then-delete-stale actually buys is avoiding *permanent* content loss from a delete-first
+ordering, not an instantaneous, gap-free cutover.
+
+Second, the "no document is left with nothing" guarantee only holds for a document that already has
+a successful prior generation indexed. [rag-indexing-job-fsm.md](state-models/rag-indexing-job-fsm.md)
+states the first-time case correctly: a document being indexed for the first time has no old chunks
+to fall back on, so a `FailedPendingRerun` during `Uploading` can leave it with no queryable content
+at all. Nothing here overrides that — this section describes re-run behavior for a document that has
+something to fall back on, not every document.
+
+The residual risk this strategy accepts, for a document with a prior generation, is duplication, not
+loss: between step 2 completing and step 4 completing, a query can retrieve both the new chunk for a
+section and the stale chunk it is replacing. **This window is scoped to the single-index, no-alias
+strategy used in this repo** — it is not an inherent limitation of Azure AI Search. An index alias
+pointed at a generation-suffixed index (build the new index fully, then repoint the alias) would let
+each generation be complete before it is exposed at all — no request would ever see the new
+generation half-written, the way the non-atomic window above can produce. Repointing the alias is
+not itself instantaneous, though: "An update to an alias might take up to 10 seconds to propagate
+through the system, so wait at least 10 seconds before you delete the index to which the alias
+previously mapped."
+([update an alias](https://learn.microsoft.com/en-us/azure/search/search-how-to-alias#update-an-alias),
+checked 2026-07). During that propagation window a request can still reach either the old or the new
+generation, and the old index must not be deleted until at least 10 seconds after the repoint. That
+is the production escape from the duplication window above, and implementing it is out of scope for
+this milestone. Within this repo's strategy, the choice being made is deliberate: a document that
+briefly shows duplicate content is recoverable by a re-run, while a document that briefly shows *no*
+content is not an acceptable failure mode — for the documents this strategy can make that promise to
+in the first place.
 
 ## The embedding 400 is not an indexing 400
 
