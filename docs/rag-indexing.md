@@ -549,10 +549,16 @@ should have — content missing from the index, invisibly, until the next succes
 The gate in step 3 is what makes this ordering safe, and it is enforced strictly:
 `may_delete_stale()` returns `True` only when every expected key came back exactly once, nothing
 unexpected came back, and every one of them succeeded. Any permanent failure, any exhausted retry,
-a duplicate key in the response, or a missing key all block the gate outright — the function does
-not attempt to deduplicate or partially credit a retry's later success, because doing so could let
-a retried success paper over an earlier, unresolved failure for the same key. When the gate does
-not open, no old chunk is deleted, and the document is reported as needing a re-run.
+a duplicate key in the response, or a missing key all block the gate outright. The scope of that
+rule is one final collection holding one result per key: the gate does not deduplicate, because a
+repeated key there could hide an unresolved failure behind a later success for the same key.
+
+Across attempts the opposite holds. A key that failed retryably and then uploaded successfully is
+settled as a success — an upsert that succeeds has proved the key durable. The retry coordinator in
+`services/search_indexing.py` maintains that single terminal state per key and hands the gate the
+settled outcome. Without this, retrying a retryable failure could never open the gate, and the
+replacement strategy would have no way to finish. When the gate does not open, no old chunk is
+deleted, and the document is reported as needing a re-run.
 
 ### Per-document status codes
 

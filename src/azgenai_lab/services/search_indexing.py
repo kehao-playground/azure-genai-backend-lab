@@ -10,12 +10,23 @@ Three contracts hold this together, and none substitutes for another:
   document can otherwise each succeed and still destroy each other's work.
 """
 
+import asyncio
 import json
-from collections.abc import Iterator, Sequence
+import logging
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from azgenai_lab.core.errors import UpstreamError
+from azgenai_lab.services.azure_search import SearchUnavailableError
+from azgenai_lab.services.indexing_results import (
+    Disposition,
+    IndexingResult,
+    classify,
+    is_storage_alert,
+)
+
+logger = logging.getLogger(__name__)
 
 # Documented API request limits (checked 2026-07): at most 1,000 documents per
 # batch of uploads, merges or deletes, and a 16 MB payload ceiling applying to
@@ -93,3 +104,113 @@ def serialize_batches(
         size += extra
     if batch:
         yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys))
+
+
+# Bounded so a permanently sick service cannot spin forever. A module constant
+# rather than a setting: nothing outside the indexing job reads it and no
+# environment has a reason to differ.
+MAX_INDEXING_ATTEMPTS = 3
+_BACKOFF_SECONDS = 1.0
+
+PostBatch = Callable[[bytes], Coroutine[Any, Any, list[IndexingResult]]]
+Sleeper = Callable[[float], Coroutine[Any, Any, None]]
+
+
+async def run_indexing_with_retry(
+    post: PostBatch,
+    documents: Sequence[dict[str, Any]],
+    action: str,
+    *,
+    sleep: Sleeper = asyncio.sleep,
+) -> dict[str, IndexingResult]:
+    """Drive one indexing action to a single terminal result per key.
+
+    The rule that makes retrying meaningful, and that Day 12's prose had
+    backwards: *within one final collection* a duplicate key is fail-closed,
+    but *across attempts* a key may legitimately move from a retryable failure
+    to success. An upsert that succeeds has proved the key durable; refusing to
+    record that would make the stale-delete gate unopenable after any retry.
+
+    Only ``SearchUnavailableError`` is retried. A rejected request and an
+    oversized document are permanent and propagate: repeating either just
+    delays the report. Permanent per-document failures are terminal and are
+    never re-sent or overwritten. Exhausted retries keep the last retryable
+    failure, and a request-level failure with no per-document answer
+    synthesizes one, so the gate stays shut either way.
+    """
+    by_key = {str(document["chunk_id"]): document for document in documents}
+    terminal: dict[str, IndexingResult] = {}
+    outstanding = list(by_key)
+    last_error: str | None = None
+
+    for attempt in range(1, MAX_INDEXING_ATTEMPTS + 1):
+        if not outstanding:
+            break
+        if attempt > 1:
+            await sleep(_BACKOFF_SECONDS * (2 ** (attempt - 2)))
+
+        still_outstanding: list[str] = []
+        # Not inside the try: an oversized document is a local, permanent
+        # failure and must not be mistaken for a transient request failure.
+        for batch in serialize_batches([by_key[key] for key in outstanding], action):
+            try:
+                results = await post(batch.body)
+            except SearchUnavailableError as exc:
+                # No per-document verdict exists for *this batch*, so exactly
+                # this batch's keys stay outstanding. Requeuing the whole
+                # attempt would re-send keys an earlier batch already settled.
+                last_error = str(exc.upstream_detail or exc.message)
+                logger.warning(
+                    "indexing request failed attempt=%d/%d action=%s keys=%s detail=%s",
+                    attempt,
+                    MAX_INDEXING_ATTEMPTS,
+                    action,
+                    ",".join(batch.keys),
+                    last_error,
+                )
+                still_outstanding.extend(batch.keys)
+                continue
+
+            returned_keys = [result.key for result in results]
+            if len(returned_keys) != len(set(returned_keys)):
+                # Fail closed *before* any terminal state is touched. Two
+                # verdicts for one key in one response cannot be resolved, and
+                # letting the last one win is precisely how an unresolved
+                # transient failure gets papered over by a later success —
+                # the thing `may_delete_stale()` refuses to do downstream.
+                raise SearchUnavailableError(
+                    f"indexing response repeated a key: {sorted(returned_keys)}"
+                )
+            returned = set(returned_keys)
+            unexpected = returned - set(batch.keys)
+            if unexpected:
+                raise SearchUnavailableError(
+                    f"indexing response mentioned keys that were not sent: {sorted(unexpected)}"
+                )
+            for result in results:
+                if is_storage_alert(result):
+                    logger.error(
+                        "indexing throttled key=%s action=%s — usually a storage-capacity "
+                        "signal rather than a request-rate one",
+                        result.key,
+                        action,
+                    )
+                terminal[result.key] = result
+                if classify(result) is Disposition.RETRYABLE:
+                    still_outstanding.append(result.key)
+            # A key that was sent but never mentioned in the response has no
+            # verdict; keep it outstanding rather than assume either way.
+            still_outstanding.extend(key for key in batch.keys if key not in returned)
+
+        outstanding = still_outstanding
+
+    for key in outstanding:
+        existing = terminal.get(key)
+        if existing is None or classify(existing) is not Disposition.RETRYABLE:
+            terminal[key] = IndexingResult(
+                key=key,
+                status=False,
+                status_code=503,
+                error_message=last_error or "indexing retries exhausted",
+            )
+    return terminal
