@@ -26,6 +26,7 @@ from azgenai_lab.models.search import (
     SearchMode,
     SearchResult,
     build_search_body,
+    validate_search_arguments,
 )
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION
 
@@ -289,3 +290,97 @@ class AzureSearchClient:
             ",".join("-" if h.reranker_score is None else f"{h.reranker_score:.3f}" for h in hits),
         )
         return SearchResult(hits=hits, mode=mode, vector_k=effective_k)
+
+
+class FakeSearchClient:
+    """An in-memory stand-in that scores lexically in **every** mode.
+
+    What it proves: composition wiring, the arguments a caller passes, result
+    shape, ordering mechanics, and the empty-result path. It applies exactly
+    the same argument validation as the real adapter, so a call that passes
+    here cannot fail against the service for a contract reason.
+
+    What it deliberately does not do: simulate cosine similarity, RRF, or the
+    semantic ranker. Day 12's fake embeddings carry no semantics, so scoring
+    cosine over them would yield numbers that look like ranking evidence and
+    are noise. Using lexical scoring for ``VECTOR`` mode is a knowingly
+    unfaithful stand-in — an honest fake beats a plausible one. Retrieval
+    quality observed here means nothing.
+    """
+
+    def __init__(self, documents: Sequence[dict[str, Any]] = ()) -> None:
+        self._documents = list(documents)
+        self.last_mode: SearchMode | None = None
+        self.last_top: int | None = None
+        self.last_vector_k: int | None = None
+        self.last_filter: str | None = None
+
+    async def search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        mode: SearchMode = SearchMode.HYBRID,
+        top: int,
+        filter: str | None = None,
+        vector_k: int = DEFAULT_VECTOR_K,
+    ) -> SearchResult:
+        validate_search_arguments(query_text, query_vector, mode=mode)
+        self.last_mode = mode
+        self.last_top = top
+        self.last_vector_k = vector_k
+        self.last_filter = filter
+
+        terms = {term for term in query_text.lower().split() if term}
+        scored: list[tuple[float, SearchHit]] = []
+        for document in self._documents:
+            haystack = " ".join(
+                str(document.get(field, "")) for field in ("title", "heading_path", "content")
+            ).lower()
+            overlap = sum(1 for term in terms if term in haystack)
+            if not overlap:
+                continue
+            scored.append(
+                (
+                    float(overlap),
+                    SearchHit(
+                        chunk_id=str(document.get("chunk_id", "")),
+                        parent_id=str(document.get("parent_id", "")),
+                        title=str(document.get("title", "")),
+                        heading_path=str(document.get("heading_path", "")),
+                        content=str(document.get("content", "")),
+                        score=float(overlap),
+                        reranker_score=None,  # never fabricated: see the docstring
+                    ),
+                )
+            )
+        # Ties break by chunk_id so ordering is reproducible across runs.
+        scored.sort(key=lambda pair: (-pair[0], pair[1].chunk_id))
+        return SearchResult(
+            hits=tuple(hit for _, hit in scored[:top]),
+            mode=mode,
+            vector_k=vector_k if mode is not SearchMode.KEYWORD else None,
+        )
+
+
+def build_search_client(settings: Settings) -> SearchClient:
+    """The one place fake and real are chosen. Handlers never branch on this."""
+    if settings.use_fake_search:
+        return FakeSearchClient()
+    return AzureSearchClient(settings)
+
+
+__all__ = [
+    "AzureSearchClient",
+    "FakeSearchClient",
+    "SearchClient",
+    "SearchConfigurationError",
+    "SearchDiagnostics",
+    "SearchError",
+    "SearchRequestRejectedError",
+    "SearchUnavailableError",
+    "build_search_client",
+    "map_search_status",
+    "parse_hits",
+    "search_url",
+]
