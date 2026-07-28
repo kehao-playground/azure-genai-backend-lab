@@ -24,12 +24,25 @@ English (see `data/sample-docs/`). The paragraph→sentence→hard-cut degradati
 to both writing systems and is not test-only.
 
 The supported Markdown subset is worth stating precisely, because its edges change what counts as a
-section boundary: ATX headings (`#` through `######`) outside fenced code blocks, blank-line
-paragraph boundaries, and fenced code blocks (opened by three or more `` ` `` or `~` characters, per
-CommonMark) treated as opaque spans that never contribute headings. Setext headings (underlined with
-`=` or `-`), 4-space-indented code blocks, and HTML blocks are **not** recognized — a `#` line inside
-an indented code block is still read as a heading, because indentation alone carries no meaning to
-this splitter.
+section boundary: ATX headings (`#` through `######`) **at column 0** and outside fenced code
+blocks, blank-line paragraph boundaries, and fenced code blocks (opened by three or more `` ` `` or
+`~` characters, per CommonMark) treated as opaque spans that never contribute headings — opaque to
+`_sections`, at least; an oversized section is still cut mid-fence by `_split_section`, which knows
+nothing about Markdown.
+
+Three constructs are not recognized, and they do not cost the same. **Setext headings** (underlined
+with `=` or `-`) collapse a document written that way into a single section. **Indented ATX
+headings** are silently swallowed as prose: CommonMark allows up to three leading spaces, and this
+module's fence matcher deliberately honours exactly that, but `_HEADING` anchors `#` at column 0, so
+`"   ## B"` never opens a section. The two rules disagree inside one module — a wart, not a design.
+**HTML blocks** are the only one that corrupts output rather than merely losing structure: a `#`
+line inside `<div>...</div>` is read as a real heading, so
+`"## A\n\n<div>\n# noise\n</div>\n\n## B\n\nBravo.\n"` produces a fabricated breadcrumb
+`"Returns Policy > noise"` and a nested `"Returns Policy > noise > B"`.
+
+Worth naming what is *not* a hazard, since an earlier draft of this section claimed it was: a
+4-space-indented code block containing a `#` line is harmless. The indentation that makes it a code
+block is the same indentation that stops `_HEADING` matching, so the line stays prose.
 
 Fence-awareness is a review fix, not a feature that was there from the start. An earlier version of
 `_sections` (`services/chunking.py`) matched any line starting with `#` regardless of context, so a

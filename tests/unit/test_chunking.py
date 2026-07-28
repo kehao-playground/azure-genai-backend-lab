@@ -416,6 +416,11 @@ def test_unclosed_fence_swallows_the_rest_of_the_document() -> None:
 
     assert len(chunks) == 1
     assert "Later heading" not in chunks[0].heading_path
+    # Without this line the test passes against the pre-fix chunker too: the
+    # stray heading merely opened a prose-less section that the no-prose rule
+    # dropped, so the heading_path assertion alone proved nothing. What the
+    # fix actually changes is that the fence swallows the line as content.
+    assert "## Later heading" in chunks[0].content
 
 
 def test_headings_outside_fences_still_split_sections() -> None:
@@ -480,17 +485,17 @@ def test_a_document_whose_body_is_only_a_title_heading_is_an_error() -> None:
 
 
 def test_negative_overlap_is_rejected() -> None:
-    with pytest.raises(ValueError, match="overlap_chars"):
+    with pytest.raises(ValueError, match="must not be negative"):
         chunk_markdown(_document("Just prose."), max_chars=2000, overlap_chars=-1)
 
 
 def test_zero_max_chars_is_rejected() -> None:
-    with pytest.raises(ValueError, match="max_chars"):
+    with pytest.raises(ValueError, match="must be positive"):
         chunk_markdown(_document("Just prose."), max_chars=0, overlap_chars=0)
 
 
 def test_overlap_at_or_above_half_of_max_chars_is_rejected() -> None:
-    with pytest.raises(ValueError, match="overlap_chars"):
+    with pytest.raises(ValueError, match="less than half of max_chars"):
         chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=50)
-    with pytest.raises(ValueError, match="overlap_chars"):
+    with pytest.raises(ValueError, match="less than half of max_chars"):
         chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=60)

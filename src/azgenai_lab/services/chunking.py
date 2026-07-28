@@ -5,12 +5,32 @@ section a reader recognises. Only a section that will not fit is broken up,
 and then by the largest natural boundary available.
 
 The supported Markdown subset is deliberately narrow: ATX headings
-(``#`` through ``######``) outside fenced code blocks, blank-line paragraph
-boundaries, and fenced code blocks (``` ``` ``` or ``~~~``) treated as opaque
-spans that never contribute headings. Setext headings (underlined with ``=``
-or ``-``), 4-space-indented code blocks, and HTML blocks are **not**
-recognised — an indented code block containing a ``#`` line is still read as
-a heading, because indentation alone carries no meaning to this splitter.
+(``#`` through ``######``) **at column 0** and outside fenced code blocks,
+blank-line paragraph boundaries, and fenced code blocks (``` ``` ``` or
+``~~~``) treated as opaque spans that never contribute headings — opaque to
+``_sections``, at least; an oversized section is still cut mid-fence by
+``_split_section``, which knows nothing about Markdown.
+
+Three limits, stated by consequence rather than by name, because "not
+supported" hides which ones actually hurt:
+
+- **Setext headings** (underlined with ``=`` or ``-``) are not recognised, so
+  a document written that way collapses into one section.
+- **Indented ATX headings** are not recognised either. CommonMark allows up
+  to three leading spaces, and ``_FENCE_OPEN`` below deliberately honours
+  exactly that for fences — but ``_HEADING`` anchors ``#`` at column 0, so
+  ``"   ## B"`` is silently swallowed as prose. The two rules disagree inside
+  this one module; that is a wart, not a design.
+- **HTML blocks** are not recognised, and this is the one that corrupts
+  output rather than merely losing structure. A ``#`` line inside
+  ``<div>...</div>`` is read as a real heading, so
+  ``"## A\\n\\n<div>\\n# noise\\n</div>\\n\\n## B\\n\\nBravo.\\n"`` yields a
+  fabricated breadcrumb ``"... > noise"`` and a nested ``"... > noise > B"``.
+
+Note what is *not* on that list: a 4-space-indented code block containing a
+``#`` line is harmless here. Because ``_HEADING`` requires column 0, the
+indentation that makes it a code block also stops it matching, so it stays
+prose. An earlier version of this docstring claimed the opposite.
 
 Everything here is a pure function of its arguments. No I/O, no settings
 lookups, no clock — the same document and parameters always produce the same
@@ -65,6 +85,7 @@ def _fence_closes(line: str, fence_char: str, min_length: int) -> bool:
     """
     pattern = rf"^ {{0,3}}{re.escape(fence_char)}{{{min_length},}}[ \t]*$"
     return re.match(pattern, line) is not None
+
 
 # Sentence terminators for both writing systems, plus any trailing closing
 # punctuation. Chinese has no inter-word spaces, so a whitespace-based splitter
@@ -210,7 +231,8 @@ def chunk_markdown(
         # content searchable forever. A document that yields no chunks is an
         # authoring error and must fail before anything is mutated.
         raise ChunkingError(
-            f"{document.doc_id} produced no chunks: it has no prose outside its headings"
+            f"{document.doc_id} produced no chunks: it has no prose to index "
+            "(an empty body, or headings with no prose of their own)"
         )
     return chunks
 
