@@ -1,11 +1,17 @@
 """RAG data transfer objects shared across the indexing and query pipelines."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
 from pydantic import BaseModel
 
-from azgenai_lab.models.search_index import validate_document_key
+from azgenai_lab.models.search_index import (
+    EMBEDDING_DIMENSIONS,
+    VECTOR_FIELD,
+    validate_document_key,
+)
 
 # A doc_id is authored by a human in front matter, and the derived chunk key
 # must fit inside the service's 1024-character limit. Rather than compute the
@@ -79,6 +85,34 @@ class Chunk:
     @property
     def embedding_input(self) -> str:
         return f"{self.heading_path}{EMBEDDING_JOIN}{self.content}"
+
+    def to_index_document(self, vector: Sequence[float]) -> dict[str, Any]:
+        """Render this chunk as one Azure AI Search document.
+
+        ``effective_date`` is the one field whose contract does not close
+        inside the dataclass. The source is a bare ``date``; the index field
+        is ``Edm.DateTimeOffset``, which requires an offset. This project
+        therefore *defines* the field as a UTC calendar date and encodes it at
+        UTC midnight — the offset is a domain decision, not something the
+        schema derives for us. Every range filter over this field must use UTC
+        date boundaries or it will silently shift by a day.
+        """
+        if len(vector) != EMBEDDING_DIMENSIONS:
+            raise ValueError(
+                f"vector for chunk {self.chunk_id} has {len(vector)} dimensions; "
+                f"the index expects {EMBEDDING_DIMENSIONS}"
+            )
+        return {
+            "chunk_id": self.chunk_id,
+            "parent_id": self.parent_id,
+            "title": self.title,
+            "heading_path": self.heading_path,
+            "content": self.content,
+            "doc_type": self.doc_type,
+            "tenant_id": self.tenant_id,
+            "effective_date": f"{self.effective_date.isoformat()}T00:00:00Z",
+            VECTOR_FIELD: list(vector),
+        }
 
 
 def make_chunk_id(parent_id: str, ordinal: int) -> str:

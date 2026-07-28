@@ -9,7 +9,12 @@ from datetime import date
 import pytest
 
 from azgenai_lab.models.rag import Chunk, SourceDocument, make_chunk_id
-from azgenai_lab.models.search_index import DOCUMENT_KEY_MAX_LENGTH, DocumentKeyError
+from azgenai_lab.models.search_index import (
+    DOCUMENT_KEY_MAX_LENGTH,
+    EMBEDDING_DIMENSIONS,
+    VECTOR_FIELD,
+    DocumentKeyError,
+)
 
 
 def _document(doc_id: str = "returns-policy") -> SourceDocument:
@@ -100,3 +105,46 @@ def test_source_document_is_frozen() -> None:
     document = _document()
     with pytest.raises(FrozenInstanceError):
         document.title = "changed"  # type: ignore[misc]
+
+
+def _document_chunk() -> Chunk:
+    return Chunk(
+        chunk_id="returns-policy-0001",
+        parent_id="returns-policy",
+        title="Returns Policy",
+        heading_path="Returns Policy > Refund window",
+        content="Customers may return most items within 30 days.",
+        doc_type="policy",
+        tenant_id="acme",
+        effective_date=date(2026, 1, 15),
+    )
+
+
+def test_effective_date_serializes_to_utc_midnight() -> None:
+    # The source is date-only. Edm.DateTimeOffset requires an offset, so this
+    # project defines the field as a UTC calendar date and encodes it at UTC
+    # midnight. Range filters must use UTC boundaries to match.
+    document = _document_chunk().to_index_document([0.0] * EMBEDDING_DIMENSIONS)
+    assert document["effective_date"] == "2026-01-15T00:00:00Z"
+
+
+def test_index_document_carries_every_schema_field() -> None:
+    vector = [0.5] * EMBEDDING_DIMENSIONS
+    assert _document_chunk().to_index_document(vector) == {
+        "chunk_id": "returns-policy-0001",
+        "parent_id": "returns-policy",
+        "title": "Returns Policy",
+        "heading_path": "Returns Policy > Refund window",
+        "content": "Customers may return most items within 30 days.",
+        "doc_type": "policy",
+        "tenant_id": "acme",
+        "effective_date": "2026-01-15T00:00:00Z",
+        VECTOR_FIELD: vector,
+    }
+
+
+def test_index_document_rejects_a_wrong_width_vector() -> None:
+    # Fail closed: the index would reject it anyway, and writing a document
+    # whose vector is the wrong width is worse than not writing it.
+    with pytest.raises(ValueError, match="dimensions"):
+        _document_chunk().to_index_document([0.1, 0.2])
