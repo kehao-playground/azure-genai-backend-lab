@@ -13,18 +13,10 @@ set -euo pipefail
 : "${AZ_RESOURCE_GROUP:?Set AZ_RESOURCE_GROUP}"
 : "${AZ_SEARCH_NAME:?Set AZ_SEARCH_NAME}"
 
-echo "About to DELETE search service '$AZ_SEARCH_NAME' in '$AZ_RESOURCE_GROUP'."
-read -r -p "Type the service name to confirm: " CONFIRM
-if [[ "$CONFIRM" != "$AZ_SEARCH_NAME" ]]; then
-  echo "Confirmation mismatch; aborting." >&2
-  exit 1
-fi
-
 az search service delete \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
-  --name "$AZ_SEARCH_NAME" \
-  --yes
+  --name "$AZ_SEARCH_NAME"
 
-echo "Deleted $AZ_SEARCH_NAME."
+echo "Deleted search service $AZ_SEARCH_NAME."
 echo "A free-tier service cannot be upgraded in place; recreate with --sku basic if needed."
