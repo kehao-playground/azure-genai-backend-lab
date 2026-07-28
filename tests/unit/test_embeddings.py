@@ -339,6 +339,138 @@ async def test_the_real_adapter_returns_vectors_on_success(
     assert "secret" not in caplog.text
 
 
+def _embedding_response(items: list[tuple[int, list[float]]]) -> CreateEmbeddingResponse:
+    return CreateEmbeddingResponse(
+        data=[
+            Embedding(embedding=vector, index=index, object="embedding")
+            for index, vector in items
+        ],
+        model="embed-small",
+        object="list",
+        usage=Usage(prompt_tokens=12, total_tokens=12),
+    )
+
+
+def _real_client() -> AzureOpenAIEmbeddingClient:
+    settings = Settings(
+        _env_file=None,
+        use_fake_embeddings=False,
+        azure_openai_endpoint="https://example.openai.azure.com",
+        azure_openai_api_key="secret",
+        azure_openai_embedding_deployment="embed-small",
+    )
+    client = build_embedding_client(settings)
+    assert isinstance(client, AzureOpenAIEmbeddingClient)
+    return client
+
+
+async def test_out_of_order_response_is_reordered_by_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The response carries items in index=1, index=0 order — the reverse of
+    # the inputs. A positional-trust implementation would return them
+    # reversed too; this pins that the return is reordered by `index`.
+    client = _real_client()
+    first = [0.1, 0.2, 0.3]
+    second = [0.4, 0.5, 0.6]
+    response = _embedding_response([(1, second), (0, first)])
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    result = await client.embed(["one", "two"])
+
+    assert result == [first, second]
+
+
+async def test_in_order_response_is_returned_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Guards against a reorder implementation that scrambles the already
+    # correct, common case.
+    client = _real_client()
+    first = [0.1, 0.2, 0.3]
+    second = [0.4, 0.5, 0.6]
+    response = _embedding_response([(0, first), (1, second)])
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    result = await client.embed(["one", "two"])
+
+    assert result == [first, second]
+
+
+async def test_duplicate_response_index_is_an_upstream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _real_client()
+    response = _embedding_response([(0, [0.0, 0.0, 0.0]), (0, [1.0, 1.0, 1.0])])
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamServiceError):
+        await client.embed(["one", "two"])
+
+
+async def test_missing_response_index_is_an_upstream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Three inputs; indices 0, 1, 1 — index 2 never appears, and 1 repeats.
+    client = _real_client()
+    response = _embedding_response(
+        [(0, [0.0, 0.0, 0.0]), (1, [1.0, 1.0, 1.0]), (1, [2.0, 2.0, 2.0])]
+    )
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamServiceError):
+        await client.embed(["one", "two", "three"])
+
+
+async def test_out_of_range_response_index_is_an_upstream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _real_client()
+    response = _embedding_response([(0, [0.0, 0.0, 0.0]), (5, [1.0, 1.0, 1.0])])
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamServiceError):
+        await client.embed(["one", "two"])
+
+
+async def test_response_item_count_mismatch_is_an_upstream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two inputs, one item returned. Distinct from `test_wrong_dimension_
+    # response_fails_closed` (that check lives in `embed_chunks`, above the
+    # adapter, and fires on vector width, not item count).
+    client = _real_client()
+    response = _embedding_response([(0, [0.0, 0.0, 0.0])])
+
+    async def _create(**kwargs: object) -> CreateEmbeddingResponse:
+        return response
+
+    monkeypatch.setattr(client._client.embeddings, "create", _create)  # type: ignore[attr-defined]
+
+    with pytest.raises(UpstreamServiceError):
+        await client.embed(["one", "two"])
+
+
 @pytest.mark.parametrize(
     ("error_cls", "status_code"),
     [
