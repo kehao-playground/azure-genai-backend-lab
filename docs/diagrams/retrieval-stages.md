@@ -29,8 +29,8 @@ flowchart TD
     class blocked blocked;
 ```
 
-The dead-end edge out of the reranker is deliberate: the semantic ranker
-"can't rerun the query over the entire corpus" ([semantic ranking
+The dead-end edge out of the reranker is deliberate: the semantic ranker cannot
+"rerun the query over the entire corpus" ([semantic ranking
 overview](https://learn.microsoft.com/en-us/azure/search/semantic-search-overview),
 checked 2026-07) — it only reorders whatever candidate generation already
 produced. If the right chunk was never recalled
