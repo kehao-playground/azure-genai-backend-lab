@@ -13,12 +13,13 @@ Three contracts hold this together, and none substitutes for another:
 import asyncio
 import json
 import logging
+from collections import Counter
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from azgenai_lab.core.errors import UpstreamError
-from azgenai_lab.services.azure_search import SearchRequestRejectedError, SearchUnavailableError
+from azgenai_lab.services.azure_search import SearchUnavailableError
 from azgenai_lab.services.indexing_results import (
     Disposition,
     IndexingResult,
@@ -56,6 +57,19 @@ class DocumentTooLargeError(UpstreamError):
     status_code = 500
     code = "document_too_large"
     message = "A document exceeds the maximum indexing request size."
+
+
+class DuplicateChunkIdError(UpstreamError):
+    """Two documents in one indexing action share a chunk_id.
+
+    Raised before anything is sent. Collapsing them keeps only the last
+    document under each key, so the earlier one is never sent and its outcome
+    never reported.
+    """
+
+    status_code = 500
+    code = "duplicate_chunk_id"
+    message = "An indexing action contained two documents with the same key."
 
 
 @dataclass(frozen=True)
@@ -131,26 +145,21 @@ async def run_indexing_with_retry(
     proved the key durable; refusing to record that would make the
     stale-delete gate unopenable after any retry.
 
-    Only ``SearchUnavailableError`` is retried. A rejected request and an
-    oversized document are permanent and propagate: repeating either just
-    delays the report. Permanent per-document failures are terminal and are
-    never re-sent or overwritten. Exhausted retries keep the last retryable
-    failure, and a request-level failure with no per-document answer
-    synthesizes one, so the gate stays shut either way.
+    Only ``SearchUnavailableError`` is retried. A rejected request, an
+    oversized document, and a duplicate key are permanent and propagate:
+    repeating any of them just delays the report. Permanent per-document
+    failures are terminal and are never re-sent or overwritten. Exhausted
+    retries keep the last retryable failure, and a request-level failure with
+    no per-document answer synthesizes one, so the gate stays shut either way.
     """
     keys_in_order = [str(document["chunk_id"]) for document in documents]
-    seen: set[str] = set()
-    duplicate_keys: set[str] = set()
-    for key in keys_in_order:
-        if key in seen:
-            duplicate_keys.add(key)
-        seen.add(key)
+    duplicate_keys = {key for key, count in Counter(keys_in_order).items() if count > 1}
     if duplicate_keys:
         # Collapsing these into a dict would keep only the last document under
         # each key, so the earlier one is silently never sent and its outcome
         # never reported — the exact erasure `may_delete_stale()` refuses to
         # perform, one layer upstream of where it can catch it.
-        raise SearchRequestRejectedError(
+        raise DuplicateChunkIdError(
             f"duplicate chunk_id in indexing input: {sorted(duplicate_keys)}"
         )
     by_key = dict(zip(keys_in_order, documents, strict=True))
