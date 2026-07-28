@@ -61,10 +61,21 @@ normalizes them.
 | `HYBRID_SEMANTIC` | RRF | 0.0–4.0 |
 
 RRF scores are much smaller than similarity scores by construction. The service's own
-documentation gives cosine vector scores a 0.333–1.00 range, while an RRF score's upper limit is
-"bounded by the number of queries being fused, with each query contributing a maximum of
-approximately `1/k`" — `k` being the RRF constant, 60 by default — an order of magnitude below a
-single-query similarity score. A low RRF score is not a weak match; it is a different scale.
+documentation ([create a hybrid
+query](https://learn.microsoft.com/en-us/azure/search/hybrid-search-how-to-query),
+[hybrid search scoring](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking))
+runs the same query both ways and shows one hotel document scoring
+`0.8399121` under pure vector search and `0.032786883413791656` under hybrid — the same
+document, two scales, a factor of twenty-five apart. That follows from the algorithm: a
+cosine score occupies 0.333–1.00, while each query fused by RRF contributes at most about
+`1/k`, and `k` defaults to 60. A low RRF score is not a weak match; it is a different ruler.
+The service's own troubleshooting guidance puts it plainly — a score of 0.03 can still
+indicate a strong match.
+
+The practical consequence is that **no threshold survives a mode change**. A cutoff tuned
+against `VECTOR` scores discards nearly everything under `HYBRID`, and it fails silently:
+the query still returns, the results are still ranked, there is simply nothing above the
+line. Only `reranker_score` has a published rubric to threshold against.
 
 `reranker_score` is the only one with a published meaning: 4.0 answers the
 question completely, 3.0 is relevant but incomplete, 2.0 partially addresses
