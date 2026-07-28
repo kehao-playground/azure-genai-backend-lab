@@ -502,6 +502,12 @@ class DocumentReplacer:
                 "delete",
                 sleep=self._sleep,
             )
+        except (DuplicateChunkIdError, DocumentTooLargeError):
+            # Permanent input faults, not cleanup failures — they must stay
+            # unretried and propagate as raised exceptions, never soften into
+            # a `stale_state_unknown` outcome the way a transport or config
+            # failure below does.
+            raise
         except UpstreamError as exc:
             logger.error(
                 "stale cleanup crashed parent_id=%s after a successful upload — new "
