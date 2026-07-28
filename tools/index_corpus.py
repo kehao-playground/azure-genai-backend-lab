@@ -54,8 +54,9 @@ async def main() -> None:
     # Measure the buffer that actually travels, by wrapping the transport
     # rather than serializing a second time. A separate json.dumps() here
     # would exclude the batch wrapper and separators, and would drift the
-    # moment either serializer changed — the article's number has to come from
-    # the same bytes Task 8's exact-bytes test proves are transmitted.
+    # moment either serializer changed — a published figure has to come from
+    # the same bytes the data plane sends, which is what the batching layer's
+    # own exact-bytes test pins.
     #
     # Two counters, because they answer different questions. A retry or a
     # stale-delete batch is real transport, but counting it into a
