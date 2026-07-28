@@ -35,6 +35,16 @@ AZ_EMBED_MODEL="${AZ_EMBED_MODEL:-text-embedding-3-small}"
 AZ_EMBED_MODEL_VERSION="${AZ_EMBED_MODEL_VERSION:-1}"
 AZ_EMBED_CAPACITY="${AZ_EMBED_CAPACITY:-50}"
 
+# `deployment create` is an upsert, so identical names would silently
+# reconfigure the chat deployment to serve the embedding model while both
+# success messages below still print. Checked here, after the defaults are
+# applied and before the first mutation, so a typo costs nothing.
+if [[ "$AZ_OPENAI_DEPLOYMENT" == "$AZ_EMBED_DEPLOYMENT" ]]; then
+  echo "AZ_OPENAI_DEPLOYMENT and AZ_EMBED_DEPLOYMENT are both '$AZ_OPENAI_DEPLOYMENT'." >&2
+  echo "They must differ: the second deployment would overwrite the first." >&2
+  exit 1
+fi
+
 az cognitiveservices account create \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --name "$AZ_OPENAI_NAME" \
