@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from azgenai_lab.core.config import get_settings
-from azgenai_lab.core.errors import UpstreamError
+from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
 from azgenai_lab.models.search_index import SEARCH_API_VERSION
@@ -155,19 +155,6 @@ def _ranks(hits: Sequence[SearchHit], expected: tuple[str, ...]) -> str:
     )
 
 
-def _summarize(body: dict[str, Any] | None) -> str:
-    """A one-line description of the request, vector elided."""
-    if body is None:
-        return "—"
-    parts = [f"top={body.get('top')}"]
-    queries = body.get("vectorQueries")
-    if isinstance(queries, list) and queries:
-        parts.append(f"k={queries[0].get('k')}")
-    if "queryType" in body:
-        parts.append(f"queryType={body['queryType']}")
-    return " ".join(parts)
-
-
 async def _run(
     client: AzureSearchClient,
     evidence: Evidence,
@@ -179,7 +166,11 @@ async def _run(
     top: int,
     vector_k: int,
 ) -> list[str]:
-    """One call, one set of table rows. Never raises: a failed call is evidence."""
+    """One call, one set of table rows.
+
+    Never raises: a failed call — including argument validation that rejects
+    the request before it is ever sent — is evidence, not an error.
+    """
     try:
         result = await client.search(
             query.text,
@@ -188,15 +179,22 @@ async def _run(
             top=top,
             vector_k=vector_k,
         )
-    except UpstreamError as exc:
+    except (UpstreamError, ValueError) as exc:
+        # ValueError is `validate_search_arguments()` rejecting the call
+        # before any request is sent (empty query text, wrong vector width).
+        # It carries none of UpstreamError's diagnostic fields, so its detail
+        # is read straight off the exception instead.
         diagnostics = client.last_diagnostics
         evidence.record_request(label, diagnostics.request_body if diagnostics else None)
         status: int | str = "no response"
         if diagnostics is not None and diagnostics.status is not None:
             status = diagnostics.status
-        request_id = diagnostics.request_id if diagnostics else "—"
+        request_id = diagnostics.request_id if diagnostics and diagnostics.request_id else "—"
         latency = f"{diagnostics.latency_ms:.1f}" if diagnostics else "—"
-        detail = (exc.upstream_detail or exc.message)[:160].replace("|", "\\|")
+        if isinstance(exc, UpstreamError):
+            detail = (exc.upstream_detail or exc.message)[:160].replace("|", "\\|")
+        else:
+            detail = (str(exc) or exc.__class__.__name__)[:160].replace("|", "\\|")
         return [
             f"| {label} | **{status}** | {request_id} | {latency} | — | — | "
             f"FAILED: {detail} | — | — |"
@@ -255,7 +253,31 @@ async def main() -> None:
 
     for query in QUERIES:
         started = time.perf_counter()
-        vector = (await embedding_client.embed([query.text]))[0]
+        try:
+            vector = (await embedding_client.embed([query.text]))[0]
+        except ConfigurationError:
+            # A broken key or deployment name fails identically on every
+            # remaining query; continuing would just spend a paid run
+            # collecting N copies of the same error instead of one.
+            raise
+        except UpstreamError as exc:
+            embed_ms = (time.perf_counter() - started) * 1000
+            detail = (exc.upstream_detail or exc.message)[:160].replace("|", "\\|")
+            evidence.add(
+                f"## Q{query.number} — {query.kind}",
+                "",
+                f"> {query.text}",
+                "",
+                f"**embedding FAILED** after {embed_ms:.1f} ms "
+                f"({exc.__class__.__name__}): {detail}",
+                "",
+                "No search calls were attempted for this query — every mode "
+                "compared here needs the query vector. This row means the "
+                "embedding call failed, not that retrieval found nothing.",
+                "",
+            )
+            evidence.flush()
+            continue
         embed_ms = (time.perf_counter() - started) * 1000
 
         expected = ", ".join(f"`{c}`" for c in query.expected_chunks) or "none (no answer)"
