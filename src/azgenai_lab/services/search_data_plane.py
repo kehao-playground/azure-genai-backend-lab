@@ -96,7 +96,17 @@ class SearchDataPlane:
         self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
 
     async def create_or_update_index(self) -> None:
-        response = await self._send("PUT", self._index_url, json=to_index_definition())
+        # The REST contract requires `Prefer: return=representation` on this
+        # PUT: it is what tells the service to answer with the created or
+        # updated resource (and with 201 on create, 200 on update) rather
+        # than a bare 204. No other call here is a PUT, so this header is
+        # kept off the shared header dict and sent only for this request.
+        response = await self._send(
+            "PUT",
+            self._index_url,
+            json=to_index_definition(),
+            extra_headers={"Prefer": "return=representation"},
+        )
         if response.status_code >= 400:
             raise self._error(response)
         logger.info("index created or updated name=%s", INDEX_NAME)
@@ -139,9 +149,17 @@ class SearchDataPlane:
             keys.append(chunk_id)
         return keys
 
-    async def _send(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        headers = {**self._headers, **extra_headers} if extra_headers else self._headers
         try:
-            return await self._client.request(method, url, headers=self._headers, **kwargs)
+            return await self._client.request(method, url, headers=headers, **kwargs)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise SearchUnavailableError(str(exc)) from exc
 
