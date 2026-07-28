@@ -36,6 +36,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from azgenai_lab.core.config import get_settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
@@ -44,6 +45,25 @@ from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
 from azgenai_lab.models.search_index import SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.embeddings import build_embedding_client
+
+
+def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
+    """Redact a configured endpoint's host and bare service name from ``text``.
+
+    Azure error bodies routinely echo the resource name back verbatim (a 403
+    naming "the service 'azgenai-lab-search-7f3a'"), and an SSL hostname
+    mismatch echoes the full host. Both are resource names this project's
+    rules require masking before anything is written to evidence, so this
+    runs on every detail before it is added to a table row.
+    """
+    if not endpoint:
+        return text
+    host = urlparse(endpoint).hostname or endpoint
+    scrubbed = text.replace(host, placeholder)
+    bare_name = host.split(".")[0]
+    if bare_name and bare_name != host:
+        scrubbed = scrubbed.replace(bare_name, placeholder)
+    return scrubbed
 
 
 @dataclass(frozen=True)
@@ -114,8 +134,10 @@ class Evidence:
     """Accumulates Markdown and raw request bodies, flushing after every call."""
 
     out: Path
+    total_queries: int
     lines: list[str] = field(default_factory=list)
     requests: list[dict[str, Any]] = field(default_factory=list)
+    attempted_queries: int = 0
 
     @property
     def sidecar(self) -> Path:
@@ -123,6 +145,9 @@ class Evidence:
 
     def add(self, *lines: str) -> None:
         self.lines.extend(lines)
+
+    def start_query(self) -> None:
+        self.attempted_queries += 1
 
     def record_request(self, label: str, body: dict[str, Any] | None) -> None:
         self.requests.append({"label": label, "body": body})
@@ -132,6 +157,12 @@ class Evidence:
             json.dumps(self.requests, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         digest = hashlib.sha256(self.sidecar.read_bytes()).hexdigest()
+        # A file truncated mid-run (the process died, the terminal was
+        # closed) is otherwise structurally identical to a finished one —
+        # same footer, same closing line. This count is the only signal
+        # inside the file itself: a value below `total_queries` means the
+        # run never reached the end, no matter how complete the last table
+        # looks.
         footer = [
             "",
             "---",
@@ -141,6 +172,9 @@ class Evidence:
             "",
             "The tables above elide the 1536-float query vector for readability.",
             "Replay from the sidecar, not from the tables.",
+            "",
+            f"Queries attempted: {self.attempted_queries}/{self.total_queries} "
+            "(below total means this file is truncated)",
         ]
         self.out.write_text("\n".join(self.lines + footer) + "\n", encoding="utf-8")
 
@@ -165,11 +199,17 @@ async def _run(
     mode: SearchMode,
     top: int,
     vector_k: int,
+    search_endpoint: str | None,
 ) -> list[str]:
     """One call, one set of table rows.
 
     Never raises: a failed call — including argument validation that rejects
-    the request before it is ever sent — is evidence, not an error.
+    the request before it is ever sent — is evidence, not an error. The one
+    exception is ``ConfigurationError`` (a bad key, a missing index): our own
+    deployment is broken, every remaining call in this run would fail
+    identically, and that is let through so the caller can abort instead of
+    spending a paid run collecting N copies of the same error — the same rule
+    the query-embedding failure path in ``main()`` applies.
     """
     try:
         result = await client.search(
@@ -179,6 +219,8 @@ async def _run(
             top=top,
             vector_k=vector_k,
         )
+    except ConfigurationError:
+        raise
     except (UpstreamError, ValueError) as exc:
         # ValueError is `validate_search_arguments()` rejecting the call
         # before any request is sent (empty query text, wrong vector width).
@@ -192,9 +234,12 @@ async def _run(
         request_id = diagnostics.request_id if diagnostics and diagnostics.request_id else "—"
         latency = f"{diagnostics.latency_ms:.1f}" if diagnostics else "—"
         if isinstance(exc, UpstreamError):
-            detail = (exc.upstream_detail or exc.message)[:160].replace("|", "\\|")
+            raw_detail = exc.upstream_detail or exc.message
         else:
-            detail = (str(exc) or exc.__class__.__name__)[:160].replace("|", "\\|")
+            raw_detail = str(exc) or exc.__class__.__name__
+        detail = _scrub(raw_detail, search_endpoint, "[search-service]")[:160].replace(
+            "|", "\\|"
+        )
         return [
             f"| {label} | **{status}** | {request_id} | {latency} | — | — | "
             f"FAILED: {detail} | — | — |"
@@ -234,24 +279,39 @@ async def main() -> None:
     arguments = parser.parse_args()
 
     settings = get_settings()
+    if settings.use_fake_embeddings:
+        raise SystemExit(
+            "USE_FAKE_EMBEDDINGS is true — refusing to run a live comparison "
+            "session with fake vectors. The fake's vectors carry no "
+            "semantics; a paid run against real search using them would "
+            "produce evidence that looks real and means nothing. Set "
+            "USE_FAKE_EMBEDDINGS=false and provide real Azure OpenAI "
+            "embedding credentials before running this tool."
+        )
     configure_logging(settings.log_level)
     client = AzureSearchClient(settings)
     embedding_client = build_embedding_client(settings)
 
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
-    evidence = Evidence(arguments.out)
+    evidence = Evidence(arguments.out, total_queries=len(QUERIES))
     evidence.add(
         "# Retrieval comparison — live evidence",
         "",
         f"- checked: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+        f"- embedding client: {embedding_client.__class__.__name__} "
+        f"deployment={settings.azure_openai_embedding_deployment}",
         f"- data-plane API version: `{SEARCH_API_VERSION}`",
         f"- top (frozen for every run): {arguments.top}",
-        "- region / SKU / semanticSearch plan: paste from `az search service show`",
+        "- region / SKU / semanticSearch plan: paste the projected fields "
+        "`infra/scripts/create-search.sh` prints (`sku`/`location`/"
+        "`semanticSearch` only) — never the unprojected `az search service "
+        "show` output, which includes the subscription id",
         "",
     )
     evidence.flush()
 
     for query in QUERIES:
+        evidence.start_query()
         started = time.perf_counter()
         try:
             vector = (await embedding_client.embed([query.text]))[0]
@@ -262,7 +322,11 @@ async def main() -> None:
             raise
         except UpstreamError as exc:
             embed_ms = (time.perf_counter() - started) * 1000
-            detail = (exc.upstream_detail or exc.message)[:160].replace("|", "\\|")
+            detail = _scrub(
+                exc.upstream_detail or exc.message,
+                settings.azure_openai_endpoint,
+                "[openai-service]",
+            )[:160].replace("|", "\\|")
             evidence.add(
                 f"## Q{query.number} — {query.kind}",
                 "",
@@ -306,6 +370,7 @@ async def main() -> None:
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
+                search_endpoint=settings.azure_search_endpoint,
             )
             evidence.add(*rows)
             evidence.flush()
@@ -330,6 +395,7 @@ async def main() -> None:
                 mode=SearchMode.VECTOR,
                 top=arguments.top,
                 vector_k=vector_k,
+                search_endpoint=settings.azure_search_endpoint,
             )
             evidence.add(*rows)
             evidence.flush()
@@ -354,6 +420,7 @@ async def main() -> None:
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
+                search_endpoint=settings.azure_search_endpoint,
             )
             evidence.add(*rows)
             evidence.flush()

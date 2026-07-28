@@ -29,6 +29,15 @@ async def main() -> None:
     arguments = parser.parse_args()
 
     settings = get_settings()
+    if settings.use_fake_embeddings:
+        raise SystemExit(
+            "USE_FAKE_EMBEDDINGS is true — refusing to run a live indexing "
+            "session with fake vectors. The fake's vectors carry no "
+            "semantics; indexing them against a real search service would "
+            "produce a populated, queryable index that looks real and means "
+            "nothing. Set USE_FAKE_EMBEDDINGS=false and provide real Azure "
+            "OpenAI embedding credentials before running this tool."
+        )
     configure_logging(settings.log_level)
 
     plane = SearchDataPlane(settings)
@@ -37,6 +46,10 @@ async def main() -> None:
         print("index created or updated")
 
     embedding_client = build_embedding_client(settings)
+    print(
+        f"embedding client: {embedding_client.__class__.__name__} "
+        f"deployment={settings.azure_openai_embedding_deployment}"
+    )
 
     # Measure the buffer that actually travels, by wrapping the transport
     # rather than serializing a second time. A separate json.dumps() here
@@ -94,9 +107,18 @@ async def main() -> None:
         print(
             f"{source.doc_id}: {len(documents)} chunks, {status}, "
             f"deleted={list(outcome.deleted_keys)}, "
-            f"unresolved={list(outcome.unresolved_stale_ids)}"
+            f"unresolved={list(outcome.unresolved_stale_ids)}, "
+            f"stale_state_unknown={outcome.stale_state_unknown}"
         )
         if not outcome.completed:
+            if outcome.stale_state_unknown:
+                # The new chunks are already live — this is not "nothing
+                # happened", it is "cleanup crashed after the upload landed".
+                raise SystemExit(
+                    f"upload for {source.doc_id} succeeded but stale cleanup crashed "
+                    "afterward; the new chunks are indexed but whether stale ones "
+                    "were removed is unknown — check the log line above and re-run"
+                )
             raise SystemExit(f"replacement did not complete for {source.doc_id}")
 
     average = first_upload_bytes / first_upload_documents if first_upload_documents else 0
