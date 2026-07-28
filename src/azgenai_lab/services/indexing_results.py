@@ -70,12 +70,18 @@ def may_delete_stale(
     new chunks both present, which is recoverable, rather than with nothing at
     all, which is not.
 
-    Every branch here fails closed. Deduplicating by key would let a retry's
-    success overwrite an earlier failure for the same document and silently
-    open the gate, so a repeated key is rejected outright rather than resolved
-    — on either side, since collapsing ``expected_keys`` to a set would erase
-    an upstream chunk-id collision just as silently as collapsing the results
-    would.
+    Every branch here fails closed, and the scope of that is exact: this
+    function judges **one final collection holding one result per key**. A
+    repeated key inside that collection is rejected outright rather than
+    resolved, on either side, since collapsing ``expected_keys`` to a set
+    would erase an upstream chunk-id collision just as silently as collapsing
+    the results would.
+
+    What this does *not* forbid is a key moving from a retryable failure to
+    success across attempts. That progression belongs to the retry coordinator
+    (``services/search_indexing.run_indexing_with_retry``), which hands this
+    function the settled outcome. Reading the rule as "a retry's success may
+    never be credited" would make the gate unopenable after any retry at all.
     """
     if not expected_keys:
         return False
