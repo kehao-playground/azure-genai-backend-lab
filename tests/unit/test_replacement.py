@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from azgenai_lab.services.indexing_results import IndexingResult
+from azgenai_lab.services.indexing_results import Disposition, IndexingResult, classify
 from azgenai_lab.services.search_indexing import DocumentReplacer, ReplacementOutcome
 
 
@@ -45,7 +45,7 @@ class _Index:
             scripted = self.delete_results.get(key)
             if scripted:
                 result = scripted.pop(0)
-                if result.status:
+                if classify(result) is Disposition.SUCCEEDED:
                     self.keys.pop(key, None)
                 results.append(result)
                 continue
@@ -125,12 +125,35 @@ async def test_a_deletion_that_succeeds_on_retry_completes() -> None:
     assert "doc-0002" not in index.keys
 
 
-async def test_nothing_to_delete_still_completes() -> None:
+async def test_first_replacement_for_a_parent_completes_without_deleting() -> None:
+    # Not a test of the `if not stale` early return in `_replace()`: with an
+    # empty `stale` list, `run_indexing_with_retry([], "delete", ...)` is
+    # already a no-op (`serialize_batches` yields no batches for an empty
+    # sequence), so the outcome is identical whether or not that branch
+    # exists. What this pins instead is the outward behaviour on a parent's
+    # very first upload — no prior chunks exist, so nothing is stale and the
+    # replacement completes with an empty deletion.
     index = _Index()
     replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
     assert outcome.completed is True
     assert outcome.deleted_keys == ()
+
+
+async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:
+    index = _Index({"doc-0000": "doc"})
+    sent: list[bytes] = []
+
+    async def recording_post(body: bytes) -> list[IndexingResult]:
+        sent.append(body)
+        return await index.post_index(body)
+
+    replacer = DocumentReplacer(recording_post, index.post_search, sleep=_no_sleep)
+    with pytest.raises(ValueError, match="no chunks"):
+        await replacer.replace("doc", [])
+
+    assert sent == []
+    assert "doc-0000" in index.keys
 
 
 async def test_documents_belonging_to_another_parent_are_refused_before_sending() -> None:
@@ -174,8 +197,21 @@ async def test_one_document_admits_only_one_replacement_at_a_time() -> None:
 
 
 async def test_different_documents_are_not_serialized_against_each_other() -> None:
+    # `max_concurrent_per_parent` cannot see this: it is keyed by parent_id,
+    # so it stays at 1 for each of "a" and "b" regardless of whether the lock
+    # is scoped per-parent or is a single lock shared by every parent_id — a
+    # regression to one global lock still serializes "a" and "b" but leaves
+    # that counter looking identical. Only `max_concurrent_replacements`,
+    # which is not keyed by anything, can tell the two apart.
     index = _Index()
     replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+
+    async def yield_control() -> None:
+        # Force a suspension point inside the critical section so two
+        # unlocked jobs would certainly interleave here.
+        await asyncio.sleep(0)
+
+    index.on_search = yield_control
 
     outcomes = await asyncio.gather(
         replacer.replace("a", _documents(["a-0000"], parent="a")),
@@ -184,3 +220,4 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     assert all(isinstance(o, ReplacementOutcome) and o.completed for o in outcomes)
     # Neither job may treat the other document's chunks as stale.
     assert sorted(index.keys) == ["a-0000", "b-0000"]
+    assert replacer.max_concurrent_replacements == 2

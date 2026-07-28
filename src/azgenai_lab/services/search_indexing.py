@@ -361,6 +361,14 @@ class DocumentReplacer:
         # surviving keys, which cannot distinguish a legal serialization from
         # a corrupted one.
         self.max_concurrent_per_parent = 0
+        self._active_total = 0
+        # Peak observed concurrency across *all* parent_ids combined, not
+        # keyed by anything. A lock narrowed from per-parent to a single
+        # global critical section still leaves `max_concurrent_per_parent`
+        # at 1 — that counter is keyed by parent_id regardless of how the
+        # lock itself is scoped — so only this unkeyed counter can catch
+        # that regression.
+        self.max_concurrent_replacements = 0
 
     def _lock_for(self, parent_id: str) -> asyncio.Lock:
         lock = self._locks.get(parent_id)
@@ -376,10 +384,15 @@ class DocumentReplacer:
             active = self._active.get(parent_id, 0) + 1
             self._active[parent_id] = active
             self.max_concurrent_per_parent = max(self.max_concurrent_per_parent, active)
+            self._active_total += 1
+            self.max_concurrent_replacements = max(
+                self.max_concurrent_replacements, self._active_total
+            )
             try:
                 return await self._replace(parent_id, documents)
             finally:
                 self._active[parent_id] -= 1
+                self._active_total -= 1
 
     async def _replace(
         self, parent_id: str, documents: Sequence[dict[str, Any]]
@@ -397,12 +410,35 @@ class DocumentReplacer:
                     f"document {document.get('chunk_id')!r} has parent_id {owner!r}, "
                     f"but replace() was called for {parent_id!r}"
                 )
+        if not documents:
+            # `may_delete_stale()` already fails closed on an empty
+            # `expected_keys`, but its log message below talks about a
+            # re-run fixing things — there is nothing to re-run when the
+            # caller sent zero chunks. An empty chunk list is indistinguishable
+            # from a chunking bug, so replacement is not how a document gets
+            # retired; refuse it here, before anything is sent, with a message
+            # that says so plainly.
+            raise ValueError(
+                f"replace() called for {parent_id!r} with no chunks — replacing a document "
+                "with zero chunks does not retire it, and a re-run will not help"
+            )
         expected_keys = [str(document["chunk_id"]) for document in documents]
         uploaded = await run_indexing_with_retry(
             self._post_index, documents, "upload", sleep=self._sleep
         )
         upload_results = tuple(uploaded[key] for key in expected_keys)
 
+        # `upload_results` is built by indexing `uploaded` with
+        # `expected_keys` just above, so the only condition `may_delete_stale`
+        # can actually fail on *at this call site* is "not every key
+        # succeeded". Its other two guards — no duplicate/unexpected key and
+        # every key answered exactly once — are enforced upstream instead:
+        # duplicates are rejected before anything is sent
+        # (`DuplicateChunkIdError` in `run_indexing_with_retry`), and that
+        # same function raises `SearchUnavailableError` on a repeated or
+        # unexpected key in a response, and synthesizes a terminal result for
+        # every key it returns. Don't simplify those checks there on the
+        # assumption this gate still covers them.
         if not may_delete_stale(upload_results, expected_keys=expected_keys):
             logger.warning(
                 "stale deletion blocked parent_id=%s — old and new chunks both remain, "
