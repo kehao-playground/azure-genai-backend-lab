@@ -207,10 +207,12 @@ class AzureSearchClient:
         self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
         # One record rather than four mutable fields a caller has to read in
         # the right order and narrow individually. The live evidence file
-        # needs all of it or none of it. ``request_body`` is stored as a copy
-        # (see the construction sites below) so the frozen dataclass is
-        # actually immutable rather than just shallow-frozen around a dict a
-        # caller could still mutate.
+        # needs all of it or none of it. ``request_body`` is stored as a
+        # shallow copy (see the construction sites below), so a caller cannot
+        # rebind a top-level key, but nested values — the ``vectorQueries``
+        # entry in particular — are still shared with the dict that went to
+        # the transport. Deep-copying a 1536-float vector on every call is not
+        # worth the protection.
         self.last_diagnostics: SearchDiagnostics | None = None
 
     async def search(

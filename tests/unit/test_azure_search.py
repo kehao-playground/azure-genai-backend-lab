@@ -89,6 +89,9 @@ async def test_absent_reranker_score_is_none() -> None:
 
     result = await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
     assert result.hits[0].reranker_score is None
+    # The other direction of the same contract: a mode that puts no
+    # `vectorQueries` on the wire must not report a `k` that was never sent.
+    assert result.vector_k is None
 
 
 async def test_empty_result_set_is_not_an_error() -> None:
@@ -138,6 +141,34 @@ async def test_connection_failure_is_unavailable() -> None:
 
     with pytest.raises(SearchUnavailableError):
         await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+
+
+async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
+    # A soft hyphen pasted into the configured endpoint parses as a URL but
+    # fails IDNA encoding when the request is sent, raising `httpx.InvalidURL`
+    # — which does not derive from `httpx.HTTPError`. Without an explicit arm
+    # for it, it would be the one way a raw transport type crosses this
+    # boundary.
+    settings = Settings(
+        _env_file=None,
+        azure_search_endpoint="https://exa\xadmple.search.windows.net",
+        azure_search_admin_key=SecretStr("k"),
+        use_fake_search=False,
+    )
+    client = AzureSearchClient(settings, client=httpx.AsyncClient())
+
+    with pytest.raises(SearchUnavailableError) as caught:
+        await client.search("q", mode=SearchMode.KEYWORD, top=5)
+
+    # Pin the cause, not just the class: a connection failure would also raise
+    # `SearchUnavailableError`. If a future httpx normalised the soft hyphen
+    # away instead of rejecting it, the host would resolve and this test would
+    # otherwise keep passing — vacuously, and over a real network.
+    assert isinstance(caught.value.__cause__, httpx.InvalidURL)
+
+    diagnostics = client.last_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.status is None
 
 
 @pytest.mark.parametrize(
