@@ -13,6 +13,10 @@
 #   AZ_OPENAI_MODEL_VERSION  - model version (default: 2025-08-07)
 #   AZ_OPENAI_SKU            - deployment SKU (default: GlobalStandard)
 #   AZ_OPENAI_CAPACITY       - capacity in K TPM (default: 50)
+#   AZ_EMBED_DEPLOYMENT      - embedding deployment name (default: embed-small)
+#   AZ_EMBED_MODEL           - embedding model name (default: text-embedding-3-small)
+#   AZ_EMBED_MODEL_VERSION   - embedding model version (default: 1)
+#   AZ_EMBED_CAPACITY        - embedding capacity in K TPM (default: 50)
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID (default az context may point at the wrong subscription)}"
@@ -24,6 +28,12 @@ AZ_OPENAI_MODEL="${AZ_OPENAI_MODEL:-gpt-5-mini}"
 AZ_OPENAI_MODEL_VERSION="${AZ_OPENAI_MODEL_VERSION:-2025-08-07}"
 AZ_OPENAI_SKU="${AZ_OPENAI_SKU:-GlobalStandard}"
 AZ_OPENAI_CAPACITY="${AZ_OPENAI_CAPACITY:-50}"
+# Embeddings get their own variable set rather than reusing the chat ones, so a
+# single run can create both deployments on the same account.
+AZ_EMBED_DEPLOYMENT="${AZ_EMBED_DEPLOYMENT:-embed-small}"
+AZ_EMBED_MODEL="${AZ_EMBED_MODEL:-text-embedding-3-small}"
+AZ_EMBED_MODEL_VERSION="${AZ_EMBED_MODEL_VERSION:-1}"
+AZ_EMBED_CAPACITY="${AZ_EMBED_CAPACITY:-50}"
 
 az cognitiveservices account create \
   --subscription "$AZ_SUBSCRIPTION_ID" \
@@ -47,9 +57,22 @@ az cognitiveservices account deployment create \
   --sku-capacity "$AZ_OPENAI_CAPACITY" \
   --output table
 
+az cognitiveservices account deployment create \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --name "$AZ_OPENAI_NAME" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --deployment-name "$AZ_EMBED_DEPLOYMENT" \
+  --model-name "$AZ_EMBED_MODEL" \
+  --model-version "$AZ_EMBED_MODEL_VERSION" \
+  --model-format OpenAI \
+  --sku-name "$AZ_OPENAI_SKU" \
+  --sku-capacity "$AZ_EMBED_CAPACITY" \
+  --output table
+
 echo "Endpoint: $(az cognitiveservices account show \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --name "$AZ_OPENAI_NAME" --resource-group "$AZ_RESOURCE_GROUP" \
   --query properties.endpoint --output tsv)"
 echo "Created deployment $AZ_OPENAI_DEPLOYMENT ($AZ_OPENAI_MODEL $AZ_OPENAI_MODEL_VERSION, $AZ_OPENAI_SKU ${AZ_OPENAI_CAPACITY}K TPM)."
+echo "Created deployment $AZ_EMBED_DEPLOYMENT ($AZ_EMBED_MODEL $AZ_EMBED_MODEL_VERSION, $AZ_OPENAI_SKU ${AZ_EMBED_CAPACITY}K TPM)."
 echo "Pair with delete-openai.sh when this resource is no longer needed."
