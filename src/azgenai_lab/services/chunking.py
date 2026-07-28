@@ -4,6 +4,14 @@ Structure first: a chunk is a Markdown section, so a citation can name a
 section a reader recognises. Only a section that will not fit is broken up,
 and then by the largest natural boundary available.
 
+The supported Markdown subset is deliberately narrow: ATX headings
+(``#`` through ``######``) outside fenced code blocks, blank-line paragraph
+boundaries, and fenced code blocks (``` ``` ``` or ``~~~``) treated as opaque
+spans that never contribute headings. Setext headings (underlined with ``=``
+or ``-``), 4-space-indented code blocks, and HTML blocks are **not**
+recognised — an indented code block containing a ``#`` line is still read as
+a heading, because indentation alone carries no meaning to this splitter.
+
 Everything here is a pure function of its arguments. No I/O, no settings
 lookups, no clock — the same document and parameters always produce the same
 chunks, which is what makes chunk ids stable.
@@ -20,6 +28,43 @@ from azgenai_lab.models.rag import (
 )
 
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
+
+# CommonMark fenced code blocks, to the depth described in the module
+# docstring: a fence opens on a line whose first non-whitespace run is three
+# or more backticks or tildes, indented by up to three spaces. `group(1)` is
+# the run itself (its first character is the fence character, its length is
+# the minimum a closing run must meet); `group(2)` is the info string.
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _fence_open(line: str) -> tuple[str, int] | None:
+    """Return ``(fence_char, run_length)`` if ``line`` opens a fence, else ``None``.
+
+    A backtick fence's info string must not itself contain a backtick — that
+    ambiguity is CommonMark's rule, not just decoration — so such a line does
+    not open a fence at all and is left for the caller to treat as ordinary
+    content. A tilde fence's info string has no such restriction.
+    """
+    match = _FENCE_OPEN.match(line)
+    if match is None:
+        return None
+    run, info_string = match.group(1), match.group(2)
+    fence_char = run[0]
+    if fence_char == "`" and "`" in info_string:
+        return None
+    return fence_char, len(run)
+
+
+def _fence_closes(line: str, fence_char: str, min_length: int) -> bool:
+    """Whether ``line`` closes a fence opened with ``fence_char`` and ``min_length``.
+
+    The closing run must be the same character, at least as long as the
+    opening run, indented by up to three spaces, with nothing but trailing
+    whitespace after it — a shorter or different-character run is content,
+    not a close.
+    """
+    pattern = rf"^ {{0,3}}{re.escape(fence_char)}{{{min_length},}}[ \t]*$"
+    return re.match(pattern, line) is not None
 
 # Sentence terminators for both writing systems, plus any trailing closing
 # punctuation. Chinese has no inter-word spaces, so a whitespace-based splitter
@@ -69,6 +114,9 @@ def _sections(document: SourceDocument) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     stack: list[tuple[int, str]] = []
     buffer: list[str] = []
+    # None when scanning ordinary lines; otherwise the fence currently open,
+    # so an ATX-looking line inside it is content, never a heading.
+    fence: tuple[str, int] | None = None
 
     def flush() -> None:
         prose = "\n".join(buffer).strip()
@@ -82,6 +130,16 @@ def _sections(document: SourceDocument) -> list[tuple[str, str]]:
         sections.append((path, prose))
 
     for line in document.body.splitlines():
+        if fence is not None:
+            buffer.append(line)
+            if _fence_closes(line, fence[0], fence[1]):
+                fence = None
+            continue
+        opened = _fence_open(line)
+        if opened is not None:
+            fence = opened
+            buffer.append(line)
+            continue
         match = _HEADING.match(line)
         if match is None:
             buffer.append(line)
