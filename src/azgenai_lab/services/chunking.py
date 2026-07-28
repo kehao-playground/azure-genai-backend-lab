@@ -187,6 +187,16 @@ def chunk_markdown(
                     effective_date=document.effective_date,
                 )
             )
+    if not chunks:
+        # "Delete everything for this document" must stay an explicit
+        # operation a caller asks for, never an inferred side effect of an
+        # empty chunk list: `may_delete_stale([], expected_keys=[])` is
+        # unconditionally False, so an empty result would leave stale
+        # content searchable forever. A document that yields no chunks is an
+        # authoring error and must fail before anything is mutated.
+        raise ChunkingError(
+            f"{document.doc_id} produced no chunks: it has no prose outside its headings"
+        )
     return chunks
 
 
