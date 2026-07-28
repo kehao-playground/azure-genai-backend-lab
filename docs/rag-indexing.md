@@ -292,7 +292,7 @@ onto every `Chunk` derived from it:
 | `title` | front matter `title` | Also the mandatory first segment of every chunk's `heading_path`. |
 | `doc_type` | front matter `doc_type` | Free text; facetable in the index for scoping retrieval by document category. |
 | `tenant_id` | front matter `tenant_id` | **Reserved for Day 15.** The field is populated and filterable now so that Day 15's multi-tenant filtering has something to filter on; no filtering logic exists yet. |
-| `effective_date` | front matter `effective_date` (YAML date) | Filterable and sortable, so a stale document's chunks can be excluded from being treated as a current answer. **Open contract gap** — see below. |
+| `effective_date` | front matter `effective_date` (YAML date) | Filterable and sortable, so a stale document's chunks can be excluded from being treated as a current answer. Encoded as a UTC calendar date at index time — see below. |
 | `heading_path` | derived during chunking | Always starts with `title`; see [Embedding input versus citation text](#embedding-input-versus-citation-text). |
 | `content` | derived during chunking | The citation text; see above. |
 
@@ -300,17 +300,16 @@ Front-matter parsing is strict and closed-set (`_REQUIRED_FIELDS` in `document_l
 five fields are required, no unknown field is tolerated, and `doc_id` must match the filename. This
 mirrors how Day 8 validates prompt template front matter — fail at load time, not at index time.
 
-**`effective_date` has no closed path from producer to schema.** `SourceDocument.effective_date`
+**`effective_date` crosses a type boundary between producer and schema.** `SourceDocument.effective_date`
 and `Chunk.effective_date` (`models/rag.py`) are both typed `datetime.date`, copied through
 verbatim. The index field, though, is `Edm.DateTimeOffset` (see [Index schema](#index-schema)),
 which takes an ISO-8601 timestamp rather than a bare calendar date — `2026-01-15T00:00:00Z`, not
-`date.isoformat()`'s `2026-01-15`. The exact form the service accepts is not confirmed here (this
-milestone writes nothing to Azure AI Search), so the precise serialization is Day 13's to establish
-against the live service. Nothing on this branch serializes a `Chunk` into an index
-document, so nothing is broken today; `effective_date` is simply the one metadata field whose
-contract does not close within this milestone's deliverable. Deciding what time and offset a bare
-date should serialize to belongs to Day 13's `to_index_document()`, not here — recorded as an open
-seam rather than papered over.
+`date.isoformat()`'s `2026-01-15`. Day 13 settled it. The source data is date-only, so this project *defines* the field as a UTC
+calendar date and encodes it at UTC midnight — `2026-01-15T00:00:00Z`. The offset is a domain
+decision, not something `Edm.DateTimeOffset` derives for us: the type requires an offset and we
+choose which one. `Chunk.to_index_document()` performs the encoding, and every range filter over
+this field must use UTC date boundaries or it will silently shift by a day. See
+[rag-retrieval.md](rag-retrieval.md).
 
 ## Embedding model and batching
 
@@ -381,16 +380,14 @@ one search document:
 | `effective_date` | `Edm.DateTimeOffset` | filterable, sortable | Keeps an expired document from being treated as a current answer. |
 | `content_vector` | `Collection(Edm.Single)` | searchable, `stored: true`, `retrievable: false`, `dimensions: 1536` | The vector side of hybrid search; see [`stored` is the vector's only backup](#stored-is-the-vectors-only-backup). |
 
-**Two sources of truth name the index.** `INDEX_NAME = "azgenai-lab-chunks"` (`models/search_index.py`)
+**The index name has one source of truth.** `INDEX_NAME = "azgenai-lab-chunks"` (`models/search_index.py`)
 is a hard-coded constant, using the same constant-over-setting reasoning as `EMBEDDING_DIMENSIONS`
 (see [Embedding model and batching](#embedding-model-and-batching)) — a setting is precisely a
-mechanism for letting two things that must agree disagree at runtime. But `core/config.py` also
-carries a pre-existing `azure_search_index_name: str | None = None` setting, which predates this
-milestone and is untouched here. The two are not reconciled: the exported schema always pins the
-name `INDEX_NAME` defines, the setting is currently read by no code path, and this milestone lands
-on the opposite side from that setting — constant, not setting — without having said so
-until now. Reconciling them (or deciding the index name should stay a constant and the setting
-should go away) is a Day 13 decision; it is recorded here as an open seam, not a resolved rule.
+mechanism for letting two things that must agree disagree at runtime. Day 13 settled it: the setting is gone. `INDEX_NAME` is the only source of truth, and
+`.env.example` no longer publishes a conflicting `AZURE_SEARCH_INDEX_NAME=documents` — which had
+already drifted from the constant, making this a demonstrated failure rather than a hypothetical
+one. Per-environment naming, when it is eventually needed, arrives as an index alias with the same
+alias name in every environment and the endpoint providing the isolation, not as a settings knob.
 
 **`en.microsoft` is the one schema choice this document does not defend on its own terms.**
 `content`'s analyzer (`models/search_index.py`) is hard-coded to `en.microsoft` — an
