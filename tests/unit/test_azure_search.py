@@ -19,7 +19,6 @@ from azgenai_lab.services.azure_search import (
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 
 
-
 def _settings() -> Settings:
     return Settings(
         _env_file=None,
@@ -149,6 +148,7 @@ async def test_connection_failure_is_unavailable() -> None:
         {"value": [_hit(**{"@search.score": "high"})]},        # non-numeric score
         {"value": [_hit(**{"@search.rerankerScore": "n/a"})]}, # non-numeric reranker
         {"value": [{"@search.score": 1.0}]},                   # no chunk_id
+        {"value": [5]},                                        # hit is not an object
         {"value": "not-a-list"},
         {"nothing": True},
         [1, 2, 3],
@@ -164,6 +164,18 @@ async def test_every_malformed_2xx_payload_stays_inside_the_adapter(payload: obj
         await _client(handler).search("q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5)
 
 
+async def test_non_object_hit_is_reported_distinctly_from_a_missing_score() -> None:
+    # A hit that is not an object at all has no @search.score to be missing;
+    # reporting it as "missing @search.score" would misdescribe the payload.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [5]})
+
+    with pytest.raises(SearchUnavailableError) as caught:
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+    assert caught.value.upstream_detail is not None
+    assert "expected an object" in caught.value.upstream_detail
+
+
 async def test_non_json_2xx_is_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"not json")
@@ -172,14 +184,44 @@ async def test_non_json_2xx_is_unavailable() -> None:
         await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
 
 
-async def test_client_facing_message_does_not_leak_endpoint_or_key() -> None:
+async def test_client_facing_message_does_not_leak_endpoint_key_filter_or_query_text() -> None:
+    # Every forbidden string must actually be reachable from the message
+    # under test, or the assertions pass regardless of whether the adapter
+    # leaks anything. The handler below echoes the request URL, the api-key
+    # header and the request body (which carries the query text and the
+    # filter) back in its 400 detail, so a regression that forwards upstream
+    # detail into the client-facing message has something real to catch.
+    admin_key = "very-secret-admin-key-4b2d9c"
+    query_text = "distinctive-query-text-9f3c"
+    filter_expression = "distinctive-filter-a71e"
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"error": {"message": "bad"}})
+        detail = (
+            f"bad request to {request.url} "
+            f"with api-key {request.headers.get('api-key')} "
+            f"body {request.content.decode()}"
+        )
+        return httpx.Response(400, json={"error": {"message": detail}})
+
+    transport = httpx.MockTransport(handler)
+    settings = Settings(
+        _env_file=None,
+        azure_search_endpoint="https://example.search.windows.net",
+        azure_search_admin_key=SecretStr(admin_key),
+        use_fake_search=False,
+    )
+    client = AzureSearchClient(settings, client=httpx.AsyncClient(transport=transport))
 
     with pytest.raises(SearchRequestRejectedError) as caught:
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
-    assert "example.search.windows.net" not in caught.value.message
-    assert "k" not in caught.value.message.split()
+        await client.search(
+            query_text, mode=SearchMode.KEYWORD, top=5, filter=filter_expression
+        )
+
+    # UpstreamError.__init__ passes self.message to Exception.__init__, so
+    # str(exc) is a second caller-reachable surface — both must be clean.
+    for forbidden in ("example.search.windows.net", admin_key, query_text, filter_expression):
+        assert forbidden not in caught.value.message
+        assert forbidden not in str(caught.value)
 
 
 async def test_diagnostics_are_recorded_on_success_and_on_failure() -> None:
@@ -240,6 +282,26 @@ async def test_a_transport_failure_never_inherits_the_previous_call_diagnostics(
     assert diagnostics.request_id is None
     assert "vectorQueries" in diagnostics.request_body, "body must be the failed call's"
     assert diagnostics.request_body.get("search") is None
+
+
+async def test_a_call_rejected_by_argument_validation_leaves_no_stale_diagnostics() -> None:
+    # validate_search_arguments() raises before any HTTP request is built, so
+    # this call never reaches the try/except that records diagnostics either
+    # way. If the previous call's record were still in place, it would be
+    # mistaken for evidence about *this* rejected call, not the one that
+    # actually produced it.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [_hit()]}, headers={"request-id": "first"})
+
+    client = _client(handler)
+    await client.search("first query", mode=SearchMode.KEYWORD, top=5)
+    assert client.last_diagnostics is not None
+
+    with pytest.raises(ValueError):
+        # A vector of the wrong width fails validate_search_arguments().
+        await client.search("second query", [0.1], mode=SearchMode.VECTOR, top=5)
+
+    assert client.last_diagnostics is None
 
 
 async def test_missing_configuration_fails_fast() -> None:

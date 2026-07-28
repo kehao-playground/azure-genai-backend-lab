@@ -51,7 +51,13 @@ class _Diagnosable:
 
 
 class SearchError(_Diagnosable, UpstreamError):
-    """Base for query-side search failures.
+    """Base for query-side search failures that are not configuration.
+
+    Configuration failures (bad key, missing role assignment, missing index)
+    deliberately route through ``SearchConfigurationError`` /
+    ``ConfigurationError`` instead of through this class — ``except
+    SearchError:`` will not catch a 401/403/404. ``UpstreamError`` is the true
+    catch-all across both branches.
 
     ``status`` and ``request_id`` are for the log. The client-facing
     ``message`` is fixed per subclass and never carries the endpoint, the key,
@@ -150,7 +156,9 @@ def parse_hits(payload: object) -> tuple[SearchHit, ...]:
         raise SearchUnavailableError("search response has no 'value' array")
     hits: list[SearchHit] = []
     for document in payload["value"]:
-        if not isinstance(document, dict) or "@search.score" not in document:
+        if not isinstance(document, dict):
+            raise SearchUnavailableError(f"search result was {document!r}, expected an object")
+        if "@search.score" not in document:
             raise SearchUnavailableError("search result is missing @search.score")
         # Membership, not truthiness: 0.0 is a real reranker verdict.
         raw_reranker = document.get("@search.rerankerScore")
@@ -197,9 +205,12 @@ class AzureSearchClient:
             "content-type": "application/json",
         }
         self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
-        # One immutable record rather than four mutable fields a caller has to
-        # read in the right order and narrow individually. The live evidence
-        # file needs all of it or none of it.
+        # One record rather than four mutable fields a caller has to read in
+        # the right order and narrow individually. The live evidence file
+        # needs all of it or none of it. ``request_body`` is stored as a copy
+        # (see the construction sites below) so the frozen dataclass is
+        # actually immutable rather than just shallow-frozen around a dict a
+        # caller could still mutate.
         self.last_diagnostics: SearchDiagnostics | None = None
 
     async def search(
@@ -212,24 +223,25 @@ class AzureSearchClient:
         filter: str | None = None,
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult:
+        # Cleared first, before argument validation can raise. Leaving the
+        # previous call's record in place would let a rejected or failed call
+        # be written up with the *last successful* call's body, status and
+        # request id — misattributed evidence that no checksum on the file
+        # can detect, because the file is intact and the contents are simply
+        # about the wrong request.
+        self.last_diagnostics = None
         body = build_search_body(
             query_text, query_vector, mode=mode, top=top, filter=filter, vector_k=vector_k
         )
-        # Cleared first. Leaving the previous call's record in place would let
-        # a transport failure be written up with the *last successful* call's
-        # body, status and request id — misattributed evidence that no
-        # checksum on the file can detect, because the file is intact and the
-        # contents are simply about the wrong request.
-        self.last_diagnostics = None
         started = time.perf_counter()
         try:
             response = await self._client.post(self._url, json=body, headers=self._headers)
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             # No response exists, so there is no status and no request id —
             # recorded as None rather than omitted, because "the call never
             # landed" is itself the finding.
             self.last_diagnostics = SearchDiagnostics(
-                request_body=body,
+                request_body=dict(body),
                 status=None,
                 request_id=None,
                 latency_ms=(time.perf_counter() - started) * 1000,
@@ -239,7 +251,7 @@ class AzureSearchClient:
         # captures successful calls cannot rule out a configuration error.
         request_id = response.headers.get("request-id")
         self.last_diagnostics = SearchDiagnostics(
-            request_body=body,
+            request_body=dict(body),
             status=response.status_code,
             request_id=request_id,
             latency_ms=(time.perf_counter() - started) * 1000,
@@ -258,8 +270,10 @@ class AzureSearchClient:
         # Per-stage retrieval logging: which stage was asked, how wide the
         # candidate window was, what came back and in what order. Day 8's
         # correlation id joins these to the prompt and usage lines.
-        sends_vector = query_vector is not None and mode is not SearchMode.KEYWORD
-        effective_k = vector_k if sends_vector else None
+        # Read from the body that was actually built, not re-derived from the
+        # caller's arguments: a future mode that sends no vector would make a
+        # re-derived rule report a `k` that was never on the wire.
+        effective_k = vector_k if "vectorQueries" in body else None
         logger.info(
             "search mode=%s vector_k=%s top=%d returned=%d latency_ms=%.1f "
             "chunk_ids=%s scores=%s reranker_scores=%s",
