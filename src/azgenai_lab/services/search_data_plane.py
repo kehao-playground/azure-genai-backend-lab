@@ -162,7 +162,10 @@ class SearchDataPlane:
         # case from a shared one would duplicate on the wire instead of
         # replacing it.
         headers = (
-            {**self._headers, **{key.lower(): value for key, value in extra_headers.items()}}
+            {
+                **{key.lower(): value for key, value in self._headers.items()},
+                **{key.lower(): value for key, value in extra_headers.items()},
+            }
             if extra_headers
             else self._headers
         )
