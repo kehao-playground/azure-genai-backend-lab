@@ -378,3 +378,20 @@ def test_the_corpus_exercises_heading_depth() -> None:
     depths = {chunk.heading_path.count(" > ") for chunk in _corpus_chunks()}
 
     assert max(depths) >= 2, "no document uses a '###' subsection"
+
+
+def test_a_document_with_no_prose_is_an_error() -> None:
+    # Only headings, no prose anywhere: the "no prose, no chunk" rule drops
+    # every section, leaving nothing. A document left with nothing at all is
+    # an authoring error, not a silent empty chunk list.
+    body = "## Only a heading\n\n### Nested heading\n"
+    with pytest.raises(ChunkingError, match="returns-policy"):
+        chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
+
+
+def test_a_document_whose_body_is_only_a_title_heading_is_an_error() -> None:
+    # The title-H1 rule strips this heading as structure, not a section,
+    # leaving no sections at all.
+    body = "# Returns Policy\n"
+    with pytest.raises(ChunkingError, match="returns-policy"):
+        chunk_markdown(_document(body), max_chars=2000, overlap_chars=500)
