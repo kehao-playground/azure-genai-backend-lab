@@ -155,7 +155,17 @@ async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
         azure_search_admin_key=SecretStr("k"),
         use_fake_search=False,
     )
-    client = AzureSearchClient(settings, client=httpx.AsyncClient())
+
+    # `httpx.URL(...)` raises `InvalidURL` at construction, before the
+    # transport is ever consulted — this handler proves that: if it were
+    # reached, the test would fail loudly here rather than pass vacuously
+    # over a real DNS lookup and connection attempt.
+    def unreachable_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport must not be reached: InvalidURL should raise first")
+
+    client = AzureSearchClient(
+        settings, client=httpx.AsyncClient(transport=httpx.MockTransport(unreachable_handler))
+    )
 
     with pytest.raises(SearchUnavailableError) as caught:
         await client.search("q", mode=SearchMode.KEYWORD, top=5)
