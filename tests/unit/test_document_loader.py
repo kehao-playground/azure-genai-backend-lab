@@ -185,7 +185,7 @@ def test_the_shipped_corpus_has_third_level_headings_in_at_least_two_files() -> 
 
 
 def test_the_shipped_corpus_has_a_section_over_the_chunk_max_chars_threshold() -> None:
-    threshold = Settings().chunk_max_chars
+    threshold = Settings(_env_file=None).chunk_max_chars
     longest = 0
     for path in sorted(SAMPLE_DOCS_DIR.glob("*.md")):
         text = path.read_text(encoding="utf-8")
