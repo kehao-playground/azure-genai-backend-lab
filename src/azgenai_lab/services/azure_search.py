@@ -161,7 +161,8 @@ def parse_hits(payload: object) -> tuple[SearchHit, ...]:
             raise SearchUnavailableError(f"search result was {document!r}, expected an object")
         if "@search.score" not in document:
             raise SearchUnavailableError("search result is missing @search.score")
-        # Membership, not truthiness: 0.0 is a real reranker verdict.
+        # Read with .get() and compared via `is None`, not truthiness:
+        # 0.0 is a real reranker verdict, not an absent one.
         raw_reranker = document.get("@search.rerankerScore")
         hits.append(
             SearchHit(
@@ -306,6 +307,12 @@ class FakeSearchClient:
     are noise. Using lexical scoring for ``VECTOR`` mode is a knowingly
     unfaithful stand-in — an honest fake beats a plausible one. Retrieval
     quality observed here means nothing.
+
+    It also does not apply ``filter``: the argument is recorded on
+    ``last_filter`` so a caller can assert what was passed, but every document
+    is still scored and can still be returned regardless of its value. A test
+    written against this fake to assert "tenant B's chunks are not returned"
+    would pass whether or not real filtering was ever wired up.
     """
 
     def __init__(self, documents: Sequence[dict[str, Any]] = ()) -> None:

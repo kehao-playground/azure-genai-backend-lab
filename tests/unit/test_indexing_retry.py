@@ -225,6 +225,38 @@ async def test_a_key_missing_from_every_response_stays_outstanding() -> None:
     assert classify(results["b"]) is Disposition.RETRYABLE
 
 
+async def test_a_response_mentioning_a_key_that_was_not_sent_is_rejected() -> None:
+    # `may_delete_stale()`'s own duplicate/unexpected-key checks are narrowed
+    # at their call site in `DocumentReplacer._replace()` on the assumption
+    # that this guard already covers a response naming a key outside the
+    # batch — nothing exercises it directly. Without it, a phantom key would
+    # enter `terminal`, join `still_outstanding`, and the next attempt would
+    # raise an unhandled `KeyError` building `by_key[key]` in the coordinator.
+    async def post(_body: bytes) -> list[IndexingResult]:
+        return [_ok("a"), _ok("b"), _ok("ghost")]
+
+    with pytest.raises(SearchUnavailableError) as exc_info:
+        await run_indexing_with_retry(post, DOCUMENTS, "upload", sleep=_no_sleep)
+    assert "ghost" in str(exc_info.value.upstream_detail)
+
+
+async def test_a_synthesized_error_carries_its_own_batchs_message() -> None:
+    # A synthesized result for one batch's key must carry that batch's own
+    # error text, not whichever batch the retry loop happened to process
+    # last within the same attempt — that text reaches the evidence write-up.
+    documents = [{"chunk_id": f"k{i}"} for i in range(MAX_BATCH_DOCUMENTS + 1)]
+
+    async def post(body: bytes) -> list[IndexingResult]:
+        keys = _keys(body)
+        if len(keys) == MAX_BATCH_DOCUMENTS:
+            raise SearchUnavailableError("first batch down")
+        raise SearchUnavailableError("second batch down")
+
+    results = await run_indexing_with_retry(post, documents, "upload", sleep=_no_sleep)
+    assert results["k0"].error_message == "first batch down"
+    assert results["k1000"].error_message == "second batch down"
+
+
 async def test_duplicate_keys_in_the_input_are_rejected_before_sending() -> None:
     # Collapsing two documents that share a chunk_id into one upload would
     # silently drop the earlier one and report nothing about it. That must

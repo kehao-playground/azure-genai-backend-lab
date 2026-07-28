@@ -72,6 +72,22 @@ async def test_fake_records_the_parameters_it_was_called_with() -> None:
     assert fake.last_filter == "tenant_id eq 'acme'"
 
 
+async def test_fake_does_not_apply_the_filter_it_records() -> None:
+    # `last_filter` proves what a caller passed; it proves nothing about
+    # whether the fake honoured it. A "tenant B's chunks are not returned"
+    # test would pass against this fake regardless of whether real filtering
+    # was ever wired up — this pins that gap so the next reader cannot
+    # mistake `last_filter` for filtering.
+    result = await FakeSearchClient(DOCUMENTS).search(
+        "refund",
+        VECTOR,
+        mode=SearchMode.HYBRID,
+        top=5,
+        filter="tenant_id eq 'someone-else'",
+    )
+    assert [hit.chunk_id for hit in result.hits] == ["returns-policy-0001"]
+
+
 async def test_fake_never_invents_a_reranker_score() -> None:
     # It does not simulate the semantic ranker. A plausible reranker score
     # would be ranking "evidence" that is pure noise.
