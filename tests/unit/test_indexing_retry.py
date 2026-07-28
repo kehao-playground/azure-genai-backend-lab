@@ -17,6 +17,7 @@ from azgenai_lab.services.search_indexing import (
     MAX_INDEXING_ATTEMPTS,
     MAX_REQUEST_BYTES,
     DocumentTooLargeError,
+    DuplicateChunkIdError,
     run_indexing_with_retry,
 )
 
@@ -228,11 +229,11 @@ async def test_duplicate_keys_in_the_input_are_rejected_before_sending() -> None
     # Collapsing two documents that share a chunk_id into one upload would
     # silently drop the earlier one and report nothing about it. That must
     # fail closed at the boundary, before anything is sent.
-    documents = [{"chunk_id": "a"}, {"chunk_id": "a"}]
+    documents = [{"chunk_id": "dup-1"}, {"chunk_id": "dup-1"}]
 
     async def post(_body: bytes) -> list[IndexingResult]:
         raise AssertionError("nothing should be sent")
 
-    with pytest.raises(SearchRequestRejectedError) as exc_info:
+    with pytest.raises(DuplicateChunkIdError) as exc_info:
         await run_indexing_with_retry(post, documents, "upload", sleep=_no_sleep)
-    assert "a" in str(exc_info.value.upstream_detail)
+    assert "dup-1" in str(exc_info.value.upstream_detail)
