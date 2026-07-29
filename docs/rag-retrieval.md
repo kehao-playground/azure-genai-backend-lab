@@ -89,16 +89,16 @@ while the documented 1-based form reproduces none of them. What the measurement 
 combination, not either half alone — a constant of 60 over 0-based ranks is indistinguishable
 from 59 over 1-based ranks.
 
-That reconstruction is only possible because this corpus is smaller than `top`, so the separate
-keyword and vector runs return complete lists. On a corpus larger than `top`, the inputs to the
-fusion are not fully observable from outside it.
+That reconstruction is only possible because this corpus is no larger than `top` — 25 chunks
+against `top` 25 — so the separate keyword and vector runs return complete lists. On a corpus
+larger than `top`, the inputs to the fusion are not fully observable from outside it.
 
 It also reframes the published figure. Under the documented formula, `0.032786883413791656` —
 bit-for-bit the IEEE-754 float32 value of `2/61` — is exactly what a document ranked first in
 both lists scores, and the page does introduce it as the top result. Under the formula the
-service actually runs, first-in-both scores `2/60 ≈ 0.0333`; the only ranks that would yield
-`2/61` are second in both, which the page's own wording rules out. The published example
-therefore illustrates the documented formula rather than current behaviour — worth knowing
+service actually runs, first-in-both scores `2/60 ≈ 0.0333`; the only two-list ranks that would
+yield `2/61` are second in both, which the page's own wording rules out. The published example
+therefore illustrates the documented formula rather than current behavior — worth knowing
 before deriving anything from it. A low RRF score is not a weak match; it is a different ruler.
 The service's own troubleshooting guidance puts it plainly — a score of 0.03 can still indicate
 a strong match.
