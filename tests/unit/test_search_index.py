@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from azgenai_lab.models.rag import Chunk
+from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import (
     DOCUMENT_KEY_MAX_LENGTH,
     EMBEDDING_DIMENSIONS,
@@ -21,6 +22,7 @@ from azgenai_lab.models.search_index import (
     to_index_definition,
     validate_document_key,
 )
+from azgenai_lab.services.azure_search import build_search_body
 
 
 def test_embedding_dimensions_is_the_full_text_embedding_3_small_width() -> None:
@@ -174,6 +176,26 @@ def test_semantic_fields_are_searchable_and_retrievable() -> None:
         field = _field(name)
         assert field["searchable"] is True, name
         assert field["retrievable"] is True, name
+
+
+def test_the_vector_field_has_one_name_across_the_schema_and_the_query() -> None:
+    # The field is located by its *type*, not by VECTOR_FIELD: looking it up by
+    # the constant would make the comparison agree with itself. Two artifacts
+    # have to name the same field — the index that stores the vectors and the
+    # query that searches them — and a mismatch is not a build error, a type
+    # error or a 4xx. It is a live query that quietly returns nothing.
+    vector_fields = [
+        field
+        for field in to_index_definition()["fields"]
+        if field["type"] == "Collection(Edm.Single)"
+    ]
+    assert len(vector_fields) == 1
+    assert vector_fields[0]["name"] == VECTOR_FIELD
+
+    body = build_search_body(
+        "q", [0.1] * EMBEDDING_DIMENSIONS, mode=SearchMode.VECTOR, top=5
+    )
+    assert body["vectorQueries"][0]["fields"] == VECTOR_FIELD
 
 
 def test_constants_are_pinned() -> None:
