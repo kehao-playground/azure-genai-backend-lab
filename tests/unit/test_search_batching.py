@@ -4,11 +4,12 @@ import json
 
 import pytest
 
-from azgenai_lab.services.search_indexing import (
+from azgenai_lab.models.rag import IndexingAction
+from azgenai_lab.services.search_data_plane import (
     MAX_BATCH_DOCUMENTS,
     MAX_REQUEST_BYTES,
     DocumentTooLargeError,
-    serialize_batches,
+    plan_batches,
 )
 
 
@@ -17,7 +18,7 @@ def _documents(count: int, filler: str = "x") -> list[dict[str, object]]:
 
 
 def test_batch_is_valid_json_with_the_action_attached() -> None:
-    batches = list(serialize_batches(_documents(2), "upload"))
+    batches = list(plan_batches(_documents(2), IndexingAction.UPSERT))
     assert len(batches) == 1
     payload = json.loads(batches[0].body)
     assert [d["@search.action"] for d in payload["value"]] == ["upload", "upload"]
@@ -25,7 +26,7 @@ def test_batch_is_valid_json_with_the_action_attached() -> None:
 
 
 def test_document_count_ceiling_is_honoured() -> None:
-    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS + 1), "upload"))
+    batches = list(plan_batches(_documents(MAX_BATCH_DOCUMENTS + 1), IndexingAction.UPSERT))
     assert len(batches) == 2
     assert len(batches[0].keys) == MAX_BATCH_DOCUMENTS
     assert len(batches[1].keys) == 1
@@ -37,11 +38,11 @@ def test_document_count_ceiling_lands_exactly_without_splitting() -> None:
     # document past it starts a second batch. The test above only checks
     # MAX_BATCH_DOCUMENTS + 1, which would stay green even if the guard were
     # loosened by one and let 1,001 documents share a single batch.
-    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS), "upload"))
+    batches = list(plan_batches(_documents(MAX_BATCH_DOCUMENTS), IndexingAction.UPSERT))
     assert len(batches) == 1
     assert batches[0].keys == tuple(f"doc-{i:05d}" for i in range(MAX_BATCH_DOCUMENTS))
 
-    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS + 1), "upload"))
+    batches = list(plan_batches(_documents(MAX_BATCH_DOCUMENTS + 1), IndexingAction.UPSERT))
     assert len(batches) == 2
     assert len(batches[0].keys) == MAX_BATCH_DOCUMENTS
     assert len(batches[1].keys) == 1
@@ -60,7 +61,7 @@ def test_byte_ceiling_lands_exactly_without_splitting() -> None:
     # document's `content` field with plain ASCII up to the ceiling -- each
     # extra character adds exactly one byte to the encoded batch, with no
     # escaping to account for.
-    probe = next(iter(serialize_batches(_documents(2, filler=""), "upload")))
+    probe = next(iter(plan_batches(_documents(2, filler=""), IndexingAction.UPSERT)))
     overhead = len(probe.body)
     pad = MAX_REQUEST_BYTES - overhead
 
@@ -68,7 +69,7 @@ def test_byte_ceiling_lands_exactly_without_splitting() -> None:
         {"chunk_id": "doc-00000", "content": "a" * pad},
         {"chunk_id": "doc-00001", "content": ""},
     ]
-    batches = list(serialize_batches(documents, "upload"))
+    batches = list(plan_batches(documents, IndexingAction.UPSERT))
     assert len(batches) == 1
     assert len(batches[0].body) == MAX_REQUEST_BYTES
     assert batches[0].keys == ("doc-00000", "doc-00001")
@@ -77,7 +78,7 @@ def test_byte_ceiling_lands_exactly_without_splitting() -> None:
         {"chunk_id": "doc-00000", "content": "a" * (pad + 1)},
         {"chunk_id": "doc-00001", "content": ""},
     ]
-    batches_over = list(serialize_batches(documents_over, "upload"))
+    batches_over = list(plan_batches(documents_over, IndexingAction.UPSERT))
     assert len(batches_over) == 2
     assert batches_over[0].keys == ("doc-00000",)
     assert batches_over[1].keys == ("doc-00001",)
@@ -86,20 +87,21 @@ def test_byte_ceiling_lands_exactly_without_splitting() -> None:
 def test_byte_ceiling_splits_before_the_count_ceiling_does() -> None:
     # Documents carrying vectors hit the 16 MB payload limit well before the
     # 1,000-document limit. Batching by count alone writes a 400.
-    batches = list(serialize_batches(_documents(20, filler="y" * 2_000_000), "upload"))
+    batches = list(plan_batches(_documents(20, filler="y" * 2_000_000), IndexingAction.UPSERT))
     assert len(batches) > 1
     assert all(len(batch.body) <= MAX_REQUEST_BYTES for batch in batches)
 
 
 def test_every_emitted_batch_fits_including_wrapper_and_commas() -> None:
-    for batch in serialize_batches(_documents(60, filler="z" * 1_000_000), "upload"):
+    for batch in plan_batches(_documents(60, filler="z" * 1_000_000), IndexingAction.UPSERT):
         assert len(batch.body) <= MAX_REQUEST_BYTES
         json.loads(batch.body)  # still parses: the wrapper was accounted for
 
 
 def test_a_single_oversized_document_fails_before_the_request_is_sent() -> None:
+    oversized = _documents(1, filler="q" * (MAX_REQUEST_BYTES + 1))
     with pytest.raises(DocumentTooLargeError) as caught:
-        list(serialize_batches(_documents(1, filler="q" * (MAX_REQUEST_BYTES + 1)), "upload"))
+        list(plan_batches(oversized, IndexingAction.UPSERT))
 
     # DocumentTooLargeError.message is a fixed, client-facing string (never
     # leaks upstream detail into the HTTP response); the oversized document key
@@ -109,11 +111,29 @@ def test_a_single_oversized_document_fails_before_the_request_is_sent() -> None:
 
 
 def test_keys_partition_the_input_exactly_once() -> None:
-    batches = list(serialize_batches(_documents(MAX_BATCH_DOCUMENTS + 5), "upload"))
+    batches = list(plan_batches(_documents(MAX_BATCH_DOCUMENTS + 5), IndexingAction.UPSERT))
     seen = [key for batch in batches for key in batch.keys]
     assert seen == [f"doc-{i:05d}" for i in range(MAX_BATCH_DOCUMENTS + 5)]
 
 
+def test_a_batchs_keys_are_exactly_the_documents_in_its_body() -> None:
+    # Everything above this module treats a batch as its key list: a
+    # request-level failure requeues `batch.keys`, and nothing up there ever
+    # opens the body to check. Keys that drifted from the documents actually
+    # carried would resend the wrong ones, or leave a sent document with no
+    # verdict at all, and no other test would see it. Checked across a split,
+    # where both lists are rebuilt per batch.
+    batches = list(plan_batches(_documents(MAX_BATCH_DOCUMENTS + 5), IndexingAction.UPSERT))
+    assert len(batches) == 2
+    for batch in batches:
+        carried = tuple(document["chunk_id"] for document in json.loads(batch.body)["value"])
+        assert batch.keys == carried
+
+
 def test_delete_batches_carry_the_delete_action() -> None:
-    batch = next(iter(serialize_batches([{"chunk_id": "a"}], "delete")))
+    batch = next(iter(plan_batches([{"chunk_id": "a"}], IndexingAction.REMOVE)))
     assert json.loads(batch.body)["value"][0]["@search.action"] == "delete"
+    # The domain action is readable without parsing the body: the indexing
+    # tool decides what to count from this field, and reading it back out of
+    # the wire bytes would put `@search.action` in a caller again.
+    assert batch.action is IndexingAction.REMOVE

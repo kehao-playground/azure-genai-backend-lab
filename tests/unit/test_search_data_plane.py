@@ -9,6 +9,7 @@ from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError
+from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.services.azure_search import (
     SearchConfigurationError,
     SearchError,
@@ -16,7 +17,12 @@ from azgenai_lab.services.azure_search import (
     SearchUnavailableError,
 )
 from azgenai_lab.services.indexing_results import Disposition, classify
-from azgenai_lab.services.search_data_plane import ENUMERATION_PAGE_SIZE, SearchDataPlane
+from azgenai_lab.services.search_data_plane import (
+    ENUMERATION_PAGE_SIZE,
+    IndexingBatch,
+    SearchDataPlane,
+    plan_batches,
+)
 
 
 def _settings() -> Settings:
@@ -31,6 +37,16 @@ def _settings() -> Settings:
 def _plane(handler: object) -> SearchDataPlane:
     transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
     return SearchDataPlane(_settings(), client=httpx.AsyncClient(transport=transport))
+
+
+def _batch(body: bytes) -> IndexingBatch:
+    """A batch carrying a body chosen by the test rather than by the planner.
+
+    Response handling is what these tests are about, so the body is whatever
+    the case needs; the tests that care what a real body looks like build one
+    with `plan_batches()`.
+    """
+    return IndexingBatch(body, ("a",), IndexingAction.UPSERT)
 
 
 async def test_create_or_update_index_puts_the_schema() -> None:
@@ -70,7 +86,7 @@ async def test_prefer_header_is_sent_only_on_the_index_put() -> None:
 
     plane = _plane(handler)
     await plane.create_or_update_index()
-    await plane.post_index(b"{}")
+    await plane.post_batch(_batch(b"{}"))
 
     assert seen["put_prefer"] == "return=representation"
     assert seen["post_prefer"] is None
@@ -138,7 +154,7 @@ async def test_delete_index_actually_issues_a_delete() -> None:
     )
 
 
-async def test_post_index_sends_the_exact_bytes_it_was_given() -> None:
+async def test_post_batch_sends_the_exact_bytes_it_was_given() -> None:
     # The serialize-once regression, checked where it can actually fail: if a
     # caller handed the Python objects to `json=` instead of passing this
     # buffer through, the guarded size would not be the transmitted size. The
@@ -154,12 +170,41 @@ async def test_post_index_sends_the_exact_bytes_it_was_given() -> None:
             200, json={"value": [{"key": "a", "status": True, "statusCode": 200}]}
         )
 
-    await _plane(handler).post_index(body)
+    await _plane(handler).post_batch(_batch(body))
     assert seen["content"] == body
     assert seen["content-type"] == "application/json"
 
 
-async def test_post_index_parses_a_207_document_by_document() -> None:
+async def test_a_planned_batch_travels_as_the_bytes_it_was_measured_as() -> None:
+    # Serialize-once spans two functions: `plan_batches()` measures a buffer
+    # against the 16 MB ceiling, `post_batch()` sends it, and nothing in
+    # between may re-encode. This checks the whole seam with a body the
+    # planner really produced, non-ASCII included, because `ensure_ascii` is
+    # the kind of setting a second encoder would not happen to share.
+    #
+    # Its limit is worth stating: a re-encode agreeing with the planner on
+    # separators *and* `ensure_ascii` would slip through here, since the
+    # transmitted bytes would coincide. That case is covered by the
+    # whitespace-carrying body in the test above, whose spacing no encoder
+    # reproduces.
+    documents = [
+        {"chunk_id": "doc-0000", "parent_id": "doc", "content": "café — refund"},
+        {"chunk_id": "doc-0001", "parent_id": "doc", "content": "second"},
+    ]
+    batch = next(iter(plan_batches(documents, IndexingAction.UPSERT)))
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content"] = request.read()
+        return httpx.Response(200, json={"value": []})
+
+    await _plane(handler).post_batch(batch)
+
+    assert seen["content"] == batch.body
+    assert "café — refund".encode() in batch.body
+
+
+async def test_post_batch_parses_a_207_document_by_document() -> None:
     # 207 is a *successful* HTTP response. A client that only checks whether
     # the call raised treats a partial failure as a complete one.
     def handler(request: httpx.Request) -> httpx.Response:
@@ -174,7 +219,7 @@ async def test_post_index_parses_a_207_document_by_document() -> None:
             },
         )
 
-    results = await _plane(handler).post_index(b"{}")
+    results = await _plane(handler).post_batch(_batch(b"{}"))
     assert [r.key for r in results] == ["a", "b", "c"]
     assert classify(results[0]) is Disposition.SUCCEEDED
     assert classify(results[1]) is Disposition.RETRYABLE
@@ -198,7 +243,7 @@ async def test_malformed_indexing_payloads_stay_inside_the_adapter(payload: obje
         return httpx.Response(200, json=payload)
 
     with pytest.raises(SearchUnavailableError):
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
@@ -207,7 +252,7 @@ async def test_indexing_transient_statuses_are_unavailable(status: int) -> None:
         return httpx.Response(status, json={"error": {"message": "later"}})
 
     with pytest.raises(SearchUnavailableError):
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
 
 async def test_indexing_400_is_rejected_not_retried() -> None:
@@ -215,7 +260,7 @@ async def test_indexing_400_is_rejected_not_retried() -> None:
         return httpx.Response(400, json={"error": {"message": "bad batch"}})
 
     with pytest.raises(SearchRequestRejectedError):
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
 
 async def test_indexing_404_is_a_configuration_error_not_a_search_error() -> None:
@@ -227,17 +272,17 @@ async def test_indexing_404_is_a_configuration_error_not_a_search_error() -> Non
         return httpx.Response(404, json={"error": {"message": "no such index"}})
 
     with pytest.raises(SearchConfigurationError) as caught:
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
     assert not isinstance(caught.value, SearchError)
 
 
-async def test_post_index_rejects_a_non_json_body() -> None:
+async def test_post_batch_rejects_a_non_json_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"not json")
 
     with pytest.raises(SearchUnavailableError):
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
 
 async def test_indexing_connection_failure_is_unavailable() -> None:
@@ -245,7 +290,7 @@ async def test_indexing_connection_failure_is_unavailable() -> None:
         raise httpx.ConnectError("no route")
 
     with pytest.raises(SearchUnavailableError):
-        await _plane(handler).post_index(b"{}")
+        await _plane(handler).post_batch(_batch(b"{}"))
 
 
 async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
@@ -273,7 +318,7 @@ async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
     )
 
     with pytest.raises(SearchUnavailableError) as caught:
-        await plane.post_index(b"{}")
+        await plane.post_batch(_batch(b"{}"))
 
     # Pin the cause, not just the class: a connection failure would also raise
     # `SearchUnavailableError`. If a future httpx normalised the soft hyphen

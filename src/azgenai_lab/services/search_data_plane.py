@@ -1,14 +1,21 @@
 """The write-side Azure AI Search boundary.
 
-Everything REST about indexing lives here: URLs, the api-key header, the raw
-request buffer, the OData expression that enumerates one document's chunks,
-per-document 207 parsing, and the mapping from HTTP failures to this project's
-search error vocabulary. `services/search_indexing.py` is transport-free above
-it — it asks for "the chunks of this document, resuming after this key" and
-never spells a filter — which is what lets the orchestration contracts be
-tested without a network and the transport be tested without orchestration.
+Everything REST about indexing lives here: URLs, the api-key header, the
+indexing request body and the `@search.action` vocabulary inside it, the
+request-size ceilings that decide how many documents fit in one call, the
+OData expression that enumerates one document's chunks, per-document 207
+parsing, and the mapping from HTTP failures to this project's search error
+vocabulary. `services/search_indexing.py` is transport-free above it — it
+hands down typed documents and an `IndexingAction`, asks for "the chunks of
+this document, resuming after this key", and never spells a filter, a field
+name or a batch — which is what lets the orchestration contracts be tested
+without a network and the transport be tested without orchestration.
 
-A 404 from `post_index` (or from `create_or_update_index`/`delete_index`)
+The import of `UnsendableDocumentError` runs in that direction too: the
+orchestration owns what a permanent, nothing-was-sent failure *means*, and
+this module supplies the one reason it can happen here.
+
+A 404 from `post_batch` (or from `create_or_update_index`/`delete_index`)
 maps, via `map_search_status`, to `SearchConfigurationError` — a missing
 index is a configuration failure, not a transient one. That class
 deliberately does not subclass `SearchError`, so a retry coordinator written
@@ -16,21 +23,117 @@ as `except SearchError:` will not retry it; only `UpstreamError` catches
 both branches.
 """
 
+import json
 import logging
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
+from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION, to_index_definition
 from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status, search_url
 from azgenai_lab.services.indexing_results import IndexingResult
+from azgenai_lab.services.search_indexing import UnsendableDocumentError
 
 logger = logging.getLogger(__name__)
 
 # The service returns 50 results by default and at most 1,000 per page.
 ENUMERATION_PAGE_SIZE = 1_000
+
+# Documented API request limits (checked 2026-07): at most 1,000 documents per
+# batch of uploads, merges or deletes, and a 16 MB payload ceiling applying to
+# the whole request.
+MAX_BATCH_DOCUMENTS = 1_000
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+_OPEN = b'{"value":['
+_CLOSE = b"]}"
+_WRAPPER_BYTES = len(_OPEN) + len(_CLOSE)
+
+# The `@search.action` spelling of each action this project performs. This
+# table is the reason the vocabulary stops here: "upload" is the service's
+# word for an upsert, and nothing above this module says it.
+_WIRE_ACTIONS = {
+    IndexingAction.UPSERT: "upload",
+    IndexingAction.REMOVE: "delete",
+}
+
+
+class DocumentTooLargeError(UnsendableDocumentError):
+    """One document cannot fit in a request on its own.
+
+    Raised before anything is sent, and **not** retryable: no number of
+    attempts makes an oversized document smaller. The retry coordinator
+    deliberately does not catch this.
+    """
+
+    code = "document_too_large"
+    message = "A document exceeds the maximum indexing request size."
+
+
+@dataclass(frozen=True)
+class IndexingBatch:
+    """One request body, exactly the keys it carries, and what it does to them.
+
+    The keys travel with the body because a request-level failure must requeue
+    only this batch. Requeuing the whole attempt would re-send keys an earlier
+    batch already settled as succeeded.
+
+    ``body`` is this module's business. The orchestration above holds a batch
+    only to hand it back to :meth:`SearchDataPlane.post_batch`, and reads
+    nothing but ``keys`` — which is what keeps the buffer that was measured
+    and the buffer that travels the same object.
+    """
+
+    body: bytes
+    keys: tuple[str, ...]
+    action: IndexingAction
+
+
+def plan_batches(
+    documents: Sequence[dict[str, Any]], action: IndexingAction
+) -> Iterator[IndexingBatch]:
+    """Group documents into request bodies, each within both ceilings.
+
+    Serialize **once**. The yielded ``body`` is exactly what gets sent —
+    :meth:`SearchDataPlane.post_batch` passes it as raw content rather than
+    handing Python objects back to an encoder, because two serializations of
+    the same object are not guaranteed to be byte-identical, and then the
+    limit guarded here would not be the limit that travels.
+    """
+    wire_action = _WIRE_ACTIONS[action]
+    encoded: list[tuple[str, bytes]] = []
+    for document in documents:
+        key = str(document["chunk_id"])
+        payload = {**document, "@search.action": wire_action}
+        blob = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if _WRAPPER_BYTES + len(blob) > MAX_REQUEST_BYTES:
+            raise DocumentTooLargeError(
+                f"document {key} serializes to {len(blob)} bytes, above the "
+                f"{MAX_REQUEST_BYTES} byte request limit"
+            )
+        encoded.append((key, blob))
+
+    batch: list[bytes] = []
+    keys: list[str] = []
+    size = _WRAPPER_BYTES
+    for key, blob in encoded:
+        # The separating comma is payload too, and has to be counted or a
+        # batch can land one byte over the ceiling.
+        extra = len(blob) + (1 if batch else 0)
+        if batch and (len(batch) >= MAX_BATCH_DOCUMENTS or size + extra > MAX_REQUEST_BYTES):
+            yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys), action)
+            batch, keys, size = [], [], _WRAPPER_BYTES
+            extra = len(blob)
+        batch.append(blob)
+        keys.append(key)
+        size += extra
+    if batch:
+        yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys), action)
 
 
 def escape_odata_literal(value: str) -> str:
@@ -147,13 +250,13 @@ class SearchDataPlane:
             raise self._error(response)
         logger.info("index deleted name=%s", INDEX_NAME)
 
-    async def post_index(self, body: bytes) -> list[IndexingResult]:
-        """Send one pre-serialized batch and read its per-document verdicts.
+    async def post_batch(self, batch: IndexingBatch) -> list[IndexingResult]:
+        """Send one planned batch and read its per-document verdicts.
 
-        ``body`` is passed through as raw content, never re-encoded: the
-        batcher measured these exact bytes against the 16 MB ceiling.
+        ``batch.body`` is passed through as raw content, never re-encoded:
+        `plan_batches()` measured these exact bytes against the 16 MB ceiling.
         """
-        response = await self._send("POST", self._documents_url, content=body)
+        response = await self._send("POST", self._documents_url, content=batch.body)
         if response.status_code >= 400:
             raise self._error(response)
         return parse_indexing_results(self._json(response))
@@ -241,9 +344,14 @@ class SearchDataPlane:
 
 __all__ = [
     "ENUMERATION_PAGE_SIZE",
+    "MAX_BATCH_DOCUMENTS",
+    "MAX_REQUEST_BYTES",
+    "DocumentTooLargeError",
+    "IndexingBatch",
     "SearchDataPlane",
     "documents_url",
     "escape_odata_literal",
     "index_url",
     "parse_indexing_results",
+    "plan_batches",
 ]

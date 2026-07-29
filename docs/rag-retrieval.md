@@ -149,15 +149,28 @@ overview](https://learn.microsoft.com/en-us/azure/search/semantic-search-overvie
 ## Where the REST vocabulary stops
 
 Every request body in this document is built inside an adapter — the query body in
-`services/azure_search.py`, the index and enumeration bodies in `services/search_data_plane.py`.
-Nothing above them names a wire field. `models/search.py` knows the four modes, the hit and the
-argument contract; the write-path orchestration in `services/search_indexing.py` asks for "the
-chunks of this document, resuming after this key" and never spells an OData filter.
+`services/azure_search.py`, the indexing, index-management and enumeration bodies in
+`services/search_data_plane.py`. Nothing above them names a wire field. `models/search.py` knows
+the four modes, the hit and the argument contract; the write-path orchestration in
+`services/search_indexing.py` asks for "the chunks of this document, resuming after this key" and
+never spells an OData filter.
+
+The indexing write path is where that line is easiest to blur, because the request body is not
+built per call: documents are grouped into batches first, against a document-count limit and a
+byte ceiling, and the buffer that is measured has to be the buffer that travels. Both halves live
+in the adapter. `plan_batches()` serializes the documents once, attaches the `@search.action` each
+one needs, and yields batches; `post_batch()` sends a batch's buffer through as raw content. The
+orchestration above passes what it is given straight back and reads only the keys — it says
+`IndexingAction.UPSERT` or `IndexingAction.REMOVE` and never `upload`, `delete` or
+`{"value": [...]}`. A batch is typed as a protocol carrying keys and nothing else, so a
+replacement adapter is free to define its own, and the two functions are taken as a pair: a batch
+means nothing to a transport that did not build it.
 
 The line is drawn there so that replacing REST with the SDK, or one service with another, is a
-change to one file rather than a search across the codebase for strings like `vectorQueries`.
-Whether the boundary actually holds is testable: the request bodies are pinned byte for byte, so
-moving construction around cannot quietly change what travels.
+change to one file rather than a search across the codebase for strings like `vectorQueries` or
+`@search.action`. Whether the boundary actually holds is testable: the request bodies — query,
+enumeration and indexing alike — are pinned byte for byte, so moving construction around cannot
+quietly change what travels.
 
 The adapters own their connection pool when they allocate it and never close one that was handed
 in. Long-running tools open them in an `async with` block, which releases the pool at a point in
@@ -214,6 +227,8 @@ limits](https://learn.microsoft.com/en-us/azure/search/search-limits-quotas-capa
 before the document count limit, so batching by count alone produces a 400 from code that looks
 correct.
 
-The batcher serializes each batch **once** and the transport sends that exact buffer. Measuring
-with one serializer and transmitting with another would mean the limit being guarded is not the
-limit that travels. A single document too large to fit alone fails before anything is sent.
+The batcher serializes each batch **once** and the transport sends that exact buffer — both sides
+of that sentence are the same adapter, and what passes between them is the buffer itself rather
+than the documents it was built from. Measuring with one serializer and transmitting with another
+would mean the limit being guarded is not the limit that travels. A single document too large to
+fit alone fails before anything is sent.

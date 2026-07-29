@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel
@@ -26,6 +27,20 @@ DOC_ID_MAX_LENGTH = 64
 # to cross that boundary.
 HEADING_SEPARATOR = " > "
 EMBEDDING_JOIN = "\n\n"
+
+
+class IndexingAction(StrEnum):
+    """What an indexing request does to the documents it carries.
+
+    Two actions, named for their effect rather than for a service's spelling
+    of it. The write path is a replacement: chunks are written whole (there is
+    no partial update of a chunk) and stale ones are removed. Which JSON field
+    carries this, and what string goes in it, belongs to the adapter that
+    builds the request.
+    """
+
+    UPSERT = "upsert"
+    REMOVE = "remove"
 
 
 class Citation(BaseModel):

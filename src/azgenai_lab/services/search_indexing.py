@@ -1,25 +1,32 @@
-"""Write-path orchestration for Azure AI Search: batching, retry, enumeration,
+"""Write-path orchestration for Azure AI Search: retry, enumeration,
 replacement. No transport lives here — see `services/search_data_plane.py`.
+
+This module deals in typed documents, actions and per-key outcomes. It never
+spells a request: how documents are grouped into requests, how they are
+serialized, and what a service calls each action all belong to the adapter,
+which hands back batches this module treats as opaque apart from the keys they
+carry. That is what lets the contracts below be tested without a network, and
+what makes swapping REST for an SDK a change to one file.
 
 Three contracts hold this together, and none substitutes for another:
 
-* a per-key **terminal state** for every document in a batch (upload *and*
-  delete), so a retry's later success is representable without a duplicate;
+* a per-key **terminal state** for every document in a batch (upsert *and*
+  remove), so a retry's later success is representable without a duplicate;
 * the **fail-closed gate** in `indexing_results.may_delete_stale()`;
 * a per-`parent_id` **critical section**, because two replacements of one
   document can otherwise each succeed and still destroy each other's work.
 """
 
 import asyncio
-import json
 import logging
 from collections import Counter
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from azgenai_lab.core.errors import UpstreamError
 from azgenai_lab.core.keyed_lock import KeyedLock
+from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.services.azure_search import SearchUnavailableError
 from azgenai_lab.services.indexing_results import (
     Disposition,
@@ -31,34 +38,50 @@ from azgenai_lab.services.indexing_results import (
 
 logger = logging.getLogger(__name__)
 
-# Documented API request limits (checked 2026-07): at most 1,000 documents per
-# batch of uploads, merges or deletes, and a 16 MB payload ceiling applying to
-# the whole request.
-MAX_BATCH_DOCUMENTS = 1_000
-MAX_REQUEST_BYTES = 16 * 1024 * 1024
-
 # Bounded so a permanently sick service cannot spin forever. A module constant
 # rather than a setting: nothing outside the indexing job reads it and no
 # environment has a reason to differ.
 MAX_INDEXING_ATTEMPTS = 3
 _BACKOFF_SECONDS = 1.0
 
-_OPEN = b'{"value":['
-_CLOSE = b"]}"
-_WRAPPER_BYTES = len(_OPEN) + len(_CLOSE)
+
+class DocumentBatch(Protocol):
+    """As much of a request as this module is allowed to know.
+
+    Just the keys travelling together. They are needed here because a
+    request-level failure has no per-document verdict, so exactly this batch's
+    keys — and no others — stay outstanding. Everything else about a batch is
+    the adapter's: this module receives one from the planner and hands it back
+    unread.
+    """
+
+    @property
+    def keys(self) -> tuple[str, ...]: ...
 
 
-class DocumentTooLargeError(UpstreamError):
-    """One document cannot fit in a request on its own.
+# Documents grouped into sendable requests, and one such request sent. The two
+# are a pair from the same adapter — the type parameter says so — because a
+# batch is only meaningful to whatever built it.
+type PlanBatches[BatchT] = Callable[
+    [Sequence[dict[str, Any]], IndexingAction], Iterator[BatchT]
+]
+type PostBatch[BatchT] = Callable[[BatchT], Coroutine[Any, Any, list[IndexingResult]]]
+type Sleeper = Callable[[float], Coroutine[Any, Any, None]]
 
-    Raised before anything is sent, and **not** retryable: no number of
-    attempts makes an oversized document smaller. The retry coordinator
-    deliberately does not catch this.
+
+class UnsendableDocumentError(UpstreamError):
+    """A document cannot be made into a request, and no retry will change that.
+
+    Raised by the planner before anything is sent. *Why* a document is
+    unsendable is the adapter's to name — a size ceiling, a shape the service
+    will not take — but the disposition belongs here: permanent, never
+    retried, and never softened into an "outcome unknown" result, because
+    nothing was ever sent.
     """
 
     status_code = 500
-    code = "document_too_large"
-    message = "A document exceeds the maximum indexing request size."
+    code = "unsendable_document"
+    message = "A document could not be prepared for indexing."
 
 
 class DuplicateChunkIdError(UpstreamError):
@@ -74,68 +97,11 @@ class DuplicateChunkIdError(UpstreamError):
     message = "An indexing action contained two documents with the same key."
 
 
-@dataclass(frozen=True)
-class IndexingBatch:
-    """One request body and exactly the keys it carries.
-
-    The keys travel with the body because a request-level failure must requeue
-    only this batch. Requeuing the whole attempt would re-send keys an earlier
-    batch already settled as succeeded.
-    """
-
-    body: bytes
-    keys: tuple[str, ...]
-
-
-def serialize_batches(
-    documents: Sequence[dict[str, Any]], action: str
-) -> Iterator[IndexingBatch]:
-    """Yield request bodies, each within both ceilings.
-
-    Serialize **once**. The yielded ``body`` is exactly what gets sent — the
-    caller passes it as raw content rather than handing Python objects back to
-    an encoder, because two serializations of the same object are not
-    guaranteed to be byte-identical, and then the limit guarded here would not
-    be the limit that travels.
-    """
-    encoded: list[tuple[str, bytes]] = []
-    for document in documents:
-        key = str(document["chunk_id"])
-        payload = {**document, "@search.action": action}
-        blob = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        if _WRAPPER_BYTES + len(blob) > MAX_REQUEST_BYTES:
-            raise DocumentTooLargeError(
-                f"document {key} serializes to {len(blob)} bytes, above the "
-                f"{MAX_REQUEST_BYTES} byte request limit"
-            )
-        encoded.append((key, blob))
-
-    batch: list[bytes] = []
-    keys: list[str] = []
-    size = _WRAPPER_BYTES
-    for key, blob in encoded:
-        # The separating comma is payload too, and has to be counted or a
-        # batch can land one byte over the ceiling.
-        extra = len(blob) + (1 if batch else 0)
-        if batch and (len(batch) >= MAX_BATCH_DOCUMENTS or size + extra > MAX_REQUEST_BYTES):
-            yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys))
-            batch, keys, size = [], [], _WRAPPER_BYTES
-            extra = len(blob)
-        batch.append(blob)
-        keys.append(key)
-        size += extra
-    if batch:
-        yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys))
-
-
-PostBatch = Callable[[bytes], Coroutine[Any, Any, list[IndexingResult]]]
-Sleeper = Callable[[float], Coroutine[Any, Any, None]]
-
-
-async def run_indexing_with_retry(
-    post: PostBatch,
+async def run_indexing_with_retry[BatchT: DocumentBatch](
+    plan_batches: PlanBatches[BatchT],
+    post: PostBatch[BatchT],
     documents: Sequence[dict[str, Any]],
-    action: str,
+    action: IndexingAction,
     *,
     sleep: Sleeper = asyncio.sleep,
 ) -> dict[str, IndexingResult]:
@@ -147,8 +113,8 @@ async def run_indexing_with_retry(
     proved the key durable; refusing to record that would make the
     stale-delete gate unopenable after any retry.
 
-    Only ``SearchUnavailableError`` is retried. A rejected request, an
-    oversized document, and a duplicate key are permanent and propagate:
+    Only ``SearchUnavailableError`` is retried. A rejected request, a document
+    the planner refuses, and a duplicate key are permanent and propagate:
     repeating any of them just delays the report. Permanent per-document
     failures are terminal and are never re-sent or overwritten. Exhausted
     retries keep the last retryable failure, and a request-level failure with
@@ -181,11 +147,12 @@ async def run_indexing_with_retry(
             await sleep(_BACKOFF_SECONDS * (2 ** (attempt - 2)))
 
         still_outstanding: list[str] = []
-        # Not inside the try: an oversized document is a local, permanent
-        # failure and must not be mistaken for a transient request failure.
-        for batch in serialize_batches([by_key[key] for key in outstanding], action):
+        # Not inside the try: a document the planner refuses is a local,
+        # permanent failure and must not be mistaken for a transient request
+        # failure.
+        for batch in plan_batches([by_key[key] for key in outstanding], action):
             try:
-                results = await post(batch.body)
+                results = await post(batch)
             except SearchUnavailableError as exc:
                 # No per-document verdict exists for *this batch*, so exactly
                 # this batch's keys stay outstanding. Requeuing the whole
@@ -343,8 +310,8 @@ class ReplacementOutcome:
     stale_state_unknown: bool = False
 
 
-class DocumentReplacer:
-    """Replace one document's chunks: upload, gate, enumerate, delete.
+class DocumentReplacer[BatchT: DocumentBatch]:
+    """Replace one document's chunks: upsert, gate, enumerate, remove.
 
     Every step for a given ``parent_id`` runs inside one critical section. Two
     concurrent replacements of the same document can otherwise each pass their
@@ -366,12 +333,16 @@ class DocumentReplacer:
 
     def __init__(
         self,
-        post_index: PostBatch,
+        plan_batches: PlanBatches[BatchT],
+        post_batch: PostBatch[BatchT],
         list_page: ListChunkIdPage,
         *,
         sleep: Sleeper = asyncio.sleep,
     ) -> None:
-        self._post_index = post_index
+        # Planner and poster arrive as a pair and are never mixed across
+        # adapters: a batch means nothing to a transport that did not build it.
+        self._plan_batches = plan_batches
+        self._post_batch = post_batch
         self._list_page = list_page
         self._sleep = sleep
         self._locks = KeyedLock()
@@ -457,7 +428,11 @@ class DocumentReplacer:
             )
         expected_keys = [str(document["chunk_id"]) for document in documents]
         uploaded = await run_indexing_with_retry(
-            self._post_index, documents, "upload", sleep=self._sleep
+            self._plan_batches,
+            self._post_batch,
+            documents,
+            IndexingAction.UPSERT,
+            sleep=self._sleep,
         )
         upload_results = tuple(uploaded[key] for key in expected_keys)
 
@@ -503,12 +478,13 @@ class DocumentReplacer:
                 return ReplacementOutcome(upload_results, (), (), True)
 
             deletions = await run_indexing_with_retry(
-                self._post_index,
+                self._plan_batches,
+                self._post_batch,
                 [{"chunk_id": key} for key in stale],
-                "delete",
+                IndexingAction.REMOVE,
                 sleep=self._sleep,
             )
-        except (DuplicateChunkIdError, DocumentTooLargeError):
+        except (DuplicateChunkIdError, UnsendableDocumentError):
             # Permanent input faults, not cleanup failures — they must stay
             # unretried and propagate as raised exceptions, never soften into
             # a `stale_state_unknown` outcome the way a transport or config

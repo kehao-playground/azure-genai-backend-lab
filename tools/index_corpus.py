@@ -10,16 +10,15 @@ Usage:
 
 import argparse
 import asyncio
-import json
 
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
-from azgenai_lab.models.rag import Chunk
+from azgenai_lab.models.rag import Chunk, IndexingAction
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import load_documents
 from azgenai_lab.services.embeddings import build_embedding_client, embed_chunks
 from azgenai_lab.services.indexing_results import IndexingResult
-from azgenai_lab.services.search_data_plane import SearchDataPlane
+from azgenai_lab.services.search_data_plane import IndexingBatch, SearchDataPlane, plan_batches
 from azgenai_lab.services.search_indexing import DocumentReplacer
 
 
@@ -76,23 +75,18 @@ async def _index(plane: SearchDataPlane, settings: Settings, *, create_index: bo
     other_batches = 0
     attempted_bytes = 0
 
-    async def measured_post(body: bytes) -> list[IndexingResult]:
+    async def measured_post(batch: IndexingBatch) -> list[IndexingResult]:
         nonlocal first_upload_bytes, first_upload_documents, other_batches, attempted_bytes
-        attempted_bytes += len(body)
-        # Parsing the bytes we are about to send is not a second serializer —
-        # it cannot drift from the buffer, because it *is* the buffer.
-        entries = json.loads(body)["value"]
-        actions = {entry["@search.action"] for entry in entries}
-        keys = [entry["chunk_id"] for entry in entries]
-        if actions == {"upload"} and not seen_upload_keys.intersection(keys):
-            first_upload_bytes += len(body)
-            first_upload_documents += len(entries)
-            seen_upload_keys.update(keys)
+        attempted_bytes += len(batch.body)
+        if batch.action is IndexingAction.UPSERT and not seen_upload_keys.intersection(batch.keys):
+            first_upload_bytes += len(batch.body)
+            first_upload_documents += len(batch.keys)
+            seen_upload_keys.update(batch.keys)
         else:
             other_batches += 1
-        return await plane.post_index(body)
+        return await plane.post_batch(batch)
 
-    replacer = DocumentReplacer(measured_post, plane.list_chunk_ids)
+    replacer = DocumentReplacer(plan_batches, measured_post, plane.list_chunk_ids)
 
     total_documents = 0
     for source in load_documents():
