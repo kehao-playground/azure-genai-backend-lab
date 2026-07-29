@@ -164,7 +164,7 @@ def build_search_body(
     isolation must not interpolate a user-supplied value into this string; it
     has to be built from a typed authorization context and escaped there.
     """
-    validate_search_arguments(query_text, query_vector, mode=mode)
+    validate_search_arguments(query_text, query_vector, mode=mode, top=top, vector_k=vector_k)
 
     body: dict[str, Any] = {"top": top, "select": ",".join(SELECT_FIELDS)}
     if mode in TEXT_QUERY_MODES:
@@ -411,7 +411,9 @@ class FakeSearchClient:
         filter: str | None = None,
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult:
-        validate_search_arguments(query_text, query_vector, mode=mode)
+        validate_search_arguments(
+            query_text, query_vector, mode=mode, top=top, vector_k=vector_k
+        )
         self.last_mode = mode
         self.last_top = top
         self.last_vector_k = vector_k

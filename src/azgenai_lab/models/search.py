@@ -22,6 +22,24 @@ from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 # and it does not control the keyword side at all.
 DEFAULT_VECTOR_K = 50
 
+# The documented maximum page size (checked 2026-07): "The default page size is
+# 50, while the maximum page size is 1,000. If you specify a value greater than
+# 1,000 and there are more than 1,000 results found in your index, only the
+# first 1,000 results are returned."
+#
+# That last clause is why this is enforced rather than left to the service: a
+# `top` above the ceiling is not rejected, it is silently honoured as 1,000.
+# The caller asked one question and got the answer to another, with a 200 and
+# no warning to say so.
+MAX_TOP = 1_000
+
+# `vector_k` has a documented type (int32) and no documented bound in either
+# direction, so only the lower one is enforced. Picking a ceiling here would
+# mean writing down a number nobody published and then citing it — the same
+# trap as an unmeasured constant. If the service grows a documented limit,
+# this is where it goes.
+MIN_BOUND = 1
+
 
 class SearchMode(StrEnum):
     KEYWORD = "keyword"
@@ -69,18 +87,35 @@ class SearchResult:
     vector_k: int | None
 
 
+def _validate_count(value: int, *, name: str, maximum: int | None = None) -> None:
+    """Bound one of the "how many" parameters, or say which one was wrong."""
+    if value < MIN_BOUND:
+        raise ValueError(f"{name} must be at least {MIN_BOUND}; got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}; got {value}")
+
+
 def validate_search_arguments(
     query_text: str,
     query_vector: Sequence[float] | None,
     *,
     mode: SearchMode,
+    top: int,
+    vector_k: int = DEFAULT_VECTOR_K,
 ) -> None:
     """The one validator every ``SearchClient`` implementation must apply.
 
     It lives here, apart from any request builder, so the fake enforces exactly
     the same contract as the real adapter. A fake that accepts calls the
     service would reject turns a green test suite into a production failure.
+
+    ``vector_k`` is bounded in every mode, not only the ones that send it.
+    KEYWORD ignores the value, so a nonsensical one there is inert rather than
+    harmful — but a caller passing ``-5`` has a bug either way, and a rule that
+    fires only in some modes teaches callers to find out which.
     """
+    _validate_count(top, name="top", maximum=MAX_TOP)
+    _validate_count(vector_k, name="vector_k")
     if not query_text.strip():
         # Required in every mode, including VECTOR: the text is retained for
         # logging and comparison there, and an empty one is a caller bug.
@@ -97,6 +132,8 @@ def validate_search_arguments(
 
 __all__ = [
     "DEFAULT_VECTOR_K",
+    "MAX_TOP",
+    "MIN_BOUND",
     "TEXT_QUERY_MODES",
     "VECTOR_MODES",
     "SearchHit",
