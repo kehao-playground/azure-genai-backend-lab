@@ -69,16 +69,31 @@ query both ways and shows one hotel document scoring `0.8399121` under pure vect
 `0.032786883413791656` under hybrid — the same document, two scales, roughly twenty-six times
 apart (`0.8399121 / 0.032786883413791656 ≈ 25.6`). That follows from the algorithm: a cosine
 score occupies 0.333–1.00, while each query fused by RRF contributes at most about `1/k`, where
-`k` is a small constant the service documents as 60. The published hybrid figure is exact
-corroboration of that constant rather than just documentation wording: for a document ranked
-first in both the vector and keyword lists, RRF contributes `1/(k + 1)` from each list, and
-`0.032786883413791656` is bit-for-bit the IEEE-754 float32 value of `2/61`. A low RRF score is
-not a weak match; it is a different ruler. The service's own troubleshooting guidance puts it
-plainly — a score of 0.03 can still indicate a strong match.
+`k` is a small constant the service documents as 60.
+
+The exact form is worth measuring rather than assuming, because the textbook statement of RRF
+and the one this service implements differ by one. Running the four modes against this repo's
+sample corpus (25 chunks, 6 queries, api-version `2026-04-01`) and recomputing every fused score
+from the keyword and vector rank lists it was built from: all 150 hybrid scores are reproduced
+exactly by
+
+```
+score = sum over lists of 1 / (60 + rank)     # rank counted from 0
+```
+
+while the textbook 1-based form, `1 / (60 + rank)` with the top result at rank 1, reproduces
+none of them. What the measurement pins is the combination, not either half alone — a constant
+of 60 over 0-based ranks is indistinguishable from 59 over 1-based ranks.
+
+That changes what the published figure means. A document ranked first in both lists scores
+`2/60 ≈ 0.0333`, so `0.032786883413791656` — bit-for-bit the IEEE-754 float32 value of `2/61` —
+is a document sitting *second* in both lists, not first. A low RRF score is not a weak match; it
+is a different ruler. The service's own troubleshooting guidance puts it plainly — a score of
+0.03 can still indicate a strong match.
 
 The practical consequence is that **no threshold survives a mode change**. A cutoff tuned against
 `VECTOR` scores discards everything under `HYBRID`: a cosine floor of 0.333 sits above even the
-two-query RRF ceiling of roughly 0.0328, so a cutoff drawn anywhere in the cosine range excludes
+two-query RRF ceiling of `2/60 ≈ 0.0333`, so a cutoff drawn anywhere in the cosine range excludes
 every hybrid result. It also fails silently: the query still returns, the results are still
 ranked, there is simply nothing above the line. Only `reranker_score` has a published rubric to
 threshold against.
