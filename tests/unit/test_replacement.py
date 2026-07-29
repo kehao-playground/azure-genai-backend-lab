@@ -267,6 +267,41 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     assert replacer.max_concurrent_replacements == 2
 
 
+async def test_completed_replacements_leave_no_per_parent_bookkeeping() -> None:
+    # Every document the corpus ever contained would otherwise keep a lock and
+    # a counter alive for the life of the process, growing with the corpus and
+    # never shrinking. Checked after both a completed replacement and a failed
+    # one: the release has to survive the error path too.
+    index = _Index()
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+
+    for n in range(200):
+        parent = f"doc-{n}"
+        await replacer.replace(parent, _documents([f"{parent}-0000"], parent=parent))
+    assert replacer.tracked_parent_count == 0
+
+    with pytest.raises(ValueError):
+        await replacer.replace("bad", [])
+    assert replacer.tracked_parent_count == 0
+
+
+async def test_a_replacement_that_raises_still_frees_its_parent() -> None:
+    # The lock has to be released even when the work under it blows up, or the
+    # next replacement of that document waits forever on a holder that is gone.
+    index = _Index()
+
+    async def exploding_post(_body: bytes) -> list[IndexingResult]:
+        raise RuntimeError("upload blew up")
+
+    replacer = DocumentReplacer(exploding_post, index.list_chunk_ids, sleep=_no_sleep)
+    with pytest.raises(RuntimeError):
+        await replacer.replace("doc", _documents(["doc-0000"]))
+    assert replacer.tracked_parent_count == 0
+
+    working = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+    assert (await working.replace("doc", _documents(["doc-0000"]))).completed is True
+
+
 async def test_two_parents_pin_per_parent_and_overall_concurrency_together() -> None:
     # Two jobs race the same document, "doc"; a third races "other". Neither
     # counter alone tells the two-job cases above apart from a regression:

@@ -33,12 +33,12 @@ a response is out, SSE ``error`` terminal after a 200). By then inference
 may already have incurred billable processing; retrying repeats it.
 """
 
-import asyncio
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import StorageError, UpstreamServiceError
+from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import Conversation, ReplayItem
 from azgenai_lab.services.azure_openai import (
@@ -80,14 +80,6 @@ def _user_item(message: str) -> ReplayItem:
     return {"role": "user", "content": message}
 
 
-class _LockEntry:
-    __slots__ = ("lock", "refs")
-
-    def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.refs = 0
-
-
 class ConversationChatService:
     def __init__(
         self,
@@ -98,34 +90,11 @@ class ConversationChatService:
         self._chat_service = chat_service
         self._store = store
         self._token_budget = token_budget
-        # Reference-counted per-conversation locks: an entry exists only while
-        # a request holds or awaits it, so probing unknown ids cannot grow the
-        # registry unboundedly (review r04 finding 3).
-        self._locks: dict[str, _LockEntry] = {}
-
-    async def _acquire(self, conversation_id: str) -> None:
-        entry = self._locks.get(conversation_id)
-        if entry is None:
-            entry = _LockEntry()
-            self._locks[conversation_id] = entry
-        entry.refs += 1
-        try:
-            await entry.lock.acquire()
-        except BaseException:
-            # A waiter cancelled in the queue never reaches the caller's
-            # _release(): drop its reference here, without releasing a lock
-            # it never acquired (review r06 finding 1).
-            entry.refs -= 1
-            if entry.refs == 0:
-                del self._locks[conversation_id]
-            raise
-
-    def _release(self, conversation_id: str) -> None:
-        entry = self._locks[conversation_id]
-        entry.lock.release()
-        entry.refs -= 1
-        if entry.refs == 0:
-            del self._locks[conversation_id]
+        # One turn at a time per conversation id. Acquire and release sit in
+        # different frames on the streaming path — the release happens when
+        # the event iterator finishes, not when open_stream() returns — so the
+        # lock is taken explicitly here rather than with a `hold()` block.
+        self._locks = KeyedLock()
 
     async def _load(self, provided_id: str | None, resolved_id: str) -> Conversation:
         if provided_id is None:
@@ -173,7 +142,7 @@ class ConversationChatService:
 
     async def complete(self, message: str, conversation_id: str | None) -> tuple[str, ChatResult]:
         resolved_id = conversation_id or str(uuid4())
-        await self._acquire(resolved_id)
+        await self._locks.acquire(resolved_id)
         try:
             conversation = await self._load(conversation_id, resolved_id)
             self._check_budget(conversation)
@@ -202,14 +171,14 @@ class ConversationChatService:
                     usage_tokens=result.usage.total_tokens if result.usage else 0,
                 )
         finally:
-            self._release(resolved_id)
+            self._locks.release(resolved_id)
         return resolved_id, result
 
     async def open_stream(
         self, message: str, conversation_id: str | None
     ) -> tuple[str, AsyncIterator[ChatStreamEvent]]:
         resolved_id = conversation_id or str(uuid4())
-        await self._acquire(resolved_id)
+        await self._locks.acquire(resolved_id)
         try:
             conversation = await self._load(conversation_id, resolved_id)
             # Budget rejection is pre-stream by design: it raises before any
@@ -221,7 +190,7 @@ class ConversationChatService:
             # passes through this layer intact.
             events = await self._chat_service.open_stream([*conversation.replay_items, user_item])
         except BaseException:
-            self._release(resolved_id)
+            self._locks.release(resolved_id)
             raise
         return resolved_id, self._commit_on_done(
             resolved_id, message, user_item, events, conversation.revision
@@ -263,7 +232,7 @@ class ConversationChatService:
                     parts.append(event.text)
                 yield event
         finally:
-            self._release(conversation_id)
+            self._locks.release(conversation_id)
 
 
 def build_conversation_service(settings: Settings) -> ConversationChatService:

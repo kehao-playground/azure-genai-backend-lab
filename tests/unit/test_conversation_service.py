@@ -193,7 +193,7 @@ async def test_concurrent_turns_on_one_conversation_are_serialized() -> None:
     lengths = sorted(len(received) for received in spy.received[1:])
     assert lengths == [3, 5]  # the second turn saw the first turn's commit
     assert len(await history(store, conversation_id)) == 6
-    assert service._locks == {}  # every lock entry released and removed
+    assert len(service._locks) == 0  # every lock entry released and removed
 
 
 async def test_stream_completed_commits_transcript_and_replay() -> None:
@@ -335,7 +335,7 @@ async def test_lock_registry_does_not_grow_on_unknown_ids() -> None:
         with pytest.raises(ConversationNotFoundError):
             await service.complete("hi", f"never-issued-{n}")
 
-    assert service._locks == {}  # probing unknown ids leaves no entries behind
+    assert len(service._locks) == 0  # probing unknown ids leaves no entries behind
 
 
 async def test_lock_registry_is_empty_after_normal_turns_and_streams() -> None:
@@ -346,7 +346,7 @@ async def test_lock_registry_is_empty_after_normal_turns_and_streams() -> None:
     _, events = await service.open_stream("two", conversation_id)
     _ = [event async for event in events]
 
-    assert service._locks == {}
+    assert len(service._locks) == 0
 
 
 async def test_cancelled_waiter_does_not_leak_a_lock_entry() -> None:
@@ -357,10 +357,10 @@ async def test_cancelled_waiter_does_not_leak_a_lock_entry() -> None:
     # A holder owns the lock while a second request queues behind it, then
     # gets cancelled before ever acquiring — the production shape of a
     # client dropping a request stuck behind a slow turn.
-    await service._acquire(conversation_id)
-    waiter = asyncio.create_task(service._acquire(conversation_id))
+    await service._locks.acquire(conversation_id)
+    waiter = asyncio.create_task(service._locks.acquire(conversation_id))
     await asyncio.sleep(0)  # let the waiter enqueue on the lock
-    assert service._locks[conversation_id].refs == 2
+    assert service._locks.holders(conversation_id) == 2
 
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -368,8 +368,8 @@ async def test_cancelled_waiter_does_not_leak_a_lock_entry() -> None:
 
     # The cancelled waiter dropped its reference and did not release the
     # lock it never held; the holder's entry survives until it releases.
-    assert service._locks[conversation_id].refs == 1
-    assert service._locks[conversation_id].lock.locked()
+    assert service._locks.holders(conversation_id) == 1
+    assert service._locks.is_held(conversation_id) is True
 
-    service._release(conversation_id)
-    assert service._locks == {}
+    service._locks.release(conversation_id)
+    assert len(service._locks) == 0

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from azgenai_lab.core.errors import UpstreamError
+from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.services.azure_search import SearchUnavailableError
 from azgenai_lab.services.indexing_results import (
     Disposition,
@@ -356,6 +357,11 @@ class DocumentReplacer:
     worker needs a durable lease, a generation field on the document, or a
     compare-and-set on that generation; an in-process lock does not span
     processes and must not be mistaken for one that does.
+
+    Both per-parent registries — the locks and the concurrency counters — are
+    reclaimed as each replacement finishes. A corpus is enumerable by whoever
+    can trigger indexing, so an entry per parent_id that is never removed
+    grows with the corpus and never comes back.
     """
 
     def __init__(
@@ -368,7 +374,7 @@ class DocumentReplacer:
         self._post_index = post_index
         self._list_page = list_page
         self._sleep = sleep
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks = KeyedLock()
         self._active: dict[str, int] = {}
         # Peak observed concurrency for any single parent_id. Exposed so the
         # mutual exclusion can be asserted directly instead of inferred from
@@ -384,17 +390,22 @@ class DocumentReplacer:
         # that regression.
         self.max_concurrent_replacements = 0
 
-    def _lock_for(self, parent_id: str) -> asyncio.Lock:
-        lock = self._locks.get(parent_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[parent_id] = lock
-        return lock
+    @property
+    def tracked_parent_count(self) -> int:
+        """Parent ids still holding bookkeeping of any kind.
+
+        Both registries are counted together because they must empty
+        together. A lock entry reclaimed while a zero-valued concurrency
+        counter survives (or the reverse) is still a leak whose size is set by
+        how many documents have ever been replaced, just a leak that takes
+        longer to notice.
+        """
+        return len(self._locks) + len(self._active)
 
     async def replace(
         self, parent_id: str, documents: Sequence[dict[str, Any]]
     ) -> ReplacementOutcome:
-        async with self._lock_for(parent_id):
+        async with self._locks.hold(parent_id):
             active = self._active.get(parent_id, 0) + 1
             self._active[parent_id] = active
             self.max_concurrent_per_parent = max(self.max_concurrent_per_parent, active)
@@ -405,7 +416,15 @@ class DocumentReplacer:
             try:
                 return await self._replace(parent_id, documents)
             finally:
-                self._active[parent_id] -= 1
+                remaining = self._active[parent_id] - 1
+                if remaining:
+                    self._active[parent_id] = remaining
+                else:
+                    # Removed rather than left at zero. A counter kept for
+                    # every parent_id ever replaced grows with the corpus and
+                    # never shrinks, which is the same leak as an unreclaimed
+                    # lock wearing different clothes.
+                    del self._active[parent_id]
                 self._active_total -= 1
 
     async def _replace(
