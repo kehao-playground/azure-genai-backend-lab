@@ -69,27 +69,37 @@ query both ways and shows one hotel document scoring `0.8399121` under pure vect
 `0.032786883413791656` under hybrid — the same document, two scales, roughly twenty-six times
 apart (`0.8399121 / 0.032786883413791656 ≈ 25.6`). That follows from the algorithm: a cosine
 score occupies 0.333–1.00, while each query fused by RRF contributes at most about `1/k`, where
-`k` is a small constant the service documents as 60.
+`k` is a small constant — the documentation recommends setting it "to a small value, such as
+60".
 
-The exact form is worth measuring rather than assuming, because the textbook statement of RRF
-and the one this service implements differ by one. Running the four modes against this repo's
-sample corpus (25 chunks, 6 queries, api-version `2026-04-01`) and recomputing every fused score
-from the keyword and vector rank lists it was built from: all 150 hybrid scores are reproduced
-exactly by
+The exact form is worth measuring rather than assuming, because the formula the service runs is
+not the formula it documents. The scoring page gives the score as `1/(rank + k)`, "where `rank`
+is the position of the document in the list", and its worked example counts positions from 1.
+Running the four modes against this repo's sample corpus (25 chunks, 6 queries, api-version
+`2026-04-01`) and recomputing every fused score from the keyword and vector rank lists: all 150
+hybrid scores are reproduced exactly by
 
 ```
 score = sum over lists of 1 / (60 + rank)     # rank counted from 0
 ```
 
-while the textbook 1-based form, `1 / (60 + rank)` with the top result at rank 1, reproduces
-none of them. What the measurement pins is the combination, not either half alone — a constant
-of 60 over 0-based ranks is indistinguishable from 59 over 1-based ranks.
+while the documented 1-based form reproduces none of them. What the measurement pins is the
+combination, not either half alone — a constant of 60 over 0-based ranks is indistinguishable
+from 59 over 1-based ranks.
 
-That changes what the published figure means. A document ranked first in both lists scores
-`2/60 ≈ 0.0333`, so `0.032786883413791656` — bit-for-bit the IEEE-754 float32 value of `2/61` —
-is a document sitting *second* in both lists, not first. A low RRF score is not a weak match; it
-is a different ruler. The service's own troubleshooting guidance puts it plainly — a score of
-0.03 can still indicate a strong match.
+That reconstruction is only possible because this corpus is smaller than `top`, so the separate
+keyword and vector runs return complete lists. On a corpus larger than `top`, the inputs to the
+fusion are not fully observable from outside it.
+
+It also reframes the published figure. Under the documented formula, `0.032786883413791656` —
+bit-for-bit the IEEE-754 float32 value of `2/61` — is exactly what a document ranked first in
+both lists scores, and the page does introduce it as the top result. Under the formula the
+service actually runs, first-in-both scores `2/60 ≈ 0.0333`; the only ranks that would yield
+`2/61` are second in both, which the page's own wording rules out. The published example
+therefore illustrates the documented formula rather than current behaviour — worth knowing
+before deriving anything from it. A low RRF score is not a weak match; it is a different ruler.
+The service's own troubleshooting guidance puts it plainly — a score of 0.03 can still indicate
+a strong match.
 
 The practical consequence is that **no threshold survives a mode change**. A cutoff tuned against
 `VECTOR` scores discards everything under `HYBRID`: a cosine floor of 0.333 sits above even the
