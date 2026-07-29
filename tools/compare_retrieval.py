@@ -113,30 +113,30 @@ class Query:
 # query is issued. Leaving a placeholder here and choosing after seeing
 # rankings would make the whole comparison unfalsifiable.
 QUERIES = (
-    Query(1, "99.9% monthly uptime", "exact literal", ("<service-sla premium tier>",)),
+    Query(1, "99.9% monthly uptime", "exact literal", ("service-sla-0003",)),
     Query(
         2,
         "How long do I have to send something back if I bought it on sale?",
         "paraphrase",
-        ("<returns-policy promotional purchases>",),
+        ("returns-policy-0002",),
     ),
     Query(
         3,
         "when do customers get credit?",
         "cross-document ambiguity (both relevant)",
-        ("<service-sla standard tier>", "<returns-policy promotional purchases>"),
+        ("service-sla-0002", "returns-policy-0002"),
     ),
     Query(
         4,
         "what happens if the customer misconfigured their own system?",
         "lexical decoy",
-        ("<service-sla exclusions>",),
+        ("service-sla-0005",),
     ),
     Query(
         5,
         "how do I escalate a Sev 1 outage at 3am?",
         "scattered answer",
-        ("<oncall-runbook escalation path>", "<service-sla response times>"),
+        ("oncall-runbook-0003", "service-sla-0004"),
     ),
     Query(6, "What is the parental leave policy?", "absent from corpus", ()),
 )
