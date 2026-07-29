@@ -129,7 +129,11 @@ def to_index_definition() -> dict[str, Any]:
                 "facetable": False,
             },
             {
-                "name": "content_vector",
+                # The constant, not a literal: the query side targets this
+                # field by name, and a schema built from a second copy of that
+                # string can drift from it without anything failing until a
+                # live query returns nothing for a reason no test explains.
+                "name": VECTOR_FIELD,
                 "type": "Collection(Edm.Single)",
                 # Vector fields must be searchable and must not be filterable,
                 # sortable or facetable.
