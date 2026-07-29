@@ -9,7 +9,11 @@ import pytest
 from azgenai_lab.services.azure_search import SearchRequestRejectedError, SearchUnavailableError
 from azgenai_lab.services.indexing_results import Disposition, IndexingResult, classify
 from azgenai_lab.services.search_data_plane import ENUMERATION_PAGE_SIZE
-from azgenai_lab.services.search_indexing import DocumentReplacer, ReplacementOutcome
+from azgenai_lab.services.search_indexing import (
+    MAX_INDEXING_ATTEMPTS,
+    DocumentReplacer,
+    ReplacementOutcome,
+)
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -35,9 +39,24 @@ class _Index:
         self.delete_results: dict[str, list[IndexingResult]] = {}
         self.on_search: Any = None
         self.enumerations: list[tuple[str, str | None]] = []
+        # (action, keys) for every batch, in the order it was sent. The action
+        # is recorded because a delete-path assertion written only against key
+        # sets passes just as happily when the batch says "upload" — and an
+        # upload of `{"chunk_id": ...}` alone would blank every other field of
+        # a document that was supposed to be removed.
+        self.batches: list[tuple[str, tuple[str, ...]]] = []
+
+    @property
+    def delete_batches(self) -> list[tuple[str, ...]]:
+        return [keys for action, keys in self.batches if action == "delete"]
 
     async def post_index(self, body: bytes) -> list[IndexingResult]:
         payload = json.loads(body)
+        actions = {document["@search.action"] for document in payload["value"]}
+        assert len(actions) == 1, f"one batch carried several actions: {sorted(actions)}"
+        self.batches.append(
+            (actions.pop(), tuple(document["chunk_id"] for document in payload["value"]))
+        )
         results: list[IndexingResult] = []
         for document in payload["value"]:
             key = document["chunk_id"]
@@ -265,6 +284,102 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     # Neither job may treat the other document's chunks as stale.
     assert sorted(index.keys) == ["a-0000", "b-0000"]
     assert replacer.max_concurrent_replacements == 2
+
+
+def _permanent(key: str) -> IndexingResult:
+    return IndexingResult(key=key, status=False, status_code=400, error_message="bad")
+
+
+async def test_every_stale_key_is_deleted_in_one_batch_when_all_succeed() -> None:
+    index = _Index(
+        {"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc", "doc-0004": "doc"}
+    )
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is True
+    assert outcome.deleted_keys == ("doc-0002", "doc-0003", "doc-0004")
+    assert index.delete_batches == [("doc-0002", "doc-0003", "doc-0004")]
+
+
+async def test_a_mixed_delete_response_resends_only_the_retryable_keys() -> None:
+    # The 207 that matters most: one response carrying success and failure
+    # together. Resending a key the service already deleted is at best a
+    # wasted round trip and at worst a second verdict for a settled key.
+    index = _Index(
+        {"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc", "doc-0004": "doc"}
+    )
+    index.delete_results["doc-0003"] = [_retryable("doc-0003"), _ok("doc-0003")]
+
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is True
+    assert sorted(outcome.deleted_keys) == ["doc-0002", "doc-0003", "doc-0004"]
+    assert index.delete_batches == [
+        ("doc-0002", "doc-0003", "doc-0004"),
+        ("doc-0003",),
+    ]
+
+
+async def test_a_request_level_delete_failure_resends_only_unconfirmed_keys() -> None:
+    # No per-document verdict exists for a request that never landed, so the
+    # whole batch is outstanding — but keys an *earlier* attempt already
+    # settled as deleted must stay settled. The middle attempt here fails at
+    # the request level after doc-0002 has already succeeded.
+    index = _Index({"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc"})
+    index.delete_results["doc-0003"] = [_retryable("doc-0003"), _ok("doc-0003")]
+    attempts: list[int] = []
+
+    async def flaky_post(body: bytes) -> list[IndexingResult]:
+        payload = json.loads(body)
+        if payload["value"][0]["@search.action"] == "delete":
+            attempts.append(1)
+            if len(attempts) == 2:
+                raise SearchUnavailableError("the gateway dropped the delete")
+        return await index.post_index(body)
+
+    replacer = DocumentReplacer(flaky_post, index.list_chunk_ids, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is True
+    assert sorted(outcome.deleted_keys) == ["doc-0002", "doc-0003"]
+    # The batch that never landed is retried whole; the batch after it carries
+    # only the key still without a verdict, never doc-0002 again.
+    assert index.delete_batches == [("doc-0002", "doc-0003"), ("doc-0003",)]
+
+
+async def test_delete_retries_are_bounded_and_the_survivor_is_reported() -> None:
+    # A partial cleanup is the dangerous report: doc-0002 really is gone, so a
+    # summary that only counted deletions would look like progress. The
+    # replacement is not complete while doc-0003 is still queryable.
+    index = _Index({"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc"})
+    index.delete_results["doc-0003"] = [_retryable("doc-0003")] * 5
+
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is False
+    assert outcome.deleted_keys == ("doc-0002",)
+    assert outcome.unresolved_stale_ids == ("doc-0003",)
+    assert "doc-0003" in index.keys
+    assert len(index.delete_batches) == MAX_INDEXING_ATTEMPTS
+    assert index.delete_batches[1:] == [("doc-0003",), ("doc-0003",)]
+
+
+async def test_a_permanently_rejected_delete_is_not_retried() -> None:
+    # A 400 on one document means deleting it will never work. Spending two
+    # more attempts on it delays the report without changing it.
+    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index.delete_results["doc-0002"] = [_permanent("doc-0002")]
+
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
+    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+
+    assert outcome.completed is False
+    assert outcome.unresolved_stale_ids == ("doc-0002",)
+    assert index.delete_batches == [("doc-0002",)]
 
 
 async def test_completed_replacements_leave_no_per_parent_bookkeeping() -> None:
