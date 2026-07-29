@@ -58,12 +58,23 @@ there are more than 1,000 results found in your index, only the first 1,000 resu
 locally rather than left to the service: too large a `top` is not an error, it is a 200 answering
 a different question than the one asked.
 
-`vector_k` is required to be at least 1 and has no upper bound here, because the REST reference
-documents it only as an `int32` — "Number of nearest neighbours to return as top hits" — with no
-published limit ([Documents - Search
+`vector_k` is required to be at least 1 and at most 2,147,483,647. The REST reference documents
+the field as an `int32` — "Number of nearest neighbours to return as top hits" — and publishes no
+limit on how many neighbours may be asked for ([Documents - Search
 Post](https://learn.microsoft.com/en-us/rest/api/searchservice/documents/search-post), checked
-2026-07). Writing a ceiling down anyway would put a number in this repository that no source
-supports, and the next reader would cite it.
+2026-07). The declared type is still a bound, and it is the only one this repository may enforce:
+a value outside `int32` is not the field being described, while a tighter ceiling would be a
+number no source supports, and the next reader would cite it. That is why the two parameters are
+bounded differently — `top`'s ceiling is published, `vector_k`'s is a consequence of its type.
+
+Both are also required to *be* integers, which is not the same check as being in range. `bool` is
+a subclass of `int` in Python, so `True` satisfies an `isinstance` test and every comparison
+against a bound, then travels as the JSON literal `true` where the service documents a number. A
+float clears the same comparisons and then means different things on each side: the fake slices a
+list with it, the adapter puts a JSON float on the wire. Both clients apply one shared validator,
+so neither can accept a call the other refuses — a fake that is more permissive than the service
+turns a green suite into a production failure, and one that is stricter is a fake nobody can
+develop against.
 
 ## Two scores, and only one of them has a rubric
 

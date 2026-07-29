@@ -33,12 +33,16 @@ DEFAULT_VECTOR_K = 50
 # no warning to say so.
 MAX_TOP = 1_000
 
-# `vector_k` has a documented type (int32) and no documented bound in either
-# direction, so only the lower one is enforced. Picking a ceiling here would
-# mean writing down a number nobody published and then citing it — the same
-# trap as an unmeasured constant. If the service grows a documented limit,
-# this is where it goes.
 MIN_BOUND = 1
+
+# `vector_k` has a documented *type* — int32 — and no documented bound in
+# either direction. That type is still a bound: a value outside int32 cannot
+# be the field the reference describes, whatever the service does with it.
+# It is also the only ceiling this project may put on `vector_k`. Picking a
+# smaller one would mean writing down a number nobody published and then
+# citing it — the same trap as an unmeasured constant. `top` is different:
+# its ceiling of 1,000 *is* published, which is why the two differ.
+INT32_MAX = 2**31 - 1
 
 
 class SearchMode(StrEnum):
@@ -87,11 +91,31 @@ class SearchResult:
     vector_k: int | None
 
 
-def _validate_count(value: int, *, name: str, maximum: int | None = None) -> None:
-    """Bound one of the "how many" parameters, or say which one was wrong."""
+def _validate_count(value: object, *, name: str, maximum: int) -> None:
+    """Bound one of the "how many" parameters, or say which one was wrong.
+
+    The parameter is typed ``object`` because the values worth guarding
+    against are the ones the type system never saw: a JSON body, a CLI
+    argument, a dict from a config file. Where a value came from is what
+    decides whether it is trustworthy, and by the time it reaches here that
+    is no longer visible — so it is checked rather than assumed.
+
+    Two rejections that a range comparison alone does not make:
+
+    * ``bool`` is a subclass of ``int``, so ``True`` passes both
+      ``isinstance(value, int)`` and ``value >= 1`` and reaches the wire as
+      ``true`` — a JSON boolean where the service documents a number.
+    * a positive ``float`` also passes ``>= 1``, and then the two
+      implementations diverge: the fake slices a list with it (or raises),
+      while the real adapter forwards a JSON float. Fake and real disagreeing
+      about what is legal is the one failure this validator exists to
+      prevent, so the type is checked, not just the range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an int; got {type(value).__name__} {value!r}")
     if value < MIN_BOUND:
         raise ValueError(f"{name} must be at least {MIN_BOUND}; got {value}")
-    if maximum is not None and value > maximum:
+    if value > maximum:
         raise ValueError(f"{name} must be at most {maximum}; got {value}")
 
 
@@ -113,9 +137,13 @@ def validate_search_arguments(
     KEYWORD ignores the value, so a nonsensical one there is inert rather than
     harmful — but a caller passing ``-5`` has a bug either way, and a rule that
     fires only in some modes teaches callers to find out which.
+
+    The two counts are annotated ``int`` because that is what a typed caller
+    owes this function. They are checked anyway: the callers that matter here
+    are the ones the annotations never reached.
     """
     _validate_count(top, name="top", maximum=MAX_TOP)
-    _validate_count(vector_k, name="vector_k")
+    _validate_count(vector_k, name="vector_k", maximum=INT32_MAX)
     if not query_text.strip():
         # Required in every mode, including VECTOR: the text is retained for
         # logging and comparison there, and an empty one is a caller bug.
@@ -132,6 +160,7 @@ def validate_search_arguments(
 
 __all__ = [
     "DEFAULT_VECTOR_K",
+    "INT32_MAX",
     "MAX_TOP",
     "MIN_BOUND",
     "TEXT_QUERY_MODES",

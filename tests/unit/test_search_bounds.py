@@ -1,12 +1,14 @@
 """``top`` and ``vector_k`` are bounded, and both clients bound them alike.
 
-Two different failures hide behind an unchecked count. ``top`` above the
+The bound is on the domain, not just the range: a count has to be an ``int``
+within its limits, and neither half of that is redundant. ``top`` above the
 documented ceiling is not rejected by the service — it is silently answered as
 1,000, so the caller gets a 200 for a question it did not ask. A count below 1
 reaches the wire as ``"top": -1`` or ``"k": -5``, and the fake, scoring and
 slicing in Python, quietly returns a *different* result instead of the same
-error. Either way the mistake surfaces somewhere other than the call that made
-it, which is what these tests are for.
+error. A ``bool`` or a ``float`` clears every range comparison and then parts
+the two implementations the same way. Either way the mistake surfaces
+somewhere other than the call that made it, which is what these tests are for.
 
 Every case runs against the fake and the real adapter through the same
 parametrization. A bound the service enforces and the fake does not is a green
@@ -24,6 +26,7 @@ from pydantic import SecretStr
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
+    INT32_MAX,
     MAX_TOP,
     SearchMode,
     SearchResult,
@@ -79,6 +82,29 @@ REJECTED: list[tuple[str, dict[str, Any]]] = [
     ("top-above-the-page-ceiling", {"top": MAX_TOP + 1}),
     ("vector_k-zero", {"top": 5, "vector_k": 0}),
     ("vector_k-negative", {"top": 5, "vector_k": -5}),
+    # `bool` is a subclass of `int`, so `True` satisfies both an
+    # `isinstance(x, int)` check and `x >= 1`. Unrejected it reaches the wire
+    # as the JSON literal `true` where the service documents a number, and
+    # `False` slips past as a zero that never trips the lower bound as a
+    # *type* error — it is caught, if at all, as the wrong complaint.
+    ("top-true", {"top": True}),
+    ("top-false", {"top": False}),
+    ("vector_k-true", {"top": 5, "vector_k": True}),
+    # A positive float clears every range comparison and then the two
+    # implementations part ways: one slices a list, the other sends a JSON
+    # float. Both integral and fractional, because a float that happens to
+    # equal an integer is the one a `== int(value)` shortcut would wave
+    # through — and it is still a float on the wire.
+    ("top-float", {"top": 5.0}),
+    ("top-fractional-float", {"top": 2.5}),
+    ("vector_k-float", {"top": 5, "vector_k": 2.0}),
+    # Values with no business being counts at all, which is what a JSON body
+    # or a CLI argument can hand over without the type system noticing.
+    ("top-string", {"top": "5"}),
+    ("vector_k-none", {"top": 5, "vector_k": None}),
+    # The REST reference declares `k` an int32. A larger value is not the
+    # field being described, whatever the service does with it.
+    ("vector_k-above-int32", {"top": 5, "vector_k": INT32_MAX + 1}),
 ]
 
 
@@ -103,6 +129,30 @@ async def test_both_clients_accept_the_edges_of_the_range(
     search = build()
     await search("refund", VECTOR, mode=SearchMode.HYBRID, top=1, vector_k=1)
     await search("refund", VECTOR, mode=SearchMode.HYBRID, top=MAX_TOP)
+
+
+@pytest.mark.parametrize("build", CLIENTS)
+async def test_the_largest_int32_vector_k_is_accepted(
+    build: Callable[[], Search],
+) -> None:
+    # The upper bound on `vector_k` is the declared type and nothing tighter.
+    # No source publishes a limit on how many neighbours may be asked for, so
+    # a smaller ceiling here would be this repository inventing a number and
+    # then being cited for it. This test is what makes that deliberate rather
+    # than an oversight: tightening the bound has to break it.
+    search = build()
+    await search("refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=INT32_MAX)
+
+
+async def test_a_boolean_count_is_rejected_as_a_type_not_read_as_a_number() -> None:
+    # `isinstance(True, int)` is True and `True >= 1` is True, so a range
+    # check alone accepts it and the caller learns nothing. The complaint has
+    # to name the type, or the next reader "fixes" it by widening the range.
+    fake = FakeSearchClient(DOCUMENTS)
+    with pytest.raises(ValueError, match="top must be an int; got bool"):
+        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=True)
+    with pytest.raises(ValueError, match="vector_k must be an int; got bool"):
+        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=False)
 
 
 @pytest.mark.parametrize("build", CLIENTS)
