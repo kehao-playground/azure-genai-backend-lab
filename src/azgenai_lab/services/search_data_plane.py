@@ -1,9 +1,11 @@
 """The write-side Azure AI Search boundary.
 
 Everything REST about indexing lives here: URLs, the api-key header, the raw
-request buffer, per-document 207 parsing, and the mapping from HTTP failures
-to this project's search error vocabulary. `services/search_indexing.py` is
-transport-free above it, which is what lets the orchestration contracts be
+request buffer, the OData expression that enumerates one document's chunks,
+per-document 207 parsing, and the mapping from HTTP failures to this project's
+search error vocabulary. `services/search_indexing.py` is transport-free above
+it — it asks for "the chunks of this document, resuming after this key" and
+never spells a filter — which is what lets the orchestration contracts be
 tested without a network and the transport be tested without orchestration.
 
 A 404 from `post_index` (or from `create_or_update_index`/`delete_index`)
@@ -26,6 +28,14 @@ from azgenai_lab.services.azure_search import SearchUnavailableError, map_search
 from azgenai_lab.services.indexing_results import IndexingResult
 
 logger = logging.getLogger(__name__)
+
+# The service returns 50 results by default and at most 1,000 per page.
+ENUMERATION_PAGE_SIZE = 1_000
+
+
+def escape_odata_literal(value: str) -> str:
+    """Escape a value for an OData string literal (a single quote doubles)."""
+    return value.replace("'", "''")
 
 
 def index_url(endpoint: str) -> str:
@@ -126,8 +136,27 @@ class SearchDataPlane:
             raise self._error(response)
         return parse_indexing_results(self._json(response))
 
-    async def post_search(self, body: dict[str, Any]) -> list[str]:
-        """Run a query and return just the chunk ids, in response order."""
+    async def list_chunk_ids(self, parent_id: str, after: str | None = None) -> list[str]:
+        """One page of chunk ids under ``parent_id``, resuming after ``after``.
+
+        The range filter is strictly ``gt``. The official paging example uses
+        ``ge``, which repeats the previous page's last key; a caller that then
+        re-derives its cursor from that repeat never advances at all — a silent
+        infinite loop rather than one duplicate row.
+
+        ``search=*`` with a ``select`` of the key alone: nothing here needs the
+        content, and the caller is computing a set difference, not ranking.
+        """
+        expression = f"parent_id eq '{escape_odata_literal(parent_id)}'"
+        if after is not None:
+            expression = f"{expression} and chunk_id gt '{escape_odata_literal(after)}'"
+        body: dict[str, Any] = {
+            "search": "*",
+            "filter": expression,
+            "select": "chunk_id",
+            "orderby": "chunk_id asc",
+            "top": ENUMERATION_PAGE_SIZE,
+        }
         response = await self._send("POST", self._search_url, json=body)
         if response.status_code >= 400:
             raise self._error(response)
@@ -189,8 +218,10 @@ class SearchDataPlane:
 
 
 __all__ = [
+    "ENUMERATION_PAGE_SIZE",
     "SearchDataPlane",
     "documents_url",
+    "escape_odata_literal",
     "index_url",
     "parse_indexing_results",
 ]

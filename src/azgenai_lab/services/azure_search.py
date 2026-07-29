@@ -3,7 +3,10 @@
 Raw REST rather than the SDK: `to_index_definition()` already emits the wire
 body, `httpx` is already a dependency, and the SDK would layer a second
 vocabulary over a contract this project owns. The cost is that URL shapes,
-headers and `@search.*` field names live here — and nowhere else.
+headers, request JSON and `@search.*` field names live here — and nowhere
+else. `models/search.py` names the modes and the hit; it does not know that a
+vector query is spelled `vectorQueries`, which is what keeps swapping this
+adapter for the SDK a one-file change.
 
 Search failures get their own vocabulary. A query-time 422 means our request
 shape is wrong; a 422 inside an indexing 207 means one document is retryable.
@@ -22,18 +25,28 @@ from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
+    TEXT_QUERY_MODES,
+    VECTOR_MODES,
     SearchHit,
     SearchMode,
     SearchResult,
-    build_search_body,
     validate_search_arguments,
 )
-from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION
+from azgenai_lab.models.search_index import (
+    INDEX_NAME,
+    SEARCH_API_VERSION,
+    SEMANTIC_CONFIGURATION_NAME,
+    VECTOR_FIELD,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONFIGURATION_STATUSES = frozenset({401, 403, 404})
 _REJECTED_STATUSES = frozenset({400, 422})
+
+# Vectors are never selected back: not human-readable, large, and the field is
+# not retrievable anyway.
+SELECT_FIELDS = ("chunk_id", "parent_id", "title", "heading_path", "content")
 
 
 class _Diagnosable:
@@ -128,6 +141,50 @@ def search_url(endpoint: str) -> str:
         f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}/docs/search"
         f"?api-version={SEARCH_API_VERSION}"
     )
+
+
+def build_search_body(
+    query_text: str,
+    query_vector: Sequence[float] | None = None,
+    *,
+    mode: SearchMode,
+    top: int,
+    filter: str | None = None,
+    vector_k: int = DEFAULT_VECTOR_K,
+) -> dict[str, Any]:
+    """Build the Search Documents request body for one mode.
+
+    Module-level rather than a method so the four request shapes — the thing
+    the article is about — can be read and asserted without a client, an
+    endpoint or a key. It stays inside this module because every name in it
+    (``vectorQueries``, ``queryType``, ``semanticConfiguration``) is Azure's
+    vocabulary, not this project's.
+
+    ``filter`` is a **trusted internal OData expression**. Day 15's tenant
+    isolation must not interpolate a user-supplied value into this string; it
+    has to be built from a typed authorization context and escaped there.
+    """
+    validate_search_arguments(query_text, query_vector, mode=mode)
+
+    body: dict[str, Any] = {"top": top, "select": ",".join(SELECT_FIELDS)}
+    if mode in TEXT_QUERY_MODES:
+        body["search"] = query_text
+    if mode in VECTOR_MODES:
+        assert query_vector is not None  # narrowed by the validator
+        body["vectorQueries"] = [
+            {
+                "kind": "vector",
+                "vector": list(query_vector),
+                "fields": VECTOR_FIELD,
+                "k": vector_k,
+            }
+        ]
+    if mode is SearchMode.HYBRID_SEMANTIC:
+        body["queryType"] = "semantic"
+        body["semanticConfiguration"] = SEMANTIC_CONFIGURATION_NAME
+    if filter is not None:
+        body["filter"] = filter
+    return body
 
 
 def _number(value: object, field: str) -> float:
@@ -378,6 +435,7 @@ def build_search_client(settings: Settings) -> SearchClient:
 
 
 __all__ = [
+    "SELECT_FIELDS",
     "AzureSearchClient",
     "FakeSearchClient",
     "SearchClient",
@@ -386,6 +444,7 @@ __all__ = [
     "SearchError",
     "SearchRequestRejectedError",
     "SearchUnavailableError",
+    "build_search_body",
     "build_search_client",
     "map_search_status",
     "parse_hits",
