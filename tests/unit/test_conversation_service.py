@@ -4,9 +4,8 @@ A turn enters the history atomically — visible transcript plus provider
 replay items — and only when the reply is one the client keeps: non-streaming
 success, stream ``completed``, or stream ``incomplete``/``max_output_tokens``.
 Failed or discarded turns leave no trace. Turns on one conversation are
-serialized (review r01 finding 2); storage failures map to ``StorageError``
-(finding 3); empty non-streaming replies are upstream failures, never a 200
-with a ghost id (finding 4).
+serialized; storage failures map to ``StorageError``; empty non-streaming
+replies are upstream failures, never a 200 with a ghost id.
 """
 
 import asyncio
@@ -184,7 +183,7 @@ async def test_concurrent_turns_on_one_conversation_are_serialized() -> None:
     conversation_id, _ = await service.complete("first", None)
 
     # Fire both turns concurrently; without the per-conversation lock both
-    # would read the same 2-item snapshot (r01 finding 2's barrier probe).
+    # would read the same 2-item snapshot.
     await asyncio.gather(
         service.complete("A", conversation_id),
         service.complete("B", conversation_id),

@@ -151,7 +151,7 @@ class ConversationChatService:
             if result.status == "completed" and not result.message:
                 # A 200 with a freshly issued id that resolves to 404 next
                 # turn would break the contract; an empty reply is an
-                # upstream failure, not a turn (review r01 finding 4).
+                # upstream failure, not a turn.
                 raise UpstreamServiceError("upstream returned an empty reply")
             # Same keep/discard rule as the stream terminal (Day 6): completed
             # and incomplete/max_output_tokens commit; content_filter and
