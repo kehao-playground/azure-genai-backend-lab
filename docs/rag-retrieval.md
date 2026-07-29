@@ -69,8 +69,10 @@ query both ways and shows one hotel document scoring `0.8399121` under pure vect
 `0.032786883413791656` under hybrid — the same document, two scales, roughly twenty-six times
 apart (`0.8399121 / 0.032786883413791656 ≈ 25.6`). That follows from the algorithm: a cosine
 score occupies 0.333–1.00, while each query fused by RRF contributes at most about `1/k`, where
-`k` is a small constant — the documentation recommends setting it "to a small value, such as
-60".
+`k` is a small constant — the documentation describes the algorithm as performing best with `k`
+at "a small value, such as 60". It is fixed inside the service, not a query parameter, and it is
+"entirely separate from the `k` that controls the number of nearest neighbors" — the one this
+repo sets as `DEFAULT_VECTOR_K`.
 
 The exact form is worth measuring rather than assuming, because the formula the service runs is
 not the formula it documents. The scoring page gives the score as `1/(rank + k)`, "where `rank`
