@@ -68,7 +68,7 @@ def test_filter_is_included_only_when_given() -> None:
 )
 def test_vector_modes_require_a_vector(mode: SearchMode) -> None:
     with pytest.raises(ValueError, match="requires a query vector"):
-        validate_search_arguments("q", None, mode=mode)
+        validate_search_arguments("q", None, mode=mode, top=5)
 
 
 @pytest.mark.parametrize("mode", list(SearchMode))
@@ -78,12 +78,12 @@ def test_every_mode_requires_non_empty_query_text(mode: SearchMode) -> None:
     # empty one is a caller bug there too.
     vector = None if mode is SearchMode.KEYWORD else VECTOR
     with pytest.raises(ValueError, match="non-empty"):
-        validate_search_arguments("   ", vector, mode=mode)
+        validate_search_arguments("   ", vector, mode=mode, top=5)
 
 
 def test_wrong_width_vector_is_rejected_before_the_request_is_built() -> None:
     with pytest.raises(ValueError, match="dimensions"):
-        validate_search_arguments("q", [0.1, 0.2], mode=SearchMode.VECTOR)
+        validate_search_arguments("q", [0.1, 0.2], mode=SearchMode.VECTOR, top=5)
 
 
 def test_keyword_mode_tolerates_a_vector_being_supplied() -> None:

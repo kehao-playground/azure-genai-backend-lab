@@ -50,6 +50,21 @@ not mean the semantic candidate count *is* 50, and it does not control the keywo
 formula also contains a constant called `k`, unrelated to either; this codebase names its
 parameter `vector_k` so the two cannot be confused in a log line six months from now.
 
+Both are bounded before a request is built. `top` must be between 1 and 1,000: "The default page
+size is 50, while the maximum page size is 1,000. If you specify a value greater than 1,000 and
+there are more than 1,000 results found in your index, only the first 1,000 results are returned"
+([shape search results](https://learn.microsoft.com/en-us/azure/search/search-pagination-page-layout),
+`ms.date` 2026-07-21, checked 2026-07). That last clause is the reason the ceiling is enforced
+locally rather than left to the service: too large a `top` is not an error, it is a 200 answering
+a different question than the one asked.
+
+`vector_k` is required to be at least 1 and has no upper bound here, because the REST reference
+documents it only as an `int32` — "Number of nearest neighbours to return as top hits" — with no
+published limit ([Documents - Search
+Post](https://learn.microsoft.com/en-us/rest/api/searchservice/documents/search-post), checked
+2026-07). Writing a ceiling down anyway would put a number in this repository that no source
+supports, and the next reader would cite it.
+
 ## Two scores, and only one of them has a rubric
 
 `SearchHit` carries `score` and `reranker_score` separately and never normalizes them.
@@ -131,6 +146,23 @@ this as its reason for advising against granular thresholds ([semantic ranking
 overview](https://learn.microsoft.com/en-us/azure/search/semantic-search-overview), checked
 2026-07) — so thresholds built on it must stay coarse.
 
+## Where the REST vocabulary stops
+
+Every request body in this document is built inside an adapter — the query body in
+`services/azure_search.py`, the index and enumeration bodies in `services/search_data_plane.py`.
+Nothing above them names a wire field. `models/search.py` knows the four modes, the hit and the
+argument contract; the write-path orchestration in `services/search_indexing.py` asks for "the
+chunks of this document, resuming after this key" and never spells an OData filter.
+
+The line is drawn there so that replacing REST with the SDK, or one service with another, is a
+change to one file rather than a search across the codebase for strings like `vectorQueries`.
+Whether the boundary actually holds is testable: the request bodies are pinned byte for byte, so
+moving construction around cannot quietly change what travels.
+
+The adapters own their connection pool when they allocate it and never close one that was handed
+in. Long-running tools open them in an `async with` block, which releases the pool at a point in
+time the program chooses instead of whenever the object is collected.
+
 ## Authentication
 
 The lab uses an admin key: creating an index, uploading and deleting documents all require
@@ -158,6 +190,13 @@ it does **not** provide snapshot isolation and is not what makes concurrency saf
 
 The lock's scope is one process. A deployment running multiple workers needs a durable lease, a
 generation field on the document, or a compare-and-set on that generation.
+
+The lock registry is reference-counted: an entry exists only while a job holds or awaits it, and
+the last one out removes it. The naive `dict[str, Lock]` grows with the number of documents ever
+indexed and never shrinks. The reclamation has to survive cancellation too — a job cancelled while
+queued must drop its own reference without releasing a lock it never held and without removing an
+entry someone else is still holding. That mistake is worse than the leak it fixes, because it puts
+two jobs in the critical section and the damage surfaces nowhere near the lock.
 
 Deletion has its own terminal state for the same reasons as upload. A failed deletion is the safe
 side — stale content survives rather than new content vanishing — but the replacement is reported
