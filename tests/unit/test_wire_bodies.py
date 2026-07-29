@@ -16,10 +16,11 @@ import httpx
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 from azgenai_lab.services.azure_search import AzureSearchClient
-from azgenai_lab.services.search_data_plane import SearchDataPlane
+from azgenai_lab.services.search_data_plane import SearchDataPlane, plan_batches
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 _VECTOR_JSON = b",".join([b"0.1"] * EMBEDDING_DIMENSIONS)
@@ -109,6 +110,34 @@ async def test_hybrid_semantic_body_is_byte_for_byte_what_it_has_always_been() -
         + _VECTOR_JSON
         + b'],"fields":"content_vector","k":50}],"queryType":"semantic",'
         b'"semanticConfiguration":"chunk-semantic","filter":"tenant_id eq \'acme\'"}'
+    ]
+
+
+async def test_indexing_bodies_are_byte_for_byte_what_they_have_always_been() -> None:
+    # The indexing body is built by the planner and sent untouched, so the
+    # bytes are pinned where they arrive: at the transport. Key order follows
+    # the document's own insertion order with `@search.action` appended last,
+    # separators are compact, and non-ASCII content travels as UTF-8 rather
+    # than as `\\uXXXX` escapes — none of which any field-level assertion
+    # elsewhere would notice changing.
+    recorder = _Recorder()
+    plane = SearchDataPlane(_settings(), client=recorder.transport())
+
+    documents = [
+        {"chunk_id": "doc-0000", "parent_id": "doc", "content": "café — refund"},
+        {"chunk_id": "doc-0001", "parent_id": "doc", "content": "second"},
+    ]
+    for batch in plan_batches(documents, IndexingAction.UPSERT):
+        await plane.post_batch(batch)
+    for batch in plan_batches([{"chunk_id": "doc-0002"}], IndexingAction.REMOVE):
+        await plane.post_batch(batch)
+
+    assert recorder.bodies == [
+        b'{"value":[{"chunk_id":"doc-0000","parent_id":"doc",'
+        b'"content":"caf\xc3\xa9 \xe2\x80\x94 refund","@search.action":"upload"},'
+        b'{"chunk_id":"doc-0001","parent_id":"doc","content":"second",'
+        b'"@search.action":"upload"}]}',
+        b'{"value":[{"chunk_id":"doc-0002","@search.action":"delete"}]}',
     ]
 
 
