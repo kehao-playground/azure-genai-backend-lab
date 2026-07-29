@@ -89,19 +89,29 @@ while the documented 1-based form reproduces none of them. What the measurement 
 combination, not either half alone — a constant of 60 over 0-based ranks is indistinguishable
 from 59 over 1-based ranks.
 
-That reconstruction is only possible because this corpus is no larger than `top` — 25 chunks
-against `top` 25 — so the separate keyword and vector runs return complete lists. On a corpus
-larger than `top`, the inputs to the fusion are not fully observable from outside it.
+Read that result with its scope attached. The agreement is to the six decimal places the
+evidence records, not to full float precision. The input ranks were not read out of the service:
+they come from separate keyword-only and vector-only calls issued with the same query text and
+the same query vector, which is an inference about what the hybrid request fused, not a
+subscore dump. And it is one region, one date, one API version, one static corpus, and one query
+shape with two fused legs and default weights. That is observed behavior, not a contract Azure
+has published.
 
-It also reframes the published figure. Under the documented formula, `0.032786883413791656` —
-bit-for-bit the IEEE-754 float32 value of `2/61` — is exactly what a document ranked first in
-both lists scores, and the page does introduce it as the top result. Under the formula the
-service actually runs, first-in-both scores `2/60 ≈ 0.0333`; the only two-list ranks that would
-yield `2/61` are second in both, which the page's own wording rules out. The published example
-therefore illustrates the documented formula rather than current behavior — worth knowing
-before deriving anything from it. A low RRF score is not a weak match; it is a different ruler.
-The service's own troubleshooting guidance puts it plainly — a score of 0.03 can still indicate
-a strong match.
+The reconstruction is only possible at all because this corpus is no larger than `top` — 25
+chunks against `top` 25 — so the separate keyword and vector runs return complete lists. On a
+corpus larger than `top`, the inputs to the fusion are not fully observable from outside it.
+
+The published figure cannot settle the question either way. `0.032786883413791656` is bit-for-bit
+the IEEE-754 float32 value of `2/61`, which is what a document first in both lists scores under
+the documented formula and what a document *second* in both lists scores under the implemented
+one. The page introduces it as the top result, but "top" there means top after fusion, and a
+document second in both lists (`2/61 ≈ 0.0328`) outranks one that is first in only a single list
+(`1/60 ≈ 0.0167`). Since the page never publishes the document's rank in each input list, both
+readings remain open. Treat the example as illustrative of scale, not as evidence about the rank
+convention.
+
+A low RRF score is not a weak match; it is a different ruler. The service's own troubleshooting
+guidance puts it plainly — a score of 0.03 can still indicate a strong match.
 
 The practical consequence is that **no threshold survives a mode change**. A cutoff tuned against
 `VECTOR` scores discards everything under `HYBRID`: a cosine floor of 0.333 sits above even the
