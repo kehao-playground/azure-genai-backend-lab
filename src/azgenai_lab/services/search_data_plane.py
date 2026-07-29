@@ -97,7 +97,29 @@ class SearchDataPlane:
             "api-key": settings.azure_search_admin_key.get_secret_value(),
             "content-type": "application/json",
         }
+        # Ownership is decided once, here, and remembered: `aclose()` closes
+        # only a connection pool this object created. Closing an injected one
+        # would reach outside this object's lifetime and break whatever else
+        # is sharing it — a test's MockTransport client, or an application-wide
+        # pool a later composition point may hand in.
+        self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
+
+    async def aclose(self) -> None:
+        """Release the connection pool, if this object is the one that made it.
+
+        Idempotent, and a no-op for an injected client. Without this, a
+        long-running tool has no way to shut a pool down except to wait for
+        garbage collection, which is not a point in time anyone controls.
+        """
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> "SearchDataPlane":
+        return self
+
+    async def __aexit__(self, *exception: object) -> None:
+        await self.aclose()
 
     async def create_or_update_index(self) -> None:
         # The REST contract requires `Prefer: return=representation` on this

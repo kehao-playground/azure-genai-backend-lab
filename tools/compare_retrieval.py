@@ -52,13 +52,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from azgenai_lab.core.config import get_settings
+from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
 from azgenai_lab.models.search_index import SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
-from azgenai_lab.services.embeddings import build_embedding_client
+from azgenai_lab.services.embeddings import EmbeddingClient, build_embedding_client
 
 
 def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
@@ -352,9 +352,20 @@ async def main() -> None:
             "absent, producing evidence that looks complete and is worthless."
         )
     configure_logging(settings.log_level)
-    client = AzureSearchClient(settings)
     embedding_client = build_embedding_client(settings)
 
+    # The client owns its connection pool here, so it is closed on the way out
+    # — including when a ConfigurationError below aborts the run partway.
+    async with AzureSearchClient(settings) as client:
+        await _compare(client, embedding_client, settings, arguments)
+
+
+async def _compare(
+    client: AzureSearchClient,
+    embedding_client: EmbeddingClient,
+    settings: Settings,
+    arguments: argparse.Namespace,
+) -> None:
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     evidence = Evidence(arguments.out, total_queries=len(QUERIES))
     evidence.add(

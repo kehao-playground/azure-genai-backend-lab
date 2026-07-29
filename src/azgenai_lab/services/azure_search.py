@@ -263,6 +263,12 @@ class AzureSearchClient:
             "api-key": settings.azure_search_admin_key.get_secret_value(),
             "content-type": "application/json",
         }
+        # Ownership is decided once, here, and remembered: `aclose()` closes
+        # only a connection pool this object created. Closing an injected one
+        # would reach outside this object's lifetime and break whatever else
+        # is sharing it — a test's MockTransport client, or an application-wide
+        # pool a later composition point may hand in.
+        self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
         # One record rather than four mutable fields a caller has to read in
         # the right order and narrow individually. The live evidence file
@@ -273,6 +279,22 @@ class AzureSearchClient:
         # the transport. Deep-copying a 1536-float vector on every call is not
         # worth the protection.
         self.last_diagnostics: SearchDiagnostics | None = None
+
+    async def aclose(self) -> None:
+        """Release the connection pool, if this object is the one that made it.
+
+        Idempotent, and a no-op for an injected client. Without this, a
+        long-running tool has no way to shut a pool down except to wait for
+        garbage collection, which is not a point in time anyone controls.
+        """
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def __aenter__(self) -> "AzureSearchClient":
+        return self
+
+    async def __aexit__(self, *exception: object) -> None:
+        await self.aclose()
 
     async def search(
         self,

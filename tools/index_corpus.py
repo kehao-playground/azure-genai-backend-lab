@@ -12,7 +12,7 @@ import argparse
 import asyncio
 import json
 
-from azgenai_lab.core.config import get_settings
+from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.rag import Chunk
 from azgenai_lab.services.chunking import chunk_markdown
@@ -40,8 +40,14 @@ async def main() -> None:
         )
     configure_logging(settings.log_level)
 
-    plane = SearchDataPlane(settings)
-    if arguments.create_index:
+    # The data plane owns its connection pool here, so it is closed on the way
+    # out — including when a SystemExit below aborts the run partway.
+    async with SearchDataPlane(settings) as plane:
+        await _index(plane, settings, create_index=arguments.create_index)
+
+
+async def _index(plane: SearchDataPlane, settings: Settings, *, create_index: bool) -> None:
+    if create_index:
         await plane.create_or_update_index()
         print("index created or updated")
 
