@@ -130,8 +130,8 @@ corpus larger than `top`, the inputs to the fusion are not fully observable from
 
 The published figure cannot settle the question either way. `0.032786883413791656` is bit-for-bit
 the IEEE-754 float32 value of `2/61`, which is what a document first in both lists scores under
-the documented formula and what a document *second* in both lists scores under the implemented
-one. The page introduces it as the top result, but "top" there means top after fusion, and a
+the documented formula and what a document *second* in both lists scores under the 0-based form
+reconstructed here. The page introduces it as the top result, but "top" there means top after fusion, and a
 document second in both lists (`2/61 ≈ 0.0328`) outranks one that is first in only a single list
 (`1/60 ≈ 0.0167`). Since the page never publishes the document's rank in each input list, both
 readings remain open. Treat the example as illustrative of scale, not as evidence about the rank
@@ -141,8 +141,10 @@ A low RRF score is not a weak match; it is a different ruler. The service's own 
 guidance puts it plainly — a score of 0.03 can still indicate a strong match.
 
 The practical consequence is that **no threshold survives a mode change**. A cutoff tuned against
-`VECTOR` scores discards everything under `HYBRID`: a cosine floor of 0.333 sits above even the
-two-query RRF ceiling of `2/60 ≈ 0.0333`, so a cutoff drawn anywhere in the cosine range excludes
+`VECTOR` scores discards everything under `HYBRID`: a cosine floor of 0.333 sits above `2/60 ≈
+0.0333`, which is the ceiling for the shape measured here — two equally weighted sources under
+the 0-based reconstruction. Fuse more sources, or weight them, and the ceiling moves. A cutoff
+drawn anywhere in the cosine range still excludes
 every hybrid result. It also fails silently: the query still returns, the results are still
 ranked, there is simply nothing above the line. Only `reranker_score` has a published rubric to
 threshold against.
