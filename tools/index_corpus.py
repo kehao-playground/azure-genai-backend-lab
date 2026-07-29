@@ -86,7 +86,7 @@ async def main() -> None:
             other_batches += 1
         return await plane.post_index(body)
 
-    replacer = DocumentReplacer(measured_post, plane.post_search)
+    replacer = DocumentReplacer(measured_post, plane.list_chunk_ids)
 
     total_documents = 0
     for source in load_documents():

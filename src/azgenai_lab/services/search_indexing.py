@@ -250,10 +250,12 @@ async def run_indexing_with_retry(
     return terminal
 
 
-# The service returns 50 results by default and at most 1,000 per page.
-ENUMERATION_PAGE_SIZE = 1_000
-
-PostSearch = Callable[[dict[str, Any]], Coroutine[Any, Any, list[str]]]
+# Pages of chunk ids under one parent, asked for in this project's terms: the
+# document, and the key to resume after. How that becomes a query — the OData
+# expression, the ordering, the page size — is the adapter's business, and
+# naming any of it here would put the write path's own request JSON in a module
+# that is otherwise transport-free.
+ListChunkIdPage = Callable[[str, str | None], Coroutine[Any, Any, list[str]]]
 
 
 class EnumerationError(UpstreamError):
@@ -264,43 +266,27 @@ class EnumerationError(UpstreamError):
     message = "Listing the indexed chunks of a document failed."
 
 
-def escape_odata_literal(value: str) -> str:
-    """Escape a value for an OData string literal (a single quote doubles)."""
-    return value.replace("'", "''")
-
-
-async def list_indexed_chunk_ids(post_search: PostSearch, parent_id: str) -> list[str]:
+async def list_indexed_chunk_ids(list_page: ListChunkIdPage, parent_id: str) -> list[str]:
     """List every ``chunk_id`` currently indexed under ``parent_id``.
 
-    Pages with ``orderby`` plus a strict ``gt`` range filter rather than
-    ``skip``: ``skip`` shifts when the index changes underneath the walk, so a
-    concurrent write can make it repeat or miss rows. The cursor removes that
-    displacement — it does **not** provide snapshot isolation, and it is not
-    what makes concurrent replacement safe. That is the critical section's job.
+    Pages by resuming strictly *after* the last key seen rather than by
+    offset: an offset shifts when the index changes underneath the walk, so a
+    concurrent write can make it repeat or miss rows. Resuming after a key
+    removes that displacement — it does **not** provide snapshot isolation, and
+    it is not what makes concurrent replacement safe. That is the critical
+    section's job.
 
     Two conditions abort rather than continue, because both mean the walk has
     lost its footing: a key already seen, and a cursor that failed to advance.
     Continuing past either risks an unbounded loop, and this list decides what
     gets deleted.
     """
-    literal = escape_odata_literal(parent_id)
     seen: set[str] = set()
     ordered: list[str] = []
     cursor: str | None = None
 
     while True:
-        expression = f"parent_id eq '{literal}'"
-        if cursor is not None:
-            expression = f"{expression} and chunk_id gt '{escape_odata_literal(cursor)}'"
-        page = await post_search(
-            {
-                "search": "*",
-                "filter": expression,
-                "select": "chunk_id",
-                "orderby": "chunk_id asc",
-                "top": ENUMERATION_PAGE_SIZE,
-            }
-        )
+        page = await list_page(parent_id, cursor)
         if not page:
             return ordered
 
@@ -312,11 +298,12 @@ async def list_indexed_chunk_ids(post_search: PostSearch, parent_id: str) -> lis
             seen.add(chunk_id)
             ordered.append(chunk_id)
 
-        # `max()` is Python's ordinal string comparison; the filter above is
-        # server-side OData `gt`. If the two collations ever disagreed, a row
-        # could be skipped without tripping either fail-closed guard in this
-        # loop. Low risk today: chunk_id suffixes are a fixed-width numeric
-        # string, so ordinal and typical collations agree on their order.
+        # `max()` is Python's ordinal string comparison; the service applies
+        # its own collation when it resumes after this key. If the two ever
+        # disagreed, a row could be skipped without tripping either fail-closed
+        # guard in this loop. Low risk today: chunk_id suffixes are a
+        # fixed-width numeric string, so ordinal and typical collations agree
+        # on their order.
         next_cursor = max(page)
         if cursor is not None and next_cursor <= cursor:
             raise EnumerationError(
@@ -374,12 +361,12 @@ class DocumentReplacer:
     def __init__(
         self,
         post_index: PostBatch,
-        post_search: PostSearch,
+        list_page: ListChunkIdPage,
         *,
         sleep: Sleeper = asyncio.sleep,
     ) -> None:
         self._post_index = post_index
-        self._post_search = post_search
+        self._list_page = list_page
         self._sleep = sleep
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, int] = {}
@@ -490,7 +477,7 @@ class DocumentReplacer:
         # misconfigured delete request (`SearchRequestRejectedError`,
         # `SearchConfigurationError`) leaves exactly the same ambiguity.
         try:
-            indexed = await list_indexed_chunk_ids(self._post_search, parent_id)
+            indexed = await list_indexed_chunk_ids(self._list_page, parent_id)
             expected = set(expected_keys)
             stale = [key for key in indexed if key not in expected]
             if not stale:

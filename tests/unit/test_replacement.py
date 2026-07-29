@@ -8,6 +8,7 @@ import pytest
 
 from azgenai_lab.services.azure_search import SearchRequestRejectedError, SearchUnavailableError
 from azgenai_lab.services.indexing_results import Disposition, IndexingResult, classify
+from azgenai_lab.services.search_data_plane import ENUMERATION_PAGE_SIZE
 from azgenai_lab.services.search_indexing import DocumentReplacer, ReplacementOutcome
 
 
@@ -33,6 +34,7 @@ class _Index:
         self.keys: dict[str, str] = dict(existing or {})
         self.delete_results: dict[str, list[IndexingResult]] = {}
         self.on_search: Any = None
+        self.enumerations: list[tuple[str, str | None]] = []
 
     async def post_index(self, body: bytes) -> list[IndexingResult]:
         payload = json.loads(body)
@@ -54,20 +56,15 @@ class _Index:
             results.append(_ok(key))
         return results
 
-    async def post_search(self, body: dict[str, Any]) -> list[str]:
+    async def list_chunk_ids(self, parent_id: str, after: str | None = None) -> list[str]:
         if self.on_search is not None:
             await self.on_search()
-        expression = body["filter"]
-        parent = expression.split("parent_id eq '")[1].split("'")[0]
-        cursor = None
-        if " and chunk_id gt '" in expression:
-            cursor = expression.split(" and chunk_id gt '")[1].rstrip("'")
-        matching = sorted(
+        self.enumerations.append((parent_id, after))
+        return sorted(
             key
             for key, owner in self.keys.items()
-            if owner == parent and (cursor is None or key > cursor)
-        )
-        return matching[: body["top"]]
+            if owner == parent_id and (after is None or key > after)
+        )[:ENUMERATION_PAGE_SIZE]
 
 
 def _documents(keys: list[str], parent: str = "doc") -> list[dict[str, Any]]:
@@ -76,7 +73,7 @@ def _documents(keys: list[str], parent: str = "doc") -> list[dict[str, Any]]:
 
 async def test_successful_replacement_deletes_only_stale_chunks() -> None:
     index = _Index({"doc-0000": "doc", "doc-0001": "doc", "doc-0002": "doc"})
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
 
     outcome = await replacer.replace("doc", _documents(["doc-0000", "doc-0001"]))
 
@@ -92,7 +89,7 @@ async def test_a_blocked_gate_deletes_nothing() -> None:
     async def failing_upload(_body: bytes) -> list[IndexingResult]:
         return [_retryable("doc-0000")]
 
-    replacer = DocumentReplacer(failing_upload, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(failing_upload, index.list_chunk_ids, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
@@ -106,7 +103,7 @@ async def test_a_failed_deletion_reports_unresolved_stale_ids() -> None:
     index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
     index.delete_results["doc-0002"] = [_retryable("doc-0002")] * 5
 
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
@@ -118,7 +115,7 @@ async def test_a_deletion_that_succeeds_on_retry_completes() -> None:
     index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
     index.delete_results["doc-0002"] = [_retryable("doc-0002"), _ok("doc-0002")]
 
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
 
     assert outcome.completed is True
@@ -135,7 +132,7 @@ async def test_first_replacement_for_a_parent_completes_without_deleting() -> No
     # very first upload — no prior chunks exist, so nothing is stale and the
     # replacement completes with an empty deletion.
     index = _Index()
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
     assert outcome.completed is True
     assert outcome.deleted_keys == ()
@@ -149,7 +146,7 @@ async def test_enumeration_crash_after_upload_reports_unknown_stale_state() -> N
     # we cannot say".
     index = _Index({"doc-0000": "doc"})
 
-    async def crashing_search(_body: dict[str, Any]) -> list[str]:
+    async def crashing_search(_parent_id: str, _after: str | None) -> list[str]:
         raise SearchUnavailableError("search timed out")
 
     replacer = DocumentReplacer(index.post_index, crashing_search, sleep=_no_sleep)
@@ -175,7 +172,7 @@ async def test_deletion_rejection_after_upload_reports_unknown_stale_state() -> 
             raise SearchRequestRejectedError("malformed delete batch")
         return await index.post_index(body)
 
-    replacer = DocumentReplacer(rejecting_post, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(rejecting_post, index.list_chunk_ids, sleep=_no_sleep)
     outcome = await replacer.replace("doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
@@ -191,7 +188,7 @@ async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:
         sent.append(body)
         return await index.post_index(body)
 
-    replacer = DocumentReplacer(recording_post, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(recording_post, index.list_chunk_ids, sleep=_no_sleep)
     with pytest.raises(ValueError, match="no chunks"):
         await replacer.replace("doc", [])
 
@@ -214,7 +211,7 @@ async def test_documents_belonging_to_another_parent_are_refused_before_sending(
         sent.append(body)
         return await index.post_index(body)
 
-    replacer = DocumentReplacer(recording_post, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(recording_post, index.list_chunk_ids, sleep=_no_sleep)
     with pytest.raises(ValueError, match="parent_id"):
         await replacer.replace("parent-a", _documents(["b-0000"], parent="parent-b"))
 
@@ -227,7 +224,7 @@ async def test_one_document_admits_only_one_replacement_at_a_time() -> None:
     # key-set assertion accepts the corrupted outcome, because A deleting B's
     # new chunk leaves exactly the key set A's own generation would.
     index = _Index()
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
 
     async def yield_control() -> None:
         # Force a suspension point inside the critical section so two
@@ -251,7 +248,7 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     # that counter looking identical. Only `max_concurrent_replacements`,
     # which is not keyed by anything, can tell the two apart.
     index = _Index()
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
 
     async def yield_control() -> None:
         # Force a suspension point inside the critical section so two
@@ -283,7 +280,7 @@ async def test_two_parents_pin_per_parent_and_overall_concurrency_together() -> 
     # "doc" jobs must never overlap each other, while the "other" job must
     # overlap one of them.
     index = _Index()
-    replacer = DocumentReplacer(index.post_index, index.post_search, sleep=_no_sleep)
+    replacer = DocumentReplacer(index.post_index, index.list_chunk_ids, sleep=_no_sleep)
 
     async def yield_control() -> None:
         # Force a suspension point inside the critical section so two

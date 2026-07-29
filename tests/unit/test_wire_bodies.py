@@ -12,8 +12,6 @@ under test: an expectation derived from the code it checks agrees with that
 code by construction.
 """
 
-from typing import Any
-
 import httpx
 from pydantic import SecretStr
 
@@ -22,7 +20,6 @@ from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.search_data_plane import SearchDataPlane
-from azgenai_lab.services.search_indexing import list_indexed_chunk_ids
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 _VECTOR_JSON = b",".join([b"0.1"] * EMBEDDING_DIMENSIONS)
@@ -120,13 +117,9 @@ async def test_enumeration_bodies_are_byte_for_byte_what_they_have_always_been()
     # is pinned rather than something the fixture happens to avoid.
     recorder = _Recorder()
     plane = SearchDataPlane(_settings(), client=recorder.transport())
-    pages = [["doc-0000", "doc-0001"], []]
 
-    async def post_search(body: dict[str, Any]) -> list[str]:
-        await plane.post_search(body)
-        return pages.pop(0)
-
-    await list_indexed_chunk_ids(post_search, "o'brien")
+    await plane.list_chunk_ids("o'brien")
+    await plane.list_chunk_ids("o'brien", "doc-0001")
 
     assert recorder.bodies == [
         b'{"search":"*","filter":"parent_id eq \'o\'\'brien\'",'

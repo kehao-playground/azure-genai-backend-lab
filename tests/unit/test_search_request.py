@@ -5,7 +5,6 @@ import pytest
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
     SearchMode,
-    build_search_body,
     validate_search_arguments,
 )
 from azgenai_lab.models.search_index import (
@@ -13,6 +12,7 @@ from azgenai_lab.models.search_index import (
     SEMANTIC_CONFIGURATION_NAME,
     VECTOR_FIELD,
 )
+from azgenai_lab.services.azure_search import build_search_body
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 
