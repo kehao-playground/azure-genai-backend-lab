@@ -100,20 +100,21 @@ at "a small value, such as 60". It is fixed inside the service, not a query para
 "entirely separate from the `k` that controls the number of nearest neighbors" — the one this
 repo sets as `DEFAULT_VECTOR_K`.
 
-The exact form is worth measuring rather than assuming, because the formula the service runs is
-not the formula it documents. The scoring page gives the score as `1/(rank + k)`, "where `rank`
-is the position of the document in the list", and its worked example counts positions from 1.
-Running the four modes against this repo's sample corpus (25 chunks, 6 queries, api-version
-`2026-04-01`) and recomputing every fused score from the keyword and vector rank lists: all 150
-hybrid scores are reproduced exactly by
+The exact form is worth measuring rather than assuming, because the scores this service returned
+do not match the formula it documents. The scoring page gives the score as `1/(rank + k)`, "where
+`rank` is the position of the document in the list", and its worked example counts positions
+from 1. Running the four modes against this repo's sample corpus (25 chunks, 6 queries,
+api-version `2026-04-01`) and recomputing every fused score from the keyword and vector rank
+lists: all 150 hybrid rows agree, to the six decimal places the capture records, with
 
 ```
 score = sum over lists of 1 / (60 + rank)     # rank counted from 0
 ```
 
-while the documented 1-based form reproduces none of them. What the measurement pins is the
-combination, not either half alone — a constant of 60 over 0-based ranks is indistinguishable
-from 59 over 1-based ranks.
+while the documented 1-based form matches none of them. What the capture pins is the combination,
+not either half alone — a constant of 60 over 0-based ranks is indistinguishable from 59 over
+1-based ranks — and it pins that for the observed responses, not for an internal implementation
+this repository has never seen.
 
 Read that result with its scope attached. The agreement is to the six decimal places the
 evidence records, not to full float precision. The input ranks were not read out of the service:
