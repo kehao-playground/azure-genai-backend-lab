@@ -76,3 +76,9 @@ def test_admin_key_is_a_secret() -> None:
     assert settings.azure_search_admin_key is not None
     assert "super-secret" not in repr(settings)
     assert settings.azure_search_admin_key.get_secret_value() == "super-secret"
+
+
+def test_rag_top_default_and_validation() -> None:
+    assert Settings(_env_file=None).rag_top == 5
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rag_top=0)
