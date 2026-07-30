@@ -21,8 +21,11 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {
         "model": ErrorEnvelope,
         "description": (
-            "content_filtered (the question was blocked by the content filter) or "
-            "invalid_input (the upstream model rejected the input, e.g. context length)"
+            "content_filtered (the question was blocked by the content filter); "
+            "invalid_input is deliberately absent — a provider context-length "
+            "rejection on this route is server-owned and surfaces as 500 "
+            "rag_context_overflow, because the prompt is composed from "
+            "server-selected sources, not caller input"
         ),
     },
     500: {
@@ -31,8 +34,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
             "configuration_error (our deployment is misconfigured), "
             "embedding_rejected (the embeddings service rejected the input), "
             "search_request_rejected (the search service rejected the request), or "
-            "rag_context_overflow (the highest-ranked retrieved hit alone could not "
-            "fit the model input budget)"
+            "rag_context_overflow (the retrieved context could not fit the model "
+            "input budget — either the highest-ranked hit alone exceeds the local "
+            "byte guardrail, or the provider rejected the composed prompt for "
+            "context length despite it)"
         ),
     },
     502: {

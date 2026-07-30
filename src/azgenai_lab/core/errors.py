@@ -67,6 +67,17 @@ class InvalidInputError(UpstreamError):
     message = "The upstream model rejected the input (for example, it exceeds the context window)."
 
 
+class ContextLengthExceededError(InvalidInputError):
+    """The upstream model rejected the input specifically for context length.
+
+    Same wire contract as ``InvalidInputError`` (400 ``invalid_input``) — on
+    ``/chat`` the caller composed the prompt, so a too-long prompt really is
+    caller-owned. The subtype exists so that boundaries where the *server*
+    composed the prompt (``/rag``: bounded question + server-selected
+    sources) can reclassify this one failure as server-owned without
+    touching any other upstream-400 semantics (Day 14 review r08)."""
+
+
 class StorageError(UpstreamError):
     """Conversation storage failed — our dependency, not the client's fault.
 

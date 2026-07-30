@@ -153,9 +153,13 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   bound of its own. `PROMPT_FRAMING_HEADROOM_BYTES = 4,096` reserves budget
   for that unbounded overhead (well beyond any observed framing cost); if a
   provider-side overflow ever occurred despite this headroom, it would remain
-  a server-owned failure (the corpus is server-selected), the same class as
-  `500 rag_context_overflow` (below) even though today that error only
-  covers the pre-check case where even the rank-1 hit alone cannot fit.
+  a server-owned failure (the corpus is server-selected) and is in fact
+  reclassified: the adapter translates the provider's
+  `context_length_exceeded` into a dedicated `ContextLengthExceededError`
+  subtype, and `RagService` rethrows exactly that subtype as
+  `500 rag_context_overflow` (r08). On `/chat` the same subtype keeps its
+  inherited `400 invalid_input` contract — there the caller composed the
+  prompt, so the ownership genuinely differs per route.
   Selection includes retrieved hits in rank order, stopping at
   the first hit that would not fit rather than skipping it for a lower-ranked
   one. Truncation semantics: the `sources` list in the response is exactly
@@ -169,7 +173,9 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   `RagService` raises `500 rag_context_overflow` through the standard
   envelope — server-owned, since the corpus is server-selected, not user
   input — instead of an unhandled error. Zero provider calls happen on this
-  path.
+  path. The same error code also covers the post-call case above (provider
+  `context_length_exceeded` despite the headroom), which by definition made
+  one provider call before failing.
 
 ## Correlation ID
 

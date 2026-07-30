@@ -33,7 +33,7 @@ from azgenai_lab.core.correlation import correlation_id_var
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
-    InvalidInputError,
+    ContextLengthExceededError,
     UpstreamError,
     UpstreamServiceError,
     UpstreamThrottledError,
@@ -287,7 +287,11 @@ def _translate_upstream_error(exc: openai.OpenAIError) -> UpstreamError:
         if exc.code == "content_filter":
             return ContentFilteredError(str(exc))
         if exc.code == "context_length_exceeded":
-            return InvalidInputError(str(exc))
+            # Subtype, not the generic InvalidInputError: the adapter cannot
+            # know who composed the prompt, so it preserves the distinction
+            # and lets each boundary assign ownership (/chat: caller 400;
+            # /rag: server 500 rag_context_overflow — Day 14 r08).
+            return ContextLengthExceededError(str(exc))
         # Unknown 400: don't guess whose fault it is — neither "fix your input"
         # nor "we are misconfigured" is provable. Log it, report upstream failure.
         return UpstreamServiceError(str(exc))
