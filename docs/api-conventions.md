@@ -61,6 +61,68 @@ Usage is also logged (`llm usage input_tokens=… output_tokens=… reasoning_to
 
 The executable contract is `tests/bdd/features/token_budget_guardrail.feature` plus `tests/unit/test_token_budget.py` and `tests/unit/test_chat_incomplete.py` (non-streaming truncation contract, also covered by a `chat_api_contract.feature` scenario).
 
+## RAG (Retrieval-Augmented Generation)
+
+`POST /api/v1/rag` (Day 14) is a single-turn read path, not a `/chat` variant: no
+`conversation_id`, no history, no lifetime token-budget ledger — those belong to the
+stateful `/chat` machinery above (Day 7/Day 9) and RAG does not opt into them.
+`store=False` still applies per call, and `LLM_MAX_OUTPUT_TOKENS` still caps this
+call exactly as it caps a `/chat` turn.
+
+```json
+// request
+{ "question": "..." }
+
+// response
+{
+  "answer": "... [1]" ,
+  "status": "answered",
+  "incomplete_reason": null,
+  "sources": [
+    {
+      "number": 1,
+      "chunk_id": "...",
+      "title": "...",
+      "heading_path": "...",
+      "score": 0.0166,
+      "reranker_score": null
+    }
+  ],
+  "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+  "correlation_id": "5f0d2c9e-..."
+}
+```
+
+- `status` is `"answered"` or `"no_answer"`. `"no_answer"` is a structural
+  short-circuit — retrieval returned zero hits, so the request never reaches the
+  LLM (`answer`, `usage`, and `incomplete_reason` are `null`, `sources` is empty).
+  There is no score-based gate: Day 13's live probe showed hybrid RRF scores
+  cannot distinguish an answer-present corpus from an answer-absent one, so
+  nothing downstream of "were there hits at all" gets to threshold on a number.
+- **`status: "answered"` does not mean grounded.** Grounding past the zero-hits
+  gate is instructional, not structural: the `rag_answer` prompt tells the model
+  to cite sources and to say plainly when the sources don't cover the question,
+  but a model-level refusal is still a successful generation from the pipeline's
+  view and comes back as `"answered"`. Clients that need to tell "cited answer"
+  from "polite refusal" apart must inspect `answer` and `sources`, not `status`
+  alone.
+- `sources` is the ranked hit list the model was given, numbered to match the
+  `[1]`/`[2]` citation markers the prompt asks the model to use; `score` and
+  `reranker_score` follow the [two-scores contract](rag-retrieval.md#two-scores-and-only-one-of-them-has-a-rubric) — hybrid mode never populates `reranker_score`.
+- Retrieved chunk content is untrusted data, not instructions: it travels inside
+  the *user* message, while the citation/refusal rules live only in the prompt
+  template's instructions, which explicitly tell the model to treat source text
+  as non-instructions. That is mitigation, not immunity — corpus poisoning
+  crafted to look like an instruction stays on the threat model.
+- Retrieval is unscoped by tenant or user; per-tenant/per-user authorization on
+  retrieval is deferred to Day 15.
+- Errors follow the standard envelope; `incomplete_reason` mirrors the `/chat`
+  vocabulary (`max_output_tokens`, `content_filter`, `other`) for the same
+  client rules (keep/discard/treat-as-unusable) — it only ever appears when
+  `status` is `"answered"`.
+- See [diagrams/rag-query-sequence.md](diagrams/rag-query-sequence.md) for the
+  full request flow.
+
 ## Correlation ID
 
 The middleware in `azgenai_lab.core.correlation`:

@@ -6,14 +6,14 @@ Day 11 milestone (docs tier). This document records the RAG design decisions for
 
 RAG (Retrieval-Augmented Generation) lets the model answer over data it was never trained on: before calling the LLM, search a corpus, put the top matches into the prompt, and instruct the model to answer from that context ([Azure Architecture Center RAG guide](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/rag/rag-solution-design-and-evaluation-guide), checked 2026-07).
 
-In backend terms it is a query-then-respond read path — the same shape as "look up the order in the database, then render the response", with the render step replaced by an LLM. The analogy breaks in one place: a database returns what it returns, while an LLM given reference context may still ignore it, distort it, or add to it. RAG downgrades hallucination from *unfalsifiable* to *checkable against retrieved sources*; closing the remaining gap is Day 14's grounding / no-answer work.
+In backend terms it is a query-then-respond read path — the same shape as "look up the order in the database, then render the response", with the render step replaced by an LLM. The analogy breaks in one place: a database returns what it returns, while an LLM given reference context may still ignore it, distort it, or add to it. RAG downgrades hallucination from *unfalsifiable* to *checkable against retrieved sources*; it does not close the gap. Day 14 implemented grounding as far as this pipeline can take it — see the honest gap noted below.
 
 ## Two pipelines, two lifecycles
 
 See [diagrams/rag-two-pipelines.md](diagrams/rag-two-pipelines.md).
 
 - **Indexing pipeline** (offline/asynchronous; triggered by initial import, data changes, or a schedule): chunk documents → enrich with metadata → embed → persist to the search index.
-- **Query pipeline** (online; runs for each request that requires retrieval augmentation): embed the query (hybrid search needs both a text and a vector query) → retrieve (hybrid search + rerank) → augment (top-K chunks into the prompt) → generate.
+- **Query pipeline** (online; runs for each request that requires retrieval augmentation): embed the query (hybrid search needs both a text and a vector query) → retrieve (hybrid search + rerank) → augment (top-K chunks into the prompt) → generate. Implemented Day 14 as `POST /api/v1/rag`; see [diagrams/rag-query-sequence.md](diagrams/rag-query-sequence.md) and the [`/rag` contract](api-conventions.md#rag-retrieval-augmented-generation) for the shipped shape.
 
 Query embedding is an online upstream call with its own latency, failure surface, and bill. This project uses application-owned vectorization (calling the v1 embeddings endpoint directly) rather than Azure AI Search integrated vectorization, so "retrieval broke" debugging must first distinguish an embedding-call failure from a search failure.
 
@@ -26,7 +26,7 @@ They differ in everything that matters operationally:
 | Debugging surface | chunk & index contents | query embedding, retrieval results & prompt |
 | Cost driver | embedding calls + index storage (scales with data) | query embedding + search + LLM calls (scales with traffic) |
 
-This decomposition drives the Part 3 milestone order: [Day 12](rag-indexing.md) builds the indexing side (chunking, embeddings, index schema), Day 13 the retrieval side (search modes), Day 14 wires the query pipeline into the API.
+This decomposition drove the Part 3 milestone order: [Day 12](rag-indexing.md) built the indexing side (chunking, embeddings, index schema), [Day 13](rag-retrieval.md) the retrieval side (search modes), Day 14 wired the query pipeline into `POST /api/v1/rag`.
 
 ## Why RAG and not fine-tuning
 
@@ -53,7 +53,7 @@ The canonical taxonomy is the Seven Failure Points ([Barnett et al., CAIN 2024](
 
 Design consequences adopted here:
 
-- FP1's correct behavior is an honest "no answer" — a contract decision, not a model behavior. It becomes the Day 14 no-answer policy. A feature file (`rag_no_answer_policy.feature`) reserves the topic, but its only scenario currently verifies the 501 placeholder; the executable no-answer contract scenario lands with Day 14.
+- FP1's correct behavior is an honest "no answer" — a contract decision, not a model behavior. Day 14 implements it structurally, not as a model instruction: zero retrieval hits short-circuit to `status: "no_answer"` before the LLM is called, because Day 13's live probe showed hybrid RRF scores cannot separate an answer-present corpus from an answer-absent one — there is no threshold to gate on past that point. The remaining gap is honest, not closed: a model-level refusal ("the sources don't cover this") still returns `status: "answered"`, because from the pipeline's point of view a refusal is a successful generation. A client has to read `answer` and `sources`, not just `status`, to tell the two apart.
 - FP1–FP3 happen before the LLM sees the prompt: retrieval is the upstream bottleneck — if the correct context is absent from the prompt, the LLM has little chance of a satisfactory corpus-grounded answer ([Microsoft RAG evaluators](https://learn.microsoft.com/en-us/azure/foundry/concepts/evaluation-evaluators/rag-evaluators), checked 2026-07). Days 8–9 provide the observability *foundation* (correlation ids, prompt provenance, usage); RAG per-stage logging (retrieval mode/count, selected chunk ids and scores, stage latency, context-budget contribution, metadata redaction) does not exist yet and is part of the Day 13/14 DoD — the paper's conclusion is that RAG validation is only feasible in operation.
 
 ## Azure mapping and the classic-vs-agentic choice

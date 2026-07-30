@@ -210,6 +210,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '400':
+          description: Content filtered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Configuration error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '502':
+          description: Upstream service failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Upstream throttled or unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '504':
+          description: Upstream timeout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
 components:
   schemas:
     ChatRequest:
@@ -327,11 +357,6 @@ components:
           type: string
           minLength: 1
           title: Question
-        tenant_id:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Tenant Id
       type: object
       required:
       - question
@@ -339,22 +364,74 @@ components:
     RagResponse:
       properties:
         answer:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
           title: Answer
+        status:
+          type: string
+          enum:
+          - answered
+          - no_answer
+          title: Status
+        incomplete_reason:
+          anyOf:
+          - type: string
+            enum:
+            - max_output_tokens
+            - content_filter
+            - other
+          - type: 'null'
+          title: Incomplete Reason
         sources:
           items:
-            type: string
+            $ref: '#/components/schemas/RagSource'
           type: array
           title: Sources
+        usage:
+          anyOf:
+          - $ref: '#/components/schemas/TokenUsage'
+          - type: 'null'
         correlation_id:
           type: string
           title: Correlation Id
       type: object
       required:
       - answer
+      - status
       - sources
       - correlation_id
       title: RagResponse
+    RagSource:
+      properties:
+        number:
+          type: integer
+          title: Number
+        chunk_id:
+          type: string
+          title: Chunk Id
+        title:
+          type: string
+          title: Title
+        heading_path:
+          type: string
+          title: Heading Path
+        score:
+          type: number
+          title: Score
+        reranker_score:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Reranker Score
+      type: object
+      required:
+      - number
+      - chunk_id
+      - title
+      - heading_path
+      - score
+      title: RagSource
     StreamingChatRequest:
       properties:
         message:
