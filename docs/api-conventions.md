@@ -150,6 +150,14 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   semantics: the `sources` list in the response is exactly the set of hits
   actually sent to the model for generation, never the full retrieved set;
   a stage log line reports `dropped_source_count` when hits were excluded.
+- **Context overflow (Day 14 r06 residual 1):** live `SearchHit.content`/
+  `heading_path` carry no runtime maximum (only the offline chunker bounds
+  our own corpus), so the query boundary does not trust that indexing-side
+  invariant. If even the rank-1 hit alone cannot fit `MAX_PROMPT_BYTES`,
+  `RagService` raises `500 rag_context_overflow` through the standard
+  envelope — server-owned, since the corpus is server-selected, not user
+  input — instead of an unhandled error. Zero provider calls happen on this
+  path.
 
 ## Correlation ID
 

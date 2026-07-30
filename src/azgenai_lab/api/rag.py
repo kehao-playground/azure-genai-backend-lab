@@ -29,8 +29,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorEnvelope,
         "description": (
             "configuration_error (our deployment is misconfigured), "
-            "embedding_rejected (the embeddings service rejected the input), or "
-            "search_request_rejected (the search service rejected the request)"
+            "embedding_rejected (the embeddings service rejected the input), "
+            "search_request_rejected (the search service rejected the request), or "
+            "rag_context_overflow (the highest-ranked retrieved hit alone could not "
+            "fit the model input budget)"
         ),
     },
     502: {
