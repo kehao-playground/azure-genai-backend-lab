@@ -13,6 +13,7 @@ marks sources as non-instructions. That is mitigation, not immunity —
 prompt injection via poisoned corpus stays on the threat-model page.
 """
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -22,6 +23,8 @@ from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.services.azure_openai import ChatService, IncompleteReason, build_chat_service
 from azgenai_lab.services.retrieval import Retriever, build_retriever
+
+logger = logging.getLogger(__name__)
 
 RagStatus = Literal["answered", "no_answer"]
 
@@ -49,6 +52,31 @@ def render_user_message(question: str, hits: Sequence[SearchHit]) -> str:
     return f"Sources:\n\n{render_sources(hits)}\n\nQuestion: {question}"
 
 
+def _log_rag_stage(question: str, hits: Sequence[SearchHit], context: str) -> None:
+    # Bridges the two stages Day 8/13 already log (search's per-call line,
+    # the LLM adapter's prompt/usage lines): what retrieval handed to
+    # augmentation, and how much of it there was. core.logging's record
+    # factory (Day 14 review finding 5) stamps correlation_id on this line
+    # automatically, so no manual read/extra is needed here to keep it
+    # joinable with the other two stages.
+    #
+    # Redaction: question text and chunk content are never logged, here or
+    # anywhere else in this module — only counts, ids, and character lengths.
+    # Both are user-submitted/corpus-sourced text that may be sensitive; the
+    # stage line exists to debug retrieval shape, not to double as a content
+    # log.
+    content_lengths = ",".join(str(len(hit.content)) for hit in hits)
+    logger.info(
+        "rag stage=assemble_context hits=%d chunk_ids=%s content_chars=%s "
+        "context_chars=%d question_chars=%d",
+        len(hits),
+        ",".join(hit.chunk_id for hit in hits),
+        content_lengths,
+        len(context),
+        len(question),
+    )
+
+
 class RagService:
     def __init__(self, retriever: Retriever, chat_service: ChatService) -> None:
         self._retriever = retriever
@@ -57,10 +85,13 @@ class RagService:
     async def answer(self, question: str) -> RagAnswer:
         retrieved = await self._retriever.retrieve(question)
         if not retrieved.hits:
+            _log_rag_stage(question, retrieved.hits, context="")
             return RagAnswer(
                 status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
             )
-        item = {"role": "user", "content": render_user_message(question, retrieved.hits)}
+        user_message = render_user_message(question, retrieved.hits)
+        _log_rag_stage(question, retrieved.hits, context=user_message)
+        item = {"role": "user", "content": user_message}
         result = await self._chat_service.complete([item])
         return RagAnswer(
             status="answered",
