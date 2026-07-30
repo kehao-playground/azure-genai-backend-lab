@@ -94,3 +94,61 @@ async def test_rag_stage_log_on_no_answer_path_has_zero_counts(
     assert "hits=0" in message
     assert "chunk_ids=" in message
     assert "anything with no corpus match" not in message
+
+
+async def test_rag_answered_path_logs_generation_and_total_duration_correlation_joined(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5),
+        FakeChatService(prompt=load_prompt("rag_answer")),
+    )
+    token = correlation_id_var.set("cid-duration-answered")
+    try:
+        with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+            result = await service.answer("alpha")
+    finally:
+        correlation_id_var.reset(token)
+
+    assert result.status == "answered"
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    assert all(r.correlation_id == "cid-duration-answered" for r in rag_records)
+
+    generation_record = next(r for r in rag_records if "stage=generation" in r.getMessage())
+    assert "duration_ms=" in generation_record.getMessage()
+
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    complete_message = complete_record.getMessage()
+    assert "total_ms=" in complete_message
+    assert "status=answered" in complete_message
+
+    for record in rag_records:
+        message = record.getMessage()
+        assert "alpha" not in message
+        assert "alpha beta" not in message
+
+
+async def test_rag_no_answer_path_logs_total_duration_without_generation_field(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RagService(Retriever(FakeEmbeddingClient(), FakeSearchClient([]), top=5), None)  # type: ignore[arg-type]
+
+    token = correlation_id_var.set("cid-duration-no-answer")
+    try:
+        with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+            result = await service.answer("anything with no corpus match")
+    finally:
+        correlation_id_var.reset(token)
+
+    assert result.status == "no_answer"
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    assert all(r.correlation_id == "cid-duration-no-answer" for r in rag_records)
+
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    complete_message = complete_record.getMessage()
+    assert "total_ms=" in complete_message
+    assert "status=no_answer" in complete_message
+
+    assert not any("stage=generation" in r.getMessage() for r in rag_records)
+    for record in rag_records:
+        assert "anything with no corpus match" not in record.getMessage()

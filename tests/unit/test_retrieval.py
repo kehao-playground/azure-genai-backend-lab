@@ -1,3 +1,7 @@
+import logging
+
+import pytest
+
 from azgenai_lab.core.config import get_settings
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.services.azure_search import FakeSearchClient
@@ -31,3 +35,18 @@ async def test_retrieve_returns_empty_result_when_nothing_matches() -> None:
 def test_build_retriever_uses_settings_top() -> None:
     retriever = build_retriever(get_settings())
     assert retriever._top == get_settings().rag_top
+
+
+async def test_retrieve_logs_embed_query_stage_with_duration_and_dims(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    retriever = Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5)
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.retrieval"):
+        await retriever.retrieve("a sensitive question that must never be logged")
+
+    record = next(r for r in caplog.records if r.name == "azgenai_lab.services.retrieval")
+    message = record.getMessage()
+    assert message.startswith("rag stage=embed_query")
+    assert "duration_ms=" in message
+    assert "vector_dims=" in message
+    assert "a sensitive question that must never be logged" not in message

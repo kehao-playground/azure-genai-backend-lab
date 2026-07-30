@@ -6,10 +6,15 @@ queries the other catches, and the semantic ranker stays out of the default
 path (single-probe result; documentation conflict unresolved).
 """
 
+import logging
+import time
+
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.search import SearchMode, SearchResult
 from azgenai_lab.services.azure_search import SearchClient, build_search_client
 from azgenai_lab.services.embeddings import EmbeddingClient, build_embedding_client
+
+logger = logging.getLogger(__name__)
 
 
 class Retriever:
@@ -21,7 +26,16 @@ class Retriever:
         self._top = top
 
     async def retrieve(self, question: str) -> SearchResult:
+        started = time.perf_counter()
         vector = (await self._embedding_client.embed([question]))[0]
+        duration_ms = (time.perf_counter() - started) * 1000
+        # Redaction: question text is never logged here, only its embedding's
+        # dimensionality and how long the call took (Day 14 r04 residual B).
+        # The Search adapter already logs its own latency; that line stands
+        # as-is.
+        logger.info(
+            "rag stage=embed_query duration_ms=%.1f vector_dims=%d", duration_ms, len(vector)
+        )
         return await self._search_client.search(
             question, vector, mode=SearchMode.HYBRID, top=self._top
         )
