@@ -268,3 +268,11 @@ async def test_real_service_sends_prompt_as_instructions() -> None:
     await service.complete(user_items("hello"))
 
     assert responses.calls[0]["instructions"] == PROMPT.text
+
+
+async def test_build_chat_service_binds_named_prompt() -> None:
+    service = build_chat_service(make_settings(use_fake_llm=True))
+    assert isinstance(service, FakeChatService)
+    rag_service = build_chat_service(make_settings(use_fake_llm=True), prompt_name="rag_answer")
+    result = await rag_service.complete([{"role": "user", "content": "q"}])
+    assert "prompt=rag_answer@1" in result.message
