@@ -161,3 +161,10 @@ def test_empty_changelog_list_raises(tmp_path: Path) -> None:
     base = _write(tmp_path, "sample", content)
     with pytest.raises(PromptTemplateError, match="changelog"):
         load_prompt("sample", base_dir=base)
+
+
+def test_rag_answer_prompt_loads() -> None:
+    prompt = load_prompt("rag_answer")
+    assert prompt.name == "rag_answer"
+    assert prompt.version == 1
+    assert "[n]" in prompt.text or "[1]" in prompt.text
