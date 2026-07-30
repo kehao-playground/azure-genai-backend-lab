@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     use_fake_search: bool = Field(default=True)
     use_fake_embeddings: bool = Field(default=True)
 
+    # How many chunks retrieval hands to generation. Small on purpose: every
+    # hit is prompt input the model must read and the caller pays for
+    # (Day 9 metering); top=5 of 2,000-char chunks is ~10k chars of context.
+    # Recall/precision tuning belongs to retrieval evaluation, not this knob.
+    rag_top: int = Field(default=5, gt=0)
+
     @model_validator(mode="after")
     def _overlap_must_leave_room_to_advance(self) -> "Settings":
         if self.chunk_overlap_chars * 2 >= self.chunk_max_chars:
