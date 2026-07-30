@@ -1,8 +1,13 @@
 import os
 
 # Must run before the app import below: BDD contract runs never depend on the
-# local .env or shell environment (review r01 fix 2).
+# local .env or shell environment (review r01 fix 2). The app builds the
+# chat, search, and embedding clients at import time via build_rag_service,
+# so all three fake-adapter flags are owned by the test suite here, not the
+# developer's shell (Day 14 review finding 3).
 os.environ["USE_FAKE_LLM"] = "true"
+os.environ["USE_FAKE_SEARCH"] = "true"
+os.environ["USE_FAKE_EMBEDDINGS"] = "true"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
