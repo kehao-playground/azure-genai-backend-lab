@@ -139,17 +139,29 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   embedding-size 400. `RAG_TOP` is bounded to 1-50: 50 is `DEFAULT_VECTOR_K`,
   the vector leg's own candidate pool, so a larger value would ask generation
   to read more chunks than retrieval ever offers.
-- **Assembled-prompt budget (Day 14 r04 residual A):** the worst legal case
-  (`RAG_TOP=50` hits of `chunk_max_chars=2000` chars each, plus the 2,000-char
-  question) can exceed the model's documented input limit before this guard
-  existed. `RagService` enforces `MAX_PROMPT_BYTES = 272,000` — the same
-  byte-bound proof as above, applied to the whole assembled prompt
-  (instructions + rendered sources + question) instead of the question alone
-  — and includes retrieved hits in rank order, stopping at the first hit that
-  would not fit rather than skipping it for a lower-ranked one. Truncation
-  semantics: the `sources` list in the response is exactly the set of hits
-  actually sent to the model for generation, never the full retrieved set;
-  a stage log line reports `dropped_source_count` when hits were excluded.
+- **Assembled-prompt budget (Day 14 r04 residual A; headroom added r06
+  residual 2):** the worst legal case (`RAG_TOP=50` hits of
+  `chunk_max_chars=2000` chars each, plus the 2,000-char question) can exceed
+  the model's documented input limit before this guard existed. `RagService`
+  enforces `MAX_PROMPT_BYTES = 267,904` (`272,000 - 4,096`) — the same
+  byte-bound argument as above (token_count <= utf8_byte_count), applied to
+  the whole assembled prompt (instructions + rendered sources + question)
+  instead of the question alone. That byte bound is a conservative guardrail
+  on the counted *text*, not a full proof of the complete provider-input
+  ceiling: the Responses API's message framing (roles, field wrappers,
+  protocol overhead) sits outside the counted text and has no documented
+  bound of its own. `PROMPT_FRAMING_HEADROOM_BYTES = 4,096` reserves budget
+  for that unbounded overhead (well beyond any observed framing cost); if a
+  provider-side overflow ever occurred despite this headroom, it would remain
+  a server-owned failure (the corpus is server-selected), the same class as
+  `500 rag_context_overflow` (below) even though today that error only
+  covers the pre-check case where even the rank-1 hit alone cannot fit.
+  Selection includes retrieved hits in rank order, stopping at
+  the first hit that would not fit rather than skipping it for a lower-ranked
+  one. Truncation semantics: the `sources` list in the response is exactly
+  the set of hits actually sent to the model for generation, never the full
+  retrieved set; a stage log line reports `dropped_source_count` when hits
+  were excluded.
 - **Context overflow (Day 14 r06 residual 1):** live `SearchHit.content`/
   `heading_path` carry no runtime maximum (only the offline chunker bounds
   our own corpus), so the query boundary does not trust that indexing-side

@@ -39,12 +39,23 @@ RagStatus = Literal["answered", "no_answer"]
 PROMPT_INPUT_TOKEN_LIMIT = 272_000
 
 # Day 9 "meter, don't estimate": no tokenizer is used here either. Instead
-# this caps total UTF-8 *bytes* sent as provider input. Proof: every token in
-# a BPE vocabulary decodes to at least one UTF-8 byte, so for any input,
-# token_count <= utf8_byte_count. Capping total input bytes at
-# PROMPT_INPUT_TOKEN_LIMIT therefore provably caps the token count at or
-# below the documented input limit too — a conservative, tokenizer-free bound.
-MAX_PROMPT_BYTES = PROMPT_INPUT_TOKEN_LIMIT
+# this caps total UTF-8 *bytes* of the counted TEXT sent as provider input.
+# Proof (exact, for the text it covers): every token in a BPE vocabulary
+# decodes to at least one UTF-8 byte, so for any text, token_count <=
+# utf8_byte_count. That bound covers the instructions + rendered sources +
+# question text we assemble -- it does NOT cover the Responses API's message
+# framing (roles, field wrappers, protocol overhead), which sits outside the
+# text we count and has no documented byte/token bound of its own. This is
+# therefore a conservative text-byte guardrail, not a full mathematical proof
+# of the complete provider-input ceiling.
+#
+# PROMPT_FRAMING_HEADROOM_BYTES reserves budget for that unbounded framing
+# overhead: chosen well above any observed framing overhead, equivalent to
+# reserving >=4,096 framing tokens. If provider-side overflow ever occurs
+# despite this headroom, it remains a server-owned failure surfaced as
+# RagContextOverflowError (see below) rather than an uncaught upstream error.
+PROMPT_FRAMING_HEADROOM_BYTES = 4_096
+MAX_PROMPT_BYTES = PROMPT_INPUT_TOKEN_LIMIT - PROMPT_FRAMING_HEADROOM_BYTES
 
 
 class RagContextOverflowError(UpstreamError):
@@ -232,6 +243,8 @@ def build_rag_service(settings: Settings) -> RagService:
 
 
 __all__ = [
+    "PROMPT_FRAMING_HEADROOM_BYTES",
+    "PROMPT_INPUT_TOKEN_LIMIT",
     "RagAnswer",
     "RagContextOverflowError",
     "RagService",
