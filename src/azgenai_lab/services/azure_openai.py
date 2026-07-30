@@ -424,10 +424,10 @@ class AzureOpenAIChatService:
         return _translate_stream(stream)
 
 
-def build_chat_service(settings: Settings) -> ChatService:
+def build_chat_service(settings: Settings, *, prompt_name: str = "default_chat") -> ChatService:
     """Composition point: the only place that decides fake vs. real."""
     # Fail fast: a malformed template must kill startup, not the first request.
-    prompt = load_prompt("default_chat")
+    prompt = load_prompt(prompt_name)
     if settings.use_fake_llm:
         return FakeChatService(prompt=prompt)
     if not (
