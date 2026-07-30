@@ -7,7 +7,8 @@ from azgenai_lab.api.rag import get_rag_service
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
-from azgenai_lab.models.search import SearchHit
+from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, IncompleteReason
 from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
@@ -200,6 +201,61 @@ def test_openapi_schema_marks_usage_and_incomplete_reason_required() -> None:
     required = set(rag_response_schema.get("required", []))
     assert "usage" in required
     assert "incomplete_reason" in required
+
+
+class _OversizedSearchClient:
+    """Duck-typed SearchClient returning a fixed hostile hit set."""
+
+    def __init__(self, hits: Sequence[SearchHit]) -> None:
+        self._hits = tuple(hits)
+
+    async def search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        mode: SearchMode = SearchMode.HYBRID,
+        top: int,
+        filter: str | None = None,
+        vector_k: int = 50,
+    ) -> SearchResult:
+        return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_rag_response_sources_reflect_truncation_over_http(client: TestClient) -> None:
+    hostile_content = "\U0010ffff" * 2000
+    hits = [
+        SearchHit(
+            chunk_id=f"doc-{i:04d}",
+            parent_id=f"doc-{i:04d}",
+            title=f"Doc {i}",
+            heading_path=f"Doc {i}",
+            content=hostile_content,
+            score=1.0,
+        )
+        for i in range(50)
+    ]
+    prompt = load_prompt("rag_answer")
+    from azgenai_lab.services.azure_openai import FakeChatService
+
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), _OversizedSearchClient(hits), top=50),
+        FakeChatService(prompt=prompt),
+        instructions_bytes=len(prompt.text.encode("utf-8")),
+    )
+    app.dependency_overrides[get_rag_service] = lambda: service
+    try:
+        response = client.post("/api/v1/rag", json={"question": "q" * 2000})
+    finally:
+        app.dependency_overrides.pop(get_rag_service, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "answered"
+    assert 0 < len(body["sources"]) < 50
 
 
 def test_rag_endpoint_wired_at_startup(client: TestClient) -> None:

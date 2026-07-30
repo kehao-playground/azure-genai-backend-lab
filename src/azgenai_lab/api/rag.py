@@ -58,12 +58,15 @@ def get_rag_service(request: Request) -> RagService:
 
 
 class RagRequest(BaseModel):
-    # 2,000 characters is the Day 12 conservative char proxy: the worst
-    # measured density (2,572 tokens per 2,000 chars, zh) still stays under
-    # the embedding model's 8,192-token input ceiling, so a within-contract
-    # question can never trigger an upstream embedding-size 400 (Day 14
-    # review finding 2 — that misclassification is why embedding rejects
-    # stay classified as service-side 500 elsewhere in this stack).
+    # 2,000 characters is the Day 12 conservative char proxy, with a
+    # universal (not sampled) bound: a UTF-8 character is at most 4 bytes, so
+    # 2,000 chars <= 8,000 bytes; since a BPE token decodes to at least one
+    # UTF-8 byte, token count <= byte count, so 2,000 chars is <= 8,000
+    # tokens, under the embedding model's 8,192-token input ceiling for any
+    # input. A within-contract question can therefore never trigger an
+    # upstream embedding-size 400 (Day 14 review finding 2 — that
+    # misclassification is why embedding rejects stay classified as
+    # service-side 500 elsewhere in this stack).
     question: str = Field(min_length=1, max_length=2000)
 
     @field_validator("question")

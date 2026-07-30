@@ -35,8 +35,10 @@ class Settings(BaseSettings):
     # series position: meter what the provider reports, do not estimate. The
     # service's own generally-available text splitter measures characters too
     # (token splitting is preview only), and the real safety margin is the
-    # embedding model's 8,192-token input ceiling, which 2,000 characters sits
-    # well under in any language.
+    # embedding model's 8,192-token input ceiling. The bound is universal, not
+    # sampled: a UTF-8 character is at most 4 bytes, so 2,000 chars <= 8,000
+    # bytes; a BPE token decodes to at least one UTF-8 byte, so token count
+    # <= byte count, giving 2,000 chars <= 8,000 tokens < 8,192 for any input.
     chunk_max_chars: int = Field(default=2000, gt=0)
     # Overlap applies only within one oversized section (see services/chunking).
     chunk_overlap_chars: int = Field(default=500, ge=0)
