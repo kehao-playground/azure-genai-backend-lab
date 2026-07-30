@@ -122,6 +122,18 @@ call exactly as it caps a `/chat` turn.
   `status` is `"answered"`.
 - See [diagrams/rag-query-sequence.md](diagrams/rag-query-sequence.md) for the
   full request flow.
+- **Question contract (Day 14 review findings 1-2):** `question` must be 1-2,000
+  characters after trimming leading/trailing whitespace; the trimmed value is
+  what flows to retrieval and generation. A whitespace-only question (e.g.
+  `"   "`) is rejected as `422 validation_error`, not accepted and then failed
+  downstream. 2,000 chars is the Day 12 conservative char proxy — the worst
+  measured density (2,572 tokens per 2,000 chars, zh) stays under the
+  embedding model's 8,192-token input ceiling, so a within-contract question
+  can never trigger an upstream embedding-size 400. `RAG_TOP` is bounded to
+  1-50: 50 is `DEFAULT_VECTOR_K`, the vector leg's own candidate pool, so a
+  larger value would ask generation to read more chunks than retrieval ever
+  offers, and it bounds assembled context to roughly 50 x 2,000 = 100k
+  characters plus the question.
 
 ## Correlation ID
 

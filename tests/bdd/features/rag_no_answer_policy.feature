@@ -17,3 +17,9 @@ Feature: RAG no-answer policy
     And the RAG status should be "no_answer"
     And the response should list no sources
     And the LLM should not have been called
+
+  Scenario: A whitespace-only question is rejected before retrieval runs
+    Given an indexed corpus that covers the question
+    When I ask the RAG endpoint a whitespace-only question
+    Then the response status code should be 422
+    And the response JSON should contain error "validation_error"

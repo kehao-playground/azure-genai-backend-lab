@@ -58,7 +58,13 @@ class Settings(BaseSettings):
     # hit is prompt input the model must read and the caller pays for
     # (Day 9 metering); top=5 of 2,000-char chunks is ~10k chars of context.
     # Recall/precision tuning belongs to retrieval evaluation, not this knob.
-    rag_top: int = Field(default=5, gt=0)
+    # Upper bound (Day 14 review finding 2): DEFAULT_VECTOR_K=50 is the
+    # vector leg's candidate pool (models/search.py), so top above 50 asks
+    # generation to read more chunks than retrieval's own vector leg ever
+    # offers. It also bounds assembled context to <= 50 * 2,000 chars =
+    # ~100k chars plus the question, keeping context growth predictable
+    # instead of an unbounded multiple of chunk_max_chars.
+    rag_top: int = Field(default=5, gt=0, le=50)
 
     @model_validator(mode="after")
     def _overlap_must_leave_room_to_advance(self) -> "Settings":

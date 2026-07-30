@@ -90,6 +90,50 @@ def test_rag_empty_question_is_422_envelope(client: TestClient) -> None:
     assert body["correlation_id"]
 
 
+def test_rag_whitespace_only_question_is_422_envelope() -> None:
+    # Day 14 review finding 1: a whitespace-only question passed the old
+    # min_length=1 check, then reached models/search.py's
+    # validate_search_arguments, which raised an unhandled ValueError -> a
+    # plain-text 500 with no envelope. raise_server_exceptions=False lets
+    # this test observe that failure mode directly if the fix regresses,
+    # instead of pytest re-raising the exception past the client.
+    with TestClient(app, raise_server_exceptions=False) as raw_client:
+        response = raw_client.post("/api/v1/rag", json={"question": "   "})
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert body["correlation_id"]
+
+
+def test_rag_question_over_max_length_is_422(client: TestClient) -> None:
+    response = client.post("/api/v1/rag", json={"question": "a" * 2001})
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+
+
+def test_rag_question_is_stripped_before_reaching_service(client: TestClient) -> None:
+    class RecordingRagService:
+        def __init__(self) -> None:
+            self.received_question: str | None = None
+
+        async def answer(self, question: str) -> RagAnswer:
+            self.received_question = question
+            return RagAnswer(
+                status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
+            )
+
+    service = RecordingRagService()
+    app.dependency_overrides[get_rag_service] = lambda: service
+
+    response = client.post("/api/v1/rag", json={"question": "  what is it?  "})
+
+    assert response.status_code == 200
+    assert service.received_question == "what is it?"
+
+
 def test_rag_endpoint_wired_at_startup(client: TestClient) -> None:
     # No override: exercises the app-state service built at startup, with the
     # fake embeddings + fake search adapters and no corpus -> no_answer.
