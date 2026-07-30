@@ -82,3 +82,13 @@ def test_rag_top_default_and_validation() -> None:
     assert Settings(_env_file=None).rag_top == 5
     with pytest.raises(ValidationError):
         Settings(_env_file=None, rag_top=0)
+
+
+def test_rag_top_upper_bound() -> None:
+    # Day 14 review finding 2: rag_top had no upper bound, so a value like
+    # 1001 passed settings validation and only failed later, as a
+    # plain-text 500, when it hit models/search.py's MAX_TOP=1000 check at
+    # request time. 50 = DEFAULT_VECTOR_K, the vector leg's candidate pool.
+    assert Settings(_env_file=None, rag_top=50).rag_top == 50
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, rag_top=51)

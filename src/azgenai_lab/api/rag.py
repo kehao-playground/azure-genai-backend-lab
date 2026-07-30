@@ -1,7 +1,7 @@
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from azgenai_lab.core.errors import ErrorEnvelope
 from azgenai_lab.models.chat import TokenUsage
@@ -27,7 +27,21 @@ def get_rag_service(request: Request) -> RagService:
 
 
 class RagRequest(BaseModel):
-    question: str = Field(min_length=1)
+    # 2,000 characters is the Day 12 conservative char proxy: the worst
+    # measured density (2,572 tokens per 2,000 chars, zh) still stays under
+    # the embedding model's 8,192-token input ceiling, so a within-contract
+    # question can never trigger an upstream embedding-size 400 (Day 14
+    # review finding 2 — that misclassification is why embedding rejects
+    # stay classified as service-side 500 elsewhere in this stack).
+    question: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("question")
+    @classmethod
+    def _question_must_not_be_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("question must not be empty or whitespace-only")
+        return stripped
 
 
 class RagSource(BaseModel):

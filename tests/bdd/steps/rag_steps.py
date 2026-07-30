@@ -73,6 +73,11 @@ def step_ask_rag_endpoint(context) -> None:  # type: ignore[no-untyped-def]
     )
 
 
+@when("I ask the RAG endpoint a whitespace-only question")
+def step_ask_rag_endpoint_whitespace_only(context) -> None:  # type: ignore[no-untyped-def]
+    context.response = context.client.post("/api/v1/rag", json={"question": "   "})
+
+
 @then('the RAG status should be "{status}"')
 def step_rag_status(context, status: str) -> None:  # type: ignore[no-untyped-def]
     assert context.response.json()["status"] == status
