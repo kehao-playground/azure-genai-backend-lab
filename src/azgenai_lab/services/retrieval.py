@@ -26,19 +26,53 @@ class Retriever:
         self._top = top
 
     async def retrieve(self, question: str) -> SearchResult:
-        started = time.perf_counter()
-        vector = (await self._embedding_client.embed([question]))[0]
-        duration_ms = (time.perf_counter() - started) * 1000
+        embed_started = time.perf_counter()
+        try:
+            vector = (await self._embedding_client.embed([question]))[0]
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - embed_started) * 1000
+            # Redaction: question text is never logged here or below, only
+            # counts/dims/durations and the exception class name (Day 14 r06
+            # residual 3 -- failure paths previously logged nothing).
+            logger.info(
+                "rag stage=embed_query duration_ms=%.1f outcome=error exception=%s",
+                duration_ms,
+                type(exc).__name__,
+            )
+            raise
+        duration_ms = (time.perf_counter() - embed_started) * 1000
         # Redaction: question text is never logged here, only its embedding's
         # dimensionality and how long the call took (Day 14 r04 residual B).
         # The Search adapter already logs its own latency; that line stands
         # as-is.
         logger.info(
-            "rag stage=embed_query duration_ms=%.1f vector_dims=%d", duration_ms, len(vector)
+            "rag stage=embed_query duration_ms=%.1f outcome=success vector_dims=%d",
+            duration_ms,
+            len(vector),
         )
-        return await self._search_client.search(
-            question, vector, mode=SearchMode.HYBRID, top=self._top
+        search_started = time.perf_counter()
+        try:
+            result = await self._search_client.search(
+                question, vector, mode=SearchMode.HYBRID, top=self._top
+            )
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - search_started) * 1000
+            # New line, distinct from the adapter's own internal logging
+            # (which does not fire reliably on failure and is not in the
+            # "rag stage=" vocabulary): Day 14 r06 residual 3.
+            logger.info(
+                "rag stage=search duration_ms=%.1f outcome=error exception=%s",
+                duration_ms,
+                type(exc).__name__,
+            )
+            raise
+        duration_ms = (time.perf_counter() - search_started) * 1000
+        logger.info(
+            "rag stage=search duration_ms=%.1f outcome=success hit_count=%d",
+            duration_ms,
+            len(result.hits),
         )
+        return result
 
     async def aclose(self) -> None:
         """Close both composed clients. Each adapter's own aclose() is idempotent."""
