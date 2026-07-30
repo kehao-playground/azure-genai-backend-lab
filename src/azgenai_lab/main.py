@@ -16,6 +16,7 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.services.conversation import build_conversation_service
+from azgenai_lab.services.rag import build_rag_service
 
 # Documents the real 422 shape: validation errors go through the envelope too.
 _VALIDATION_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
 
     # Built at startup, not per request: misconfiguration crashes here, not on request #1.
     app.state.conversation_service = build_conversation_service(settings)
+    app.state.rag_service = build_rag_service(settings)
 
     app.middleware("http")(correlation_id_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
