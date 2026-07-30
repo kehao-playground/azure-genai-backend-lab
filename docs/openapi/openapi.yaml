@@ -211,18 +211,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '400':
-          description: content_filtered (the question was blocked by the content filter)
-            or invalid_input (the upstream model rejected the input, e.g. context
-            length)
+          description: "content_filtered (the question was blocked by the content\
+            \ filter); invalid_input is deliberately absent \u2014 a provider context-length\
+            \ rejection on this route is server-owned and surfaces as 500 rag_context_overflow,\
+            \ because the prompt is composed from server-selected sources, not caller\
+            \ input"
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '500':
-          description: configuration_error (our deployment is misconfigured), embedding_rejected
-            (the embeddings service rejected the input), search_request_rejected (the
-            search service rejected the request), or rag_context_overflow (the highest-ranked
-            retrieved hit alone could not fit the model input budget)
+          description: "configuration_error (our deployment is misconfigured), embedding_rejected\
+            \ (the embeddings service rejected the input), search_request_rejected\
+            \ (the search service rejected the request), or rag_context_overflow (the\
+            \ retrieved context could not fit the model input budget \u2014 either\
+            \ the highest-ranked hit alone exceeds the local byte guardrail, or the\
+            \ provider rejected the composed prompt for context length despite it)"
           content:
             application/json:
               schema:

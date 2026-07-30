@@ -7,6 +7,7 @@ from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
+    ContextLengthExceededError,
     InvalidInputError,
     UpstreamError,
     UpstreamServiceError,
@@ -140,6 +141,9 @@ def test_empty_upstream_reply_maps_to_502_not_a_ghost_conversation(client: TestC
         (ConfigurationError("secret detail"), 500, "configuration_error"),
         (ContentFilteredError("secret detail"), 400, "content_filtered"),
         (InvalidInputError("secret detail"), 400, "invalid_input"),
+        # /chat keeps caller-owned 400 for context length: the caller composed
+        # the prompt there (contrast /rag, which reclassifies to 500 — r08).
+        (ContextLengthExceededError("secret detail"), 400, "invalid_input"),
         (UpstreamThrottledError("secret detail"), 503, "upstream_throttled"),
         (UpstreamTimeoutError("secret detail"), 504, "upstream_timeout"),
         (UpstreamServiceError("secret detail"), 502, "upstream_error"),

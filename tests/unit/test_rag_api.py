@@ -1,9 +1,11 @@
+import logging
 from collections.abc import AsyncIterator, Sequence
 
 import pytest
 from fastapi.testclient import TestClient
 
 from azgenai_lab.api.rag import get_rag_service
+from azgenai_lab.core.errors import ContextLengthExceededError
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
@@ -303,3 +305,64 @@ def test_rag_endpoint_wired_at_startup(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "no_answer"
+
+
+class _ContextLengthRaisingChatService:
+    """Simulates the adapter's translated provider context-length rejection."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        self.calls += 1
+        raise ContextLengthExceededError("provider says: maximum context length exceeded")
+
+
+def test_provider_context_overflow_is_server_owned_on_rag(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Sources fit the local byte guardrail, but the provider still rejects the
+    # composed prompt for context length. On /rag that prompt is composed from
+    # server-selected sources, so the failure is server-owned: 500
+    # rag_context_overflow, never the caller-owned 400 invalid_input that the
+    # same subtype keeps on /chat (r08).
+    hit = SearchHit(
+        chunk_id="chunk-1",
+        parent_id="doc-1",
+        title="Doc",
+        heading_path="Doc",
+        content="alpha pairs with beta",
+        score=1.0,
+    )
+    chat = _ContextLengthRaisingChatService()
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), _OversizedSearchClient([hit]), top=5),
+        chat,
+    )
+    app.dependency_overrides[get_rag_service] = lambda: service
+    try:
+        with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+            response = client.post(
+                "/api/v1/rag",
+                json={"question": "does alpha pair with beta?"},
+                headers={"X-Correlation-Id": "cid-provider-overflow"},
+            )
+    finally:
+        app.dependency_overrides.pop(get_rag_service, None)
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["code"] == "rag_context_overflow"
+    assert body["correlation_id"] == "cid-provider-overflow"
+    assert chat.calls == 1  # by definition post-call: the provider was reached once
+    assert "maximum context length" not in response.text  # detail stays in logs
+
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    generation_record = next(r for r in rag_records if "stage=generation" in r.getMessage())
+    assert "outcome=error" in generation_record.getMessage()
+    assert generation_record.correlation_id == "cid-provider-overflow"
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    assert "failed_stage=generation" in complete_record.getMessage()
+    assert complete_record.correlation_id == "cid-provider-overflow"
+    for record in caplog.records:
+        assert "does alpha pair with beta?" not in record.getMessage()

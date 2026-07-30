@@ -12,7 +12,7 @@ from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
     ConfigurationError,
     ContentFilteredError,
-    InvalidInputError,
+    ContextLengthExceededError,
     UpstreamError,
     UpstreamServiceError,
     UpstreamThrottledError,
@@ -211,7 +211,7 @@ TIMEOUT_REQUEST = httpx.Request("POST", "https://example.openai.azure.com/openai
         ),
         (
             make_status_error(openai.BadRequestError, 400, code="context_length_exceeded"),
-            InvalidInputError,
+            ContextLengthExceededError,
         ),
         (make_status_error(openai.BadRequestError, 400), UpstreamServiceError),
         (make_status_error(openai.InternalServerError, 500), UpstreamServiceError),

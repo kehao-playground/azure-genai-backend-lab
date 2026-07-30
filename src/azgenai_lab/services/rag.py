@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import UpstreamError
+from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import load_prompt
@@ -71,6 +71,11 @@ class RagContextOverflowError(UpstreamError):
     heading_path have no runtime maximum, so this is the honest fallback for
     a hostile or malformed index entry, rather than an unhandled
     AssertionError escaping as a plain-text 500.
+
+    Also raised when the provider itself reports ``context_length_exceeded``
+    despite the guardrail (the framing headroom is conservative, not a
+    complete proof): same ownership argument — the server composed that
+    prompt, so the caller is not told their input was invalid (r08).
     """
 
     status_code = 500
@@ -225,6 +230,16 @@ class RagService:
                     duration_ms,
                     type(exc).__name__,
                 )
+                if isinstance(exc, ContextLengthExceededError):
+                    # Provider-side context overflow past the byte guardrail's
+                    # framing headroom. On /rag the question is bounded and the
+                    # sources are server-selected, so this is server-owned:
+                    # reclassify to 500 rag_context_overflow rather than
+                    # telling the caller their input was invalid (r08).
+                    # Upstream detail stays in logs via the global handler.
+                    raise RagContextOverflowError(
+                        upstream_detail=f"provider context_length_exceeded: {exc.upstream_detail}"
+                    ) from exc
                 raise
             logger.info(
                 "rag stage=generation duration_ms=%.1f outcome=success",
