@@ -211,31 +211,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '400':
-          description: Content filtered
+          description: content_filtered (the question was blocked by the content filter)
+            or invalid_input (the upstream model rejected the input, e.g. context
+            length)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '500':
-          description: Configuration error
+          description: configuration_error (our deployment is misconfigured), embedding_rejected
+            (the embeddings service rejected the input), or search_request_rejected
+            (the search service rejected the request)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '502':
-          description: Upstream service failed
+          description: upstream_error (the upstream LLM service failed)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '503':
-          description: Upstream throttled or unavailable
+          description: upstream_throttled (upstream LLM capacity is exhausted) or
+            search_unavailable (the search service is unavailable)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '504':
-          description: Upstream timeout
+          description: upstream_timeout (the upstream LLM call timed out)
           content:
             application/json:
               schema:
@@ -355,6 +360,7 @@ components:
       properties:
         question:
           type: string
+          maxLength: 2000
           minLength: 1
           title: Question
       type: object
@@ -368,12 +374,15 @@ components:
           - type: string
           - type: 'null'
           title: Answer
+          description: The generated answer, or null when status is no_answer.
         status:
           type: string
           enum:
           - answered
           - no_answer
           title: Status
+          description: '''no_answer'' means retrieval found zero hits (structural
+            short-circuit, LLM never called).'
         incomplete_reason:
           anyOf:
           - type: string
@@ -399,7 +408,9 @@ components:
       required:
       - answer
       - status
+      - incomplete_reason
       - sources
+      - usage
       - correlation_id
       title: RagResponse
     RagSource:
@@ -419,11 +430,16 @@ components:
         score:
           type: number
           title: Score
+          description: 'Retrieval ranking signal. In the hybrid path this is an RRF
+            fusion score: it orders results and is NOT a similarity, confidence, or
+            grounding probability; do not apply thresholds to it.'
         reranker_score:
           anyOf:
           - type: number
           - type: 'null'
           title: Reranker Score
+          description: Semantic reranker score (0.0-4.0) when the semantic ranker
+            is enabled, null otherwise.
       type: object
       required:
       - number

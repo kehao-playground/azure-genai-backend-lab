@@ -88,10 +88,14 @@ call exactly as it caps a `/chat` turn.
       "reranker_score": null
     }
   ],
-  "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+  "usage": { "input_tokens": 812, "output_tokens": 96, "total_tokens": 908, "reasoning_tokens": null },
   "correlation_id": "5f0d2c9e-..."
 }
 ```
+
+`incomplete_reason` and `usage` are always present in the response body — never omitted — but
+their value is nullable: both are `null` on the `"no_answer"` short-circuit and on a fully
+completed generation; `usage` is `null` only if the provider omitted its usage block.
 
 - `status` is `"answered"` or `"no_answer"`. `"no_answer"` is a structural
   short-circuit — retrieval returned zero hits, so the request never reaches the
