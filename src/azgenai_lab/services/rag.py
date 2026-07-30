@@ -184,35 +184,63 @@ class RagService:
 
     async def answer(self, question: str) -> RagAnswer:
         total_started = time.perf_counter()
-        retrieved = await self._retriever.retrieve(question)
-        if not retrieved.hits:
-            _log_rag_stage(question, retrieved.hits, context="", dropped_source_count=0)
-            # No provider call happens on this path (structural short-circuit),
-            # so there is no generation duration to report -- omitted rather
-            # than logged as a fake 0ms.
+        current_stage = "retrieve"
+        try:
+            retrieved = await self._retriever.retrieve(question)
+            if not retrieved.hits:
+                _log_rag_stage(question, retrieved.hits, context="", dropped_source_count=0)
+                # No provider call happens on this path (structural
+                # short-circuit), so there is no generation duration to
+                # report -- omitted rather than logged as a fake 0ms.
+                logger.info(
+                    "rag stage=complete total_ms=%.1f status=no_answer outcome=success",
+                    (time.perf_counter() - total_started) * 1000,
+                )
+                return RagAnswer(
+                    status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
+                )
+            current_stage = "assemble_context"
+            included, dropped_source_count = _select_within_budget(
+                question, retrieved.hits, instructions_bytes=self._instructions_bytes
+            )
+            user_message = render_user_message(question, included)
+            _log_rag_stage(
+                question,
+                included,
+                context=user_message,
+                dropped_source_count=dropped_source_count,
+            )
+            item = {"role": "user", "content": user_message}
+            current_stage = "generation"
+            generation_started = time.perf_counter()
+            try:
+                result = await self._chat_service.complete([item])
+            except Exception as exc:
+                duration_ms = (time.perf_counter() - generation_started) * 1000
+                # Redaction: neither question text nor chunk content is
+                # logged here -- only duration and the exception class name
+                # (Day 14 r06 residual 3).
+                logger.info(
+                    "rag stage=generation duration_ms=%.1f outcome=error exception=%s",
+                    duration_ms,
+                    type(exc).__name__,
+                )
+                raise
             logger.info(
-                "rag stage=complete total_ms=%.1f status=no_answer",
+                "rag stage=generation duration_ms=%.1f outcome=success",
+                (time.perf_counter() - generation_started) * 1000,
+            )
+        except Exception as exc:
+            logger.info(
+                "rag stage=complete total_ms=%.1f status=error outcome=error "
+                "failed_stage=%s exception=%s",
                 (time.perf_counter() - total_started) * 1000,
+                current_stage,
+                type(exc).__name__,
             )
-            return RagAnswer(
-                status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
-            )
-        included, dropped_source_count = _select_within_budget(
-            question, retrieved.hits, instructions_bytes=self._instructions_bytes
-        )
-        user_message = render_user_message(question, included)
-        _log_rag_stage(
-            question, included, context=user_message, dropped_source_count=dropped_source_count
-        )
-        item = {"role": "user", "content": user_message}
-        generation_started = time.perf_counter()
-        result = await self._chat_service.complete([item])
+            raise
         logger.info(
-            "rag stage=generation duration_ms=%.1f",
-            (time.perf_counter() - generation_started) * 1000,
-        )
-        logger.info(
-            "rag stage=complete total_ms=%.1f status=answered",
+            "rag stage=complete total_ms=%.1f status=answered outcome=success",
             (time.perf_counter() - total_started) * 1000,
         )
         return RagAnswer(

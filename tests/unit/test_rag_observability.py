@@ -5,17 +5,21 @@ question text or chunk content.
 """
 
 import logging
+from collections.abc import AsyncIterator, Sequence
 
 import pytest
 from fastapi.testclient import TestClient
 
 from azgenai_lab.api.rag import get_rag_service
 from azgenai_lab.core.correlation import correlation_id_var
+from azgenai_lab.core.errors import UpstreamServiceError
 from azgenai_lab.main import app
+from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.search import SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
-from azgenai_lab.services.azure_openai import FakeChatService
+from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, FakeChatService
 from azgenai_lab.services.azure_search import FakeSearchClient
-from azgenai_lab.services.embeddings import FakeEmbeddingClient
+from azgenai_lab.services.embeddings import EmbeddingRejectedError, FakeEmbeddingClient
 from azgenai_lab.services.rag import RagService
 from azgenai_lab.services.retrieval import Retriever
 
@@ -152,3 +156,137 @@ async def test_rag_no_answer_path_logs_total_duration_without_generation_field(
     assert not any("stage=generation" in r.getMessage() for r in rag_records)
     for record in rag_records:
         assert "anything with no corpus match" not in record.getMessage()
+
+
+class _RaisingEmbeddingClient:
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise EmbeddingRejectedError("simulated embedding failure")
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _RaisingSearchClient:
+    async def search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        mode: SearchMode = SearchMode.HYBRID,
+        top: int,
+        filter: str | None = None,
+        vector_k: int = 50,
+    ) -> SearchResult:
+        raise UpstreamServiceError("simulated search failure")
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _RaisingChatService:
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        raise UpstreamServiceError("simulated generation failure")
+
+    async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
+        raise AssertionError("this test never streams")
+
+    async def aclose(self) -> None:
+        pass
+
+
+async def test_embed_stage_failure_logs_error_outcome_and_propagates(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RagService(
+        Retriever(_RaisingEmbeddingClient(), FakeSearchClient([DOC]), top=5),
+        FakeChatService(prompt=load_prompt("rag_answer")),
+    )
+    token = correlation_id_var.set("cid-embed-fail")
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(EmbeddingRejectedError):
+            await service.answer("does alpha do beta things?")
+    finally:
+        correlation_id_var.reset(token)
+
+    retrieval_records = [r for r in caplog.records if r.name == "azgenai_lab.services.retrieval"]
+    embed_record = next(r for r in retrieval_records if "stage=embed_query" in r.getMessage())
+    assert "outcome=error" in embed_record.getMessage()
+    assert "duration_ms=" in embed_record.getMessage()
+    assert "EmbeddingRejectedError" in embed_record.getMessage()
+    assert embed_record.correlation_id == "cid-embed-fail"
+
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    complete_message = complete_record.getMessage()
+    assert "outcome=error" in complete_message
+    assert "total_ms=" in complete_message
+    assert "failed_stage=retrieve" in complete_message
+
+    for record in caplog.records:
+        assert "does alpha do beta things?" not in record.getMessage()
+        assert "alpha beta" not in record.getMessage()
+
+
+async def test_search_stage_failure_logs_error_outcome_and_propagates(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), _RaisingSearchClient(), top=5),
+        FakeChatService(prompt=load_prompt("rag_answer")),
+    )
+    token = correlation_id_var.set("cid-search-fail")
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(UpstreamServiceError):
+            await service.answer("does alpha do beta things?")
+    finally:
+        correlation_id_var.reset(token)
+
+    retrieval_records = [r for r in caplog.records if r.name == "azgenai_lab.services.retrieval"]
+    search_record = next(r for r in retrieval_records if "stage=search" in r.getMessage())
+    assert "outcome=error" in search_record.getMessage()
+    assert "duration_ms=" in search_record.getMessage()
+    assert "UpstreamServiceError" in search_record.getMessage()
+    assert search_record.correlation_id == "cid-search-fail"
+
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    complete_message = complete_record.getMessage()
+    assert "outcome=error" in complete_message
+    assert "total_ms=" in complete_message
+    assert "failed_stage=retrieve" in complete_message
+
+    for record in caplog.records:
+        assert "does alpha do beta things?" not in record.getMessage()
+        assert "alpha beta" not in record.getMessage()
+
+
+async def test_generation_stage_failure_logs_error_outcome_and_propagates(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5),
+        _RaisingChatService(),
+    )
+    token = correlation_id_var.set("cid-generation-fail")
+    try:
+        with caplog.at_level(logging.INFO), pytest.raises(UpstreamServiceError):
+            await service.answer("does alpha do beta things?")
+    finally:
+        correlation_id_var.reset(token)
+
+    rag_records = [r for r in caplog.records if r.name == "azgenai_lab.services.rag"]
+    generation_record = next(r for r in rag_records if "stage=generation" in r.getMessage())
+    assert "outcome=error" in generation_record.getMessage()
+    assert "duration_ms=" in generation_record.getMessage()
+    assert "UpstreamServiceError" in generation_record.getMessage()
+    assert generation_record.correlation_id == "cid-generation-fail"
+
+    complete_record = next(r for r in rag_records if "stage=complete" in r.getMessage())
+    complete_message = complete_record.getMessage()
+    assert "outcome=error" in complete_message
+    assert "total_ms=" in complete_message
+    assert "failed_stage=generation" in complete_message
+
+    for record in caplog.records:
+        assert "does alpha do beta things?" not in record.getMessage()
+        assert "alpha beta" not in record.getMessage()
