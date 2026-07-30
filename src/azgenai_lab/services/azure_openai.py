@@ -172,6 +172,8 @@ class ChatService(Protocol):
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]: ...
 
+    async def aclose(self) -> None: ...
+
 
 def _fake_reply(items: Sequence[ReplayItem], prompt: PromptTemplate | None) -> str:
     # The history marker makes state visible to contract tests: a fake can't
@@ -244,6 +246,9 @@ class FakeChatService:
             )
 
         return stream()
+
+    async def aclose(self) -> None:
+        """Nothing owned; the fake never opens a client."""
 
 
 def _to_input(items: Sequence[ReplayItem]) -> ResponseInputParam:
@@ -355,6 +360,11 @@ class AzureOpenAIChatService:
         self._deployment_name = deployment_name
         self._prompt = prompt
         self._max_output_tokens = max_output_tokens
+        # build_chat_service() constructs this AsyncOpenAI and hands it in
+        # here: ownership transfers to this adapter, so it — not the caller —
+        # is responsible for closing it. Guarded so a double aclose() (e.g.
+        # both direct and via a composing service) is safe.
+        self._closed = False
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         _log_llm_call(self._prompt, streaming=False)
@@ -422,6 +432,12 @@ class AzureOpenAIChatService:
         except openai.OpenAIError as exc:
             raise _translate_upstream_error(exc) from exc
         return _translate_stream(stream)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._client.close()
 
 
 def build_chat_service(settings: Settings, *, prompt_name: str = "default_chat") -> ChatService:

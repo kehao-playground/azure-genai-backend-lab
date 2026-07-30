@@ -99,6 +99,8 @@ class EmbeddingClient(Protocol):
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
+    async def aclose(self) -> None: ...
+
 
 class FakeEmbeddingClient:
     """Deterministic vectors derived from a hash of the text.
@@ -111,6 +113,9 @@ class FakeEmbeddingClient:
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return [_pseudo_vector(text) for text in texts]
+
+    async def aclose(self) -> None:
+        """Nothing owned; the fake never opens a client."""
 
 
 def _pseudo_vector(text: str) -> list[float]:
@@ -184,6 +189,10 @@ class AzureOpenAIEmbeddingClient:
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+        # This constructor built the AsyncOpenAI client itself, so this
+        # adapter owns it and is responsible for closing it. Guarded so a
+        # double aclose() is safe.
+        self._closed = False
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         try:
@@ -247,6 +256,12 @@ class AzureOpenAIEmbeddingClient:
 
         ordered = sorted(data, key=lambda item: item.index)
         return [item.embedding for item in ordered]
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._client.close()
 
 
 def build_embedding_client(settings: Settings) -> EmbeddingClient:

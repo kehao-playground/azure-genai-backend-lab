@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
@@ -24,6 +26,19 @@ _VALIDATION_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Built at startup, not per request: misconfiguration crashes here, not on
+    # request #1. Kept in the lifespan (rather than moved into it entirely)
+    # so app.state is populated before startup completes either way.
+    yield
+    # Long-lived owned clients (AsyncOpenAI, the search httpx.AsyncClient)
+    # have no other shutdown path in a running API process (Day 14 review
+    # finding 4) — without this, they leak connections until the process exits.
+    await app.state.conversation_service.aclose()
+    await app.state.rag_service.aclose()
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     # Must run before any request handling: without this, configure_logging()
@@ -35,6 +50,7 @@ def create_app() -> FastAPI:
         title="Azure GenAI Backend Lab",
         description="Production-minded Azure GenAI backend patterns with Python and FastAPI.",
         version="0.1.0",
+        lifespan=_lifespan,
     )
 
     # Built at startup, not per request: misconfiguration crashes here, not on request #1.

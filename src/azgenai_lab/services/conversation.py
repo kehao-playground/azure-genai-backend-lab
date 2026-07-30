@@ -234,6 +234,16 @@ class ConversationChatService:
         finally:
             self._locks.release(conversation_id)
 
+    async def aclose(self) -> None:
+        """Close the composed chat service.
+
+        ``ConversationStore`` (in-memory today) holds no external resource —
+        it is a process-local dict — so there is nothing to close there;
+        a future persistent adapter (Cosmos DB, Postgres) would need to grow
+        its own ``aclose()`` and be composed here too.
+        """
+        await self._chat_service.aclose()
+
 
 def build_conversation_service(settings: Settings) -> ConversationChatService:
     """Composition point: the chat adapter wrapped with app-owned state."""
