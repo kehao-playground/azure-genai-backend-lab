@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.errors import UpstreamError
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import load_prompt
@@ -44,6 +45,26 @@ PROMPT_INPUT_TOKEN_LIMIT = 272_000
 # PROMPT_INPUT_TOKEN_LIMIT therefore provably caps the token count at or
 # below the documented input limit too — a conservative, tokenizer-free bound.
 MAX_PROMPT_BYTES = PROMPT_INPUT_TOKEN_LIMIT
+
+
+class RagContextOverflowError(UpstreamError):
+    """Even the single highest-ranked hit does not fit MAX_PROMPT_BYTES.
+
+    Server-owned, not client-owned: the corpus is server-selected (indexing
+    is our pipeline, not user input), so a hit this large is our failure to
+    enforce an indexing-side invariant, not a bad request. The offline
+    chunker (Day 12) makes this unreachable for our own corpus -- chunks are
+    bounded to chunk_max_chars=2000 U+10FFFF-worst-case chars, far under this
+    budget -- but the query boundary (this module) must not *trust* an
+    indexing invariant it does not itself enforce. Live SearchHit.content /
+    heading_path have no runtime maximum, so this is the honest fallback for
+    a hostile or malformed index entry, rather than an unhandled
+    AssertionError escaping as a plain-text 500.
+    """
+
+    status_code = 500
+    code = "rag_context_overflow"
+    message = "The retrieved context could not fit the model input budget."
 
 
 @dataclass(frozen=True)
@@ -113,13 +134,13 @@ def _select_within_budget(
     excluding a higher-ranked one would misrepresent the ranking the caller
     asked retrieval for.
 
-    Invariant: at least one hit always fits. `instructions_bytes` (the
-    rag_answer prompt) is small (well under ~10.5k bytes observed); a single
-    hit's rendered contribution is bounded by chunk_max_chars=2000 chars at
-    <=4 UTF-8 bytes/char (<=8k bytes) plus a short heading/label overhead.
-    MAX_PROMPT_BYTES=272,000 leaves enormous headroom above that combined
-    floor, so the loop below cannot legitimately produce zero included hits
-    when `hits` is non-empty.
+    For our own corpus this always includes at least the rank-1 hit: the
+    offline chunker (Day 12) bounds chunk_max_chars=2000, far under the
+    budget. But `hits` here come from a live SearchHit with no runtime
+    maximum on `content`/`heading_path` -- the query boundary must not
+    *trust* that indexing-side invariant. If even the rank-1 hit cannot fit,
+    that is a server-owned failure (the corpus is server-selected), raised
+    as `RagContextOverflowError` rather than an unhandled AssertionError.
     """
     budget = MAX_PROMPT_BYTES - instructions_bytes
     included: list[SearchHit] = []
@@ -130,9 +151,10 @@ def _select_within_budget(
             break
         included.append(hit)
     if hits and not included:
-        raise AssertionError(
-            "prompt budget invariant violated: no hit fit within MAX_PROMPT_BYTES "
-            "even though per-hit and instructions sizes are bounded well under it"
+        first = hits[0]
+        first_bytes = len(render_user_message(question, [first]).encode("utf-8"))
+        raise RagContextOverflowError(
+            upstream_detail=f"chunk_id={first.chunk_id} bytes={first_bytes}"
         )
     return included, len(hits) - len(included)
 
@@ -211,6 +233,7 @@ def build_rag_service(settings: Settings) -> RagService:
 
 __all__ = [
     "RagAnswer",
+    "RagContextOverflowError",
     "RagService",
     "RagStatus",
     "build_rag_service",

@@ -16,6 +16,7 @@ from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.rag import (
     MAX_PROMPT_BYTES,
+    RagContextOverflowError,
     RagService,
     render_sources,
     render_user_message,
@@ -180,6 +181,37 @@ async def test_answer_truncates_hostile_oversized_corpus_to_fit_prompt_budget() 
     for marker in expected_numbers:
         assert marker in rendered
     assert f"[{len(result.hits) + 1}]" not in rendered
+
+
+async def test_answer_raises_context_overflow_when_first_hit_content_too_big() -> None:
+    # Live SearchHit.content has no runtime maximum (only the offline chunker
+    # bounds it) -- an oversized first hit must not escape as an unhandled
+    # AssertionError / plain-text 500.
+    oversized_hit = replace(HIT, content="x" * (MAX_PROMPT_BYTES + 1))
+    retriever = Retriever(
+        FakeEmbeddingClient(), _StubOversizedSearchClient([oversized_hit]), top=5
+    )
+    chat = _RecordingChatService()
+    service = RagService(retriever, chat)
+
+    with pytest.raises(RagContextOverflowError):
+        await service.answer("q")
+
+    assert chat.received_items is None  # zero provider calls
+
+
+async def test_answer_raises_context_overflow_when_first_hit_heading_path_too_big() -> None:
+    oversized_hit = replace(HIT, heading_path="h" * (MAX_PROMPT_BYTES + 1))
+    retriever = Retriever(
+        FakeEmbeddingClient(), _StubOversizedSearchClient([oversized_hit]), top=5
+    )
+    chat = _RecordingChatService()
+    service = RagService(retriever, chat)
+
+    with pytest.raises(RagContextOverflowError):
+        await service.answer("q")
+
+    assert chat.received_items is None
 
 
 async def test_answer_includes_all_hits_when_within_budget() -> None:

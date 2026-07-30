@@ -9,7 +9,12 @@ from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
-from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, IncompleteReason
+from azgenai_lab.services.azure_openai import (
+    ChatResult,
+    ChatStreamEvent,
+    FakeChatService,
+    IncompleteReason,
+)
 from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.rag import RagAnswer, RagService
@@ -239,7 +244,6 @@ def test_rag_response_sources_reflect_truncation_over_http(client: TestClient) -
         for i in range(50)
     ]
     prompt = load_prompt("rag_answer")
-    from azgenai_lab.services.azure_openai import FakeChatService
 
     service = RagService(
         Retriever(FakeEmbeddingClient(), _OversizedSearchClient(hits), top=50),
@@ -256,6 +260,40 @@ def test_rag_response_sources_reflect_truncation_over_http(client: TestClient) -
     body = response.json()
     assert body["status"] == "answered"
     assert 0 < len(body["sources"]) < 50
+
+
+def test_rag_context_overflow_returns_500_envelope_with_correlation_id(
+    client: TestClient,
+) -> None:
+    from azgenai_lab.services.rag import MAX_PROMPT_BYTES
+
+    hit = SearchHit(
+        chunk_id="doc-oversized",
+        parent_id="doc-oversized",
+        title="Doc",
+        heading_path="Doc",
+        content="x" * (MAX_PROMPT_BYTES + 1),
+        score=1.0,
+    )
+    prompt = load_prompt("rag_answer")
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), _OversizedSearchClient([hit]), top=5),
+        FakeChatService(prompt=prompt),
+    )
+    app.dependency_overrides[get_rag_service] = lambda: service
+    try:
+        response = client.post(
+            "/api/v1/rag",
+            json={"question": "q"},
+            headers={"X-Correlation-Id": "cid-overflow"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_rag_service, None)
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["code"] == "rag_context_overflow"
+    assert body["correlation_id"] == "cid-overflow"
 
 
 def test_rag_endpoint_wired_at_startup(client: TestClient) -> None:
