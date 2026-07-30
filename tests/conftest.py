@@ -1,9 +1,14 @@
 import os
 
-# Must run before the app import below: the chat service is built at import
-# time (fail fast in production) and the test suite must never depend on the
-# local .env or shell environment (review r01 fix 2).
+# Must run before the app import below: the chat, search, and embedding
+# clients are all built at import time via build_rag_service (fail fast in
+# production), and the test suite must never depend on the local .env or
+# shell environment (review r01 fix 2; extended to search/embeddings for
+# Day 14 review finding 3). Each of these three flags is owned by the test
+# suite, not the developer's shell — pin all three.
 os.environ["USE_FAKE_LLM"] = "true"
+os.environ["USE_FAKE_SEARCH"] = "true"
+os.environ["USE_FAKE_EMBEDDINGS"] = "true"
 
 from collections.abc import Generator  # noqa: E402
 
