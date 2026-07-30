@@ -14,6 +14,7 @@ prompt injection via poisoned corpus stays on the threat-model page.
 """
 
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -149,9 +150,17 @@ class RagService:
         self._instructions_bytes = instructions_bytes
 
     async def answer(self, question: str) -> RagAnswer:
+        total_started = time.perf_counter()
         retrieved = await self._retriever.retrieve(question)
         if not retrieved.hits:
             _log_rag_stage(question, retrieved.hits, context="", dropped_source_count=0)
+            # No provider call happens on this path (structural short-circuit),
+            # so there is no generation duration to report -- omitted rather
+            # than logged as a fake 0ms.
+            logger.info(
+                "rag stage=complete total_ms=%.1f status=no_answer",
+                (time.perf_counter() - total_started) * 1000,
+            )
             return RagAnswer(
                 status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
             )
@@ -163,7 +172,16 @@ class RagService:
             question, included, context=user_message, dropped_source_count=dropped_source_count
         )
         item = {"role": "user", "content": user_message}
+        generation_started = time.perf_counter()
         result = await self._chat_service.complete([item])
+        logger.info(
+            "rag stage=generation duration_ms=%.1f",
+            (time.perf_counter() - generation_started) * 1000,
+        )
+        logger.info(
+            "rag stage=complete total_ms=%.1f status=answered",
+            (time.perf_counter() - total_started) * 1000,
+        )
         return RagAnswer(
             status="answered",
             answer=result.message,
