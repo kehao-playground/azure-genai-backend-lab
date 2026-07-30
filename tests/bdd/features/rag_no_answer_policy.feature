@@ -1,17 +1,19 @@
 Feature: RAG no-answer policy
-  Grounded answers cite retrieved sources; when retrieval finds nothing,
-  the API says so deterministically instead of letting the model guess.
+  Retrieved sources flow into generation with citations that map to them;
+  when retrieval returns zero hits, the API answers no_answer deterministically
+  without calling the LLM, instead of letting the model guess.
 
-  Scenario: A question covered by the indexed corpus gets a grounded answer
+  Scenario: Retrieved sources flow into generation and citations map to returned sources
     Given an indexed corpus that covers the question
     When I ask the RAG endpoint the question
     Then the response status code should be 200
     And the RAG status should be "answered"
     And the response should list at least one numbered source
     And the response JSON should contain a non-empty "answer"
+    And every citation number in the answer should reference a returned source
 
-  Scenario: A question with no matching documents gets a no-answer response
-    Given an indexed corpus with no matching documents
+  Scenario: Zero retrieval hits produce a no-answer response without calling the LLM
+    Given retrieval that returns zero hits
     When I ask the RAG endpoint the question
     Then the response status code should be 200
     And the RAG status should be "no_answer"
