@@ -45,7 +45,10 @@ async def test_open_stream_logs_prompt_identity(caplog: pytest.LogCaptureFixture
         await FakeChatService(prompt=PROMPT).open_stream([{"role": "user", "content": "ping"}])
     record = next(r for r in caplog.records if getattr(r, "prompt_name", None))
     assert record.prompt_name == "default_chat"
-    assert record.correlation_id is None
+    # "-" is the record factory's (core/logging.py, Day 14 review finding 5)
+    # placeholder for "no request in flight" — not None, which would make an
+    # absent correlation id silently indistinguishable from a broken join.
+    assert record.correlation_id == "-"
 
 
 async def test_complete_renders_prompt_identity_in_log_line() -> None:

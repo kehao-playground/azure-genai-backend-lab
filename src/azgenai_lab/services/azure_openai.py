@@ -49,6 +49,18 @@ logger = logging.getLogger(__name__)
 def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
     # Attribution over metrics: incidents must be able to answer "which
     # prompt version was live on this request?" without asking git.
+    #
+    # correlation_id is still read and interpolated into this line's message
+    # text (the "correlation_id=%s" placeholder below) even though
+    # core.logging's record factory (Day 14 review finding 5) now stamps
+    # record.correlation_id on every record from the same ContextVar:
+    # test_prompt_logging.py pins the literal rendered text, and the
+    # rendered message is what incident response actually greps, not just
+    # the record's extra attributes. It is no longer duplicated into
+    # `extra` — the factory already sets record.correlation_id, and passing
+    # it again through `extra` raises `KeyError: Attempt to overwrite` since
+    # Python's LogRecord.__init__ (via the factory) has already set that
+    # attribute before `extra` is applied.
     prompt_name = prompt.name if prompt else None
     prompt_version = prompt.version if prompt else None
     prompt_sha256 = prompt.sha256 if prompt else None
@@ -65,7 +77,6 @@ def _log_llm_call(prompt: PromptTemplate | None, streaming: bool) -> None:
             "prompt_name": prompt_name,
             "prompt_version": prompt_version,
             "prompt_sha256": prompt_sha256,
-            "correlation_id": correlation_id,
         },
     )
 
@@ -93,7 +104,6 @@ def _log_llm_usage(usage: TokenUsage | None) -> None:
             "output_tokens": usage.output_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
             "total_tokens": usage.total_tokens,
-            "correlation_id": correlation_id,
         },
     )
 

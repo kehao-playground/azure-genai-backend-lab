@@ -1,6 +1,6 @@
 # RAG Overview
 
-Day 11 milestone (docs tier). This document records the RAG design decisions for Part 3 (Days 11–15) before any RAG code lands: the pipeline decomposition, the Azure service mapping, and the classic-vs-agentic choice.
+Day 11 milestone (docs tier), originally written before any RAG code landed. This document records the RAG design decisions for Part 3 (Days 11–15): the pipeline decomposition, the Azure service mapping, and the classic-vs-agentic choice. Day 12 (indexing), Day 13 (retrieval), and Day 14 (the query pipeline, `POST /api/v1/rag`) have since shipped against this design.
 
 ## RAG as a backend retrieval pattern
 
@@ -54,7 +54,11 @@ The canonical taxonomy is the Seven Failure Points ([Barnett et al., CAIN 2024](
 Design consequences adopted here:
 
 - FP1's correct behavior is an honest "no answer" — a contract decision, not a model behavior. Day 14 implements it structurally, not as a model instruction: zero retrieval hits short-circuit to `status: "no_answer"` before the LLM is called, because Day 13's live probe showed hybrid RRF scores cannot separate an answer-present corpus from an answer-absent one — there is no threshold to gate on past that point. The remaining gap is honest, not closed: a model-level refusal ("the sources don't cover this") still returns `status: "answered"`, because from the pipeline's point of view a refusal is a successful generation. A client has to read `answer` and `sources`, not just `status`, to tell the two apart.
-- FP1–FP3 happen before the LLM sees the prompt: retrieval is the upstream bottleneck — if the correct context is absent from the prompt, the LLM has little chance of a satisfactory corpus-grounded answer ([Microsoft RAG evaluators](https://learn.microsoft.com/en-us/azure/foundry/concepts/evaluation-evaluators/rag-evaluators), checked 2026-07). Days 8–9 provide the observability *foundation* (correlation ids, prompt provenance, usage); RAG per-stage logging (retrieval mode/count, selected chunk ids and scores, stage latency, context-budget contribution, metadata redaction) does not exist yet and is part of the Day 13/14 DoD — the paper's conclusion is that RAG validation is only feasible in operation.
+- FP1–FP3 happen before the LLM sees the prompt: retrieval is the upstream bottleneck — if the correct context is absent from the prompt, the LLM has little chance of a satisfactory corpus-grounded answer ([Microsoft RAG evaluators](https://learn.microsoft.com/en-us/azure/foundry/concepts/evaluation-evaluators/rag-evaluators), checked 2026-07). Days 8–9 provide the observability *foundation* (correlation ids, prompt provenance, usage); Day 13 added the search adapter's per-call line (mode, candidate window, returned chunk ids/scores) and Day 14 closed the remaining gap with an augmentation-stage line — see "Observability" below — the paper's conclusion is that RAG validation is only feasible in operation.
+
+### Observability
+
+Every RAG request's three stages log one line each, all joinable on `correlation_id`: `search` (Day 13, mode/candidate window/returned chunk ids and scores), `rag stage=assemble_context` (Day 14, hit count, chunk ids, per-source content character lengths, total assembled context characters, question character length), and `llm call`/`llm usage` (Day 8/9, prompt identity and token counts). `correlation_id` is stamped on every log record by a `LogRecord` factory installed in `configure_logging()` (`core/logging.py`) that reads the same `ContextVar` the correlation-id middleware populates per request, so call sites do not need to read or pass it manually to be joinable. Redaction rule, held consistently across the RAG stage line: question text and chunk content are never logged, only counts, ids, and character lengths — the same why-not-what discipline Day 9 applied to token usage.
 
 ## Azure mapping and the classic-vs-agentic choice
 
