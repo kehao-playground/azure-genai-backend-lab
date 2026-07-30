@@ -11,12 +11,43 @@ router = APIRouter(tags=["rag"])
 
 # The upstream error contract is part of the API contract: every promised
 # status code is documented here so the OpenAPI drift check guards it.
+# Codes verified against core/errors.py, services/azure_openai.py,
+# services/embeddings.py, and services/azure_search.py as actually
+# reachable from RagService.answer() -> Retriever.retrieve() (embed then
+# search) -> ChatService.complete() (Day 14 review finding 10). StorageError
+# ("storage_error") is deliberately not listed: it is only raised by
+# services/conversation.py, which the /rag path never calls.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    400: {"model": ErrorEnvelope, "description": "Content filtered"},
-    500: {"model": ErrorEnvelope, "description": "Configuration error"},
-    502: {"model": ErrorEnvelope, "description": "Upstream service failed"},
-    503: {"model": ErrorEnvelope, "description": "Upstream throttled or unavailable"},
-    504: {"model": ErrorEnvelope, "description": "Upstream timeout"},
+    400: {
+        "model": ErrorEnvelope,
+        "description": (
+            "content_filtered (the question was blocked by the content filter) or "
+            "invalid_input (the upstream model rejected the input, e.g. context length)"
+        ),
+    },
+    500: {
+        "model": ErrorEnvelope,
+        "description": (
+            "configuration_error (our deployment is misconfigured), "
+            "embedding_rejected (the embeddings service rejected the input), or "
+            "search_request_rejected (the search service rejected the request)"
+        ),
+    },
+    502: {
+        "model": ErrorEnvelope,
+        "description": "upstream_error (the upstream LLM service failed)",
+    },
+    503: {
+        "model": ErrorEnvelope,
+        "description": (
+            "upstream_throttled (upstream LLM capacity is exhausted) or "
+            "search_unavailable (the search service is unavailable)"
+        ),
+    },
+    504: {
+        "model": ErrorEnvelope,
+        "description": "upstream_timeout (the upstream LLM call timed out)",
+    },
 }
 
 
@@ -49,16 +80,35 @@ class RagSource(BaseModel):
     chunk_id: str
     title: str
     heading_path: str
-    score: float
-    reranker_score: float | None = None
+    score: float = Field(
+        description=(
+            "Retrieval ranking signal. In the hybrid path this is an RRF fusion score: it "
+            "orders results and is NOT a similarity, confidence, or grounding probability; do "
+            "not apply thresholds to it."
+        )
+    )
+    reranker_score: float | None = Field(
+        default=None,
+        description=(
+            "Semantic reranker score (0.0-4.0) when the semantic ranker is enabled, "
+            "null otherwise."
+        ),
+    )
 
 
 class RagResponse(BaseModel):
-    answer: str | None
-    status: Literal["answered", "no_answer"]
-    incomplete_reason: Literal["max_output_tokens", "content_filter", "other"] | None = None
+    answer: str | None = Field(
+        description="The generated answer, or null when status is no_answer."
+    )
+    status: Literal["answered", "no_answer"] = Field(
+        description=(
+            "'no_answer' means retrieval found zero hits "
+            "(structural short-circuit, LLM never called)."
+        )
+    )
+    incomplete_reason: Literal["max_output_tokens", "content_filter", "other"] | None
     sources: list[RagSource]
-    usage: TokenUsage | None = None
+    usage: TokenUsage | None
     correlation_id: str
 
 
