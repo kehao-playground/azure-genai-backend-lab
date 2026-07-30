@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from azgenai_lab.core.config import get_settings  # noqa: E402
 from azgenai_lab.main import app  # noqa: E402
 from azgenai_lab.services.conversation import build_conversation_service  # noqa: E402
+from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 
 
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]
@@ -21,3 +22,4 @@ def after_scenario(context, scenario):  # type: ignore[no-untyped-def]
     # The app is module-level; rebuild its state so conversations never leak
     # from one scenario into the next.
     app.state.conversation_service = build_conversation_service(get_settings())
+    app.state.rag_service = build_rag_service(get_settings())
