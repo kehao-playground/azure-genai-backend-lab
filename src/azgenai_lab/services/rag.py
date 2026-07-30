@@ -70,6 +70,11 @@ class RagService:
             incomplete_reason=result.incomplete_reason,
         )
 
+    async def aclose(self) -> None:
+        """Close the composed retriever and chat service."""
+        await self._retriever.aclose()
+        await self._chat_service.aclose()
+
 
 def build_rag_service(settings: Settings) -> RagService:
     return RagService(

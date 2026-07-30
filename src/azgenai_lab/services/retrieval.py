@@ -26,6 +26,11 @@ class Retriever:
             question, vector, mode=SearchMode.HYBRID, top=self._top
         )
 
+    async def aclose(self) -> None:
+        """Close both composed clients. Each adapter's own aclose() is idempotent."""
+        await self._embedding_client.aclose()
+        await self._search_client.aclose()
+
 
 def build_retriever(settings: Settings) -> Retriever:
     return Retriever(

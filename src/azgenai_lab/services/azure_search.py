@@ -135,6 +135,8 @@ class SearchClient(Protocol):
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult: ...
 
+    async def aclose(self) -> None: ...
+
 
 def search_url(endpoint: str) -> str:
     return (
@@ -449,6 +451,9 @@ class FakeSearchClient:
             mode=mode,
             vector_k=vector_k if mode is not SearchMode.KEYWORD else None,
         )
+
+    async def aclose(self) -> None:
+        """Nothing owned; the fake never opens a client."""
 
 
 def build_search_client(settings: Settings) -> SearchClient:
