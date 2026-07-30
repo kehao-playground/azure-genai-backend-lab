@@ -2,16 +2,24 @@
 usage/incomplete-reason plumbing through to the caller.
 """
 
+import logging
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 
+import pytest
+
 from azgenai_lab.models.conversation import ReplayItem
-from azgenai_lab.models.search import SearchHit
+from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, FakeChatService
 from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
-from azgenai_lab.services.rag import RagService, render_sources, render_user_message
+from azgenai_lab.services.rag import (
+    MAX_PROMPT_BYTES,
+    RagService,
+    render_sources,
+    render_user_message,
+)
 from azgenai_lab.services.retrieval import Retriever
 
 HIT = SearchHit(
@@ -79,3 +87,128 @@ async def test_answer_grounds_single_turn_and_carries_usage() -> None:
     assert result.usage is not None
     assert result.usage.total_tokens > 0
     assert [hit.chunk_id for hit in result.hits] == ["doc-a-0000"]
+
+
+class _StubOversizedSearchClient:
+    """Duck-typed SearchClient: returns a fixed, deliberately hostile set of
+    hits regardless of query, so the budget-selection logic can be tested
+    without routing through FakeSearchClient's keyword-overlap matching.
+    """
+
+    def __init__(self, hits: Sequence[SearchHit]) -> None:
+        self._hits = tuple(hits)
+
+    async def search(
+        self,
+        query_text: str,
+        query_vector: Sequence[float] | None = None,
+        *,
+        mode: SearchMode = SearchMode.HYBRID,
+        top: int,
+        filter: str | None = None,
+        vector_k: int = 50,
+    ) -> SearchResult:
+        return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _RecordingChatService:
+    """Records the byte size of exactly what it was called with, so tests can
+    assert on the wire-level budget without a real upstream call."""
+
+    def __init__(self) -> None:
+        self.received_items: Sequence[ReplayItem] | None = None
+
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        self.received_items = items
+        return ChatResult(
+            message="ok",
+            usage=None,
+        )
+
+    async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
+        raise AssertionError("this test never streams")
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _oversized_hits(count: int = 50) -> list[SearchHit]:
+    # Worst legal case per Day 14 r04: 50 hits x 2,000 U+10FFFF chars each
+    # (4 UTF-8 bytes per char), the maximum a within-contract chunk can carry.
+    hostile_content = "\U0010ffff" * 2000
+    return [
+        SearchHit(
+            chunk_id=f"doc-{i:04d}",
+            parent_id=f"doc-{i:04d}",
+            title=f"Doc {i}",
+            heading_path=f"Doc {i}",
+            content=hostile_content,
+            score=1.0,
+        )
+        for i in range(count)
+    ]
+
+
+async def test_answer_truncates_hostile_oversized_corpus_to_fit_prompt_budget() -> None:
+    hits = _oversized_hits(50)
+    prompt = load_prompt("rag_answer")
+    instructions_bytes = len(prompt.text.encode("utf-8"))
+    retriever = Retriever(
+        FakeEmbeddingClient(), _StubOversizedSearchClient(hits), top=50
+    )
+    chat = _RecordingChatService()
+    service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
+
+    question = "q" * 2000
+    result = await service.answer(question)
+
+    assert result.status == "answered"
+    assert len(result.hits) < 50
+    assert chat.received_items is not None
+    message_bytes = sum(
+        len(str(item.get("content", "")).encode("utf-8")) for item in chat.received_items
+    )
+    assert instructions_bytes + message_bytes <= MAX_PROMPT_BYTES
+
+    # sources reflect exactly what generation saw, and citation numbering
+    # stays contiguous 1..len(included).
+    rendered = str(chat.received_items[0]["content"])
+    expected_numbers = [f"[{n}]" for n in range(1, len(result.hits) + 1)]
+    for marker in expected_numbers:
+        assert marker in rendered
+    assert f"[{len(result.hits) + 1}]" not in rendered
+
+
+async def test_answer_includes_all_hits_when_within_budget() -> None:
+    fake_chat = FakeChatService(prompt=load_prompt("rag_answer"))
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5),
+        fake_chat,
+        instructions_bytes=10,
+    )
+    result = await service.answer("alpha")
+    assert result.status == "answered"
+    assert len(result.hits) == 1
+
+
+async def test_answer_logs_dropped_source_count_on_truncation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    hits = _oversized_hits(50)
+    prompt = load_prompt("rag_answer")
+    instructions_bytes = len(prompt.text.encode("utf-8"))
+    retriever = Retriever(FakeEmbeddingClient(), _StubOversizedSearchClient(hits), top=50)
+    chat = _RecordingChatService()
+    service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
+
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+        result = await service.answer("q" * 2000)
+
+    record = next(r for r in caplog.records if r.name == "azgenai_lab.services.rag")
+    message = record.getMessage()
+    dropped = 50 - len(result.hits)
+    assert f"dropped_source_count={dropped}" in message
+    assert dropped > 0

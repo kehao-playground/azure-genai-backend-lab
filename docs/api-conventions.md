@@ -130,14 +130,26 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   characters after trimming leading/trailing whitespace; the trimmed value is
   what flows to retrieval and generation. A whitespace-only question (e.g.
   `"   "`) is rejected as `422 validation_error`, not accepted and then failed
-  downstream. 2,000 chars is the Day 12 conservative char proxy — the worst
-  measured density (2,572 tokens per 2,000 chars, zh) stays under the
-  embedding model's 8,192-token input ceiling, so a within-contract question
-  can never trigger an upstream embedding-size 400. `RAG_TOP` is bounded to
-  1-50: 50 is `DEFAULT_VECTOR_K`, the vector leg's own candidate pool, so a
-  larger value would ask generation to read more chunks than retrieval ever
-  offers, and it bounds assembled context to roughly 50 x 2,000 = 100k
-  characters plus the question.
+  downstream. 2,000 chars is the Day 12 conservative char proxy, bounded
+  universally rather than by sample: a UTF-8 character is at most 4 bytes, so
+  2,000 chars <= 8,000 bytes, and since a BPE token decodes to at least one
+  UTF-8 byte, token count <= byte count — 2,000 chars is therefore <= 8,000
+  tokens, under the embedding model's 8,192-token input ceiling for any
+  input, so a within-contract question can never trigger an upstream
+  embedding-size 400. `RAG_TOP` is bounded to 1-50: 50 is `DEFAULT_VECTOR_K`,
+  the vector leg's own candidate pool, so a larger value would ask generation
+  to read more chunks than retrieval ever offers.
+- **Assembled-prompt budget (Day 14 r04 residual A):** the worst legal case
+  (`RAG_TOP=50` hits of `chunk_max_chars=2000` chars each, plus the 2,000-char
+  question) can exceed the model's documented input limit before this guard
+  existed. `RagService` enforces `MAX_PROMPT_BYTES = 272,000` — the same
+  byte-bound proof as above, applied to the whole assembled prompt
+  (instructions + rendered sources + question) instead of the question alone
+  — and includes retrieved hits in rank order, stopping at the first hit that
+  would not fit rather than skipping it for a lower-ranked one. Truncation
+  semantics: the `sources` list in the response is exactly the set of hits
+  actually sent to the model for generation, never the full retrieved set;
+  a stage log line reports `dropped_source_count` when hits were excluded.
 
 ## Correlation ID
 
