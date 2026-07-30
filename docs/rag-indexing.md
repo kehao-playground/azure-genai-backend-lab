@@ -351,9 +351,15 @@ floor(300_000 / 8_192) = 36        36 * 8192 = 294,912 <= 300,000
 
 36 is a provable upper bound — any smaller number would need its own justification, so none is
 added. The cost of this approach is stated rather than hidden: the per-input 8,192-token ceiling is
-still not verified ahead of time (a 2,000-character chunk could, at an unusually high token
-density, exceed it), so a violation is *detected* by the upstream 400, not *prevented* locally. That
-is the accepted cost of not depending on a tokenizer.
+still not verified ahead of time, so a violation is *detected* by the upstream 400, not
+*prevented* locally. The precise reason is a byte argument, not a density guess: BPE tokens each
+consume at least one UTF-8 byte, so token count never exceeds byte count. A 2,000-character
+`content` caps at 8,000 bytes and therefore 8,000 tokens — but the embedding input prefixes
+`heading_path`, and that prefix can push the total past the 8,192-byte line for pathological
+4-byte-character text, so the ceiling is not provable here. (The `/rag` question path differs: it
+embeds the bare question, capped at 2,000 characters ≤ 8,000 bytes < 8,192, so overflow there is
+prevented by construction — see `docs/api-conventions.md`.) Detection-not-prevention is the
+accepted cost of not depending on a tokenizer.
 
 `FakeEmbeddingClient` produces deterministic vectors from a SHA-256 hash of the input text. These
 vectors carry no semantics — two chunks about the same topic are no closer together than two
