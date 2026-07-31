@@ -291,14 +291,102 @@ onto every `Chunk` derived from it:
 | `doc_id` / `parent_id` | front matter `doc_id` | Filename-as-identity: `doc_id` must equal the file's stem. Limited to 64 characters (see [Chunk ids and replacement](#chunk-ids-and-replacement)). |
 | `title` | front matter `title` | Also the mandatory first segment of every chunk's `heading_path`. |
 | `doc_type` | front matter `doc_type` | Free text; facetable in the index for scoping retrieval by document category. |
-| `tenant_id` | front matter `tenant_id` | **Reserved for Day 15.** The field is populated and filterable now so that Day 15's multi-tenant filtering has something to filter on; no filtering logic exists yet. |
+| `tenant_id` | front matter `tenant_id` | Filterable. Owns the query-time ACL: [`build_acl_filter()`](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check) always requires an exact match, and there is no such thing as a tenant-less, globally public document. |
+| `allowed_groups` | front matter `allowed_groups` (**required**, Day 15) | Filterable only (not retrievable/searchable/sortable/facetable — ACL metadata is never selected back by an ordinary query). An empty list `[]` means tenant-wide readable; a non-empty list means "readable by any principal whose groups intersect this list". See [`allowed_groups` contract](#allowed_groups-contract) below. |
 | `effective_date` | front matter `effective_date` (YAML date) | Filterable and sortable, so a stale document's chunks can be excluded from being treated as a current answer. Encoded as a UTC calendar date at index time — see below. |
 | `heading_path` | derived during chunking | Always starts with `title`; see [Embedding input versus citation text](#embedding-input-versus-citation-text). |
 | `content` | derived during chunking | The citation text; see above. |
 
 Front-matter parsing is strict and closed-set (`_REQUIRED_FIELDS` in `document_loader.py`): all
-five fields are required, no unknown field is tolerated, and `doc_id` must match the filename. This
-mirrors how Day 8 validates prompt template front matter — fail at load time, not at index time.
+six fields (`doc_id`, `title`, `doc_type`, `tenant_id`, `effective_date`, `allowed_groups`) are
+required, no unknown field is tolerated, and `doc_id` must match the filename. This mirrors how
+Day 8 validates prompt template front matter — fail at load time, not at index time. `allowed_groups`
+has no default: a document authored without it is a load-time error, never a silently-public
+document — `.get("allowed_groups", [])` is exactly the pattern this repo forbids, because a
+silently-defaulted empty list is indistinguishable from a legitimately tenant-wide one. Duplicate
+values inside a front-matter `allowed_groups` list are rejected as an authoring error rather than
+silently deduplicated — deduplication only happens on the `Principal` side, where duplicates come
+from a different source (client-supplied groups) and carry a different meaning (repeated claims,
+not a data-authoring mistake).
+
+## `allowed_groups` contract
+
+Same-tenant is always required; `allowed_groups` narrows further, *within* a tenant, and never
+substitutes for the tenant check:
+
+- **`allowed_groups == []`** — the document is readable by every principal in that tenant,
+  regardless of group membership. This is the *only* shape of "public" this schema has: there is
+  no field or value meaning "public across tenants".
+- **`allowed_groups` non-empty** — readable only by a principal whose `group_ids` intersect this
+  list; any one shared group is sufficient (no "must hold all groups" mode exists).
+- **Missing `allowed_groups` on a document, at query or write time, is a contract violation, not a
+  default.** `services/acl.py::require_acl_metadata()` is the only place allowed to read
+  `tenant_id`/`allowed_groups` off a raw document mapping, and it raises `ValueError` rather than
+  defaulting when either key is absent or of the wrong type — enforced identically by
+  `FakeSearchClient` (`is_document_visible()`) and by every fake fixture, so a test that forgets
+  the field fails loudly instead of silently exercising a public-by-default path that production
+  never has.
+
+Both `SourceDocument.allowed_groups` and `Chunk.allowed_groups` are typed `tuple[str, ...]`; the
+index payload always emits a list, including the explicit empty list — `to_index_document()` never
+omits the key.
+
+## Tenant-scoped keys
+
+Before Day 15, `chunk_id`/`parent_id` were derived from a bare `doc_id`. That collides across
+tenants: two tenants each authoring a document named `returns-policy.md` would produce the same
+`parent_id`, so tenant B's reindex would enumerate and delete tenant A's chunks as "stale". The
+fix scopes document identity to `(tenant_id, doc_id)` and encodes both into the key with a
+**length-prefix** rather than a plain separator:
+
+```python
+parent_id = f"t{len(tenant_id)}={tenant_id}d{len(doc_id)}={doc_id}"
+chunk_id = f"{parent_id}-{ordinal:04d}"
+```
+
+A plain separator such as `"--"` does not survive concatenation: `"a"` + `"b--c"` and `"a--b"` +
+`"c"` both produce the literal string `"a--b--c"`, so two different `(tenant_id, doc_id)` pairs
+collide on the same key even though neither individual value contains anything unusual. Prefixing
+each component with its own length removes the ambiguity — the length is a boundary a reader can
+recompute (read `N` characters after each `=`), not a character the values could accidentally
+contain in the wrong place — so `("a", "b--c")` produces `t1=ad4=b--c` while `("a--b", "c")`
+produces `t4=a--bd1=c`: the two component lengths differ, so the two full keys differ too, even
+though the naive concatenation of both pairs is the identical string `"a--b--c"`. `=` and `-` are
+both already inside Azure AI Search's key charset (letters, digits, `-`, `_`, `=`),
+so this scheme adds no new characters to validate — it only changes how the existing ones are
+arranged. `parent_id` still starts with `t`, preserving the "never starts with `_`" naming rule
+document keys must satisfy.
+
+The replacer's per-document lock key and its stale-chunk enumeration both use this same
+tenant-scoped `parent_id`; enumeration additionally filters on `tenant_id eq '<t>'` so a
+same-tenant collision check is redundant defense-in-depth rather than the only guard. The corpus
+layout mirrors the scoping: documents live under `<tenant_id>/<doc_id>.md`, and a document's
+front-matter `tenant_id` must match its containing directory — the loader rejects a mismatch rather
+than trusting whichever value happens to be present. `doc_id == path.stem` still holds, but
+uniqueness is now scoped per tenant rather than requiring every tenant to coordinate a single
+global id space.
+
+## Rebuild procedure
+
+Adding `allowed_groups` to the schema does not retroactively populate it on documents indexed
+before Day 15, and the ACL filter's public branch (`not allowed_groups/any()`) reads a missing/null
+value the same way it reads an explicit empty list — so an old document with no `allowed_groups`
+would be treated as tenant-wide readable the moment ACL-aware queries go live, silently granting
+access nobody explicitly asked for. Two different procedures apply, chosen by how strict the
+no-public-window guarantee needs to be:
+
+- **This lab** — `tools/index_corpus.py --recreate-index` drops the index outright and rebuilds it
+  from the full corpus, re-embedding every chunk. At this corpus's size the re-embedding cost is
+  negligible, and there is no live traffic whose in-flight queries would observe a half-migrated
+  index, so a drop-and-rebuild is the simplest correct choice. ACL-aware queries are only enabled
+  *after* this rebuild completes — never against a partially-populated index.
+- **Production** — a drop-and-rebuild is not acceptable: it takes the whole index offline for the
+  rebuild's duration. The safe path is a **new index, fully loaded with `allowed_groups` on every
+  document from the start, cut over via an index alias** (see [the alias escape from the
+  duplication window](#idempotent-re-runs-and-the-non-atomic-window)) rather than an in-place
+  schema change on the live index. Repointing the alias only after the new index is completely
+  built and verified means no query — not even one issued mid-cutover — can ever see a document
+  missing its ACL metadata.
 
 **`effective_date` crosses a type boundary between producer and schema.**
 `SourceDocument.effective_date` and `Chunk.effective_date` (`models/rag.py`) are both typed
@@ -383,7 +471,8 @@ one search document:
 | `heading_path` | `Edm.String` | searchable | The section-level granularity of a citation. |
 | `content` | `Edm.String` | searchable, `en.microsoft` analyzer | The keyword (BM25) side of hybrid search. |
 | `doc_type` | `Edm.String` | filterable, facetable | Scopes retrieval by document category. |
-| `tenant_id` | `Edm.String` | filterable | Reserved for Day 15's multi-tenant filtering. |
+| `tenant_id` | `Edm.String` | filterable | Every query's ACL filter requires an exact match here (Day 15); see [`allowed_groups` contract](#allowed_groups-contract). |
+| `allowed_groups` | `Collection(Edm.String)` | filterable only | ACL metadata, deliberately not retrievable/searchable/sortable/facetable so it is never selected back by an ordinary query (Day 15); see [`allowed_groups` contract](#allowed_groups-contract). |
 | `effective_date` | `Edm.DateTimeOffset` | filterable, sortable | Keeps an expired document from being treated as a current answer. |
 | `content_vector` | `Collection(Edm.Single)` | searchable, `stored: true`, `retrievable: false`, `dimensions: 1536` | The vector side of hybrid search; see [`stored` is the vector's only backup](#stored-is-the-vectors-only-backup). |
 

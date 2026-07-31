@@ -40,6 +40,7 @@ The LLM API is stateless (`store=False` upstream); conversation history is owned
 
 - `POST /api/v1/chat` and `POST /api/v1/chat/stream` accept an optional `conversation_id`. Omitting it starts a new conversation; the id comes back in the JSON body (`/chat`) or in the `X-Conversation-Id` response header (`/chat/stream` — a header because SSE clients need it at response time, not from an event). On a first streaming turn that header id is **provisional**: it becomes real only with a keepable terminal (`message.done` completed or `max_output_tokens`); after `error`, `content_filter`/`other`, or a disconnect the client must discard it.
 - Unknown ids are rejected with `404 conversation_not_found` through the envelope. "Unknown" covers never-issued, expired, and lost-on-restart ids alike; the client reaction is the same — start a new conversation.
+- Every store/service key is `(tenant_id, conversation_id)` (Day 15), `tenant_id` coming from the request's `Principal` — there is no conversation lookup that skips tenant scoping. Tenant B presenting tenant A's `conversation_id` gets the same `404 conversation_not_found` as an unknown id, never a 403: existence is not leaked across tenants any more than it is across never-issued ids. B's failed cross-tenant attempt performs no mutation, so A can continue that same conversation afterward.
 - Each committed turn stores two representations: the visible transcript (user + assistant messages) and the provider **replay items** — the user input item plus every response output item, including encrypted reasoning items (`include=["reasoning.encrypted_content"]`). The replay items, not the transcript, are what the next request resends: with `store=False` and a reasoning model, replaying only visible text silently drops reasoning context.
 - A turn commits atomically only after a reply the client keeps: non-streaming success, stream `completed`, or `incomplete`/`max_output_tokens`. Failed turns, `content_filter`/`other` truncations, and disconnects **before the upstream terminal is consumed** leave no trace, so retries cannot corrupt history. Once the terminal is consumed, the commit happens whether or not delivery of `message.done` can be proven — the one-way invariant is that a client which received `message.done` can rely on the history existing. An empty non-streaming reply maps to `502 upstream_error`, never a 200 carrying an id that does not exist.
 - Turns on one conversation are serialized (per-conversation critical section with reference-counted lock entries), and every commit is **conditional**: `append` presents the revision read at the start of the turn and the store rejects stale writers (`ConversationConflictError`) — the version/ETag contract a multi-replica persistent adapter enforces natively. `append` is all-or-nothing: everything that can fail happens before the first mutation.
@@ -60,6 +61,58 @@ Cost is metered, not estimated: every turn that returns a usage-bearing terminal
 Usage is also logged (`llm usage input_tokens=… output_tokens=… reasoning_tokens=… total_tokens=… correlation_id=…`) for every call that returned a usage-bearing terminal — non-streaming success and stream `completed`/`incomplete`. Failed events, SDK exceptions and client disconnects may still have incurred billable processing with no line logged; a missing line is not zero cost. The line is joinable with the prompt-attribution line (Day 8) on `correlation_id`.
 
 The executable contract is `tests/bdd/features/token_budget_guardrail.feature` plus `tests/unit/test_token_budget.py` and `tests/unit/test_chat_incomplete.py` (non-streaming truncation contract, also covered by a `chat_api_contract.feature` scenario).
+
+## Identity and tenancy (Day 15)
+
+`/api/v1/chat`, `/api/v1/chat/stream`, and `/api/v1/rag` require a `Principal` —
+this series' identity boundary until Day 19 replaces it with verified token
+claims behind the same dependency shape. `/health` does not require one.
+
+- The `require_principal` FastAPI dependency reads two trusted gateway
+  headers: exactly one `X-Tenant-Id` and zero-or-one `X-Group-Ids` (a
+  comma-separated list; absent or whitespace-only means `group_ids=()`).
+  Identifiers match `[A-Za-z0-9_-]{1,64}`; at most 100 group tokens before
+  deduplication; the raw `X-Group-Ids` value is capped at 4096 ASCII bytes.
+  Group ids are deduplicated and sorted so the derived ACL filter is
+  deterministic.
+- Any violation — duplicate `X-Tenant-Id` lines, more than one `X-Group-Ids`
+  line, an empty token inside a non-empty CSV (`a,,b`, `,a`, `a,`), an
+  identifier outside the charset/length rule, or too many/too-long group
+  values — maps to `401 unauthorized` through the standard envelope, never
+  `422`: header syntax is not request-body validation, and a 422 here would
+  leak the distinction between "who are you" and "what did you ask for".
+- The 401 response carries a `WWW-Authenticate: Bearer` challenge (RFC 9110
+  §15.5.2), marking it as an authentication failure rather than an
+  authorization one. The stand-in scheme name is provisional: it names the
+  eventual mechanism, not a working Bearer-token check, until Day 19 lands
+  real token validation behind this same header.
+- On `/chat/stream`, a missing or malformed principal is a pre-stream JSON
+  401 (the Day 6 two-stage error boundary), never an SSE `error` event.
+- **Trust boundary (read before deploying past a lab environment).** These
+  headers are trusted-gateway input, not end-user-verifiable credentials: a
+  gateway in front of this backend must strip or override every
+  client-supplied identity header before forwarding a request, and the
+  backend must only be reachable through that gateway. Sent directly to the
+  backend, `X-Tenant-Id`/`X-Group-Ids` are impersonation knobs, not
+  authentication — anyone who can reach the backend can claim any tenant or
+  group. There is no "authorization denied" signal anywhere in this
+  pipeline: a document outside the caller's ACL is filtered at query time
+  and is indistinguishable from a document that does not exist, so silent
+  filtering *is* the absence contract, by design, not a gap to close later.
+  Finally, isolation here is **logical, not physical** — every tenant's
+  chunks live in the same shared Azure AI Search index, separated only by
+  the query-time ACL filter below; a bug in that filter, not a hardware or
+  network boundary, is what stands between tenants.
+- Every application `LogRecord` carries a `tenant_id` field once
+  `require_principal` succeeds, using the same `ContextVar` + `LogRecordFactory`
+  mechanism as the Day 5 correlation id (`core/logging.py`). Startup,
+  background tasks, and any request that never reached a valid principal log
+  `tenant_id=-`. Group ids are never logged.
+
+See [rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check)
+for how a `Principal` becomes an OData filter, and
+[rag-indexing.md](rag-indexing.md#tenant-scoped-keys) for how tenancy is
+encoded on the write side.
 
 ## RAG (Retrieval-Augmented Generation)
 
@@ -118,8 +171,24 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   template's instructions, which explicitly tell the model to treat source text
   as non-instructions. That is mitigation, not immunity — corpus poisoning
   crafted to look like an instruction stays on the threat model.
-- Retrieval is unscoped by tenant or user; per-tenant/per-user authorization on
-  retrieval is deferred to Day 15.
+- Retrieval is scoped by tenant and group through the `Principal` resolved
+  above (Day 15): every `/rag` call requires a principal, and a query-time
+  ACL filter — never a raw, unfiltered query — is the only shape
+  `AzureSearchClient.search()` can send. A document outside the caller's
+  tenant/group scope is filtered out and comes back indistinguishable from a
+  document that was never retrieved, so a cross-tenant question resolves the
+  same way an answer-absent one does: `status: "no_answer"`, not a denial
+  signal. See [rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check).
+- Retrieved chunk content is fenced with `BEGIN UNTRUSTED SOURCE n` /
+  `END UNTRUSTED SOURCE n` markers on top of the template-level warning that
+  source text is data, not instructions (Day 15). This is mitigation, not a
+  sandbox: a poisoned corpus entry crafted to look like an instruction stays
+  on the threat model regardless of the fence. Citation markers (`[n]`) in
+  the model's answer are validated syntactically against the actually-included
+  source numbers — an out-of-range or invented `[n]` is stripped, logged by
+  number only, and never fails the request or changes `status`; this proves
+  the citation *points somewhere real*, not that the cited text actually
+  supports the sentence it is attached to.
 - Errors follow the standard envelope; `incomplete_reason` mirrors the `/chat`
   vocabulary (`max_output_tokens`, `content_filter`, `other`) for the same
   client rules (keep/discard/treat-as-unusable) — it only ever appears when
