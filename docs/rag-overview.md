@@ -1,6 +1,6 @@
 # RAG Overview
 
-Day 11 milestone (docs tier), originally written before any RAG code landed. This document records the RAG design decisions for Part 3 (Days 11–15): the pipeline decomposition, the Azure service mapping, and the classic-vs-agentic choice. Day 12 (indexing), Day 13 (retrieval), and Day 14 (the query pipeline, `POST /api/v1/rag`) have since shipped against this design.
+Day 11 milestone (docs tier), originally written before any RAG code landed. This document records the RAG design decisions for Part 3 (Days 11–15): the pipeline decomposition, the Azure service mapping, and the classic-vs-agentic choice. Day 12 (indexing), Day 13 (retrieval), Day 14 (the query pipeline, `POST /api/v1/rag`), and Day 15 (tenant/group access control on that same pipeline) have since shipped against this design.
 
 ## RAG as a backend retrieval pattern
 
@@ -26,7 +26,56 @@ They differ in everything that matters operationally:
 | Debugging surface | chunk & index contents | query embedding, retrieval results & prompt |
 | Cost driver | embedding calls + index storage (scales with data) | query embedding + search + LLM calls (scales with traffic) |
 
-This decomposition drove the Part 3 milestone order: [Day 12](rag-indexing.md) built the indexing side (chunking, embeddings, index schema), [Day 13](rag-retrieval.md) the retrieval side (search modes), Day 14 wired the query pipeline into `POST /api/v1/rag`.
+This decomposition drove the Part 3 milestone order: [Day 12](rag-indexing.md) built the indexing side (chunking, embeddings, index schema), [Day 13](rag-retrieval.md) the retrieval side (search modes), Day 14 wired the query pipeline into `POST /api/v1/rag`, and Day 15 threaded a `Principal` through every stage of that same pipeline so retrieval never runs without an authorization scope — see [Principal flow through the pipeline](#principal-flow-through-the-pipeline) below.
+
+## Principal flow through the pipeline
+
+Day 15 fixed a gap the query pipeline had carried since Day 14: retrieval was unscoped by tenant or
+user, so any caller's question could surface any tenant's chunks. The fix threads a typed
+`Principal` — `tenant_id` plus deduplicated `group_ids`, resolved once per request by the
+`require_principal` FastAPI dependency from trusted gateway headers — through every layer that
+touches the search index, with no layer able to opt out:
+
+```
+RagService.answer(question, principal)
+  -> Retriever.retrieve(question, principal)
+       -> SearchClient.search(..., principal=principal)   # required, no default
+```
+
+`principal` has no default anywhere on this call chain. A default would make "no authorization
+context" a spelling a caller could reach by omission, invisibly, at any of the three call sites; a
+required keyword argument makes an unscoped query a type error instead of a runtime data leak.
+`AzureSearchClient.search()` is the one place that turns a `Principal` into the wire-level OData
+`filter` — see [access control is a query-time filter, not a separate
+check](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check) — and
+`FakeSearchClient` enforces the identical policy in Python via `is_document_visible()`, so a test
+that passes against the fake cannot be relying on an authorization check the real adapter omits.
+
+A cross-tenant or wrong-group question resolves exactly like FP1 below: zero visible hits, `status:
+"no_answer"`, no distinguishable "you asked but were denied" signal. That is a deliberate corollary
+of shared-index, query-time isolation (see [the trust-boundary
+note](api-conventions.md#identity-and-tenancy-day-15)): the index itself does not know the
+difference between "nothing matched" and "something matched but you may not see it", and this
+pipeline does not manufacture that distinction after the fact.
+
+### Two Day 15 debts, stated as honest boundaries, not silent gaps
+
+- **Source fencing is a marker, not a sandbox.** Every retrieved chunk is wrapped in
+  `BEGIN UNTRUSTED SOURCE n` / `END UNTRUSTED SOURCE n` before it reaches the prompt
+  (`render_sources()`), on top of the template-level instruction that source text is data, not
+  commands. That raises the bar against a corpus entry phrased as an instruction; it does not remove
+  the entry from the model's context window, and a sufficiently well-crafted poisoned chunk is still
+  on the threat model exactly as [Failure modes](#failure-modes-design-inputs-not-afterthoughts) FP4
+  describes it — "not extracted" has a mirror failure, "extracted as if it were an instruction",
+  that fencing mitigates rather than closes.
+- **Citation validation is syntactic, not evidentiary.** `_validate_citations()` strips a `[n]`
+  marker whose number falls outside `1..included_hit_count` — the range of sources actually sent to
+  the model, after budget-driven dropping — and logs only the invalid numbers, never the answer
+  text. What survives validation is a citation that *points at a source that was really in context*;
+  it is not proof the cited sentence is actually supported by that source's content. A model can
+  still cite source `[2]` for a claim that source does not substantiate, and this pipeline has no
+  stage that would catch it. This is the same class of honest gap as FP1's model-refusal case below:
+  the check that exists is real and worth having, and it stops at exactly the boundary stated here.
 
 ## Why RAG and not fine-tuning
 

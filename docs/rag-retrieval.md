@@ -190,6 +190,57 @@ The adapters own their connection pool when they allocate it and never close one
 in. Long-running tools open them in an `async with` block, which releases the pool at a point in
 time the program chooses instead of whenever the object is collected.
 
+## Access control is a query-time filter, not a separate check
+
+`SearchClient.search()` takes a required `principal: Principal` argument with no default (Day 15).
+There is no overload, keyword, or code path that issues an unfiltered query — "no authorization
+context" is not a value this boundary can represent, so it cannot be reached by omission the way an
+optional argument could be forgotten at a callsite.
+
+`services/acl.py::build_acl_filter(principal)` is the single function that turns a `Principal` into
+the OData `filter` clause `build_search_body()` sends on every request (query and vector alike):
+
+```odata
+tenant_id eq 'tenant-a' and (
+  not allowed_groups/any()
+  or allowed_groups/any(g: search.in(g, 'finance,support'))
+)
+```
+
+Tenant match is unconditional; the group clause's public branch (`not allowed_groups/any()`) applies
+to *every* principal regardless of its own groups, because an `allowed_groups: []` document is
+tenant-wide readable by definition. When the principal itself carries no groups, the filter
+simplifies to `tenant_id eq '...' and not allowed_groups/any()` — such a principal can only ever see
+tenant-wide documents, never a group-scoped one. Every literal embedded in the filter — the tenant
+id, the joined group list — passes through `escape_odata_literal()` (`'` doubled to `''`) before
+it reaches the string, the same escaping indexing enumeration already used; `services/acl.py` and
+`services/search_data_plane.py` share that one function rather than each carrying its own copy.
+
+**`vectorFilterMode: preFilter` accompanies every vector query, explicitly, rather than relying on
+whatever the index's creation-time default happens to be.** The alternative — post-filtering —
+applies the ACL filter *after* the ANN search has already chosen its `k` nearest neighbours, so a
+tenant whose documents lose that neighbour race against a large shared index gets fewer results, or
+none, instead of the top-`k` of what it is actually allowed to see. That reads as a relevance
+regression, not a bug, until someone traces it back to the filter mode — and it only manifests once
+the index holds enough documents belonging to *other* tenants to crowd the candidate list, which is
+exactly the shape a shared, multi-tenant index has by design. Pre-filtering restricts the candidate
+pool before the ANN search runs, so the `k` neighbours it returns are already scoped correctly.
+
+`FakeSearchClient` does not parse OData — nothing in the fake ever builds a filter string. Instead it
+enforces the identical policy via `is_document_visible(document, principal)`, a pure-Python
+predicate reading the same `tenant_id`/`allowed_groups` semantics as `build_acl_filter()`. Agreement
+between the real filter and the fake's enforcement is therefore a property of `services/acl.py`
+being the one shared policy module, not a property either client re-derives on its own; the fake
+still records `last_filter` — the OData expression the real adapter would have sent for the same
+principal — purely as an assertion about the wire, not as what was actually enforced in the test.
+
+There is no "access denied" outcome anywhere in this pipeline. A document outside the caller's
+tenant/group scope is excluded by the filter before it is ever scored, and it comes back
+indistinguishable from a document that was never indexed at all — the same shape as FP1 (missing
+content) in [rag-overview.md](rag-overview.md#failure-modes-design-inputs-not-afterthoughts). A
+cross-tenant question therefore resolves as `status: "no_answer"`, exactly like an answer-absent
+corpus, never as a distinct denial signal a client could branch on.
+
 ## Authentication
 
 The lab uses an admin key: creating an index, uploading and deleting documents all require
