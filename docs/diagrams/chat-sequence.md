@@ -20,7 +20,7 @@ sequenceDiagram
     alt conversation_id supplied
         API->>Store: get(tenant_id, conversation_id)
         Store-->>API: history (or 404 conversation_not_found)
-        Note right of Store: a conversation_id from another tenant is<br/>indistinguishable from an unknown one — 404,<br/>never 403; no mutation on this failed lookup
+        Note right of Store: a conversation_id from another tenant is<br/>indistinguishable from an unknown one — 404,<br/>never 403, no mutation on this failed lookup
     else omitted
         API->>API: issue new conversation_id (scoped to tenant_id)
     end
@@ -30,7 +30,7 @@ sequenceDiagram
     API->>LLM: Responses API: replay items (incl. encrypted reasoning) + new user input, max_output_tokens
     LLM-->>API: reply + status (completed | incomplete) + usage {input, output, reasoning, total}
     API->>Store: append(tenant_id, conversation_id, transcript turn + replay items + usage tokens)
-    Note over API,Store: turn-commit: messages and token ledger together,\nonly after success; keyed by (tenant_id, conversation_id)
+    Note over API,Store: turn-commit: messages and token ledger together,<br/>only after success, keyed by (tenant_id, conversation_id)
     API-->>Client: ChatResponse {message, conversation_id, correlation_id, usage, status, incomplete_reason?}
 ```
 
