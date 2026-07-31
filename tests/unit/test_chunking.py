@@ -21,6 +21,7 @@ def _document(body: str) -> SourceDocument:
         doc_type="policy",
         tenant_id="acme",
         effective_date=date(2026, 1, 15),
+        allowed_groups=(),
         body=body,
     )
 

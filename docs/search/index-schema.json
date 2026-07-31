@@ -67,6 +67,15 @@
       "facetable": false
     },
     {
+      "name": "allowed_groups",
+      "type": "Collection(Edm.String)",
+      "retrievable": true,
+      "searchable": false,
+      "filterable": true,
+      "sortable": false,
+      "facetable": false
+    },
+    {
       "name": "effective_date",
       "type": "Edm.DateTimeOffset",
       "retrievable": true,

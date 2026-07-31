@@ -58,6 +58,7 @@ class SourceDocument:
     doc_type: str
     tenant_id: str
     effective_date: date
+    allowed_groups: tuple[str, ...]
     body: str
 
 
@@ -81,6 +82,7 @@ class Chunk:
     doc_type: str
     tenant_id: str
     effective_date: date
+    allowed_groups: tuple[str, ...]
 
     def __post_init__(self) -> None:
         validate_document_key(self.chunk_id, field="chunk_id")
@@ -126,6 +128,7 @@ class Chunk:
             "doc_type": self.doc_type,
             "tenant_id": self.tenant_id,
             "effective_date": f"{self.effective_date.isoformat()}T00:00:00Z",
+            "allowed_groups": list(self.allowed_groups),
             VECTOR_FIELD: list(vector),
         }
 

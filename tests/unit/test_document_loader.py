@@ -28,6 +28,7 @@ title: Returns Policy
 doc_type: policy
 tenant_id: acme
 effective_date: 2026-01-15
+allowed_groups: []
 ---
 
 # Returns Policy
@@ -38,53 +39,61 @@ We accept returns within 14 days.
 
 def _write(tmp_path: Path, name: str, content: str) -> Path:
     path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return path
 
 
+def _write_in_tenant_dir(tmp_path: Path, tenant: str, filename: str, content: str) -> Path:
+    return _write(tmp_path, f"{tenant}/{filename}", content)
+
+
 def test_loads_a_valid_document(tmp_path: Path) -> None:
-    document = load_document(_write(tmp_path, "returns-policy.md", VALID))
+    document = load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", VALID))
 
     assert document.doc_id == "returns-policy"
     assert document.title == "Returns Policy"
     assert document.doc_type == "policy"
     assert document.tenant_id == "acme"
     assert document.effective_date == date(2026, 1, 15)
+    assert document.allowed_groups == ()
     assert document.body.startswith("# Returns Policy")
     assert "doc_id" not in document.body
 
 
 def test_doc_id_must_match_the_filename_stem(tmp_path: Path) -> None:
     with pytest.raises(SourceDocumentError, match="does not match filename"):
-        load_document(_write(tmp_path, "other-name.md", VALID))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "other-name.md", VALID))
 
 
 @pytest.mark.parametrize(
-    "field", ["doc_id", "title", "doc_type", "tenant_id", "effective_date"]
+    "field", ["doc_id", "title", "doc_type", "tenant_id", "effective_date", "allowed_groups"]
 )
 def test_missing_field_is_rejected(tmp_path: Path, field: str) -> None:
     content = "\n".join(
         line for line in VALID.splitlines() if not line.startswith(f"{field}:")
     )
     with pytest.raises(SourceDocumentError, match=field):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_unknown_field_is_rejected(tmp_path: Path) -> None:
     content = VALID.replace("tenant_id: acme", "tenant_id: acme\nauthor: someone")
     with pytest.raises(SourceDocumentError, match="author"):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_missing_front_matter_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(SourceDocumentError, match="front matter"):
-        load_document(_write(tmp_path, "returns-policy.md", "# No front matter\n"))
+        load_document(
+            _write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", "# No front matter\n")
+        )
 
 
 def test_effective_date_must_be_a_date(tmp_path: Path) -> None:
     content = VALID.replace("effective_date: 2026-01-15", "effective_date: yesterday")
     with pytest.raises(SourceDocumentError, match="effective_date"):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_a_yaml_timestamp_effective_date_is_rejected(tmp_path: Path) -> None:
@@ -94,7 +103,7 @@ def test_a_yaml_timestamp_effective_date_is_rejected(tmp_path: Path) -> None:
         "effective_date: 2026-01-15", "effective_date: 2026-01-15T12:34:56Z"
     )
     with pytest.raises(SourceDocumentError, match="effective_date"):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_a_timezone_naive_yaml_timestamp_is_rejected(tmp_path: Path) -> None:
@@ -102,11 +111,11 @@ def test_a_timezone_naive_yaml_timestamp_is_rejected(tmp_path: Path) -> None:
         "effective_date: 2026-01-15", "effective_date: 2026-01-15 12:34:56"
     )
     with pytest.raises(SourceDocumentError, match="effective_date"):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_a_plain_yaml_date_is_still_accepted(tmp_path: Path) -> None:
-    document = load_document(_write(tmp_path, "returns-policy.md", VALID))
+    document = load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", VALID))
 
     assert document.effective_date == date(2026, 1, 15)
 
@@ -114,29 +123,81 @@ def test_a_plain_yaml_date_is_still_accepted(tmp_path: Path) -> None:
 def test_empty_body_is_rejected(tmp_path: Path) -> None:
     content = VALID.split("---\n\n")[0] + "---\n\n"
     with pytest.raises(SourceDocumentError, match="body"):
-        load_document(_write(tmp_path, "returns-policy.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
 
 
 def test_doc_id_over_the_authoring_limit_is_rejected(tmp_path: Path) -> None:
     long_id = "a" * 65
     content = VALID.replace("doc_id: returns-policy", f"doc_id: {long_id}")
     with pytest.raises(SourceDocumentError, match="64"):
-        load_document(_write(tmp_path, f"{long_id}.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", f"{long_id}.md", content))
 
 
 def test_doc_id_with_illegal_characters_is_rejected(tmp_path: Path) -> None:
     content = VALID.replace("doc_id: returns-policy", "doc_id: _returns")
     with pytest.raises((SourceDocumentError, DocumentKeyError)):
-        load_document(_write(tmp_path, "_returns.md", content))
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "_returns.md", content))
 
 
 def test_load_documents_reads_every_markdown_file(tmp_path: Path) -> None:
-    _write(tmp_path, "returns-policy.md", VALID)
-    _write(tmp_path, "billing-faq.md", VALID.replace("returns-policy", "billing-faq"))
+    _write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", VALID)
+    globex_content = VALID.replace("returns-policy", "billing-faq").replace(
+        "tenant_id: acme", "tenant_id: globex"
+    )
+    _write_in_tenant_dir(tmp_path, "globex", "billing-faq.md", globex_content)
 
     documents = load_documents(tmp_path)
 
-    assert [document.doc_id for document in documents] == ["billing-faq", "returns-policy"]
+    # Paths are walked in full sorted order (tenant directory first), so
+    # "acme/returns-policy.md" sorts before "globex/billing-faq.md".
+    assert [document.doc_id for document in documents] == ["returns-policy", "billing-faq"]
+
+
+def test_allowed_groups_must_be_a_list(tmp_path: Path) -> None:
+    content = VALID.replace("allowed_groups: []", "allowed_groups: finance")
+    with pytest.raises(SourceDocumentError, match="allowed_groups"):
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
+
+
+def test_allowed_groups_duplicates_are_rejected(tmp_path: Path) -> None:
+    content = VALID.replace("allowed_groups: []", "allowed_groups: [finance, finance]")
+    with pytest.raises(SourceDocumentError, match="duplicate"):
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
+
+
+def test_allowed_groups_entries_are_validated_as_identifiers(tmp_path: Path) -> None:
+    content = VALID.replace("allowed_groups: []", "allowed_groups: [not a valid group]")
+    with pytest.raises(SourceDocumentError, match="allowed_groups"):
+        load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
+
+
+def test_directory_and_front_matter_tenant_mismatch_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(SourceDocumentError, match="tenant"):
+        load_document(_write_in_tenant_dir(tmp_path, "globex", "returns-policy.md", VALID))
+
+
+def test_non_identifier_tenant_directory_name_is_rejected(tmp_path: Path) -> None:
+    content = VALID.replace("tenant_id: acme", "tenant_id: not valid")
+    with pytest.raises(SourceDocumentError, match="tenant"):
+        load_document(_write_in_tenant_dir(tmp_path, "not valid", "returns-policy.md", content))
+
+
+def test_allowed_groups_propagates_from_document_to_chunk_to_index_document(
+    tmp_path: Path,
+) -> None:
+    from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+    from azgenai_lab.services.chunking import chunk_markdown
+
+    content = VALID.replace("allowed_groups: []", "allowed_groups: [oncall]")
+    document = load_document(_write_in_tenant_dir(tmp_path, "acme", "returns-policy.md", content))
+
+    assert document.allowed_groups == ("oncall",)
+
+    chunks = chunk_markdown(document, max_chars=2000, overlap_chars=500)
+    assert all(chunk.allowed_groups == ("oncall",) for chunk in chunks)
+
+    index_document = chunks[0].to_index_document([0.0] * EMBEDDING_DIMENSIONS)
+    assert index_document["allowed_groups"] == ["oncall"]
 
 
 def test_load_documents_rejects_an_empty_directory(tmp_path: Path) -> None:
@@ -164,7 +225,7 @@ def test_the_shipped_corpus_loads() -> None:
 
 
 def test_the_shipped_corpus_has_no_cjk_characters() -> None:
-    for path in sorted(SAMPLE_DOCS_DIR.glob("*.md")):
+    for path in sorted(SAMPLE_DOCS_DIR.glob("**/*.md")):
         assert not _CJK.search(path.read_text(encoding="utf-8")), (
             f"{path.name} contains a CJK character; this directory must stay English-only"
         )
@@ -178,7 +239,7 @@ def test_the_shipped_corpus_splits_tenants_two_and_two() -> None:
 def test_the_shipped_corpus_has_third_level_headings_in_at_least_two_files() -> None:
     files_with_h3 = [
         path
-        for path in sorted(SAMPLE_DOCS_DIR.glob("*.md"))
+        for path in sorted(SAMPLE_DOCS_DIR.glob("**/*.md"))
         if re.search(r"^### ", path.read_text(encoding="utf-8"), re.MULTILINE)
     ]
     assert len(files_with_h3) >= 2, "expected at least two documents with ### subsections"
@@ -187,7 +248,7 @@ def test_the_shipped_corpus_has_third_level_headings_in_at_least_two_files() -> 
 def test_the_shipped_corpus_has_a_section_over_the_chunk_max_chars_threshold() -> None:
     threshold = Settings(_env_file=None).chunk_max_chars
     longest = 0
-    for path in sorted(SAMPLE_DOCS_DIR.glob("*.md")):
+    for path in sorted(SAMPLE_DOCS_DIR.glob("**/*.md")):
         text = path.read_text(encoding="utf-8")
         headings = list(_HEADING.finditer(text))
         for index, match in enumerate(headings):
@@ -208,7 +269,7 @@ def test_the_shipped_corpus_repeats_a_heading_under_two_different_parents() -> N
     # distinct parent sections. Chunking must key chunks by full heading
     # path, not by leaf heading text alone — this fixture is what would catch
     # a chunker that got that wrong.
-    for path in sorted(SAMPLE_DOCS_DIR.glob("*.md")):
+    for path in sorted(SAMPLE_DOCS_DIR.glob("**/*.md")):
         parents_by_heading: dict[str, set[str]] = defaultdict(set)
         current_h2 = ""
         for match in _HEADING.finditer(path.read_text(encoding="utf-8")):

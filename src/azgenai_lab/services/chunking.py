@@ -233,6 +233,7 @@ def chunk_markdown(
                     doc_type=document.doc_type,
                     tenant_id=document.tenant_id,
                     effective_date=document.effective_date,
+                    allowed_groups=document.allowed_groups,
                 )
             )
     if not chunks:
