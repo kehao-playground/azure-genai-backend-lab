@@ -23,6 +23,7 @@ import httpx
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
     TEXT_QUERY_MODES,
@@ -38,7 +39,7 @@ from azgenai_lab.models.search_index import (
     SEMANTIC_CONFIGURATION_NAME,
     VECTOR_FIELD,
 )
-from azgenai_lab.services.acl import require_acl_metadata
+from azgenai_lab.services.acl import build_acl_filter, is_document_visible, require_acl_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,16 @@ class SearchDiagnostics:
 
 
 class SearchClient(Protocol):
+    """The query boundary. ``principal`` is required and has no default.
+
+    A default would make "no authorization context" a spelling a caller can
+    reach by omission, and the omission is invisible at the callsite. Every
+    query is scoped by an authenticated principal or it does not compile.
+    The raw ``filter`` argument is deliberately gone: the only OData filter
+    this boundary sends is the one it derives from the principal, so no
+    caller can widen, narrow, or replace it.
+    """
+
     async def search(
         self,
         query_text: str,
@@ -132,7 +143,7 @@ class SearchClient(Protocol):
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult: ...
 
@@ -152,7 +163,7 @@ def build_search_body(
     *,
     mode: SearchMode,
     top: int,
-    filter: str | None = None,
+    filter: str,
     vector_k: int = DEFAULT_VECTOR_K,
 ) -> dict[str, Any]:
     """Build the Search Documents request body for one mode.
@@ -163,9 +174,19 @@ def build_search_body(
     (``vectorQueries``, ``queryType``, ``semanticConfiguration``) is Azure's
     vocabulary, not this project's.
 
-    ``filter`` is a **trusted internal OData expression**. Day 15's tenant
-    isolation must not interpolate a user-supplied value into this string; it
-    has to be built from a typed authorization context and escaped there.
+    ``filter`` is a **required, trusted internal OData expression**, built by
+    ``services/acl.py`` from a typed ``Principal`` and escaped there. It has
+    no default: an unfiltered query is not a shape this function can produce,
+    so a missing authorization scope is a type error rather than a silent
+    cross-tenant read.
+
+    ``vectorFilterMode: preFilter`` accompanies every vector query. The
+    default is post-filtering, which applies the filter *after* the ANN
+    search has already picked its k neighbours — so a tenant whose documents
+    lose the neighbour race gets fewer results, or none, rather than the
+    top-k of what it is allowed to see. That is a correctness bug dressed as
+    a relevance one, and it only appears once an index holds enough foreign
+    documents to crowd the candidate list.
     """
     validate_search_arguments(query_text, query_vector, mode=mode, top=top, vector_k=vector_k)
 
@@ -182,11 +203,11 @@ def build_search_body(
                 "k": vector_k,
             }
         ]
+        body["vectorFilterMode"] = "preFilter"
     if mode is SearchMode.HYBRID_SEMANTIC:
         body["queryType"] = "semantic"
         body["semanticConfiguration"] = SEMANTIC_CONFIGURATION_NAME
-    if filter is not None:
-        body["filter"] = filter
+    body["filter"] = filter
     return body
 
 
@@ -306,7 +327,7 @@ class AzureSearchClient:
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult:
         # Cleared first, before argument validation can raise. Leaving the
@@ -316,8 +337,16 @@ class AzureSearchClient:
         # can detect, because the file is intact and the contents are simply
         # about the wrong request.
         self.last_diagnostics = None
+        # The filter is derived here, from the principal, and nowhere else:
+        # this adapter is the last place the query passes through before the
+        # wire, so a caller has no seam left to hand one in.
         body = build_search_body(
-            query_text, query_vector, mode=mode, top=top, filter=filter, vector_k=vector_k
+            query_text,
+            query_vector,
+            mode=mode,
+            top=top,
+            filter=build_acl_filter(principal),
+            vector_k=vector_k,
         )
         started = time.perf_counter()
         try:
@@ -390,11 +419,13 @@ class FakeSearchClient:
     unfaithful stand-in — an honest fake beats a plausible one. Retrieval
     quality observed here means nothing.
 
-    It also does not apply ``filter``: the argument is recorded on
-    ``last_filter`` so a caller can assert what was passed, but every document
-    is still scored and can still be returned regardless of its value. A test
-    written against this fake to assert "tenant B's chunks are not returned"
-    would pass whether or not real filtering was ever wired up.
+    Access control is the one thing it does enforce. It applies the same
+    ``services/acl.py`` policy the real filter expresses, via
+    ``is_document_visible`` — evaluated in Python rather than by the service,
+    so agreement between the two is a property of that shared module, not of
+    this fake. ``last_filter`` records the OData expression the real adapter
+    would have sent for the same principal, which is an assertion about the
+    wire, not about what was enforced here.
     """
 
     def __init__(self, documents: Sequence[dict[str, Any]] = ()) -> None:
@@ -406,6 +437,7 @@ class FakeSearchClient:
         self.last_top: int | None = None
         self.last_vector_k: int | None = None
         self.last_filter: str | None = None
+        self.last_principal: Principal | None = None
 
     async def search(
         self,
@@ -414,7 +446,7 @@ class FakeSearchClient:
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = DEFAULT_VECTOR_K,
     ) -> SearchResult:
         validate_search_arguments(
@@ -423,11 +455,14 @@ class FakeSearchClient:
         self.last_mode = mode
         self.last_top = top
         self.last_vector_k = vector_k
-        self.last_filter = filter
+        self.last_principal = principal
+        self.last_filter = build_acl_filter(principal)
 
         terms = {term for term in query_text.lower().split() if term}
         scored: list[tuple[float, SearchHit]] = []
         for document in self._documents:
+            if not is_document_visible(document, principal):
+                continue
             haystack = " ".join(
                 str(document.get(field, "")) for field in ("title", "heading_path", "content")
             ).lower()

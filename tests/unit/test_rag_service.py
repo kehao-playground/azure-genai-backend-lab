@@ -9,6 +9,7 @@ from dataclasses import replace
 import pytest
 
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, FakeChatService
@@ -32,6 +33,8 @@ HIT = SearchHit(
     content="alpha beta",
     score=1.0,
 )
+
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
 
 DOC = {
     "chunk_id": "doc-a-0000",
@@ -70,7 +73,7 @@ async def test_answer_returns_no_answer_without_calling_llm_on_zero_hits() -> No
     service = RagService(
         Retriever(FakeEmbeddingClient(), FakeSearchClient([]), top=5), ExplodingChat()
     )
-    result = await service.answer("anything")
+    result = await service.answer("anything", PRINCIPAL)
     assert result.status == "no_answer"
     assert result.answer is None
     assert result.hits == ()
@@ -83,7 +86,7 @@ async def test_answer_grounds_single_turn_and_carries_usage() -> None:
     service = RagService(
         Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5), fake_chat
     )
-    result = await service.answer("alpha")
+    result = await service.answer("alpha", PRINCIPAL)
     assert result.status == "answered"
     assert result.answer is not None
     assert "prompt=rag_answer@1" in result.answer
@@ -109,7 +112,7 @@ class _StubOversizedSearchClient:
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = 50,
     ) -> SearchResult:
         return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
@@ -167,7 +170,7 @@ async def test_answer_truncates_hostile_oversized_corpus_to_fit_prompt_budget() 
     service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
 
     question = "q" * 2000
-    result = await service.answer(question)
+    result = await service.answer(question, PRINCIPAL)
 
     assert result.status == "answered"
     assert len(result.hits) < 50
@@ -198,7 +201,7 @@ async def test_answer_raises_context_overflow_when_first_hit_content_too_big() -
     service = RagService(retriever, chat)
 
     with pytest.raises(RagContextOverflowError):
-        await service.answer("q")
+        await service.answer("q", PRINCIPAL)
 
     assert chat.received_items is None  # zero provider calls
 
@@ -212,7 +215,7 @@ async def test_answer_raises_context_overflow_when_first_hit_heading_path_too_bi
     service = RagService(retriever, chat)
 
     with pytest.raises(RagContextOverflowError):
-        await service.answer("q")
+        await service.answer("q", PRINCIPAL)
 
     assert chat.received_items is None
 
@@ -224,7 +227,7 @@ async def test_answer_includes_all_hits_when_within_budget() -> None:
         fake_chat,
         instructions_bytes=10,
     )
-    result = await service.answer("alpha")
+    result = await service.answer("alpha", PRINCIPAL)
     assert result.status == "answered"
     assert len(result.hits) == 1
 
@@ -240,7 +243,7 @@ async def test_answer_logs_dropped_source_count_on_truncation(
     service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
 
     with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
-        result = await service.answer("q" * 2000)
+        result = await service.answer("q" * 2000, PRINCIPAL)
 
     record = next(r for r in caplog.records if r.name == "azgenai_lab.services.rag")
     message = record.getMessage()
@@ -271,7 +274,7 @@ async def test_hit_landing_exactly_on_remaining_budget_is_included() -> None:
     retriever = Retriever(FakeEmbeddingClient(), _StubOversizedSearchClient([exact_hit]), top=5)
     chat = _RecordingChatService()
     service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
-    result = await service.answer(question)
+    result = await service.answer(question, PRINCIPAL)
 
     assert result.status == "answered"
     assert len(result.hits) == 1
@@ -294,7 +297,7 @@ async def test_hit_one_byte_over_remaining_budget_is_rejected() -> None:
     service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
 
     with pytest.raises(RagContextOverflowError):
-        await service.answer(question)
+        await service.answer(question, PRINCIPAL)
 
 
 async def test_prompt_framing_headroom_is_subtracted_from_token_limit() -> None:
@@ -333,7 +336,7 @@ async def test_answer_truncates_original_shape_astral_corpus_under_new_budget() 
     chat = _RecordingChatService()
     service = RagService(retriever, chat, instructions_bytes=instructions_bytes)
 
-    result = await service.answer(question)
+    result = await service.answer(question, PRINCIPAL)
 
     assert result.status == "answered"
     assert len(result.hits) == expected_included

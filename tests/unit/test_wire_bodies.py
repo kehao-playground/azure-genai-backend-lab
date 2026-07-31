@@ -16,6 +16,7 @@ import httpx
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
@@ -25,6 +26,11 @@ from azgenai_lab.services.search_data_plane import SearchDataPlane, plan_batches
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 _VECTOR_JSON = b",".join([b"0.1"] * EMBEDDING_DIMENSIONS)
 _SELECT = b'"select":"chunk_id,parent_id,title,heading_path,content"'
+
+# tenant "t1", no groups: build_acl_filter() renders this exact clause, which
+# is what makes the byte-for-byte pins below reproducible.
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+_FILTER_JSON = b'"filter":"tenant_id eq \'t1\' and not allowed_groups/any()"'
 
 
 def _settings() -> Settings:
@@ -54,10 +60,10 @@ async def test_keyword_body_is_byte_for_byte_what_it_has_always_been() -> None:
     recorder = _Recorder()
     client = AzureSearchClient(_settings(), client=recorder.transport())
 
-    await client.search("refund window", mode=SearchMode.KEYWORD, top=5)
+    await client.search("refund window", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
 
     assert recorder.bodies == [
-        b'{"top":5,' + _SELECT + b',"search":"refund window"}'
+        b'{"top":5,' + _SELECT + b',"search":"refund window",' + _FILTER_JSON + b"}"
     ]
 
 
@@ -65,14 +71,18 @@ async def test_vector_body_is_byte_for_byte_what_it_has_always_been() -> None:
     recorder = _Recorder()
     client = AzureSearchClient(_settings(), client=recorder.transport())
 
-    await client.search("refund window", VECTOR, mode=SearchMode.VECTOR, top=5, vector_k=3)
+    await client.search(
+        "refund window", VECTOR, mode=SearchMode.VECTOR, top=5, vector_k=3, principal=PRINCIPAL
+    )
 
     assert recorder.bodies == [
         b'{"top":5,'
         + _SELECT
         + b',"vectorQueries":[{"kind":"vector","vector":['
         + _VECTOR_JSON
-        + b'],"fields":"content_vector","k":3}]}'
+        + b'],"fields":"content_vector","k":3}],"vectorFilterMode":"preFilter",'
+        + _FILTER_JSON
+        + b"}"
     ]
 
 
@@ -80,27 +90,8 @@ async def test_hybrid_body_is_byte_for_byte_what_it_has_always_been() -> None:
     recorder = _Recorder()
     client = AzureSearchClient(_settings(), client=recorder.transport())
 
-    await client.search("refund window", VECTOR, mode=SearchMode.HYBRID, top=5)
-
-    assert recorder.bodies == [
-        b'{"top":5,'
-        + _SELECT
-        + b',"search":"refund window","vectorQueries":[{"kind":"vector","vector":['
-        + _VECTOR_JSON
-        + b'],"fields":"content_vector","k":50}]}'
-    ]
-
-
-async def test_hybrid_semantic_body_is_byte_for_byte_what_it_has_always_been() -> None:
-    recorder = _Recorder()
-    client = AzureSearchClient(_settings(), client=recorder.transport())
-
     await client.search(
-        "refund window",
-        VECTOR,
-        mode=SearchMode.HYBRID_SEMANTIC,
-        top=5,
-        filter="tenant_id eq 'acme'",
+        "refund window", VECTOR, mode=SearchMode.HYBRID, top=5, principal=PRINCIPAL
     )
 
     assert recorder.bodies == [
@@ -108,8 +99,34 @@ async def test_hybrid_semantic_body_is_byte_for_byte_what_it_has_always_been() -
         + _SELECT
         + b',"search":"refund window","vectorQueries":[{"kind":"vector","vector":['
         + _VECTOR_JSON
-        + b'],"fields":"content_vector","k":50}],"queryType":"semantic",'
-        b'"semanticConfiguration":"chunk-semantic","filter":"tenant_id eq \'acme\'"}'
+        + b'],"fields":"content_vector","k":50}],"vectorFilterMode":"preFilter",'
+        + _FILTER_JSON
+        + b"}"
+    ]
+
+
+async def test_hybrid_semantic_body_is_byte_for_byte_what_it_has_always_been() -> None:
+    recorder = _Recorder()
+    client = AzureSearchClient(_settings(), client=recorder.transport())
+
+    acme_principal = Principal(tenant_id="acme", group_ids=())
+    await client.search(
+        "refund window",
+        VECTOR,
+        mode=SearchMode.HYBRID_SEMANTIC,
+        top=5,
+        principal=acme_principal,
+    )
+
+    assert recorder.bodies == [
+        b'{"top":5,'
+        + _SELECT
+        + b',"search":"refund window","vectorQueries":[{"kind":"vector","vector":['
+        + _VECTOR_JSON
+        + b'],"fields":"content_vector","k":50}],"vectorFilterMode":"preFilter",'
+        b'"queryType":"semantic",'
+        b'"semanticConfiguration":"chunk-semantic",'
+        b'"filter":"tenant_id eq \'acme\' and not allowed_groups/any()"}'
     ]
 
 

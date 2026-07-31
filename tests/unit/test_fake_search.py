@@ -2,8 +2,10 @@ import pytest
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+from azgenai_lab.services.acl import build_acl_filter
 from azgenai_lab.services.azure_search import (
     AzureSearchClient,
     FakeSearchClient,
@@ -11,6 +13,8 @@ from azgenai_lab.services.azure_search import (
 )
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
+
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
 
 DOCUMENTS = [
     {
@@ -35,7 +39,9 @@ DOCUMENTS = [
 
 
 async def test_fake_matches_lexically_and_ranks_deterministically() -> None:
-    result = await FakeSearchClient(DOCUMENTS).search("refund", mode=SearchMode.KEYWORD, top=5)
+    result = await FakeSearchClient(DOCUMENTS).search(
+        "refund", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL
+    )
     assert [hit.chunk_id for hit in result.hits] == ["returns-policy-0001"]
 
 
@@ -43,7 +49,7 @@ async def test_fake_returns_nothing_for_an_absent_topic() -> None:
     # The no-answer path Day 14 needs: search returns an empty set, and the
     # absence is the caller's to handle — it is not signalled by an error.
     result = await FakeSearchClient(DOCUMENTS).search(
-        "parental leave", VECTOR, mode=SearchMode.HYBRID, top=5
+        "parental leave", VECTOR, mode=SearchMode.HYBRID, top=5, principal=PRINCIPAL
     )
     assert result.hits == ()
 
@@ -53,50 +59,118 @@ async def test_fake_enforces_the_same_arguments_the_service_would() -> None:
     # the test suite goes green and production raises. Both clients share
     # validate_search_arguments() precisely to stop that.
     with pytest.raises(ValueError, match="requires a query vector"):
-        await FakeSearchClient(DOCUMENTS).search("refund", mode=SearchMode.HYBRID, top=5)
+        await FakeSearchClient(DOCUMENTS).search(
+            "refund", mode=SearchMode.HYBRID, top=5, principal=PRINCIPAL
+        )
     with pytest.raises(ValueError, match="non-empty"):
-        await FakeSearchClient(DOCUMENTS).search("  ", VECTOR, mode=SearchMode.VECTOR, top=5)
+        await FakeSearchClient(DOCUMENTS).search(
+            "  ", VECTOR, mode=SearchMode.VECTOR, top=5, principal=PRINCIPAL
+        )
     with pytest.raises(ValueError, match="dimensions"):
-        await FakeSearchClient(DOCUMENTS).search("refund", [0.1], mode=SearchMode.VECTOR, top=5)
+        await FakeSearchClient(DOCUMENTS).search(
+            "refund", [0.1], mode=SearchMode.VECTOR, top=5, principal=PRINCIPAL
+        )
 
 
 async def test_fake_records_the_parameters_it_was_called_with() -> None:
     fake = FakeSearchClient(DOCUMENTS)
+    principal = Principal(tenant_id="acme", group_ids=("oncall",))
     await fake.search(
         "refund",
         VECTOR,
         mode=SearchMode.HYBRID_SEMANTIC,
         top=3,
-        filter="tenant_id eq 'acme'",
+        principal=principal,
         vector_k=7,
     )
     assert fake.last_mode is SearchMode.HYBRID_SEMANTIC
     assert fake.last_top == 3
     assert fake.last_vector_k == 7
-    assert fake.last_filter == "tenant_id eq 'acme'"
+    assert fake.last_principal == principal
+    # The recorded filter is the expression the *real* adapter would have put
+    # on the wire for this principal — an assertion about the request shape,
+    # not about what the fake enforced in Python.
+    assert fake.last_filter == build_acl_filter(principal)
 
 
-async def test_fake_does_not_apply_the_filter_it_records() -> None:
-    # `last_filter` proves what a caller passed; it proves nothing about
-    # whether the fake honoured it. A "tenant B's chunks are not returned"
-    # test would pass against this fake regardless of whether real filtering
-    # was ever wired up — this pins that gap so the next reader cannot
-    # mistake `last_filter` for filtering.
+async def test_fake_hides_another_tenants_documents() -> None:
+    # Same lexical match, different tenant: the hit that a same-tenant
+    # principal gets must be absent here, and absent in the same way an
+    # empty corpus is — no error, no signal that anything was withheld.
     result = await FakeSearchClient(DOCUMENTS).search(
         "refund",
         VECTOR,
         mode=SearchMode.HYBRID,
         top=5,
-        filter="tenant_id eq 'someone-else'",
+        principal=Principal(tenant_id="t2", group_ids=()),
     )
-    assert [hit.chunk_id for hit in result.hits] == ["returns-policy-0001"]
+    assert result.hits == ()
+
+
+async def test_fake_hides_a_group_restricted_document_from_a_principal_without_the_group() -> None:
+    documents = [
+        *DOCUMENTS,
+        {
+            "chunk_id": "oncall-runbook-0001",
+            "parent_id": "oncall-runbook",
+            "title": "On-Call Runbook",
+            "heading_path": "On-Call Runbook > Escalation",
+            "content": "Escalate a refund dispute to the duty manager.",
+            "tenant_id": "t1",
+            "allowed_groups": ["oncall"],
+        },
+    ]
+    fake = FakeSearchClient(documents)
+
+    without_group = await fake.search(
+        "refund", VECTOR, mode=SearchMode.HYBRID, top=5, principal=PRINCIPAL
+    )
+    assert [hit.chunk_id for hit in without_group.hits] == ["returns-policy-0001"]
+
+    with_group = await fake.search(
+        "refund",
+        VECTOR,
+        mode=SearchMode.HYBRID,
+        top=5,
+        principal=Principal(tenant_id="t1", group_ids=("oncall",)),
+    )
+    # The group-bearing principal sees both: tenant-wide documents stay
+    # visible when a group is added, they are not traded away for it.
+    assert {hit.chunk_id for hit in with_group.hits} == {
+        "returns-policy-0001",
+        "oncall-runbook-0001",
+    }
+
+
+async def test_fake_hides_a_group_restricted_document_from_another_tenants_group() -> None:
+    # Holding a group named `oncall` in tenant t2 must not open t1's
+    # `oncall` documents: the tenant clause is an AND, never an OR.
+    documents = [
+        {
+            "chunk_id": "oncall-runbook-0001",
+            "parent_id": "oncall-runbook",
+            "title": "On-Call Runbook",
+            "heading_path": "On-Call Runbook > Escalation",
+            "content": "Escalate a refund dispute to the duty manager.",
+            "tenant_id": "t1",
+            "allowed_groups": ["oncall"],
+        }
+    ]
+    result = await FakeSearchClient(documents).search(
+        "refund",
+        VECTOR,
+        mode=SearchMode.HYBRID,
+        top=5,
+        principal=Principal(tenant_id="t2", group_ids=("oncall",)),
+    )
+    assert result.hits == ()
 
 
 async def test_fake_never_invents_a_reranker_score() -> None:
     # It does not simulate the semantic ranker. A plausible reranker score
     # would be ranking "evidence" that is pure noise.
     result = await FakeSearchClient(DOCUMENTS).search(
-        "refund", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5
+        "refund", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5, principal=PRINCIPAL
     )
     assert all(hit.reranker_score is None for hit in result.hits)
 

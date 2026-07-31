@@ -16,9 +16,12 @@ import pytest
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.search_data_plane import SearchDataPlane
+
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
 
 
 def _settings() -> Settings:
@@ -53,7 +56,9 @@ async def test_the_query_adapter_leaves_an_injected_pool_open() -> None:
     # Still usable, which is the property the caller actually cares about —
     # `is_closed` alone would not catch a pool left in some other broken state.
     reused = AzureSearchClient(_settings(), client=injected)
-    assert (await reused.search("q", mode=SearchMode.KEYWORD, top=5)).hits == ()
+    assert (
+        await reused.search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
+    ).hits == ()
     await injected.aclose()
 
 

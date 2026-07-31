@@ -15,6 +15,7 @@ from azgenai_lab.core.correlation import correlation_id_var
 from azgenai_lab.core.errors import UpstreamServiceError
 from azgenai_lab.main import app
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, FakeChatService
@@ -22,6 +23,8 @@ from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import EmbeddingRejectedError, FakeEmbeddingClient
 from azgenai_lab.services.rag import RagService
 from azgenai_lab.services.retrieval import Retriever
+
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
 
 DOC = {
     "chunk_id": "doc-a-0000",
@@ -67,7 +70,7 @@ async def test_rag_stage_log_has_counts_and_lengths_not_question_or_content(
     token = correlation_id_var.set("cid-content-check")
     try:
         with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
-            await service.answer("does alpha do beta things?")
+            await service.answer("does alpha do beta things?", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 
@@ -92,7 +95,7 @@ async def test_rag_stage_log_on_no_answer_path_has_zero_counts(
     service = RagService(Retriever(FakeEmbeddingClient(), FakeSearchClient([]), top=5), None)  # type: ignore[arg-type]
 
     with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
-        result = await service.answer("anything with no corpus match")
+        result = await service.answer("anything with no corpus match", PRINCIPAL)
 
     assert result.status == "no_answer"
     record = next(r for r in caplog.records if r.name == "azgenai_lab.services.rag")
@@ -112,7 +115,7 @@ async def test_rag_answered_path_logs_generation_and_total_duration_correlation_
     token = correlation_id_var.set("cid-duration-answered")
     try:
         with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
-            result = await service.answer("alpha")
+            result = await service.answer("alpha", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 
@@ -142,7 +145,7 @@ async def test_rag_no_answer_path_logs_total_duration_without_generation_field(
     token = correlation_id_var.set("cid-duration-no-answer")
     try:
         with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
-            result = await service.answer("anything with no corpus match")
+            result = await service.answer("anything with no corpus match", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 
@@ -176,7 +179,7 @@ class _RaisingSearchClient:
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = 50,
     ) -> SearchResult:
         raise UpstreamServiceError("simulated search failure")
@@ -206,7 +209,7 @@ async def test_embed_stage_failure_logs_error_outcome_and_propagates(
     token = correlation_id_var.set("cid-embed-fail")
     try:
         with caplog.at_level(logging.INFO), pytest.raises(EmbeddingRejectedError):
-            await service.answer("does alpha do beta things?")
+            await service.answer("does alpha do beta things?", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 
@@ -239,7 +242,7 @@ async def test_search_stage_failure_logs_error_outcome_and_propagates(
     token = correlation_id_var.set("cid-search-fail")
     try:
         with caplog.at_level(logging.INFO), pytest.raises(UpstreamServiceError):
-            await service.answer("does alpha do beta things?")
+            await service.answer("does alpha do beta things?", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 
@@ -272,7 +275,7 @@ async def test_generation_stage_failure_logs_error_outcome_and_propagates(
     token = correlation_id_var.set("cid-generation-fail")
     try:
         with caplog.at_level(logging.INFO), pytest.raises(UpstreamServiceError):
-            await service.answer("does alpha do beta things?")
+            await service.answer("does alpha do beta things?", PRINCIPAL)
     finally:
         correlation_id_var.reset(token)
 

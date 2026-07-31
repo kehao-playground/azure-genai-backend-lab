@@ -133,9 +133,9 @@ async def rag(
     payload: RagRequest,
     request: Request,
     service: Annotated[RagService, Depends(get_rag_service)],
-    _: Annotated[Principal, Depends(require_principal, scope="request")],
+    principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> RagResponse:
-    result = await service.answer(payload.question)
+    result = await service.answer(payload.question, principal)
     sources = [
         RagSource(
             number=number,
