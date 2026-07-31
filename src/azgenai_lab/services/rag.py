@@ -334,11 +334,11 @@ class RagService:
                 type(exc).__name__,
             )
             raise
+        validated_answer = _validate_citations(result.message, len(included))
         logger.info(
             "rag stage=complete total_ms=%.1f status=answered outcome=success",
             (time.perf_counter() - total_started) * 1000,
         )
-        validated_answer = _validate_citations(result.message, len(included))
         return RagAnswer(
             status="answered",
             answer=validated_answer,

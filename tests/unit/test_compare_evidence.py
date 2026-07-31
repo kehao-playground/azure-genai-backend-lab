@@ -24,7 +24,9 @@ sys.modules[_SPEC.name] = compare_retrieval
 _SPEC.loader.exec_module(compare_retrieval)
 
 _redact_request_body = compare_retrieval._redact_request_body
+_principal_header_line = compare_retrieval._principal_header_line
 Evidence = compare_retrieval.Evidence
+Principal = compare_retrieval.Principal
 
 _RAW_FILTER = (
     "tenant_id eq 'acme' and (not allowed_groups/any() "
@@ -106,6 +108,28 @@ def test_rendered_evidence_contains_no_raw_filter_string_and_no_group_id(tmp_pat
     payload = json.loads(sidecar_text)
     assert payload[0]["body"]["filter_present"] is True
     assert "filter" not in payload[0]["body"]
+
+
+def test_principal_header_line_never_contains_group_ids_only_a_count() -> None:
+    principal = Principal(tenant_id="acme", group_ids=("oncall", "eng"))
+    line = _principal_header_line(principal)
+    assert "oncall" not in line
+    assert "eng" not in line
+    assert "group_count=2" in line
+    assert "tenant_id=acme" in line
+
+
+def test_rendered_evidence_markdown_header_never_leaks_group_ids(tmp_path: Path) -> None:
+    evidence = Evidence(tmp_path / "out.md", total_queries=1)
+    principal = Principal(tenant_id="acme", group_ids=("oncall",))
+    evidence.add(
+        "# Retrieval comparison — live evidence", "", _principal_header_line(principal), ""
+    )
+    evidence.flush()
+
+    markdown_text = evidence.out.read_text(encoding="utf-8")
+    assert "oncall" not in markdown_text
+    assert "group_count=1" in markdown_text
 
 
 def test_rendered_evidence_never_claims_the_bodies_are_verbatim(tmp_path: Path) -> None:

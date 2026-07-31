@@ -97,6 +97,16 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
     return scrubbed
 
 
+def _principal_header_line(principal: Principal) -> str:
+    """Render the evidence header's principal line without leaking group ids.
+
+    Group values are exactly the ACL contents the sidecar redaction exists to
+    keep out of persisted evidence — the header line must not reintroduce
+    them via a different path. Only a count is safe to write.
+    """
+    return f"- principal: tenant_id={principal.tenant_id} group_count={len(principal.group_ids)}"
+
+
 def _redact_request_body(body: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return a redacted **copy** of a request body — the original is never mutated.
 
@@ -475,7 +485,7 @@ async def _compare(
         "# Retrieval comparison — live evidence",
         "",
         f"- checked: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
-        f"- principal: tenant_id={principal.tenant_id} group_ids={list(principal.group_ids)}",
+        _principal_header_line(principal),
         f"- embedding client: {embedding_client.__class__.__name__} "
         f"deployment={settings.azure_openai_embedding_deployment}",
         f"- data-plane API version: `{SEARCH_API_VERSION}`",
