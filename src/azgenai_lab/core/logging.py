@@ -1,6 +1,7 @@
 import logging
 
 from azgenai_lab.core.correlation import correlation_id_var
+from azgenai_lab.core.tenant_context import tenant_id_var
 
 # The stock factory, captured once at import time so the wrapper below can
 # delegate to it instead of hardcoding LogRecord's constructor signature.
@@ -16,6 +17,10 @@ def _correlation_record_factory(*args: object, **kwargs: object) -> logging.LogR
     # always present and greppable rather than sometimes-missing.
     record = _base_record_factory(*args, **kwargs)
     record.correlation_id = correlation_id_var.get() or "-"
+    # tenant_id_var already defaults to "-" outside require_principal's scope,
+    # unlike correlation_id_var's None default, so no `or "-"` fallback is
+    # needed here. Group ids never enter log records — only the tenant id.
+    record.tenant_id = tenant_id_var.get()
     return record
 
 

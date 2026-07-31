@@ -3,8 +3,10 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from azgenai_lab.api.principal import require_principal
 from azgenai_lab.core.errors import ErrorEnvelope
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.conversation import (
     ConversationChatService,
     ConversationNotFoundError,
@@ -17,6 +19,10 @@ router = APIRouter(tags=["chat"])
 # status code is documented here so the OpenAPI drift check guards it.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Input rejected: content filter or invalid input"},
+    401: {
+        "model": ErrorEnvelope,
+        "description": "unauthorized (missing or malformed identity headers)",
+    },
     404: {"model": ErrorEnvelope, "description": "Unknown conversation_id"},
     429: {"model": ErrorEnvelope, "description": "Conversation token budget exhausted"},
     500: {"model": ErrorEnvelope, "description": "Service misconfiguration or storage failure"},
@@ -108,6 +114,7 @@ async def chat(
     payload: ChatRequest,
     request: Request,
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
+    _: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> ChatResponse:
     try:
         conversation_id, result = await service.complete(payload.message, payload.conversation_id)

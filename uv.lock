@@ -119,7 +119,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "azure-identity", specifier = ">=1.17.0" },
-    { name = "fastapi", specifier = ">=0.116.0" },
+    { name = "fastapi", specifier = ">=0.121.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "openai", specifier = ">=2.45.0" },
     { name = "pydantic", specifier = ">=2.8.0" },

@@ -35,7 +35,9 @@ from azgenai_lab.api.chat import (
     get_conversation_service,
     token_budget_exceeded,
 )
+from azgenai_lab.api.principal import require_principal
 from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_openai import StreamDone, TextDelta
 from azgenai_lab.services.conversation import (
     ConversationChatService,
@@ -66,6 +68,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {
         "content": _ENVELOPE_CONTENT,
         "description": "Input rejected before the stream starts: content filter or invalid input",
+    },
+    401: {
+        "content": _ENVELOPE_CONTENT,
+        "description": "unauthorized (missing or malformed identity headers)",
     },
     404: {"content": _ENVELOPE_CONTENT, "description": "Unknown conversation_id"},
     422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},
@@ -188,6 +194,7 @@ async def stream_chat(
     payload: StreamingChatRequest,
     request: Request,
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
+    _: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> EventStreamResponse:
     # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
     try:

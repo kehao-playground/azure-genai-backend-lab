@@ -16,9 +16,15 @@ from azgenai_lab.main import app  # noqa: E402
 from azgenai_lab.services.conversation import build_conversation_service  # noqa: E402
 from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 
+# Day 15: the three protected endpoints now 401 without identity headers;
+# scenarios exercise the documented contract, not the auth boundary itself
+# (that lives in tests/unit/test_auth_endpoints.py), so the shared client
+# carries valid identity headers by default.
+AUTH_HEADERS = {"X-Tenant-Id": "t1"}
+
 
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]
-    context.client = TestClient(app)
+    context.client = TestClient(app, headers=AUTH_HEADERS)
     context.response = None
 
 
