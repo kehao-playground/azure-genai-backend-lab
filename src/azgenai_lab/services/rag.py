@@ -93,6 +93,28 @@ class RagAnswer:
     usage: TokenUsage | None
     incomplete_reason: IncompleteReason | None
 
+    def __post_init__(self) -> None:
+        # Domain-level consistency guard (Task 12): the two RagStatus branches
+        # carry mutually exclusive shapes. Enforced here, once, so every
+        # caller (real service and every test stub) gets the same invariant
+        # rather than re-checking it downstream.
+        if self.status == "answered":
+            if self.answer is None:
+                raise ValueError("status='answered' requires answer to be set")
+            if not self.hits:
+                raise ValueError("status='answered' requires at least one hit")
+        elif self.status == "no_answer":
+            if self.answer is not None:
+                raise ValueError("status='no_answer' requires answer to be None")
+            if self.hits != ():
+                raise ValueError("status='no_answer' requires hits to be empty")
+            if self.usage is not None:
+                raise ValueError("status='no_answer' requires usage to be None")
+            if self.incomplete_reason is not None:
+                raise ValueError(
+                    "status='no_answer' requires incomplete_reason to be None"
+                )
+
 
 def render_sources(hits: Sequence[SearchHit]) -> str:
     # heading_path already starts with the document title (Day 12 invariant),

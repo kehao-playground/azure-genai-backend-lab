@@ -112,20 +112,31 @@ class RagSource(BaseModel):
     )
 
 
-class RagResponse(BaseModel):
-    answer: str | None = Field(
-        description="The generated answer, or null when status is no_answer."
-    )
-    status: Literal["answered", "no_answer"] = Field(
-        description=(
-            "'no_answer' means retrieval found zero hits "
-            "(structural short-circuit, LLM never called)."
-        )
+class AnsweredRagResponse(BaseModel):
+    status: Literal["answered"]
+    answer: str
+    sources: Annotated[list[RagSource], Field(min_length=1)]
+    usage: TokenUsage | None = Field(
+        description="Provider may omit usage even when answered."
     )
     incomplete_reason: Literal["max_output_tokens", "content_filter", "other"] | None
-    sources: list[RagSource]
-    usage: TokenUsage | None
     correlation_id: str
+
+
+class NoAnswerRagResponse(BaseModel):
+    status: Literal["no_answer"]
+    answer: None = None
+    sources: Annotated[list[RagSource], Field(max_length=0)] = Field(
+        default_factory=list
+    )
+    usage: None = None
+    incomplete_reason: None = None
+    correlation_id: str
+
+
+RagResponse = Annotated[
+    AnsweredRagResponse | NoAnswerRagResponse, Field(discriminator="status")
+]
 
 
 @router.post("/rag", response_model=RagResponse, responses=_ERROR_RESPONSES)
@@ -134,8 +145,11 @@ async def rag(
     request: Request,
     service: Annotated[RagService, Depends(get_rag_service)],
     principal: Annotated[Principal, Depends(require_principal, scope="request")],
-) -> RagResponse:
+) -> AnsweredRagResponse | NoAnswerRagResponse:
     result = await service.answer(payload.question, principal)
+    correlation_id: str = request.state.correlation_id
+    if result.status == "no_answer":
+        return NoAnswerRagResponse(status="no_answer", correlation_id=correlation_id)
     sources = [
         RagSource(
             number=number,
@@ -147,11 +161,12 @@ async def rag(
         )
         for number, hit in enumerate(result.hits, start=1)
     ]
-    return RagResponse(
+    assert result.answer is not None  # guaranteed by RagAnswer.__post_init__
+    return AnsweredRagResponse(
+        status="answered",
         answer=result.answer,
-        status=result.status,
-        incomplete_reason=result.incomplete_reason,
         sources=sources,
         usage=result.usage,
-        correlation_id=request.state.correlation_id,
+        incomplete_reason=result.incomplete_reason,
+        correlation_id=correlation_id,
     )
