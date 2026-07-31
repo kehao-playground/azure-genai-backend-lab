@@ -605,7 +605,7 @@ key is caught at load or chunk time, not the first time it is uploaded to a live
 
 Chunk ids are position-based rather than content-hashed on purpose: a hash would be reproducible
 and collision-resistant, but nothing in a portal view would tell a reader which document a chunk
-came from. A position-based id like `returns-policy-0002` is self-describing at the cost of
+came from. A position-based id like `t4=acmed14=returns-policy-0002` is self-describing at the cost of
 stability — editing one line near the top of a document shifts every later chunk's ordinal, so
 that document's *entire* previous chunk set becomes orphaned rather than partially valid. This is
 why a document's chunks must always be replaced as a set, never patched chunk-by-chunk (see
