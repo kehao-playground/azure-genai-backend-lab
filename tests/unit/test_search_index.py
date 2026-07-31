@@ -198,6 +198,27 @@ def test_the_vector_field_has_one_name_across_the_schema_and_the_query() -> None
     assert body["vectorQueries"][0]["fields"] == VECTOR_FIELD
 
 
+def test_allowed_groups_acl_field_shape() -> None:
+    """Verify allowed_groups field has exactly the seven required keys and no stored key.
+
+    allowed_groups is a Collection(Edm.String) used for ACL filtering via the
+    'allowed_groups/any(...)' syntax. The stored key is not set because it is
+    only valid on vector fields; setting it on a string collection is rejected
+    by the Azure AI Search service.
+    """
+    allowed_groups = _field("allowed_groups")
+    # Verify all seven required keys are present.
+    assert allowed_groups["name"] == "allowed_groups"
+    assert allowed_groups["type"] == "Collection(Edm.String)"
+    assert allowed_groups["searchable"] is False
+    assert allowed_groups["filterable"] is True
+    assert allowed_groups["retrievable"] is False
+    assert allowed_groups["sortable"] is False
+    assert allowed_groups["facetable"] is False
+    # Explicitly verify that stored key is NOT present.
+    assert "stored" not in allowed_groups
+
+
 def test_constants_are_pinned() -> None:
     assert SEARCH_API_VERSION == "2026-04-01"
     assert VECTOR_FIELD == "content_vector"
