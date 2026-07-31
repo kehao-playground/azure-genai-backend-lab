@@ -336,7 +336,7 @@ async def test_listing_chunk_ids_returns_them_in_response_order() -> None:
             200, json={"value": [{"chunk_id": "doc-0001"}, {"chunk_id": "doc-0000"}]}
         )
 
-    keys = await _plane(handler).list_chunk_ids("doc")
+    keys = await _plane(handler).list_chunk_ids("t", "doc")
     assert keys == ["doc-0001", "doc-0000"]
     assert seen["url"] == (
         "https://example.search.windows.net/indexes/azgenai-lab-chunks"
@@ -351,8 +351,8 @@ async def test_the_first_page_filters_on_the_parent_and_orders_by_the_key() -> N
         seen.update(json.loads(request.read()))
         return httpx.Response(200, json={"value": []})
 
-    await _plane(handler).list_chunk_ids("doc")
-    assert seen["filter"] == "parent_id eq 'doc'"
+    await _plane(handler).list_chunk_ids("t", "doc")
+    assert seen["filter"] == "tenant_id eq 't' and parent_id eq 'doc'"
     assert seen["orderby"] == "chunk_id asc"
     assert seen["search"] == "*"
     assert seen["select"] == "chunk_id"
@@ -369,30 +369,39 @@ async def test_resuming_uses_a_strict_greater_than_not_the_documented_ge() -> No
         seen.update(json.loads(request.read()))
         return httpx.Response(200, json={"value": []})
 
-    await _plane(handler).list_chunk_ids("doc", "doc-0001")
-    assert seen["filter"] == "parent_id eq 'doc' and chunk_id gt 'doc-0001'"
+    await _plane(handler).list_chunk_ids("t", "doc", "doc-0001")
+    assert seen["filter"] == (
+        "tenant_id eq 't' and parent_id eq 'doc' and chunk_id gt 'doc-0001'"
+    )
 
 
 @pytest.mark.parametrize(
-    ("parent_id", "after", "expected"),
+    ("tenant_id", "parent_id", "after", "expected"),
     [
-        ("o'brien", None, "parent_id eq 'o''brien'"),
-        ("doc", "o'brien-0001", "parent_id eq 'doc' and chunk_id gt 'o''brien-0001'"),
+        ("t", "o'brien", None, "tenant_id eq 't' and parent_id eq 'o''brien'"),
+        (
+            "o'hare",
+            "doc",
+            "o'brien-0001",
+            "tenant_id eq 'o''hare' and parent_id eq 'doc' and "
+            "chunk_id gt 'o''brien-0001'",
+        ),
     ],
 )
 async def test_an_apostrophe_is_escaped_on_both_sides_of_the_expression(
-    parent_id: str, after: str | None, expected: str
+    tenant_id: str, parent_id: str, after: str | None, expected: str
 ) -> None:
-    # A single quote closes an OData string literal. Unescaped, a parent id or
-    # a cursor carrying one turns a filter into a syntax error at best, and a
-    # different filter — over a different document's chunks — at worst.
+    # A single quote closes an OData string literal. Unescaped, a tenant id,
+    # a parent id, or a cursor carrying one turns a filter into a syntax
+    # error at best, and a different filter — over a different tenant's or
+    # document's chunks — at worst.
     seen: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.update(json.loads(request.read()))
         return httpx.Response(200, json={"value": []})
 
-    await _plane(handler).list_chunk_ids(parent_id, after)
+    await _plane(handler).list_chunk_ids(tenant_id, parent_id, after)
     assert seen["filter"] == expected
 
 
@@ -401,7 +410,7 @@ async def test_listing_chunk_ids_rejects_a_result_without_a_chunk_id() -> None:
         return httpx.Response(200, json={"value": [{"parent_id": "doc"}]})
 
     with pytest.raises(SearchUnavailableError):
-        await _plane(handler).list_chunk_ids("doc")
+        await _plane(handler).list_chunk_ids("t", "doc")
 
 
 async def test_listing_chunk_ids_rejects_a_non_dict_result_without_leaking_it() -> None:
@@ -412,7 +421,7 @@ async def test_listing_chunk_ids_rejects_a_non_dict_result_without_leaking_it() 
         return httpx.Response(200, json={"value": ["not-a-document"]})
 
     with pytest.raises(SearchUnavailableError) as caught:
-        await _plane(handler).list_chunk_ids("doc")
+        await _plane(handler).list_chunk_ids("t", "doc")
 
     detail = caught.value.upstream_detail
     assert detail is not None

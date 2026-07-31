@@ -13,7 +13,7 @@ import asyncio
 
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
-from azgenai_lab.models.rag import Chunk, IndexingAction
+from azgenai_lab.models.rag import Chunk, IndexingAction, make_parent_id
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import load_documents
 from azgenai_lab.services.embeddings import build_embedding_client, embed_chunks
@@ -103,7 +103,8 @@ async def _index(plane: SearchDataPlane, settings: Settings, *, create_index: bo
 
         total_documents += len(documents)
 
-        outcome = await replacer.replace(source.doc_id, documents)
+        parent_id = make_parent_id(source.tenant_id, source.doc_id)
+        outcome = await replacer.replace(source.tenant_id, parent_id, documents)
         status = "complete" if outcome.completed else "INCOMPLETE"
         print(
             f"{source.doc_id}: {len(documents)} chunks, {status}, "

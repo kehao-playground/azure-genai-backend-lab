@@ -50,14 +50,14 @@ def _retryable(key: str) -> IndexingResult:
 class _Index:
     """An in-memory stand-in for the service, faithful about parent scoping."""
 
-    def __init__(self, existing: dict[str, str] | None = None) -> None:
-        # chunk_id -> parent_id, so enumeration can honour the filter the way
-        # the real service does. A stand-in that ignores parent_id would hide
-        # cross-document deletion entirely.
-        self.keys: dict[str, str] = dict(existing or {})
+    def __init__(self, existing: dict[str, tuple[str, str]] | None = None) -> None:
+        # chunk_id -> (tenant_id, parent_id), so enumeration can honour the
+        # filter the way the real service does. A stand-in that ignores
+        # either key would hide cross-tenant or cross-document deletion.
+        self.keys: dict[str, tuple[str, str]] = dict(existing or {})
         self.delete_results: dict[str, list[IndexingResult]] = {}
         self.on_search: Any = None
-        self.enumerations: list[tuple[str, str | None]] = []
+        self.enumerations: list[tuple[str, str, str | None]] = []
         # (action, keys) for every batch, in the order it was sent. The action
         # is recorded because a delete-path assertion written only against key
         # sets passes just as happily when the batch says "upload" — and an
@@ -82,7 +82,10 @@ class _Index:
         for document in payload["value"]:
             key = document["chunk_id"]
             if document["@search.action"] == "upload":
-                self.keys[key] = document.get("parent_id", "")
+                self.keys[key] = (
+                    document.get("tenant_id", ""),
+                    document.get("parent_id", ""),
+                )
                 results.append(_ok(key))
                 continue
             scripted = self.delete_results.get(key)
@@ -96,26 +99,35 @@ class _Index:
             results.append(_ok(key))
         return results
 
-    async def list_chunk_ids(self, parent_id: str, after: str | None = None) -> list[str]:
+    async def list_chunk_ids(
+        self, tenant_id: str, parent_id: str, after: str | None = None
+    ) -> list[str]:
         if self.on_search is not None:
             await self.on_search()
-        self.enumerations.append((parent_id, after))
+        self.enumerations.append((tenant_id, parent_id, after))
         return sorted(
             key
-            for key, owner in self.keys.items()
-            if owner == parent_id and (after is None or key > after)
+            for key, (owner_tenant, owner_parent) in self.keys.items()
+            if owner_tenant == tenant_id
+            and owner_parent == parent_id
+            and (after is None or key > after)
         )[:ENUMERATION_PAGE_SIZE]
 
 
-def _documents(keys: list[str], parent: str = "doc") -> list[dict[str, Any]]:
-    return [{"chunk_id": key, "parent_id": parent, "content": key} for key in keys]
+def _documents(
+    keys: list[str], parent: str = "doc", tenant: str = "t"
+) -> list[dict[str, Any]]:
+    return [
+        {"chunk_id": key, "tenant_id": tenant, "parent_id": parent, "content": key}
+        for key in keys
+    ]
 
 
 async def test_successful_replacement_deletes_only_stale_chunks() -> None:
-    index = _Index({"doc-0000": "doc", "doc-0001": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0001": ("t", "doc"), "doc-0002": ("t", "doc")})
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
 
-    outcome = await replacer.replace("doc", _documents(["doc-0000", "doc-0001"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000", "doc-0001"]))
 
     assert outcome.completed is True
     assert outcome.deleted_keys == ("doc-0002",)
@@ -124,13 +136,13 @@ async def test_successful_replacement_deletes_only_stale_chunks() -> None:
 
 
 async def test_a_blocked_gate_deletes_nothing() -> None:
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc")})
 
     async def failing_upload(_batch: IndexingBatch) -> list[IndexingResult]:
         return [_retryable("doc-0000")]
 
     replacer = _replacer(failing_upload, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
     assert outcome.deleted_keys == ()
@@ -140,11 +152,11 @@ async def test_a_blocked_gate_deletes_nothing() -> None:
 async def test_a_failed_deletion_reports_unresolved_stale_ids() -> None:
     # Deletion failure is the safe side — stale content survives rather than
     # new content vanishing — but safe is not the same as done.
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc")})
     index.delete_results["doc-0002"] = [_retryable("doc-0002")] * 5
 
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
     assert outcome.unresolved_stale_ids == ("doc-0002",)
@@ -152,11 +164,11 @@ async def test_a_failed_deletion_reports_unresolved_stale_ids() -> None:
 
 
 async def test_a_deletion_that_succeeds_on_retry_completes() -> None:
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc")})
     index.delete_results["doc-0002"] = [_retryable("doc-0002"), _ok("doc-0002")]
 
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is True
     assert outcome.unresolved_stale_ids == ()
@@ -173,7 +185,7 @@ async def test_first_replacement_for_a_parent_completes_without_deleting() -> No
     # replacement completes with an empty deletion.
     index = _Index()
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
     assert outcome.completed is True
     assert outcome.deleted_keys == ()
 
@@ -184,13 +196,15 @@ async def test_enumeration_crash_after_upload_reports_unknown_stale_state() -> N
     # raised exception would do exactly that. The outcome type is the only
     # way to say "new chunks are in, old ones might still be there too, and
     # we cannot say".
-    index = _Index({"doc-0000": "doc"})
+    index = _Index({"doc-0000": ("t", "doc")})
 
-    async def crashing_search(_parent_id: str, _after: str | None) -> list[str]:
+    async def crashing_search(
+        _tenant_id: str, _parent_id: str, _after: str | None
+    ) -> list[str]:
         raise SearchUnavailableError("search timed out")
 
     replacer = _replacer(index.post_batch, crashing_search)
-    outcome = await replacer.replace("doc", _documents(["doc-0001"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0001"]))
 
     assert outcome.completed is False
     assert outcome.stale_state_unknown is True
@@ -204,7 +218,7 @@ async def test_deletion_rejection_after_upload_reports_unknown_stale_state() -> 
     # A permanent (non-retryable) failure on the delete call — not just a
     # retryable `SearchUnavailableError` — must be caught here too: it leaves
     # the same "upload landed, cleanup outcome unknown" ambiguity.
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc")})
 
     async def rejecting_post(batch: IndexingBatch) -> list[IndexingResult]:
         if batch.action is IndexingAction.REMOVE:
@@ -212,7 +226,7 @@ async def test_deletion_rejection_after_upload_reports_unknown_stale_state() -> 
         return await index.post_batch(batch)
 
     replacer = _replacer(rejecting_post, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
     assert outcome.stale_state_unknown is True
@@ -220,7 +234,7 @@ async def test_deletion_rejection_after_upload_reports_unknown_stale_state() -> 
 
 
 async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:
-    index = _Index({"doc-0000": "doc"})
+    index = _Index({"doc-0000": ("t", "doc")})
     sent: list[IndexingBatch] = []
 
     async def recording_post(batch: IndexingBatch) -> list[IndexingResult]:
@@ -229,7 +243,7 @@ async def test_replacing_with_no_chunks_is_refused_before_sending() -> None:
 
     replacer = _replacer(recording_post, index.list_chunk_ids)
     with pytest.raises(ValueError, match="no chunks"):
-        await replacer.replace("doc", [])
+        await replacer.replace("t", "doc", [])
 
     # Documents the "before sending" claim rather than testing it: with the
     # guard removed, an empty document sequence still sends nothing, because
@@ -243,7 +257,7 @@ async def test_documents_belonging_to_another_parent_are_refused_before_sending(
     # Without this check the upload succeeds, the gate passes on the uploaded
     # keys, and then every chunk of the *named* parent is judged stale and
     # deleted — a caller wiring mistake escalating straight to data loss.
-    index = _Index({"parent-a-0000": "parent-a"})
+    index = _Index({"parent-a-0000": ("t", "parent-a")})
     sent: list[IndexingBatch] = []
 
     async def recording_post(batch: IndexingBatch) -> list[IndexingResult]:
@@ -252,10 +266,67 @@ async def test_documents_belonging_to_another_parent_are_refused_before_sending(
 
     replacer = _replacer(recording_post, index.list_chunk_ids)
     with pytest.raises(ValueError, match="parent_id"):
-        await replacer.replace("parent-a", _documents(["b-0000"], parent="parent-b"))
+        await replacer.replace("t", "parent-a", _documents(["b-0000"], parent="parent-b"))
 
     assert sent == []
-    assert "parent-a-0000" in index.keys
+
+
+async def test_documents_belonging_to_another_tenant_are_refused_before_sending() -> None:
+    # Same hazard as the parent_id mismatch above, but on the other half of
+    # the scoped key: without this check a caller could enumerate and delete
+    # under tenant A while uploading tenant B's documents — an isolation
+    # breach, not a type nit.
+    index = _Index({"doc-0000": ("tenant-a", "doc")})
+    sent: list[IndexingBatch] = []
+    enumerated: list[tuple[str, str, str | None]] = []
+
+    async def recording_post(batch: IndexingBatch) -> list[IndexingResult]:
+        sent.append(batch)
+        return await index.post_batch(batch)
+
+    async def recording_list(
+        tenant_id: str, parent_id: str, after: str | None = None
+    ) -> list[str]:
+        enumerated.append((tenant_id, parent_id, after))
+        return await index.list_chunk_ids(tenant_id, parent_id, after)
+
+    replacer = _replacer(recording_post, recording_list)
+    with pytest.raises(ValueError, match="tenant_id"):
+        await replacer.replace(
+            "tenant-a", "doc", _documents(["doc-0001"], parent="doc", tenant="tenant-b")
+        )
+
+    assert sent == []
+    assert enumerated == []
+
+
+async def test_replacing_one_tenants_document_never_touches_another_tenants_keys() -> None:
+    # Two tenants coincidentally share a doc_id/parent_id string; only the
+    # combination of tenant_id and parent_id may scope a replacement's
+    # enumeration and deletion.
+    index = _Index(
+        {
+            "doc-0000": ("a", "policy"),
+            "doc-0001": ("a", "policy"),
+            "doc-0000-b": ("b", "policy"),
+            "doc-0001-b": ("b", "policy"),
+        }
+    )
+    replacer = _replacer(index.post_batch, index.list_chunk_ids)
+
+    outcome = await replacer.replace(
+        "a", "policy", _documents(["doc-0000"], parent="policy", tenant="a")
+    )
+
+    assert outcome.completed is True
+    # Tenant a's stale chunk is gone; tenant b's keys were never enumerated
+    # or deleted, even though they share the same parent_id string.
+    assert outcome.deleted_keys == ("doc-0001",)
+    assert sorted(index.keys) == ["doc-0000", "doc-0000-b", "doc-0001-b"]
+    assert all(
+        tenant_id == "a" and parent_id == "policy"
+        for tenant_id, parent_id, _ in index.enumerations
+    )
 
 
 async def test_one_document_admits_only_one_replacement_at_a_time() -> None:
@@ -273,8 +344,8 @@ async def test_one_document_admits_only_one_replacement_at_a_time() -> None:
     index.on_search = yield_control
 
     await asyncio.gather(
-        replacer.replace("doc", _documents(["doc-0000", "doc-0001"])),
-        replacer.replace("doc", _documents(["doc-0000", "doc-0001", "doc-0002"])),
+        replacer.replace("t", "doc", _documents(["doc-0000", "doc-0001"])),
+        replacer.replace("t", "doc", _documents(["doc-0000", "doc-0001", "doc-0002"])),
     )
     assert replacer.max_concurrent_per_parent == 1
 
@@ -297,8 +368,8 @@ async def test_different_documents_are_not_serialized_against_each_other() -> No
     index.on_search = yield_control
 
     outcomes = await asyncio.gather(
-        replacer.replace("a", _documents(["a-0000"], parent="a")),
-        replacer.replace("b", _documents(["b-0000"], parent="b")),
+        replacer.replace("t", "a", _documents(["a-0000"], parent="a")),
+        replacer.replace("t", "b", _documents(["b-0000"], parent="b")),
     )
     assert all(isinstance(o, ReplacementOutcome) and o.completed for o in outcomes)
     # Neither job may treat the other document's chunks as stale.
@@ -312,11 +383,16 @@ def _permanent(key: str) -> IndexingResult:
 
 async def test_every_stale_key_is_deleted_in_one_batch_when_all_succeed() -> None:
     index = _Index(
-        {"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc", "doc-0004": "doc"}
+        {
+            "doc-0000": ("t", "doc"),
+            "doc-0002": ("t", "doc"),
+            "doc-0003": ("t", "doc"),
+            "doc-0004": ("t", "doc"),
+        }
     )
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
 
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is True
     assert outcome.deleted_keys == ("doc-0002", "doc-0003", "doc-0004")
@@ -328,12 +404,17 @@ async def test_a_mixed_delete_response_resends_only_the_retryable_keys() -> None
     # together. Resending a key the service already deleted is at best a
     # wasted round trip and at worst a second verdict for a settled key.
     index = _Index(
-        {"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc", "doc-0004": "doc"}
+        {
+            "doc-0000": ("t", "doc"),
+            "doc-0002": ("t", "doc"),
+            "doc-0003": ("t", "doc"),
+            "doc-0004": ("t", "doc"),
+        }
     )
     index.delete_results["doc-0003"] = [_retryable("doc-0003"), _ok("doc-0003")]
 
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is True
     assert sorted(outcome.deleted_keys) == ["doc-0002", "doc-0003", "doc-0004"]
@@ -348,7 +429,7 @@ async def test_a_request_level_delete_failure_resends_only_unconfirmed_keys() ->
     # whole batch is outstanding — but keys an *earlier* attempt already
     # settled as deleted must stay settled. The middle attempt here fails at
     # the request level after doc-0002 has already succeeded.
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc"), "doc-0003": ("t", "doc")})
     index.delete_results["doc-0003"] = [_retryable("doc-0003"), _ok("doc-0003")]
     attempts: list[int] = []
 
@@ -360,7 +441,7 @@ async def test_a_request_level_delete_failure_resends_only_unconfirmed_keys() ->
         return await index.post_batch(batch)
 
     replacer = _replacer(flaky_post, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is True
     assert sorted(outcome.deleted_keys) == ["doc-0002", "doc-0003"]
@@ -373,11 +454,11 @@ async def test_delete_retries_are_bounded_and_the_survivor_is_reported() -> None
     # A partial cleanup is the dangerous report: doc-0002 really is gone, so a
     # summary that only counted deletions would look like progress. The
     # replacement is not complete while doc-0003 is still queryable.
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc", "doc-0003": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc"), "doc-0003": ("t", "doc")})
     index.delete_results["doc-0003"] = [_retryable("doc-0003")] * 5
 
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
     assert outcome.deleted_keys == ("doc-0002",)
@@ -390,11 +471,11 @@ async def test_delete_retries_are_bounded_and_the_survivor_is_reported() -> None
 async def test_a_permanently_rejected_delete_is_not_retried() -> None:
     # A 400 on one document means deleting it will never work. Spending two
     # more attempts on it delays the report without changing it.
-    index = _Index({"doc-0000": "doc", "doc-0002": "doc"})
+    index = _Index({"doc-0000": ("t", "doc"), "doc-0002": ("t", "doc")})
     index.delete_results["doc-0002"] = [_permanent("doc-0002")]
 
     replacer = _replacer(index.post_batch, index.list_chunk_ids)
-    outcome = await replacer.replace("doc", _documents(["doc-0000"]))
+    outcome = await replacer.replace("t", "doc", _documents(["doc-0000"]))
 
     assert outcome.completed is False
     assert outcome.unresolved_stale_ids == ("doc-0002",)
@@ -411,11 +492,11 @@ async def test_completed_replacements_leave_no_per_parent_bookkeeping() -> None:
 
     for n in range(200):
         parent = f"doc-{n}"
-        await replacer.replace(parent, _documents([f"{parent}-0000"], parent=parent))
+        await replacer.replace("t", parent, _documents([f"{parent}-0000"], parent=parent))
     assert replacer.tracked_parent_count == 0
 
     with pytest.raises(ValueError):
-        await replacer.replace("bad", [])
+        await replacer.replace("t", "bad", [])
     assert replacer.tracked_parent_count == 0
 
 
@@ -429,11 +510,11 @@ async def test_a_replacement_that_raises_still_frees_its_parent() -> None:
 
     replacer = _replacer(exploding_post, index.list_chunk_ids)
     with pytest.raises(RuntimeError):
-        await replacer.replace("doc", _documents(["doc-0000"]))
+        await replacer.replace("t", "doc", _documents(["doc-0000"]))
     assert replacer.tracked_parent_count == 0
 
     working = _replacer(index.post_batch, index.list_chunk_ids)
-    assert (await working.replace("doc", _documents(["doc-0000"]))).completed is True
+    assert (await working.replace("t", "doc", _documents(["doc-0000"]))).completed is True
 
 
 async def test_two_parents_pin_per_parent_and_overall_concurrency_together() -> None:
@@ -459,9 +540,9 @@ async def test_two_parents_pin_per_parent_and_overall_concurrency_together() -> 
     index.on_search = yield_control
 
     outcomes = await asyncio.gather(
-        replacer.replace("doc", _documents(["doc-0000", "doc-0001"])),
-        replacer.replace("doc", _documents(["doc-0000", "doc-0001", "doc-0002"])),
-        replacer.replace("other", _documents(["other-0000"], parent="other")),
+        replacer.replace("t", "doc", _documents(["doc-0000", "doc-0001"])),
+        replacer.replace("t", "doc", _documents(["doc-0000", "doc-0001", "doc-0002"])),
+        replacer.replace("t", "other", _documents(["other-0000"], parent="other")),
     )
     assert all(isinstance(o, ReplacementOutcome) and o.completed for o in outcomes)
     assert replacer.max_concurrent_per_parent == 1
