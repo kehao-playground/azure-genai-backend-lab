@@ -113,7 +113,9 @@ def test_rag_whitespace_only_question_is_422_envelope() -> None:
     # plain-text 500 with no envelope. raise_server_exceptions=False lets
     # this test observe that failure mode directly if the fix regresses,
     # instead of pytest re-raising the exception past the client.
-    with TestClient(app, raise_server_exceptions=False) as raw_client:
+    with TestClient(
+        app, raise_server_exceptions=False, headers={"X-Tenant-Id": "t1"}
+    ) as raw_client:
         response = raw_client.post("/api/v1/rag", json={"question": "   "})
 
     assert response.status_code == 422

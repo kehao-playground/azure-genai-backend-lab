@@ -3,8 +3,10 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, field_validator
 
+from azgenai_lab.api.principal import require_principal
 from azgenai_lab.core.errors import ErrorEnvelope
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.rag import RagService
 
 router = APIRouter(tags=["rag"])
@@ -18,6 +20,10 @@ router = APIRouter(tags=["rag"])
 # ("storage_error") is deliberately not listed: it is only raised by
 # services/conversation.py, which the /rag path never calls.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {
+        "model": ErrorEnvelope,
+        "description": "unauthorized (missing or malformed identity headers)",
+    },
     400: {
         "model": ErrorEnvelope,
         "description": (
@@ -127,6 +133,7 @@ async def rag(
     payload: RagRequest,
     request: Request,
     service: Annotated[RagService, Depends(get_rag_service)],
+    _: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> RagResponse:
     result = await service.answer(payload.question)
     sources = [

@@ -123,6 +123,10 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": error, "correlation_id": correlation_id},
+        # Preserves headers set on the raised HTTPException (e.g. the 401
+        # WWW-Authenticate challenge from require_principal) — without this,
+        # the envelope is right but the challenge header silently vanishes.
+        headers=getattr(exc, "headers", None),
     )
 
 

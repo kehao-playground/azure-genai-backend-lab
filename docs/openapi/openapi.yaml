@@ -48,6 +48,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: unauthorized (missing or malformed identity headers)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '404':
           description: Unknown conversation_id
           content:
@@ -142,6 +148,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: unauthorized (missing or malformed identity headers)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '404':
           description: Unknown conversation_id
           content:
@@ -206,6 +218,12 @@ paths:
                 $ref: '#/components/schemas/RagResponse'
         '422':
           description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: unauthorized (missing or malformed identity headers)
           content:
             application/json:
               schema:

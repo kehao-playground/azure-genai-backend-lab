@@ -20,10 +20,17 @@ from azgenai_lab.main import app  # noqa: E402
 from azgenai_lab.services.conversation import build_conversation_service  # noqa: E402
 from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 
+# Day 15: the three protected endpoints (chat, chat/stream, rag) now 401
+# without identity headers. Every existing unit test exercises the happy
+# path through the shared `client` fixture, so its default headers carry
+# valid identity — tests of the 401 boundary itself use their own
+# TestClient (see test_auth_endpoints.py) so they can omit or corrupt these.
+AUTH_HEADERS = {"X-Tenant-Id": "t1"}
+
 
 @pytest.fixture
 def client() -> Generator[TestClient]:
-    with TestClient(app) as test_client:
+    with TestClient(app, headers=AUTH_HEADERS) as test_client:
         yield test_client
     app.dependency_overrides.clear()
     # The app is module-level; rebuild its state so conversations never leak
