@@ -17,6 +17,7 @@ against. So the two are asserted to agree, not merely to each work.
 """
 
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 import httpx
@@ -24,6 +25,7 @@ import pytest
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
     INT32_MAX,
@@ -50,6 +52,11 @@ DOCUMENTS = [
 
 Search = Callable[..., Awaitable[SearchResult]]
 
+# `search` now requires a principal, so the wrappers below bind one: these
+# tests vary `top` and `vector_k`, and threading an unchanging authorization
+# argument through every case would obscure the one thing each case changes.
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+
 # Requests that were sent, if any. A bound is only enforced if nothing goes out
 # — a rejection after the request has left has already spent the call.
 sent: list[httpx.Request] = []
@@ -69,11 +76,11 @@ def _real() -> Search:
     client = AzureSearchClient(
         settings, client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
-    return client.search
+    return partial(client.search, principal=PRINCIPAL)
 
 
 def _fake() -> Search:
-    return FakeSearchClient(DOCUMENTS).search
+    return partial(FakeSearchClient(DOCUMENTS).search, principal=PRINCIPAL)
 
 
 CLIENTS = [pytest.param(_fake, id="fake"), pytest.param(_real, id="real")]
@@ -152,9 +159,13 @@ async def test_a_boolean_count_is_rejected_as_a_type_not_read_as_a_number() -> N
     # to name the type, or the next reader "fixes" it by widening the range.
     fake = FakeSearchClient(DOCUMENTS)
     with pytest.raises(ValueError, match="top must be an int; got bool"):
-        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=True)
+        await fake.search(
+            "refund", VECTOR, mode=SearchMode.HYBRID, top=True, principal=PRINCIPAL
+        )
     with pytest.raises(ValueError, match="vector_k must be an int; got bool"):
-        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=False)
+        await fake.search(
+            "refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=False, principal=PRINCIPAL
+        )
 
 
 @pytest.mark.parametrize("build", CLIENTS)
@@ -175,9 +186,13 @@ async def test_the_error_names_the_parameter_that_was_wrong() -> None:
     # tell which; both are counts and both default to something plausible.
     fake = FakeSearchClient(DOCUMENTS)
     with pytest.raises(ValueError, match="top"):
-        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=0)
+        await fake.search(
+            "refund", VECTOR, mode=SearchMode.HYBRID, top=0, principal=PRINCIPAL
+        )
     with pytest.raises(ValueError, match="vector_k"):
-        await fake.search("refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=0)
+        await fake.search(
+            "refund", VECTOR, mode=SearchMode.HYBRID, top=5, vector_k=0, principal=PRINCIPAL
+        )
 
 
 async def test_the_default_vector_k_is_inside_the_range() -> None:
@@ -185,6 +200,6 @@ async def test_the_default_vector_k_is_inside_the_range() -> None:
     # argument fail, which is the kind of thing a suite full of explicit
     # arguments never notices.
     await FakeSearchClient(DOCUMENTS).search(
-        "refund", VECTOR, mode=SearchMode.HYBRID, top=5
+        "refund", VECTOR, mode=SearchMode.HYBRID, top=5, principal=PRINCIPAL
     )
     assert DEFAULT_VECTOR_K >= 1

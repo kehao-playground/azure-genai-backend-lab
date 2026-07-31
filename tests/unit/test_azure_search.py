@@ -1,14 +1,19 @@
 """The adapter owns every REST detail. These drive the real adapter through a
 MockTransport — a fake cannot prove HTTP error mapping."""
 
+import json
+import logging
+
 import httpx
 import pytest
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchMode
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+from azgenai_lab.services.acl import build_acl_filter
 from azgenai_lab.services.azure_search import (
     AzureSearchClient,
     SearchConfigurationError,
@@ -17,6 +22,11 @@ from azgenai_lab.services.azure_search import (
 )
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
+
+# Every query is scoped by a principal, so every test here carries one. The
+# plain single-tenant case is the default; tests about the filter itself build
+# their own.
+PRINCIPAL = Principal(tenant_id="t1", group_ids=())
 
 
 def _settings() -> Settings:
@@ -54,7 +64,7 @@ async def test_request_targets_the_right_url_and_carries_the_key() -> None:
         seen["key"] = request.headers.get("api-key")
         return httpx.Response(200, json={"value": [_hit()]})
 
-    await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+    await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert seen["url"] == (
         "https://example.search.windows.net/indexes/azgenai-lab-chunks"
         "/docs/search?api-version=2026-04-01"
@@ -66,7 +76,9 @@ async def test_parses_both_scores() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"value": [_hit(**{"@search.rerankerScore": 3.25})]})
 
-    result = await _client(handler).search("q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5)
+    result = await _client(handler).search(
+        "q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5, principal=PRINCIPAL
+    )
     assert result.hits[0].score == 1.5
     assert result.hits[0].reranker_score == 3.25
     assert result.mode is SearchMode.HYBRID_SEMANTIC
@@ -79,7 +91,9 @@ async def test_a_zero_reranker_score_is_a_verdict_not_a_missing_value() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"value": [_hit(**{"@search.rerankerScore": 0.0})]})
 
-    result = await _client(handler).search("q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5)
+    result = await _client(handler).search(
+        "q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5, principal=PRINCIPAL
+    )
     assert result.hits[0].reranker_score == 0.0
 
 
@@ -87,7 +101,7 @@ async def test_absent_reranker_score_is_none() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"value": [_hit()]})
 
-    result = await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+    result = await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert result.hits[0].reranker_score is None
     # The other direction of the same contract: a mode that puts no
     # `vectorQueries` on the wire must not report a `k` that was never sent.
@@ -98,7 +112,9 @@ async def test_empty_result_set_is_not_an_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"value": []})
 
-    assert (await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)).hits == ()
+    assert (
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
+    ).hits == ()
 
 
 @pytest.mark.parametrize("status", [401, 403, 404])
@@ -109,7 +125,7 @@ async def test_auth_and_missing_index_are_configuration_errors(status: int) -> N
         )
 
     with pytest.raises(SearchConfigurationError) as caught:
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     # Spec §2.10 requires status and request id to survive for the log even on
     # the configuration branch.
     assert caught.value.status == status
@@ -123,7 +139,7 @@ async def test_bad_query_shape_is_rejected(status: int) -> None:
         return httpx.Response(status, json={"error": {"message": "bad"}})
 
     with pytest.raises(SearchRequestRejectedError):
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
 
 
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
@@ -132,7 +148,7 @@ async def test_transient_statuses_are_unavailable(status: int) -> None:
         return httpx.Response(status, json={"error": {"message": "later"}})
 
     with pytest.raises(SearchUnavailableError):
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
 
 
 async def test_connection_failure_is_unavailable() -> None:
@@ -140,7 +156,7 @@ async def test_connection_failure_is_unavailable() -> None:
         raise httpx.ConnectError("no route")
 
     with pytest.raises(SearchUnavailableError):
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
 
 
 async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
@@ -168,7 +184,7 @@ async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
     )
 
     with pytest.raises(SearchUnavailableError) as caught:
-        await client.search("q", mode=SearchMode.KEYWORD, top=5)
+        await client.search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
 
     # Pin the cause, not just the class: a connection failure would also raise
     # `SearchUnavailableError`. If a future httpx normalised the soft hyphen
@@ -184,12 +200,12 @@ async def test_an_unusable_endpoint_does_not_escape_as_an_httpx_error() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"value": [{"chunk_id": "a"}]},                       # no score
-        {"value": [_hit(**{"@search.score": None})]},          # null score
-        {"value": [_hit(**{"@search.score": "high"})]},        # non-numeric score
-        {"value": [_hit(**{"@search.rerankerScore": "n/a"})]}, # non-numeric reranker
-        {"value": [{"@search.score": 1.0}]},                   # no chunk_id
-        {"value": [5]},                                        # hit is not an object
+        {"value": [{"chunk_id": "a"}]},  # no score
+        {"value": [_hit(**{"@search.score": None})]},  # null score
+        {"value": [_hit(**{"@search.score": "high"})]},  # non-numeric score
+        {"value": [_hit(**{"@search.rerankerScore": "n/a"})]},  # non-numeric reranker
+        {"value": [{"@search.score": 1.0}]},  # no chunk_id
+        {"value": [5]},  # hit is not an object
         {"value": "not-a-list"},
         {"nothing": True},
         [1, 2, 3],
@@ -202,7 +218,9 @@ async def test_every_malformed_2xx_payload_stays_inside_the_adapter(payload: obj
         return httpx.Response(200, json=payload)
 
     with pytest.raises(SearchUnavailableError):
-        await _client(handler).search("q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5)
+        await _client(handler).search(
+            "q", VECTOR, mode=SearchMode.HYBRID_SEMANTIC, top=5, principal=PRINCIPAL
+        )
 
 
 async def test_non_object_hit_is_reported_distinctly_from_a_missing_score() -> None:
@@ -212,7 +230,7 @@ async def test_non_object_hit_is_reported_distinctly_from_a_missing_score() -> N
         return httpx.Response(200, json={"value": [5]})
 
     with pytest.raises(SearchUnavailableError) as caught:
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert caught.value.upstream_detail is not None
     assert "expected an object" in caught.value.upstream_detail
 
@@ -222,7 +240,56 @@ async def test_non_json_2xx_is_unavailable() -> None:
         return httpx.Response(200, content=b"not json")
 
     with pytest.raises(SearchUnavailableError):
-        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5)
+        await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
+
+
+async def test_the_adapter_derives_the_filter_from_the_principal() -> None:
+    # The filter is no longer something a caller can hand in, so the only
+    # place to observe it is the wire. This pins the derivation: the body
+    # carries exactly what build_acl_filter() produces for this principal,
+    # and a group-bearing principal produces a group clause rather than the
+    # tenant-only one.
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"value": []})
+
+    principal = Principal(tenant_id="acme", group_ids=("oncall", "billing"))
+    await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=principal)
+
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["filter"] == build_acl_filter(principal)
+    assert "tenant_id eq 'acme'" in body["filter"]
+    assert "oncall" in body["filter"]
+
+
+async def test_the_search_log_line_does_not_carry_group_ids_or_query_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The adapter's per-call log line is joined to the prompt and usage lines
+    # by correlation id, so it lands wherever those land. Group ids are an
+    # authorization fact about the caller's organisation and must not ride
+    # along; neither must the question.
+    query_text = "distinctive-query-text-53ab"
+    group_id = "distinctive-group-53ab"
+    principal = Principal(tenant_id="distinctive-tenant-53ab", group_ids=(group_id,))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [_hit()]})
+
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.azure_search"):
+        await _client(handler).search(
+            query_text, mode=SearchMode.KEYWORD, top=5, principal=principal
+        )
+
+    records = [r for r in caplog.records if r.name == "azgenai_lab.services.azure_search"]
+    assert records, "the adapter must log the call it made"
+    for record in records:
+        message = record.getMessage()
+        for forbidden in (query_text, group_id, principal.tenant_id):
+            assert forbidden not in message
 
 
 async def test_client_facing_message_does_not_leak_endpoint_key_filter_or_query_text() -> None:
@@ -234,7 +301,11 @@ async def test_client_facing_message_does_not_leak_endpoint_key_filter_or_query_
     # detail into the client-facing message has something real to catch.
     admin_key = "very-secret-admin-key-4b2d9c"
     query_text = "distinctive-query-text-9f3c"
-    filter_expression = "distinctive-filter-a71e"
+    # A group id, not a raw filter string: the entry point that took a raw
+    # filter is gone, so the only way to get a distinctive value into the
+    # OData filter is through the principal that derives it.
+    group_id = "distinctive-group-a71e"
+    principal = Principal(tenant_id="t1", group_ids=(group_id,))
 
     def handler(request: httpx.Request) -> httpx.Response:
         detail = (
@@ -254,13 +325,15 @@ async def test_client_facing_message_does_not_leak_endpoint_key_filter_or_query_
     client = AzureSearchClient(settings, client=httpx.AsyncClient(transport=transport))
 
     with pytest.raises(SearchRequestRejectedError) as caught:
-        await client.search(
-            query_text, mode=SearchMode.KEYWORD, top=5, filter=filter_expression
-        )
+        await client.search(query_text, mode=SearchMode.KEYWORD, top=5, principal=principal)
+
+    # Sanity: the generated filter really did carry the group, so the
+    # assertions below are checking a leak that was available to happen.
+    assert group_id in build_acl_filter(principal)
 
     # UpstreamError.__init__ passes self.message to Exception.__init__, so
     # str(exc) is a second caller-reachable surface — both must be clean.
-    for forbidden in ("example.search.windows.net", admin_key, query_text, filter_expression):
+    for forbidden in ("example.search.windows.net", admin_key, query_text, group_id):
         assert forbidden not in caught.value.message
         assert forbidden not in str(caught.value)
 
@@ -273,7 +346,7 @@ async def test_diagnostics_are_recorded_on_success_and_on_failure() -> None:
         return httpx.Response(200, json={"value": [_hit()]}, headers={"request-id": "ok-1"})
 
     client = _client(ok)
-    await client.search("q", mode=SearchMode.KEYWORD, top=5)
+    await client.search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert client.last_diagnostics is not None
     assert client.last_diagnostics.status == 200
     assert client.last_diagnostics.request_id == "ok-1"
@@ -287,7 +360,7 @@ async def test_diagnostics_are_recorded_on_success_and_on_failure() -> None:
 
     failing = _client(bad)
     with pytest.raises(SearchRequestRejectedError):
-        await failing.search("q", mode=SearchMode.KEYWORD, top=5)
+        await failing.search("q", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert failing.last_diagnostics is not None
     assert failing.last_diagnostics.status == 400
     assert failing.last_diagnostics.request_id == "e-1"
@@ -304,18 +377,18 @@ async def test_a_transport_failure_never_inherits_the_previous_call_diagnostics(
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(1)
         if len(calls) == 1:
-            return httpx.Response(
-                200, json={"value": [_hit()]}, headers={"request-id": "first"}
-            )
+            return httpx.Response(200, json={"value": [_hit()]}, headers={"request-id": "first"})
         raise httpx.ConnectError("no route")
 
     client = _client(handler)
-    await client.search("first query", mode=SearchMode.KEYWORD, top=5)
+    await client.search("first query", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert client.last_diagnostics is not None
     assert client.last_diagnostics.status == 200
 
     with pytest.raises(SearchUnavailableError):
-        await client.search("second query", VECTOR, mode=SearchMode.VECTOR, top=5)
+        await client.search(
+            "second query", VECTOR, mode=SearchMode.VECTOR, top=5, principal=PRINCIPAL
+        )
 
     diagnostics = client.last_diagnostics
     assert diagnostics is not None
@@ -335,12 +408,14 @@ async def test_a_call_rejected_by_argument_validation_leaves_no_stale_diagnostic
         return httpx.Response(200, json={"value": [_hit()]}, headers={"request-id": "first"})
 
     client = _client(handler)
-    await client.search("first query", mode=SearchMode.KEYWORD, top=5)
+    await client.search("first query", mode=SearchMode.KEYWORD, top=5, principal=PRINCIPAL)
     assert client.last_diagnostics is not None
 
     with pytest.raises(ValueError):
         # A vector of the wrong width fails validate_search_arguments().
-        await client.search("second query", [0.1], mode=SearchMode.VECTOR, top=5)
+        await client.search(
+            "second query", [0.1], mode=SearchMode.VECTOR, top=5, principal=PRINCIPAL
+        )
 
     assert client.last_diagnostics is None
 

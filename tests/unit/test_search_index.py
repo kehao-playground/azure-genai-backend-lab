@@ -193,7 +193,11 @@ def test_the_vector_field_has_one_name_across_the_schema_and_the_query() -> None
     assert vector_fields[0]["name"] == VECTOR_FIELD
 
     body = build_search_body(
-        "q", [0.1] * EMBEDDING_DIMENSIONS, mode=SearchMode.VECTOR, top=5
+        "q",
+        [0.1] * EMBEDDING_DIMENSIONS,
+        mode=SearchMode.VECTOR,
+        top=5,
+        filter="tenant_id eq 't1'",
     )
     assert body["vectorQueries"][0]["fields"] == VECTOR_FIELD
 

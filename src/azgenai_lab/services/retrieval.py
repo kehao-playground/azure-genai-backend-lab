@@ -10,6 +10,7 @@ import logging
 import time
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchMode, SearchResult
 from azgenai_lab.services.azure_search import SearchClient, build_search_client
 from azgenai_lab.services.embeddings import EmbeddingClient, build_embedding_client
@@ -25,7 +26,7 @@ class Retriever:
         self._search_client = search_client
         self._top = top
 
-    async def retrieve(self, question: str) -> SearchResult:
+    async def retrieve(self, question: str, principal: Principal) -> SearchResult:
         embed_started = time.perf_counter()
         try:
             vector = (await self._embedding_client.embed([question]))[0]
@@ -53,7 +54,7 @@ class Retriever:
         search_started = time.perf_counter()
         try:
             result = await self._search_client.search(
-                question, vector, mode=SearchMode.HYBRID, top=self._top
+                question, vector, mode=SearchMode.HYBRID, top=self._top, principal=principal
             )
         except Exception as exc:
             duration_ms = (time.perf_counter() - search_started) * 1000

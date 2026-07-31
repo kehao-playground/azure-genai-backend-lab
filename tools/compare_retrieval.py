@@ -55,6 +55,8 @@ from urllib.parse import urlparse
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.core.logging import configure_logging
+from azgenai_lab.models.principal import Principal
+from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
 from azgenai_lab.models.search_index import SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
@@ -90,12 +92,33 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
 
 
 @dataclass(frozen=True)
+class ExpectedChunkRef:
+    """One author-recorded expectation: which document, which ordinal, which
+    section, as of the last time a human looked at the chunker's output.
+
+    ``heading_path`` is not consumed to build the chunk id — ``ordinal`` and
+    ``doc_id`` alone determine that, via ``make_chunk_id``/``make_parent_id``.
+    It exists so ``tests/unit/test_compare_retrieval.py`` can catch the
+    failure mode the id alone cannot: a re-chunk that keeps the same ordinal
+    but shifts which section it belongs to (a heading inserted or removed
+    upstream of it). The id would still resolve; the heading path would not
+    match, and that mismatch is the drift signal.
+    """
+
+    doc_id: str
+    ordinal: int
+    heading_path: str
+
+
+@dataclass(frozen=True)
 class Query:
     """Frozen before the run, from a local chunker run against the live corpus.
 
-    ``expected_chunks`` holds **chunk ids**, not document ids. Matching on the
-    document would score "right document, wrong section" as a hit, which is
-    exactly the failure the reranking experiment is supposed to expose.
+    ``expected_refs`` holds structured references, not raw chunk ids: the id
+    is *derived* from ``(tenant_id, doc_id, ordinal)`` via
+    ``expected_chunk_ids()`` at run time, never hand-typed and never stored.
+    A hand-typed id copy could drift from the id-derivation scheme silently;
+    a derived one cannot.
 
     An empty tuple means the corpus genuinely has no answer. Two or more
     entries mean several chunks are legitimately relevant, and every one of
@@ -106,60 +129,97 @@ class Query:
     number: int
     text: str
     kind: str
-    expected_chunks: tuple[str, ...]
+    expected_refs: tuple[ExpectedChunkRef, ...]
+
+
+def expected_chunk_ids(tenant_id: str, refs: Sequence[ExpectedChunkRef]) -> tuple[str, ...]:
+    """Derive chunk ids for ``refs`` under ``tenant_id`` — never stored, always computed."""
+    return tuple(make_chunk_id(make_parent_id(tenant_id, ref.doc_id), ref.ordinal) for ref in refs)
 
 
 # Filled in from a local chunker run against the live corpus, before any
-# query is issued. Leaving a placeholder here and choosing after seeing
-# rankings would make the whole comparison unfalsifiable.
-QUERIES = (
-    Query(1, "99.9% monthly uptime", "exact literal", ("service-sla-0003",)),
-    Query(
-        2,
-        "How long do I have to send something back if I bought it on sale?",
-        "paraphrase",
-        ("returns-policy-0002",),
+# query is issued. Choosing an expected ordinal/heading after seeing rankings
+# would make the whole comparison unfalsifiable — freeze first, run second.
+# Split by tenant: a query issued with tenant A's principal can only ever see
+# tenant A's chunks, so a query authored against tenant B's corpus belongs in
+# tenant B's tuple, not in a shared one.
+QUERIES_BY_TENANT: dict[str, tuple[Query, ...]] = {
+    "acme": (
+        Query(
+            1,
+            "99.9% monthly uptime",
+            "exact literal",
+            (
+                ExpectedChunkRef(
+                    "service-sla", 3, "Service SLA > Availability targets > Premium tier"
+                ),
+            ),
+        ),
+        Query(
+            2,
+            "How long do I have to send something back if I bought it on sale?",
+            "paraphrase",
+            (
+                ExpectedChunkRef(
+                    "returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"
+                ),
+            ),
+        ),
+        Query(
+            3,
+            "when do customers get credit?",
+            "cross-document ambiguity (both relevant)",
+            (
+                ExpectedChunkRef(
+                    "service-sla", 2, "Service SLA > Availability targets > Standard tier"
+                ),
+                ExpectedChunkRef(
+                    "returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"
+                ),
+            ),
+        ),
+        Query(
+            4,
+            "what happens if the customer misconfigured their own system?",
+            "lexical decoy",
+            (ExpectedChunkRef("service-sla", 5, "Service SLA > Exclusions"),),
+        ),
+        Query(
+            5,
+            "how do I escalate a Sev 1 outage at 3am?",
+            "acme has no runbook — only its own SLA response-time section is relevant",
+            (ExpectedChunkRef("service-sla", 4, "Service SLA > Response times"),),
+        ),
+        Query(6, "What is the parental leave policy?", "absent from corpus", ()),
     ),
-    Query(
-        3,
-        "when do customers get credit?",
-        "cross-document ambiguity (both relevant)",
-        ("service-sla-0002", "returns-policy-0002"),
+    "globex": (
+        Query(
+            1,
+            "how are invoices delivered?",
+            "exact literal",
+            (ExpectedChunkRef("billing-faq", 1, "Billing FAQ > Invoices"),),
+        ),
+        Query(
+            2,
+            "what cards can I pay with?",
+            "paraphrase",
+            (ExpectedChunkRef("billing-faq", 2, "Billing FAQ > Payment methods"),),
+        ),
+        Query(
+            3,
+            "how do I dispute a charge?",
+            "lexical decoy",
+            (ExpectedChunkRef("billing-faq", 3, "Billing FAQ > Disputes"),),
+        ),
+        Query(
+            5,
+            "how do I escalate a Sev 1 outage at 3am?",
+            "requires the oncall group — run with --group-id oncall",
+            (ExpectedChunkRef("oncall-runbook", 3, "On-Call Runbook > Escalation path"),),
+        ),
+        Query(6, "What is the parental leave policy?", "absent from corpus", ()),
     ),
-    Query(
-        4,
-        "what happens if the customer misconfigured their own system?",
-        "lexical decoy",
-        ("service-sla-0005",),
-    ),
-    Query(
-        5,
-        "how do I escalate a Sev 1 outage at 3am?",
-        "scattered answer",
-        ("oncall-runbook-0003", "service-sla-0004"),
-    ),
-    Query(6, "What is the parental leave policy?", "absent from corpus", ()),
-)
-
-# Detects the placeholder shape used above — the chunk id starts with an
-# opening angle bracket and ends with a closing one — rather than matching
-# the specific strings, so a real chunk id that happens to reuse one of
-# these words still passes. Written via startswith/endswith, not a regex
-# literal, so this check itself doesn't read as one more placeholder.
-_ANGLE_OPEN = chr(60)
-_ANGLE_CLOSE = chr(62)
-
-
-def _placeholder_query_numbers(queries: Sequence[Query]) -> list[int]:
-    """Query numbers still carrying an unfrozen placeholder chunk id."""
-    return [
-        query.number
-        for query in queries
-        if any(
-            chunk_id.startswith(_ANGLE_OPEN) and chunk_id.endswith(_ANGLE_CLOSE)
-            for chunk_id in query.expected_chunks
-        )
-    ]
+}
 
 
 VECTOR_K_SWEEP = (1, 3, DEFAULT_VECTOR_K)
@@ -228,9 +288,7 @@ def _ranks(hits: Sequence[SearchHit], expected: tuple[str, ...]) -> str:
     if not expected:
         return "n/a (no answer expected)"
     positions = {hit.chunk_id: rank for rank, hit in enumerate(hits, start=1)}
-    return "; ".join(
-        f"`{chunk_id}`={positions.get(chunk_id, 'absent')}" for chunk_id in expected
-    )
+    return "; ".join(f"`{chunk_id}`={positions.get(chunk_id, 'absent')}" for chunk_id in expected)
 
 
 async def _run(
@@ -238,7 +296,9 @@ async def _run(
     evidence: Evidence,
     label: str,
     query: Query,
+    expected_ids: tuple[str, ...],
     vector: list[float],
+    principal: Principal,
     *,
     mode: SearchMode,
     top: int,
@@ -263,6 +323,7 @@ async def _run(
             vector if mode is not SearchMode.KEYWORD else None,
             mode=mode,
             top=top,
+            principal=principal,
             vector_k=vector_k,
         )
     except (ConfigurationError, UpstreamError, ValueError) as exc:
@@ -281,9 +342,7 @@ async def _run(
             raw_detail = exc.upstream_detail or exc.message
         else:
             raw_detail = str(exc) or exc.__class__.__name__
-        detail = _scrub(raw_detail, search_endpoint, "[search-service]")[:160].replace(
-            "|", "\\|"
-        )
+        detail = _scrub(raw_detail, search_endpoint, "[search-service]")[:160].replace("|", "\\|")
         row = (
             f"| {label} | **{status}** | {request_id} | {latency} | — | — | "
             f"FAILED: {detail} | — | — |"
@@ -302,7 +361,7 @@ async def _run(
     assert diagnostics is not None  # set on every completed round trip
     evidence.record_request(label, diagnostics.request_body)
 
-    found = _ranks(result.hits, query.expected_chunks)
+    found = _ranks(result.hits, expected_ids)
     shared = (
         f"| {label} | {diagnostics.status} | {diagnostics.request_id} "
         f"| {diagnostics.latency_ms:.1f} | {found} "
@@ -312,15 +371,12 @@ async def _run(
     rows = []
     for rank, hit in enumerate(result.hits, start=1):
         reranker = "-" if hit.reranker_score is None else f"{hit.reranker_score:.3f}"
-        rows.append(
-            shared + f"| {rank} | `{hit.chunk_id}` | {hit.score:.6f} | {reranker} |"
-        )
+        rows.append(shared + f"| {rank} | `{hit.chunk_id}` | {hit.score:.6f} | {reranker} |")
     return rows
 
 
 HEADER = (
-    "| run | status | request id | ms | expected chunk ranks | rank "
-    "| chunk_id | score | reranker |"
+    "| run | status | request id | ms | expected chunk ranks | rank | chunk_id | score | reranker |"
 )
 DIVIDER = "|---|---|---|---|---|---|---|---|---|"
 
@@ -329,6 +385,18 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, required=True, help="frozen for every run")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--tenant-id",
+        required=True,
+        choices=sorted(QUERIES_BY_TENANT),
+        help="selects both the principal's tenant and the frozen query set",
+    )
+    parser.add_argument(
+        "--group-id",
+        action="append",
+        default=[],
+        help="repeatable; a query gated behind allowed_groups needs its group here",
+    )
     arguments = parser.parse_args()
 
     settings = get_settings()
@@ -341,23 +409,14 @@ async def main() -> None:
             "USE_FAKE_EMBEDDINGS=false and provide real Azure OpenAI "
             "embedding credentials before running this tool."
         )
-    placeholder_numbers = _placeholder_query_numbers(QUERIES)
-    if placeholder_numbers:
-        numbers = ", ".join(f"Q{number}" for number in placeholder_numbers)
-        raise SystemExit(
-            f"QUERIES still has placeholder chunk ids for {numbers} — freeze "
-            "real chunk ids from a chunker run against the live corpus "
-            "before running this comparison. A run against placeholders "
-            "completes normally and reports every pre-registered chunk as "
-            "absent, producing evidence that looks complete and is worthless."
-        )
+    principal = Principal(tenant_id=arguments.tenant_id, group_ids=tuple(arguments.group_id))
     configure_logging(settings.log_level)
     embedding_client = build_embedding_client(settings)
 
     # The client owns its connection pool here, so it is closed on the way out
     # — including when a ConfigurationError below aborts the run partway.
     async with AzureSearchClient(settings) as client:
-        await _compare(client, embedding_client, settings, arguments)
+        await _compare(client, embedding_client, settings, arguments, principal)
 
 
 async def _compare(
@@ -365,13 +424,16 @@ async def _compare(
     embedding_client: EmbeddingClient,
     settings: Settings,
     arguments: argparse.Namespace,
+    principal: Principal,
 ) -> None:
+    queries = QUERIES_BY_TENANT[arguments.tenant_id]
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
-    evidence = Evidence(arguments.out, total_queries=len(QUERIES))
+    evidence = Evidence(arguments.out, total_queries=len(queries))
     evidence.add(
         "# Retrieval comparison — live evidence",
         "",
         f"- checked: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
+        f"- principal: tenant_id={principal.tenant_id} group_ids={list(principal.group_ids)}",
         f"- embedding client: {embedding_client.__class__.__name__} "
         f"deployment={settings.azure_openai_embedding_deployment}",
         f"- data-plane API version: `{SEARCH_API_VERSION}`",
@@ -384,7 +446,8 @@ async def _compare(
     )
     evidence.flush()
 
-    for query in QUERIES:
+    for query in queries:
+        expected_ids = expected_chunk_ids(principal.tenant_id, query.expected_refs)
         evidence.start_query()
         started = time.perf_counter()
         try:
@@ -418,7 +481,7 @@ async def _compare(
             continue
         embed_ms = (time.perf_counter() - started) * 1000
 
-        expected = ", ".join(f"`{c}`" for c in query.expected_chunks) or "none (no answer)"
+        expected = ", ".join(f"`{c}`" for c in expected_ids) or "none (no answer)"
         evidence.add(
             f"## Q{query.number} — {query.kind}",
             "",
@@ -440,7 +503,9 @@ async def _compare(
                 evidence,
                 f"Q{query.number} baseline {mode.value}",
                 query,
+                expected_ids,
                 vector,
+                principal,
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
@@ -453,7 +518,8 @@ async def _compare(
             "",
             "### Experiment 1 — candidate generation (vector_k is the only variable)",
             "",
-            "Fixed: query, vector, filter=None, top, index generation. Mode = VECTOR.",
+            "Fixed: query, vector, principal (filter derived from it), top, "
+            "index generation. Mode = VECTOR.",
             "",
             HEADER,
             DIVIDER,
@@ -465,7 +531,9 @@ async def _compare(
                 evidence,
                 f"Q{query.number} k={vector_k}",
                 query,
+                expected_ids,
                 vector,
+                principal,
                 mode=SearchMode.VECTOR,
                 top=arguments.top,
                 vector_k=vector_k,
@@ -478,7 +546,8 @@ async def _compare(
             "",
             "### Experiment 2 — reranking (mode is the only variable)",
             "",
-            "Fixed: query, vector, filter=None, top, vector_k=50, index generation.",
+            "Fixed: query, vector, principal (filter derived from it), top, "
+            "vector_k=50, index generation.",
             "",
             HEADER,
             DIVIDER,
@@ -490,7 +559,9 @@ async def _compare(
                 evidence,
                 f"Q{query.number} rerank {mode.value}",
                 query,
+                expected_ids,
                 vector,
+                principal,
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
@@ -505,7 +576,7 @@ async def _compare(
     # through the last query's tables still increments the per-query counter
     # to the total, so this line, not that counter, is what a finished
     # artifact needs to say so positively.
-    evidence.add(f"**Run complete — all {len(QUERIES)} queries finished.**")
+    evidence.add(f"**Run complete — all {len(queries)} queries finished.**")
     evidence.flush()
 
     print(f"wrote {arguments.out} and {evidence.sidecar}")

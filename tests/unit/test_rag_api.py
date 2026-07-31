@@ -9,6 +9,7 @@ from azgenai_lab.core.errors import ContextLengthExceededError
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import (
@@ -27,7 +28,7 @@ class StubRagService:
     def __init__(self, answer: RagAnswer) -> None:
         self._answer = answer
 
-    async def answer(self, question: str) -> RagAnswer:
+    async def answer(self, question: str, principal: Principal) -> RagAnswer:
         return self._answer
 
 
@@ -137,7 +138,7 @@ def test_rag_question_is_stripped_before_reaching_service(client: TestClient) ->
         def __init__(self) -> None:
             self.received_question: str | None = None
 
-        async def answer(self, question: str) -> RagAnswer:
+        async def answer(self, question: str, principal: Principal) -> RagAnswer:
             self.received_question = question
             return RagAnswer(
                 status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
@@ -227,7 +228,7 @@ class _OversizedSearchClient:
         *,
         mode: SearchMode = SearchMode.HYBRID,
         top: int,
-        filter: str | None = None,
+        principal: Principal,
         vector_k: int = 50,
     ) -> SearchResult:
         return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
@@ -300,6 +301,43 @@ def test_rag_context_overflow_returns_500_envelope_with_correlation_id(
     body = response.json()
     assert body["error"]["code"] == "rag_context_overflow"
     assert body["correlation_id"] == "cid-overflow"
+
+
+TENANT_A_DOC = {
+    "chunk_id": "tenant-a-doc-0000",
+    "parent_id": "tenant-a-doc",
+    "title": "Tenant A Doc",
+    "heading_path": "Tenant A Doc > Refunds",
+    "content": "tenant a refund policy details",
+    "tenant_id": "tenant-a",
+    "allowed_groups": [],
+}
+
+
+def test_rag_cross_tenant_question_is_no_answer_not_a_leak(client: TestClient) -> None:
+    # The fake corpus carries a document owned by tenant-a. A request
+    # authenticated as tenant-b asks about it: FakeSearchClient enforces the
+    # same ACL policy the real filter would (services/acl.py), so tenant-a's
+    # document is invisible to tenant-b's principal. Zero hits is a
+    # structural no-answer, not an error and not a leak — a cross-tenant read
+    # must be indistinguishable from the document simply not existing.
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([TENANT_A_DOC]), top=5),
+        FakeChatService(prompt=load_prompt("rag_answer")),
+    )
+    app.dependency_overrides[get_rag_service] = lambda: service
+    try:
+        with TestClient(app, headers={"X-Tenant-Id": "tenant-b"}) as tenant_b_client:
+            response = tenant_b_client.post(
+                "/api/v1/rag", json={"question": "what is the refund policy?"}
+            )
+    finally:
+        app.dependency_overrides.pop(get_rag_service, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "no_answer"
+    assert body["sources"] == []
 
 
 def test_rag_endpoint_wired_at_startup(client: TestClient) -> None:

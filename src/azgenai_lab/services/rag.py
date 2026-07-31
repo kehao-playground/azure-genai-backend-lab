@@ -22,6 +22,7 @@ from typing import Literal
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatService, IncompleteReason, build_chat_service
@@ -187,11 +188,11 @@ class RagService:
         # sends the instructions text on the wire.
         self._instructions_bytes = instructions_bytes
 
-    async def answer(self, question: str) -> RagAnswer:
+    async def answer(self, question: str, principal: Principal) -> RagAnswer:
         total_started = time.perf_counter()
         current_stage = "retrieve"
         try:
-            retrieved = await self._retriever.retrieve(question)
+            retrieved = await self._retriever.retrieve(question, principal)
             if not retrieved.hits:
                 _log_rag_stage(question, retrieved.hits, context="", dropped_source_count=0)
                 # No provider call happens on this path (structural
