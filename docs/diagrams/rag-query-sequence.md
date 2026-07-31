@@ -36,7 +36,7 @@ sequenceDiagram
         Note right of RagService: short-circuit — no LLM call.<br/>Cross-tenant/wrong-group questions land here too:<br/>filtered-out hits look identical to "nothing indexed".
     else one or more hits
         RagService->>Chat: complete([{role: user, content: fenced sources + question}])
-        Note right of Chat: instructions = rag_answer.md (citation + refusal rules,<br/>sources marked non-instructions);<br/>each source wrapped BEGIN/END UNTRUSTED SOURCE n;<br/>sources travel as untrusted user-message data
+        Note right of Chat: instructions = rag_answer.md (citation + refusal rules,<br/>sources marked non-instructions),<br/>each source wrapped BEGIN/END UNTRUSTED SOURCE n,<br/>sources travel as untrusted user-message data
         Chat-->>RagService: message, usage, incomplete_reason
         RagService->>RagService: strip citation numbers outside 1..included_hit_count
         RagService-->>API: RagAnswer(status="answered", answer, hits, usage)
