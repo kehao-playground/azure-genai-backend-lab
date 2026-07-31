@@ -126,7 +126,7 @@ def to_index_definition() -> dict[str, Any]:
                 # Edm.String.
                 "name": "allowed_groups",
                 "type": "Collection(Edm.String)",
-                "retrievable": True,
+                "retrievable": False,
                 "searchable": False,
                 "filterable": True,
                 "sortable": False,
