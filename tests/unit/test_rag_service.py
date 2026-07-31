@@ -60,8 +60,19 @@ class ExplodingChat:
 
 def test_render_sources_numbers_from_one_with_heading_path() -> None:
     text = render_sources([HIT, replace(HIT, chunk_id="doc-a-0001", content="gamma")])
-    assert text.startswith("[1] Doc A > Intro\nalpha beta")
-    assert "\n\n[2] Doc A > Intro\ngamma" in text
+    assert text.startswith(
+        "BEGIN UNTRUSTED SOURCE 1\n[1] Doc A > Intro\nalpha beta\nEND UNTRUSTED SOURCE 1"
+    )
+    assert (
+        "\n\nBEGIN UNTRUSTED SOURCE 2\n[2] Doc A > Intro\ngamma\nEND UNTRUSTED SOURCE 2" in text
+    )
+
+
+def test_render_sources_fences_each_source_exactly_once() -> None:
+    text = render_sources([HIT, replace(HIT, chunk_id="doc-a-0001", content="gamma")])
+    for n in (1, 2):
+        assert text.count(f"BEGIN UNTRUSTED SOURCE {n}") == 1
+        assert text.count(f"END UNTRUSTED SOURCE {n}") == 1
 
 
 def test_render_user_message_wraps_sources_and_question() -> None:
@@ -89,7 +100,7 @@ async def test_answer_grounds_single_turn_and_carries_usage() -> None:
     result = await service.answer("alpha", PRINCIPAL)
     assert result.status == "answered"
     assert result.answer is not None
-    assert "prompt=rag_answer@1" in result.answer
+    assert "prompt=rag_answer@2" in result.answer
     assert "history=" not in result.answer  # single item: no conversation replay
     assert result.usage is not None
     assert result.usage.total_tokens > 0
@@ -125,13 +136,14 @@ class _RecordingChatService:
     """Records the byte size of exactly what it was called with, so tests can
     assert on the wire-level budget without a real upstream call."""
 
-    def __init__(self) -> None:
+    def __init__(self, message: str = "ok") -> None:
         self.received_items: Sequence[ReplayItem] | None = None
+        self._message = message
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         self.received_items = items
         return ChatResult(
-            message="ok",
+            message=self._message,
             usage=None,
         )
 
@@ -345,3 +357,86 @@ async def test_answer_truncates_original_shape_astral_corpus_under_new_budget() 
     )
     assert instructions_bytes + message_bytes <= MAX_PROMPT_BYTES
     assert [hit.chunk_id for hit in result.hits] == [h.chunk_id for h in hits[:expected_included]]
+
+
+async def test_fence_markers_count_toward_prompt_budget() -> None:
+    # Proves _select_within_budget (which measures render_user_message
+    # output) is fence-aware with no code motion: a hit sized to fit exactly
+    # within MAX_PROMPT_BYTES under the OLD unfenced rendering overflows once
+    # render_sources wraps it in BEGIN/END UNTRUSTED SOURCE markers, so it
+    # must be dropped -- here, dropped as the sole hit means a context
+    # overflow rather than a silent shrink.
+    question = "q"
+
+    def unfenced_message(hit: SearchHit) -> str:
+        return f"Sources:\n\n[1] {hit.heading_path}\n{hit.content}\n\nQuestion: {question}"
+
+    base_hit = SearchHit(
+        chunk_id="doc-x-0000",
+        parent_id="doc-x",
+        title="Doc X",
+        heading_path="H",
+        content="",
+        score=1.0,
+    )
+    overhead = len(unfenced_message(base_hit).encode("utf-8"))
+    content_len = MAX_PROMPT_BYTES - overhead
+    hit = replace(base_hit, content="x" * content_len)
+    assert len(unfenced_message(hit).encode("utf-8")) == MAX_PROMPT_BYTES
+
+    fenced_bytes = len(render_user_message(question, [hit]).encode("utf-8"))
+    assert fenced_bytes > MAX_PROMPT_BYTES
+
+    retriever = Retriever(FakeEmbeddingClient(), _StubOversizedSearchClient([hit]), top=5)
+    chat = _RecordingChatService()
+    service = RagService(retriever, chat)
+
+    with pytest.raises(RagContextOverflowError):
+        await service.answer(question, PRINCIPAL)
+
+    assert chat.received_items is None
+
+
+async def test_answer_strips_invalid_citations_and_logs_invalid_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat = _RecordingChatService(message="ok [1] [99]")
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5), chat
+    )
+
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+        result = await service.answer("alpha", PRINCIPAL)
+
+    assert result.status == "answered"
+    assert result.answer == "ok [1] "
+
+    record = next(
+        r
+        for r in caplog.records
+        if r.name == "azgenai_lab.services.rag" and "citation_validation" in r.getMessage()
+    )
+    message = record.getMessage()
+    assert "invalid_citation_count=1" in message
+    assert "citations=99" in message
+
+
+async def test_answer_keeps_valid_citations_and_logs_zero_invalid(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    chat = _RecordingChatService(message="ok [1]")
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5), chat
+    )
+
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.services.rag"):
+        result = await service.answer("alpha", PRINCIPAL)
+
+    assert result.answer == "ok [1]"
+
+    record = next(
+        r
+        for r in caplog.records
+        if r.name == "azgenai_lab.services.rag" and "citation_validation" in r.getMessage()
+    )
+    assert "invalid_citation_count=0" in record.getMessage()

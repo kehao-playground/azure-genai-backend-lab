@@ -14,6 +14,7 @@ prompt injection via poisoned corpus stays on the threat-model page.
 """
 
 import logging
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -97,8 +98,18 @@ def render_sources(hits: Sequence[SearchHit]) -> str:
     # heading_path already starts with the document title (Day 12 invariant),
     # so one line locates the chunk; content stays verbatim — it is the text
     # a citation points at (embedding input != citation text).
+    #
+    # Each source is fenced with BEGIN/END UNTRUSTED SOURCE {n} markers
+    # (Task 11): retrieved content is data, not instructions, and the fence
+    # makes that boundary explicit to the model on top of the template's
+    # instruction-level warning. The fence text is part of what
+    # render_user_message returns, so `_select_within_budget` -- which sizes
+    # candidates via that same function -- counts fence bytes toward the
+    # prompt budget automatically, with no code motion.
     return "\n\n".join(
-        f"[{number}] {hit.heading_path}\n{hit.content}"
+        f"BEGIN UNTRUSTED SOURCE {number}\n"
+        f"[{number}] {hit.heading_path}\n{hit.content}\n"
+        f"END UNTRUSTED SOURCE {number}"
         for number, hit in enumerate(hits, start=1)
     )
 
@@ -174,6 +185,37 @@ def _select_within_budget(
             upstream_detail=f"chunk_id={first.chunk_id} bytes={first_bytes}"
         )
     return included, len(hits) - len(included)
+
+
+_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _validate_citations(answer: str, included_hit_count: int) -> str:
+    """Strip citation markers whose number is outside 1..included_hit_count.
+
+    Syntactic only (Task 11): this never fails the request and never
+    reclassifies `status` -- a citation number the model invented (or that
+    pointed past what was actually sent as context) is a generation-quality
+    gap, not a request failure, so the answer is cleaned and returned rather
+    than rejected. Only numbers are logged; the answer text itself is not
+    (consistent with this module's redaction discipline elsewhere).
+    """
+    invalid: list[int] = []
+
+    def _strip_if_invalid(match: re.Match[str]) -> str:
+        number = int(match.group(1))
+        if 1 <= number <= included_hit_count:
+            return match.group(0)
+        invalid.append(number)
+        return ""
+
+    cleaned = _CITATION_PATTERN.sub(_strip_if_invalid, answer)
+    logger.info(
+        "rag stage=citation_validation invalid_citation_count=%d citations=%s",
+        len(invalid),
+        ",".join(str(number) for number in invalid),
+    )
+    return cleaned
 
 
 class RagService:
@@ -259,9 +301,10 @@ class RagService:
             "rag stage=complete total_ms=%.1f status=answered outcome=success",
             (time.perf_counter() - total_started) * 1000,
         )
+        validated_answer = _validate_citations(result.message, len(included))
         return RagAnswer(
             status="answered",
-            answer=result.message,
+            answer=validated_answer,
             hits=tuple(included),
             usage=result.usage,
             incomplete_reason=result.incomplete_reason,
