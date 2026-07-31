@@ -71,7 +71,7 @@ async def test_the_data_plane_leaves_an_injected_pool_open() -> None:
 
     assert injected.is_closed is False
     reused = SearchDataPlane(_settings(), client=injected)
-    assert await reused.list_chunk_ids("doc") == []
+    assert await reused.list_chunk_ids("t", "doc") == []
     await injected.aclose()
 
 

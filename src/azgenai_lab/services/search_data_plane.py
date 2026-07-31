@@ -257,8 +257,10 @@ class SearchDataPlane:
             raise self._error(response)
         return parse_indexing_results(self._json(response))
 
-    async def list_chunk_ids(self, parent_id: str, after: str | None = None) -> list[str]:
-        """One page of chunk ids under ``parent_id``, resuming after ``after``.
+    async def list_chunk_ids(
+        self, tenant_id: str, parent_id: str, after: str | None = None
+    ) -> list[str]:
+        """One page of chunk ids under ``tenant_id``/``parent_id``, resuming after ``after``.
 
         The range filter is strictly ``gt``. The official paging example uses
         ``ge``, which repeats the previous page's last key; a caller that then
@@ -267,8 +269,17 @@ class SearchDataPlane:
 
         ``search=*`` with a ``select`` of the key alone: nothing here needs the
         content, and the caller is computing a set difference, not ranking.
+
+        The filter conjoins ``tenant_id`` with ``parent_id`` rather than
+        relying on ``parent_id`` alone: enumeration is a write-path input
+        (replacement decides what to delete from it), so it must be scoped by
+        tenant the same way the read-path ACL filter is, not merely by
+        whatever key happens to be unique.
         """
-        expression = f"parent_id eq '{escape_odata_literal(parent_id)}'"
+        expression = (
+            f"tenant_id eq '{escape_odata_literal(tenant_id)}' "
+            f"and parent_id eq '{escape_odata_literal(parent_id)}'"
+        )
         if after is not None:
             expression = f"{expression} and chunk_id gt '{escape_odata_literal(after)}'"
         body: dict[str, Any] = {

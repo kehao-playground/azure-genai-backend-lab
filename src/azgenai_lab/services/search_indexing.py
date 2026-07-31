@@ -218,12 +218,12 @@ async def run_indexing_with_retry[BatchT: DocumentBatch](
     return terminal
 
 
-# Pages of chunk ids under one parent, asked for in this project's terms: the
-# document, and the key to resume after. How that becomes a query — the OData
-# expression, the ordering, the page size — is the adapter's business, and
-# naming any of it here would put the write path's own request JSON in a module
-# that is otherwise transport-free.
-ListChunkIdPage = Callable[[str, str | None], Coroutine[Any, Any, list[str]]]
+# Pages of chunk ids under one tenant's document, asked for in this project's
+# terms: the tenant, the document, and the key to resume after. How that
+# becomes a query — the OData expression, the ordering, the page size — is the
+# adapter's business, and naming any of it here would put the write path's own
+# request JSON in a module that is otherwise transport-free.
+ListChunkIdPage = Callable[[str, str, str | None], Coroutine[Any, Any, list[str]]]
 
 
 class EnumerationError(UpstreamError):
@@ -234,8 +234,10 @@ class EnumerationError(UpstreamError):
     message = "Listing the indexed chunks of a document failed."
 
 
-async def list_indexed_chunk_ids(list_page: ListChunkIdPage, parent_id: str) -> list[str]:
-    """List every ``chunk_id`` currently indexed under ``parent_id``.
+async def list_indexed_chunk_ids(
+    list_page: ListChunkIdPage, tenant_id: str, parent_id: str
+) -> list[str]:
+    """List every ``chunk_id`` currently indexed under ``tenant_id``/``parent_id``.
 
     Pages by resuming strictly *after* the last key seen rather than by
     offset: an offset shifts when the index changes underneath the walk, so a
@@ -254,7 +256,7 @@ async def list_indexed_chunk_ids(list_page: ListChunkIdPage, parent_id: str) -> 
     cursor: str | None = None
 
     while True:
-        page = await list_page(parent_id, cursor)
+        page = await list_page(tenant_id, parent_id, cursor)
         if not page:
             return ordered
 
@@ -374,7 +376,7 @@ class DocumentReplacer[BatchT: DocumentBatch]:
         return len(self._locks) + len(self._active)
 
     async def replace(
-        self, parent_id: str, documents: Sequence[dict[str, Any]]
+        self, tenant_id: str, parent_id: str, documents: Sequence[dict[str, Any]]
     ) -> ReplacementOutcome:
         async with self._locks.hold(parent_id):
             active = self._active.get(parent_id, 0) + 1
@@ -385,7 +387,7 @@ class DocumentReplacer[BatchT: DocumentBatch]:
                 self.max_concurrent_replacements, self._active_total
             )
             try:
-                return await self._replace(parent_id, documents)
+                return await self._replace(tenant_id, parent_id, documents)
             finally:
                 remaining = self._active[parent_id] - 1
                 if remaining:
@@ -399,15 +401,22 @@ class DocumentReplacer[BatchT: DocumentBatch]:
                 self._active_total -= 1
 
     async def _replace(
-        self, parent_id: str, documents: Sequence[dict[str, Any]]
+        self, tenant_id: str, parent_id: str, documents: Sequence[dict[str, Any]]
     ) -> ReplacementOutcome:
         # Checked before anything is sent. Uploading documents belonging to one
-        # parent while enumerating another turns a caller wiring mistake into
-        # deletion: the upload succeeds, the gate passes on the uploaded keys,
-        # and then every chunk of the *named* parent is judged stale and
-        # removed. A mismatch is never a recoverable situation, so nothing goes
-        # out until it is ruled out.
+        # tenant or parent while enumerating another turns a caller wiring
+        # mistake into deletion: the upload succeeds, the gate passes on the
+        # uploaded keys, and then every chunk of the *named* tenant/parent is
+        # judged stale and removed. A mismatch on either key is never a
+        # recoverable situation, so nothing goes out until both are ruled out
+        # — a tenant_id mismatch is an isolation breach, not a type nit.
         for document in documents:
+            owner_tenant = document.get("tenant_id")
+            if owner_tenant != tenant_id:
+                raise ValueError(
+                    f"document {document.get('chunk_id')!r} has tenant_id {owner_tenant!r}, "
+                    f"but replace() was called for {tenant_id!r}"
+                )
             owner = document.get("parent_id")
             if owner != parent_id:
                 raise ValueError(
@@ -471,7 +480,7 @@ class DocumentReplacer[BatchT: DocumentBatch]:
         # misconfigured delete request (`SearchRequestRejectedError`,
         # `SearchConfigurationError`) leaves exactly the same ambiguity.
         try:
-            indexed = await list_indexed_chunk_ids(self._list_page, parent_id)
+            indexed = await list_indexed_chunk_ids(self._list_page, tenant_id, parent_id)
             expected = set(expected_keys)
             stale = [key for key in indexed if key not in expected]
             if not stale:

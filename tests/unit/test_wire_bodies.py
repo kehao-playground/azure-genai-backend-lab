@@ -147,13 +147,13 @@ async def test_enumeration_bodies_are_byte_for_byte_what_they_have_always_been()
     recorder = _Recorder()
     plane = SearchDataPlane(_settings(), client=recorder.transport())
 
-    await plane.list_chunk_ids("o'brien")
-    await plane.list_chunk_ids("o'brien", "doc-0001")
+    await plane.list_chunk_ids("t", "o'brien")
+    await plane.list_chunk_ids("t", "o'brien", "doc-0001")
 
     assert recorder.bodies == [
-        b'{"search":"*","filter":"parent_id eq \'o\'\'brien\'",'
+        b'{"search":"*","filter":"tenant_id eq \'t\' and parent_id eq \'o\'\'brien\'",'
         b'"select":"chunk_id","orderby":"chunk_id asc","top":1000}',
-        b'{"search":"*","filter":"parent_id eq \'o\'\'brien\' '
+        b'{"search":"*","filter":"tenant_id eq \'t\' and parent_id eq \'o\'\'brien\' '
         b'and chunk_id gt \'doc-0001\'",'
         b'"select":"chunk_id","orderby":"chunk_id asc","top":1000}',
     ]
