@@ -19,6 +19,8 @@ DOCUMENTS = [
         "title": "Returns Policy",
         "heading_path": "Returns Policy > Refund window",
         "content": "Customers may return most items within 30 days.",
+        "tenant_id": "t1",
+        "allowed_groups": [],
     },
     {
         "chunk_id": "service-sla-0001",
@@ -26,6 +28,8 @@ DOCUMENTS = [
         "title": "Service SLA",
         "heading_path": "Service SLA > Availability targets",
         "content": "Premium tier customers are covered by a 99.9% uptime target.",
+        "tenant_id": "t1",
+        "allowed_groups": [],
     },
 ]
 
@@ -109,3 +113,19 @@ def test_composition_point_picks_the_real_client_when_told_to() -> None:
         azure_search_admin_key=SecretStr("k"),
     )
     assert isinstance(build_search_client(settings), AzureSearchClient)
+
+
+def test_fake_requires_acl_metadata_on_construction() -> None:
+    # A document missing allowed_groups must raise ValueError at construction,
+    # not at query time: contract enforcement early, not late.
+    doc_without_allowed_groups = {
+        "chunk_id": "chunk-1",
+        "parent_id": "doc-1",
+        "title": "Title",
+        "heading_path": "Title > Path",
+        "content": "content",
+        "tenant_id": "t1",
+        # missing "allowed_groups"
+    }
+    with pytest.raises(ValueError, match="allowed_groups"):
+        FakeSearchClient([doc_without_allowed_groups])

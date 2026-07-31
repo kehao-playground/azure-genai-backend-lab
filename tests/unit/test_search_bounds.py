@@ -43,6 +43,8 @@ DOCUMENTS = [
         "title": "Returns Policy",
         "heading_path": "Returns Policy > Refund window",
         "content": "Customers may return most items within 30 days.",
+        "tenant_id": "t1",
+        "allowed_groups": [],
     }
 ]
 
