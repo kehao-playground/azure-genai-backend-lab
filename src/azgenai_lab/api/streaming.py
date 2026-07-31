@@ -194,12 +194,12 @@ async def stream_chat(
     payload: StreamingChatRequest,
     request: Request,
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
-    _: Annotated[Principal, Depends(require_principal, scope="request")],
+    principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> EventStreamResponse:
     # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
     try:
         conversation_id, events = await service.open_stream(
-            payload.message, payload.conversation_id
+            payload.message, payload.conversation_id, tenant_id=principal.tenant_id
         )
     except ConversationNotFoundError:
         raise conversation_not_found() from None

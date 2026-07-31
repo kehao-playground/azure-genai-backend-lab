@@ -114,10 +114,12 @@ async def chat(
     payload: ChatRequest,
     request: Request,
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
-    _: Annotated[Principal, Depends(require_principal, scope="request")],
+    principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> ChatResponse:
     try:
-        conversation_id, result = await service.complete(payload.message, payload.conversation_id)
+        conversation_id, result = await service.complete(
+            payload.message, payload.conversation_id, tenant_id=principal.tenant_id
+        )
     except ConversationNotFoundError:
         raise conversation_not_found() from None
     except TokenBudgetExceededError:

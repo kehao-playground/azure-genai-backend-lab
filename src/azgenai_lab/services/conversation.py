@@ -90,23 +90,31 @@ class ConversationChatService:
         self._chat_service = chat_service
         self._store = store
         self._token_budget = token_budget
-        # One turn at a time per conversation id. Acquire and release sit in
-        # different frames on the streaming path — the release happens when
-        # the event iterator finishes, not when open_stream() returns — so the
-        # lock is taken explicitly here rather than with a `hold()` block.
-        self._locks = KeyedLock()
+        # One turn at a time per (tenant_id, conversation_id). Acquire and
+        # release sit in different frames on the streaming path — the release
+        # happens when the event iterator finishes, not when open_stream()
+        # returns — so the lock is taken explicitly here rather than with a
+        # `hold()` block. Keying on the tenant too (not just the
+        # conversation id) means two tenants can never serialize behind each
+        # other's turns, even if a conversation_id collided across tenants.
+        self._locks: KeyedLock[tuple[str, str]] = KeyedLock()
 
-    async def _load(self, provided_id: str | None, resolved_id: str) -> Conversation:
+    async def _load(
+        self, tenant_id: str, provided_id: str | None, resolved_id: str
+    ) -> Conversation:
         if provided_id is None:
             # The id is issued by the caller path, but the conversation exists
             # only once its first turn commits — a failed first call leaves
             # nothing behind.
             return Conversation(id=resolved_id)
         try:
-            conversation = await self._store.get(provided_id)
+            conversation = await self._store.get(tenant_id, provided_id)
         except Exception as exc:
             raise StorageError(str(exc)) from exc
         if conversation is None:
+            # Indistinguishable from a never-issued id: a cross-tenant read
+            # of another tenant's conversation_id lands here too, since the
+            # store's key space already excludes it (Day 15).
             raise ConversationNotFoundError(provided_id)
         return conversation
 
@@ -124,6 +132,7 @@ class ConversationChatService:
 
     async def _commit(
         self,
+        tenant_id: str,
         conversation_id: str,
         turns: list[Message],
         replay_items: list[ReplayItem],
@@ -132,7 +141,7 @@ class ConversationChatService:
     ) -> None:
         try:
             await self._store.append(
-                conversation_id, turns, replay_items, expected_revision, usage_tokens
+                tenant_id, conversation_id, turns, replay_items, expected_revision, usage_tokens
             )
         except Exception as exc:
             # Includes ConversationConflictError: under the per-process lock a
@@ -140,11 +149,14 @@ class ConversationChatService:
             # does not support — a broken deployment, not a client case.
             raise StorageError(str(exc)) from exc
 
-    async def complete(self, message: str, conversation_id: str | None) -> tuple[str, ChatResult]:
+    async def complete(
+        self, message: str, conversation_id: str | None, *, tenant_id: str
+    ) -> tuple[str, ChatResult]:
         resolved_id = conversation_id or str(uuid4())
-        await self._locks.acquire(resolved_id)
+        lock_key = (tenant_id, resolved_id)
+        await self._locks.acquire(lock_key)
         try:
-            conversation = await self._load(conversation_id, resolved_id)
+            conversation = await self._load(tenant_id, conversation_id, resolved_id)
             self._check_budget(conversation)
             user_item = _user_item(message)
             result = await self._chat_service.complete([*conversation.replay_items, user_item])
@@ -164,6 +176,7 @@ class ConversationChatService:
                 if result.message:
                     turns.append(Message(role="assistant", content=result.message))
                 await self._commit(
+                    tenant_id,
                     resolved_id,
                     turns,
                     [user_item, *result.replay_items],
@@ -171,16 +184,17 @@ class ConversationChatService:
                     usage_tokens=result.usage.total_tokens if result.usage else 0,
                 )
         finally:
-            self._locks.release(resolved_id)
+            self._locks.release(lock_key)
         return resolved_id, result
 
     async def open_stream(
-        self, message: str, conversation_id: str | None
+        self, message: str, conversation_id: str | None, *, tenant_id: str
     ) -> tuple[str, AsyncIterator[ChatStreamEvent]]:
         resolved_id = conversation_id or str(uuid4())
-        await self._locks.acquire(resolved_id)
+        lock_key = (tenant_id, resolved_id)
+        await self._locks.acquire(lock_key)
         try:
-            conversation = await self._load(conversation_id, resolved_id)
+            conversation = await self._load(tenant_id, conversation_id, resolved_id)
             # Budget rejection is pre-stream by design: it raises before any
             # byte reaches the client, so it travels as an HTTP envelope.
             self._check_budget(conversation)
@@ -190,14 +204,15 @@ class ConversationChatService:
             # passes through this layer intact.
             events = await self._chat_service.open_stream([*conversation.replay_items, user_item])
         except BaseException:
-            self._locks.release(resolved_id)
+            self._locks.release(lock_key)
             raise
         return resolved_id, self._commit_on_done(
-            resolved_id, message, user_item, events, conversation.revision
+            tenant_id, resolved_id, message, user_item, events, conversation.revision
         )
 
     async def _commit_on_done(
         self,
+        tenant_id: str,
         conversation_id: str,
         message: str,
         user_item: ReplayItem,
@@ -220,6 +235,7 @@ class ConversationChatService:
                         # client sees message.done, the history it implies
                         # already exists.
                         await self._commit(
+                            tenant_id,
                             conversation_id,
                             turns,
                             [user_item, *event.replay_items],
@@ -232,7 +248,7 @@ class ConversationChatService:
                     parts.append(event.text)
                 yield event
         finally:
-            self._locks.release(conversation_id)
+            self._locks.release((tenant_id, conversation_id))
 
     async def aclose(self) -> None:
         """Close the composed chat service.

@@ -131,6 +131,21 @@ async def test_a_cancelled_waiter_drops_only_its_own_reference() -> None:
     assert len(locks) == 0
 
 
+async def test_tuple_keys_are_independent_of_each_other() -> None:
+    # Task 10: conversations are keyed (tenant_id, conversation_id). A lock
+    # held for one tenant's "c" must not block another tenant's "c".
+    locks: KeyedLock[tuple[str, str]] = KeyedLock()
+    await locks.acquire(("t1", "c"))
+    try:
+        async with asyncio.timeout(0.1):
+            await locks.acquire(("t2", "c"))
+        locks.release(("t2", "c"))
+    finally:
+        locks.release(("t1", "c"))
+
+    assert len(locks) == 0
+
+
 async def test_the_last_of_several_cancelled_waiters_reclaims_the_entry() -> None:
     # Nobody ever holds this key: every acquirer is cancelled while queued
     # except the first, which is then released. If a cancelled waiter forgot

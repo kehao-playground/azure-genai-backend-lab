@@ -42,10 +42,11 @@ class ConversationConflictError(Exception):
 
 
 class ConversationStore(Protocol):
-    async def get(self, conversation_id: str) -> Conversation | None: ...
+    async def get(self, tenant_id: str, conversation_id: str) -> Conversation | None: ...
 
     async def append(
         self,
+        tenant_id: str,
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
@@ -55,14 +56,20 @@ class ConversationStore(Protocol):
 
 
 class InMemoryConversationStore:
-    def __init__(self) -> None:
-        self._messages: dict[str, list[Message]] = {}
-        self._replay_items: dict[str, list[ReplayItem]] = {}
-        self._revisions: dict[str, int] = {}
-        self._token_totals: dict[str, int] = {}
+    """Keyed by ``(tenant_id, conversation_id)``: a conversation created under
+    one tenant is invisible to every other tenant — same key space, no
+    cross-tenant read or write path exists at all, so there is nothing to
+    filter (Day 15)."""
 
-    async def get(self, conversation_id: str) -> Conversation | None:
-        messages = self._messages.get(conversation_id)
+    def __init__(self) -> None:
+        self._messages: dict[tuple[str, str], list[Message]] = {}
+        self._replay_items: dict[tuple[str, str], list[ReplayItem]] = {}
+        self._revisions: dict[tuple[str, str], int] = {}
+        self._token_totals: dict[tuple[str, str], int] = {}
+
+    async def get(self, tenant_id: str, conversation_id: str) -> Conversation | None:
+        key = (tenant_id, conversation_id)
+        messages = self._messages.get(key)
         if messages is None:
             return None
         # Copies on the way out: Message is frozen so a shallow list copy is
@@ -71,20 +78,22 @@ class InMemoryConversationStore:
         return Conversation(
             id=conversation_id,
             messages=list(messages),
-            replay_items=copy.deepcopy(self._replay_items.get(conversation_id, [])),
-            revision=self._revisions.get(conversation_id, 0),
-            total_tokens=self._token_totals.get(conversation_id, 0),
+            replay_items=copy.deepcopy(self._replay_items.get(key, [])),
+            revision=self._revisions.get(key, 0),
+            total_tokens=self._token_totals.get(key, 0),
         )
 
     async def append(
         self,
+        tenant_id: str,
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
         usage_tokens: int,
     ) -> None:
-        current = self._revisions.get(conversation_id, 0)
+        key = (tenant_id, conversation_id)
+        current = self._revisions.get(key, 0)
         if expected_revision != current:
             raise ConversationConflictError(conversation_id, expected_revision, current)
         # Prepare-then-publish: everything that can fail (the deep copy)
@@ -92,14 +101,12 @@ class InMemoryConversationStore:
         # log untouched instead of half a two-representation turn.
         prepared_turns = list(turns)
         prepared_replay = copy.deepcopy(list(replay_items))
-        self._messages.setdefault(conversation_id, []).extend(prepared_turns)
-        self._replay_items.setdefault(conversation_id, []).extend(prepared_replay)
-        self._revisions[conversation_id] = current + 1
+        self._messages.setdefault(key, []).extend(prepared_turns)
+        self._replay_items.setdefault(key, []).extend(prepared_replay)
+        self._revisions[key] = current + 1
         # The ledger commits with the turn: usage is part of the same
         # all-or-nothing append, never a separate write that can drift.
-        self._token_totals[conversation_id] = (
-            self._token_totals.get(conversation_id, 0) + usage_tokens
-        )
+        self._token_totals[key] = self._token_totals.get(key, 0) + usage_tokens
 
 
 def build_conversation_store(settings: Settings) -> ConversationStore:

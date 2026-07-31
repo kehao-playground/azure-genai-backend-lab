@@ -7,8 +7,10 @@ EOF without one is itself reported as an ``error`` event.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator, Sequence
 
+import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
 
@@ -76,6 +78,24 @@ def override(service: ScriptedChatService) -> None:
     app.dependency_overrides[get_conversation_service] = lambda: wrapped
 
 
+class SpyConversationService:
+    """Records the tenant_id the route handler passes into open_stream()."""
+
+    def __init__(self) -> None:
+        self.tenant_ids: list[str] = []
+
+    async def open_stream(
+        self, message: str, conversation_id: str | None, *, tenant_id: str
+    ) -> tuple[str, AsyncIterator[TextDelta | StreamDone]]:
+        self.tenant_ids.append(tenant_id)
+
+        async def stream() -> AsyncIterator[TextDelta | StreamDone]:
+            yield TextDelta("x")
+            yield StreamDone(status="completed")
+
+        return "spy-conversation", stream()
+
+
 def post_stream(client: TestClient) -> Response:
     return client.post("/api/v1/chat/stream", json={"message": "Hello"})
 
@@ -111,6 +131,41 @@ def test_pre_stream_failure_is_a_plain_http_error(client: TestClient) -> None:
     body = response.json()
     assert body["error"]["code"] == "upstream_throttled"
     assert body["correlation_id"]
+
+
+def test_stream_endpoint_passes_the_principals_tenant_id_into_open_stream(
+    client: TestClient,
+) -> None:
+    spy = SpyConversationService()
+    app.dependency_overrides[get_conversation_service] = lambda: spy
+
+    response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1
+
+    assert response.status_code == 200
+    assert spy.tenant_ids == ["t1"]
+
+
+def test_log_record_emitted_inside_the_streaming_iterator_carries_tenant_id(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A generator-scope ContextVar can look right in the handler and still be
+    # gone once StreamingResponse actually drains the body outside the
+    # request coroutine. Assert on a log line the serializer emits from
+    # *inside* the async generator, captured while the SSE body is consumed
+    # — the Task 2 generator-dependency test alone does not exercise this.
+    override(
+        ScriptedChatService([TextDelta("par"), UpstreamServiceError("upstream died mid-stream")])
+    )
+
+    with caplog.at_level(logging.WARNING):
+        response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1
+
+    assert response.status_code == 200
+    mid_stream_records = [
+        r for r in caplog.records if "mid-stream upstream failure" in r.getMessage()
+    ]
+    assert len(mid_stream_records) == 1
+    assert mid_stream_records[0].tenant_id == "t1"  # type: ignore[attr-defined]
 
 
 def test_mid_stream_failure_ends_with_error_event(client: TestClient) -> None:
@@ -222,6 +277,7 @@ def test_provisional_id_after_content_filter_resolves_to_404(client: TestClient)
 class FailingStore(InMemoryConversationStore):
     async def append(
         self,
+        tenant_id: str,
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],

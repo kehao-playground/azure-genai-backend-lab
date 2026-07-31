@@ -28,6 +28,8 @@ from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 PROMPT = load_prompt("default_chat")
 
+TENANT_ID = "t1"
+
 
 def make_service(response: Any) -> AzureOpenAIChatService:
     async def create(**kwargs: Any) -> Any:
@@ -141,11 +143,11 @@ async def test_max_output_tokens_truncation_commits_the_partial_turn() -> None:
     scripted = ChatResult(message="par", status="incomplete", incomplete_reason="max_output_tokens")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None)
-    _, result = await service.complete("two", conversation_id)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
     assert result.status == "incomplete"
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     # turn 1 (2 messages) + truncated turn 2: user + partial assistant reply.
     assert [(m.role, m.content) for m in conversation.messages][-2:] == [
@@ -158,12 +160,12 @@ async def test_content_filter_truncation_leaves_no_trace() -> None:
     scripted = ChatResult(message="bad", status="incomplete", incomplete_reason="content_filter")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None)
-    _, result = await service.complete("two", conversation_id)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
     assert result.status == "incomplete"
     assert result.incomplete_reason == "content_filter"
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     # The discarded turn left nothing: transcript still holds only turn 1.
     assert len(conversation.messages) == 2
@@ -173,9 +175,9 @@ async def test_empty_completed_reply_is_still_an_upstream_failure() -> None:
     scripted = ChatResult(message="", status="completed")
     service, _ = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
     with pytest.raises(UpstreamServiceError):
-        await service.complete("two", conversation_id)
+        await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
 
 async def test_empty_max_output_tokens_reply_commits_the_user_turn_only() -> None:
@@ -184,11 +186,11 @@ async def test_empty_max_output_tokens_reply_commits_the_user_turn_only() -> Non
     scripted = ChatResult(message="", status="incomplete", incomplete_reason="max_output_tokens")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None)
-    _, result = await service.complete("two", conversation_id)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
     assert result.status == "incomplete"
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     assert [(m.role, m.content) for m in conversation.messages][-1:] == [("user", "two")]
 

@@ -22,7 +22,7 @@ needs a durable lease or a compare-and-set on a version the store owns.
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Hashable
 from contextlib import asynccontextmanager
 
 
@@ -34,26 +34,32 @@ class _Entry:
         self.refs = 0
 
 
-class KeyedLock:
-    """A lock per key, existing only while someone holds or awaits it."""
+class KeyedLock[K: Hashable]:
+    """A lock per key, existing only while someone holds or awaits it.
+
+    ``K`` is any hashable key: a plain ``str`` conversation id, or a
+    composite tuple such as ``(tenant_id, conversation_id)`` — the entry
+    registry only ever compares keys for equality, so a tuple key behaves
+    exactly like a string one.
+    """
 
     def __init__(self) -> None:
-        self._entries: dict[str, _Entry] = {}
+        self._entries: dict[K, _Entry] = {}
 
     def __len__(self) -> int:
         """Keys with a live entry — zero once every operation has finished."""
         return len(self._entries)
 
-    def holders(self, key: str) -> int:
+    def holders(self, key: K) -> int:
         """Holders plus waiters for ``key``; zero if it has no entry at all."""
         entry = self._entries.get(key)
         return entry.refs if entry is not None else 0
 
-    def is_held(self, key: str) -> bool:
+    def is_held(self, key: K) -> bool:
         entry = self._entries.get(key)
         return entry is not None and entry.lock.locked()
 
-    async def acquire(self, key: str) -> None:
+    async def acquire(self, key: K) -> None:
         entry = self._entries.get(key)
         if entry is None:
             entry = _Entry()
@@ -73,7 +79,7 @@ class KeyedLock:
                 del self._entries[key]
             raise
 
-    def release(self, key: str) -> None:
+    def release(self, key: K) -> None:
         entry = self._entries[key]
         entry.lock.release()
         entry.refs -= 1
@@ -81,7 +87,7 @@ class KeyedLock:
             del self._entries[key]
 
     @asynccontextmanager
-    async def hold(self, key: str) -> AsyncIterator[None]:
+    async def hold(self, key: K) -> AsyncIterator[None]:
         """Acquire for the duration of a block.
 
         Callers whose acquire and release sit in different frames — an
