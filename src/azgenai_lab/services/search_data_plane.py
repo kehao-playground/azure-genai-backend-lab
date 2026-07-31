@@ -37,6 +37,7 @@ from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION, to_index_definition
 from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status, search_url
 from azgenai_lab.services.indexing_results import IndexingResult
+from azgenai_lab.services.odata import escape_odata_literal
 from azgenai_lab.services.search_indexing import UnsendableDocumentError
 
 logger = logging.getLogger(__name__)
@@ -134,11 +135,6 @@ def plan_batches(
         size += extra
     if batch:
         yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys), action)
-
-
-def escape_odata_literal(value: str) -> str:
-    """Escape a value for an OData string literal (a single quote doubles)."""
-    return value.replace("'", "''")
 
 
 def index_url(endpoint: str) -> str:
@@ -350,7 +346,6 @@ __all__ = [
     "IndexingBatch",
     "SearchDataPlane",
     "documents_url",
-    "escape_odata_literal",
     "index_url",
     "parse_indexing_results",
     "plan_batches",
