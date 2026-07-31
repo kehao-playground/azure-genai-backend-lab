@@ -69,7 +69,7 @@
     {
       "name": "allowed_groups",
       "type": "Collection(Edm.String)",
-      "retrievable": true,
+      "retrievable": false,
       "searchable": false,
       "filterable": true,
       "sortable": false,
