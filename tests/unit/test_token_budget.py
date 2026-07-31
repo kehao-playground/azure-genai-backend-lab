@@ -29,6 +29,8 @@ from azgenai_lab.services.conversation import (
 )
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
+TENANT_ID = "t1"
+
 
 def make_service(
     budget: int | None, chat: FakeChatService | None = None
@@ -54,10 +56,10 @@ async def test_fake_usage_is_history_proportional() -> None:
 async def test_committed_turns_accumulate_reported_tokens() -> None:
     service, store = make_service(budget=None)
 
-    conversation_id, _ = await service.complete("one", None)
-    await service.complete("two", conversation_id)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     # turn 1: 1 input item -> 15; turn 2: 3 items (user+assistant+user) -> 35.
     assert conversation.total_tokens == 50
@@ -66,11 +68,11 @@ async def test_committed_turns_accumulate_reported_tokens() -> None:
 async def test_stream_commit_records_the_terminal_usage() -> None:
     service, store = make_service(budget=None)
 
-    conversation_id, events = await service.open_stream("one", None)
+    conversation_id, events = await service.open_stream("one", None, tenant_id=TENANT_ID)
     async for _ in events:
         pass
 
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     assert conversation.total_tokens == 15
 
@@ -90,11 +92,11 @@ async def test_failed_turn_leaves_no_ledger_trace() -> None:
 
     service, store = make_service(budget=None, chat=EmptyReplyChat())
 
-    conversation_id, _ = await service.complete("one", None)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
     with pytest.raises(UpstreamServiceError):
-        await service.complete("two", conversation_id)
+        await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
-    conversation = await store.get(conversation_id)
+    conversation = await store.get(TENANT_ID, conversation_id)
     assert conversation is not None
     # The failed turn may have incurred billable processing, but turn-commit wins:
     # nothing — transcript, replay items, or tokens — entered the log.
@@ -115,9 +117,9 @@ async def test_exhausted_budget_rejects_before_calling_upstream() -> None:
     chat = CountingChat()
     service, _ = make_service(budget=10, chat=chat)
 
-    conversation_id, _ = await service.complete("one", None)  # 15 committed
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)  # 15 committed
     with pytest.raises(TokenBudgetExceededError) as excinfo:
-        await service.complete("two", conversation_id)
+        await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
     assert CountingChat.calls == 1  # the rejected turn never reached upstream
     assert excinfo.value.spent == 15
@@ -127,19 +129,19 @@ async def test_exhausted_budget_rejects_before_calling_upstream() -> None:
 async def test_stream_budget_rejection_is_pre_stream() -> None:
     service, _ = make_service(budget=10)
 
-    conversation_id, events = await service.open_stream("one", None)
+    conversation_id, events = await service.open_stream("one", None, tenant_id=TENANT_ID)
     async for _ in events:
         pass
 
     with pytest.raises(TokenBudgetExceededError):
-        await service.open_stream("two", conversation_id)
+        await service.open_stream("two", conversation_id, tenant_id=TENANT_ID)
 
 
 async def test_none_budget_disables_the_guardrail() -> None:
     service, _ = make_service(budget=None)
 
-    conversation_id, _ = await service.complete("one", None)
-    _, result = await service.complete("two", conversation_id)
+    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
 
     assert result.message
 
@@ -147,11 +149,11 @@ async def test_none_budget_disables_the_guardrail() -> None:
 async def test_a_new_conversation_is_not_affected_by_an_exhausted_one() -> None:
     service, _ = make_service(budget=10)
 
-    exhausted_id, _ = await service.complete("one", None)
+    exhausted_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
     with pytest.raises(TokenBudgetExceededError):
-        await service.complete("two", exhausted_id)
+        await service.complete("two", exhausted_id, tenant_id=TENANT_ID)
 
-    fresh_id, result = await service.complete("hello", None)
+    fresh_id, result = await service.complete("hello", None, tenant_id=TENANT_ID)
     assert fresh_id != exhausted_id
     assert result.message
 

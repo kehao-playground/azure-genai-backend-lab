@@ -347,7 +347,7 @@ class DocumentReplacer[BatchT: DocumentBatch]:
         self._post_batch = post_batch
         self._list_page = list_page
         self._sleep = sleep
-        self._locks = KeyedLock()
+        self._locks: KeyedLock[str] = KeyedLock()
         self._active: dict[str, int] = {}
         # Peak observed concurrency for any single parent_id. Exposed so the
         # mutual exclusion can be asserted directly instead of inferred from

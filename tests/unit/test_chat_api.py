@@ -70,6 +70,21 @@ def test_chat_unknown_conversation_id_maps_to_404_envelope(client: TestClient) -
     assert body["correlation_id"]
 
 
+def test_chat_cross_tenant_conversation_id_maps_to_404(client: TestClient) -> None:
+    first = client.post("/api/v1/chat", json={"message": "ping"})  # tenant t1 (fixture default)
+    conversation_id = first.json()["conversation_id"]
+
+    from azgenai_lab.main import app as _app
+
+    with TestClient(_app, headers={"X-Tenant-Id": "t2"}) as other_tenant_client:
+        response = other_tenant_client.post(
+            "/api/v1/chat", json={"message": "intruder", "conversation_id": conversation_id}
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "conversation_not_found"
+
+
 def test_chat_rejects_empty_message_with_error_envelope(client: TestClient) -> None:
     response = client.post("/api/v1/chat", json={"message": ""})
 
@@ -98,6 +113,7 @@ def override_with_raising(error: UpstreamError) -> None:
 class FailingStore(InMemoryConversationStore):
     async def append(
         self,
+        tenant_id: str,
         conversation_id: str,
         turns: Sequence[Message],
         replay_items: Sequence[ReplayItem],
