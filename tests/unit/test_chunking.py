@@ -9,7 +9,7 @@ from datetime import date
 
 import pytest
 
-from azgenai_lab.models.rag import Chunk, SourceDocument
+from azgenai_lab.models.rag import Chunk, SourceDocument, make_parent_id
 from azgenai_lab.services.chunking import ChunkingError, chunk_markdown
 from azgenai_lab.services.document_loader import load_documents
 
@@ -62,13 +62,15 @@ def test_heading_path_always_starts_with_the_document_title() -> None:
 
 
 def test_chunk_ids_are_sequential_and_parented() -> None:
-    chunks = chunk_markdown(_document(BODY), max_chars=2000, overlap_chars=500)
+    doc = _document(BODY)
+    chunks = chunk_markdown(doc, max_chars=2000, overlap_chars=500)
 
+    expected_parent_id = make_parent_id(doc.tenant_id, doc.doc_id)
     assert [chunk.chunk_id for chunk in chunks[:2]] == [
-        "returns-policy-0000",
-        "returns-policy-0001",
+        f"{expected_parent_id}-0000",
+        f"{expected_parent_id}-0001",
     ]
-    assert all(chunk.parent_id == "returns-policy" for chunk in chunks)
+    assert all(chunk.parent_id == expected_parent_id for chunk in chunks)
 
 
 def test_metadata_is_copied_onto_every_chunk() -> None:
@@ -542,3 +544,20 @@ def test_overlap_at_or_above_half_of_max_chars_is_rejected() -> None:
         chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=50)
     with pytest.raises(ValueError, match="less than half of max_chars"):
         chunk_markdown(_document("Just prose."), max_chars=100, overlap_chars=60)
+
+
+def test_chunker_builds_parent_id_with_tenant_scoped_format() -> None:
+    doc = _document(BODY)
+    chunks = chunk_markdown(doc, max_chars=2000, overlap_chars=500)
+
+    expected_parent_id = make_parent_id(doc.tenant_id, doc.doc_id)
+    assert all(chunk.parent_id == expected_parent_id for chunk in chunks)
+
+
+def test_chunker_builds_chunk_id_from_parent_and_ordinal() -> None:
+    doc = _document(BODY)
+    chunks = chunk_markdown(doc, max_chars=2000, overlap_chars=500)
+
+    expected_parent_id = make_parent_id(doc.tenant_id, doc.doc_id)
+    for ordinal, chunk in enumerate(chunks):
+        assert chunk.chunk_id == f"{expected_parent_id}-{ordinal:04d}"

@@ -8,7 +8,7 @@ from datetime import date
 
 import pytest
 
-from azgenai_lab.models.rag import Chunk, SourceDocument, make_chunk_id
+from azgenai_lab.models.rag import Chunk, SourceDocument, make_chunk_id, make_parent_id
 from azgenai_lab.models.search_index import (
     DOCUMENT_KEY_MAX_LENGTH,
     EMBEDDING_DIMENSIONS,
@@ -30,8 +30,8 @@ def _document(doc_id: str = "returns-policy") -> SourceDocument:
 
 def _chunk(**overrides: object) -> Chunk:
     fields: dict[str, object] = {
-        "chunk_id": "returns-policy-0000",
-        "parent_id": "returns-policy",
+        "chunk_id": "t4=acmed14=returns-policy-0000",
+        "parent_id": "t4=acmed14=returns-policy",
         "title": "Returns Policy",
         "heading_path": "Returns Policy > Refund window",
         "content": "Refunds are issued within 14 days.",
@@ -109,8 +109,8 @@ def test_source_document_is_frozen() -> None:
 
 def _document_chunk() -> Chunk:
     return Chunk(
-        chunk_id="returns-policy-0001",
-        parent_id="returns-policy",
+        chunk_id="t4=acmed14=returns-policy-0001",
+        parent_id="t4=acmed14=returns-policy",
         title="Returns Policy",
         heading_path="Returns Policy > Refund window",
         content="Customers may return most items within 30 days.",
@@ -131,8 +131,8 @@ def test_effective_date_serializes_to_utc_midnight() -> None:
 def test_index_document_carries_every_schema_field() -> None:
     vector = [0.5] * EMBEDDING_DIMENSIONS
     assert _document_chunk().to_index_document(vector) == {
-        "chunk_id": "returns-policy-0001",
-        "parent_id": "returns-policy",
+        "chunk_id": "t4=acmed14=returns-policy-0001",
+        "parent_id": "t4=acmed14=returns-policy",
         "title": "Returns Policy",
         "heading_path": "Returns Policy > Refund window",
         "content": "Customers may return most items within 30 days.",
@@ -148,3 +148,26 @@ def test_index_document_rejects_a_wrong_width_vector() -> None:
     # whose vector is the wrong width is worse than not writing it.
     with pytest.raises(ValueError, match="dimensions"):
         _document_chunk().to_index_document([0.1, 0.2])
+
+
+def test_parent_id_format_with_typical_values() -> None:
+    assert make_parent_id("acme", "returns-policy") == "t4=acmed14=returns-policy"
+
+
+def test_parent_id_format_with_single_character_ids() -> None:
+    assert make_parent_id("a", "b") == "t1=ad1=b"
+
+
+def test_parent_id_collision_prevention() -> None:
+    # A collision would occur if the format were not carefully designed.
+    # Without length prefixes, both of these would become "a-b--c" if naively concatenated.
+    assert make_parent_id("a", "b--c") != make_parent_id("a--b", "c")
+
+
+def test_parent_id_is_legal_key() -> None:
+    parent_id = make_parent_id("acme", "returns-policy")
+    # Must start with 't'
+    assert parent_id.startswith("t")
+    # Must match legal key pattern (alphanumeric, underscore, equals, dash)
+    import re
+    assert re.match(r"^[A-Za-z0-9_=-]+$", parent_id)
