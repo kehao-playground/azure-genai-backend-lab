@@ -158,6 +158,8 @@ DOC = {
     "title": "Doc A",
     "heading_path": "Doc A > Intro",
     "content": "alpha beta",
+    "tenant_id": "t1",
+    "allowed_groups": [],
 }
 
 

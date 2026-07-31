@@ -52,6 +52,8 @@ def step_corpus_covers_question(context) -> None:  # type: ignore[no-untyped-def
             "title": "Hybrid Search Overview",
             "heading_path": "Hybrid Search Overview > Basics",
             "content": "Hybrid search combines vector and keyword search results.",
+            "tenant_id": "t1",
+            "allowed_groups": [],
         }
     ]
     _override_rag_service(documents, context)

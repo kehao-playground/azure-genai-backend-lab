@@ -38,6 +38,7 @@ from azgenai_lab.models.search_index import (
     SEMANTIC_CONFIGURATION_NAME,
     VECTOR_FIELD,
 )
+from azgenai_lab.services.acl import require_acl_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +398,9 @@ class FakeSearchClient:
     """
 
     def __init__(self, documents: Sequence[dict[str, Any]] = ()) -> None:
+        # Validate that every document carries mandatory ACL metadata
+        for document in documents:
+            require_acl_metadata(document)
         self._documents = list(documents)
         self.last_mode: SearchMode | None = None
         self.last_top: int | None = None

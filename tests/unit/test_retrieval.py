@@ -14,6 +14,8 @@ DOC = {
     "title": "Doc A",
     "heading_path": "Doc A > Intro",
     "content": "hybrid search combines keyword and vector retrieval",
+    "tenant_id": "t1",
+    "allowed_groups": [],
 }
 
 
