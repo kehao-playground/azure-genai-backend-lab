@@ -4,6 +4,7 @@ title: Returns Policy
 doc_type: policy
 tenant_id: acme
 effective_date: 2026-01-15
+allowed_groups: []
 ---
 
 # Returns Policy

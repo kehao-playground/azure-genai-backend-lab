@@ -24,6 +24,7 @@ def _document(doc_id: str = "returns-policy") -> SourceDocument:
         doc_type="policy",
         tenant_id="acme",
         effective_date=date(2026, 1, 15),
+        allowed_groups=(),
         body="# Returns Policy\n\nWe accept returns.",
     )
 
@@ -38,6 +39,7 @@ def _chunk(**overrides: object) -> Chunk:
         "doc_type": "policy",
         "tenant_id": "acme",
         "effective_date": date(2026, 1, 15),
+        "allowed_groups": (),
     }
     fields.update(overrides)
     return Chunk(**fields)  # type: ignore[arg-type]
@@ -117,6 +119,7 @@ def _document_chunk() -> Chunk:
         doc_type="policy",
         tenant_id="acme",
         effective_date=date(2026, 1, 15),
+        allowed_groups=("oncall",),
     )
 
 
@@ -139,6 +142,7 @@ def test_index_document_carries_every_schema_field() -> None:
         "doc_type": "policy",
         "tenant_id": "acme",
         "effective_date": "2026-01-15T00:00:00Z",
+        "allowed_groups": ["oncall"],
         VECTOR_FIELD: vector,
     }
 

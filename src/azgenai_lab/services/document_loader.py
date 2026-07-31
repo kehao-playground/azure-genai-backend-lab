@@ -10,6 +10,7 @@ from pathlib import Path
 
 import yaml
 
+from azgenai_lab.models.principal import validate_identifier
 from azgenai_lab.models.rag import DOC_ID_MAX_LENGTH, SourceDocument
 from azgenai_lab.models.search_index import DocumentKeyError, validate_document_key
 
@@ -18,7 +19,14 @@ from azgenai_lab.models.search_index import DocumentKeyError, validate_document_
 SAMPLE_DOCS_DIR = Path(__file__).resolve().parents[3] / "data" / "sample-docs"
 
 _DELIMITER = "---"
-_REQUIRED_FIELDS = ("doc_id", "title", "doc_type", "tenant_id", "effective_date")
+_REQUIRED_FIELDS = (
+    "doc_id",
+    "title",
+    "doc_type",
+    "tenant_id",
+    "effective_date",
+    "allowed_groups",
+)
 _KNOWN_FIELDS = frozenset(_REQUIRED_FIELDS)
 
 
@@ -68,6 +76,34 @@ def load_document(path: Path) -> SourceDocument:
             "not a timestamp"
         )
 
+    allowed_groups_raw = meta["allowed_groups"]
+    if not isinstance(allowed_groups_raw, list) or not all(
+        isinstance(group, str) for group in allowed_groups_raw
+    ):
+        raise SourceDocumentError(f"{path.name}: allowed_groups must be a YAML list of strings")
+    if len(set(allowed_groups_raw)) != len(allowed_groups_raw):
+        raise SourceDocumentError(f"{path.name}: allowed_groups contains duplicate entries")
+    for group in allowed_groups_raw:
+        try:
+            validate_identifier(group, field="allowed_groups entry")
+        except ValueError as exc:
+            raise SourceDocumentError(f"{path.name}: {exc}") from exc
+    allowed_groups = tuple(allowed_groups_raw)
+
+    # The tenant directory a document lives under is load-bearing: it is what
+    # a future bulk-upload script trusts to scope a document to one tenant,
+    # so the front matter must agree with it rather than merely repeat it.
+    tenant_dir = path.parent.name
+    try:
+        validate_identifier(tenant_dir, field="tenant directory")
+    except ValueError as exc:
+        raise SourceDocumentError(f"{path.name}: {exc}") from exc
+    if meta["tenant_id"] != tenant_dir:
+        raise SourceDocumentError(
+            f"{path.name}: tenant_id {meta['tenant_id']!r} does not match "
+            f"its directory {tenant_dir!r}"
+        )
+
     doc_id: str = meta["doc_id"]
     if doc_id != path.stem:
         raise SourceDocumentError(
@@ -94,12 +130,14 @@ def load_document(path: Path) -> SourceDocument:
         doc_type=meta["doc_type"],
         tenant_id=meta["tenant_id"],
         effective_date=meta["effective_date"],
+        allowed_groups=allowed_groups,
         body=text,
     )
 
 
 def load_documents(base_dir: Path = SAMPLE_DOCS_DIR) -> list[SourceDocument]:
-    paths = sorted(base_dir.glob("*.md"))
+    # Documents live one directory per tenant: <base_dir>/<tenant>/<doc_id>.md.
+    paths = sorted(base_dir.glob("*/*.md"))
     if not paths:
         raise SourceDocumentError(f"no documents found in {base_dir}")
     return [load_document(path) for path in paths]

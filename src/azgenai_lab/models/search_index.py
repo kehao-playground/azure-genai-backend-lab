@@ -120,6 +120,19 @@ def to_index_definition() -> dict[str, Any]:
             _text_field("doc_type", filterable=True, facetable=True),
             _text_field("tenant_id", filterable=True),
             {
+                # `build_acl_filter` (services/acl.py) filters on this field
+                # with `allowed_groups/any(...)`, which Azure AI Search only
+                # supports on a filterable Collection(Edm.String) field, not
+                # Edm.String.
+                "name": "allowed_groups",
+                "type": "Collection(Edm.String)",
+                "retrievable": True,
+                "searchable": False,
+                "filterable": True,
+                "sortable": False,
+                "facetable": False,
+            },
+            {
                 "name": "effective_date",
                 "type": "Edm.DateTimeOffset",
                 "retrievable": True,

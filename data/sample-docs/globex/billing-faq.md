@@ -4,6 +4,7 @@ title: Billing FAQ
 doc_type: faq
 tenant_id: globex
 effective_date: 2026-04-05
+allowed_groups: []
 ---
 
 # Billing FAQ

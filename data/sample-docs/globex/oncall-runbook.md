@@ -4,6 +4,7 @@ title: On-Call Runbook
 doc_type: runbook
 tenant_id: globex
 effective_date: 2026-03-10
+allowed_groups: [oncall]
 ---
 
 # On-Call Runbook

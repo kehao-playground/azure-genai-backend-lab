@@ -42,6 +42,7 @@ def _chunks(count: int) -> list[Chunk]:
             doc_type="policy",
             tenant_id="acme",
             effective_date=date(2026, 1, 15),
+            allowed_groups=(),
         )
         for index in range(count)
     ]

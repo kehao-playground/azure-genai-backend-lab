@@ -4,6 +4,7 @@ title: Service SLA
 doc_type: sla
 tenant_id: acme
 effective_date: 2026-02-01
+allowed_groups: []
 ---
 
 # Service SLA
