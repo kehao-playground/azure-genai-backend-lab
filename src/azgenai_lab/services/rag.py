@@ -18,16 +18,31 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import load_prompt
-from azgenai_lab.services.azure_openai import ChatService, IncompleteReason, build_chat_service
+from azgenai_lab.services.azure_openai import ChatResult, IncompleteReason, build_chat_service
 from azgenai_lab.services.retrieval import Retriever, build_retriever
+
+
+class RagChatService(Protocol):
+    """The narrow slice of ChatService the RAG path actually uses.
+
+    ChatService (azure_openai.py) also demands open_stream()/aclose() for
+    the streaming /chat path, which /rag never exercises. Declaring this
+    smaller Protocol as RagService's dependency lets a stub satisfy it
+    structurally without implementing streaming it will never be asked for.
+    """
+
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult: ...
+
+    async def aclose(self) -> None: ...
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +257,7 @@ def _validate_citations(answer: str, included_hit_count: int) -> str:
 
 class RagService:
     def __init__(
-        self, retriever: Retriever, chat_service: ChatService, *, instructions_bytes: int = 0
+        self, retriever: Retriever, chat_service: RagChatService, *, instructions_bytes: int = 0
     ) -> None:
         self._retriever = retriever
         self._chat_service = chat_service
@@ -355,6 +370,7 @@ __all__ = [
     "PROMPT_FRAMING_HEADROOM_BYTES",
     "PROMPT_INPUT_TOKEN_LIMIT",
     "RagAnswer",
+    "RagChatService",
     "RagContextOverflowError",
     "RagService",
     "RagStatus",

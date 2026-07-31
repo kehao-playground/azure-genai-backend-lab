@@ -27,7 +27,7 @@ import json
 import logging
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -58,7 +58,9 @@ _WRAPPER_BYTES = len(_OPEN) + len(_CLOSE)
 # The `@search.action` spelling of each action this project performs. This
 # table is the reason the vocabulary stops here: "upload" is the service's
 # word for an upsert, and nothing above this module says it.
-_WIRE_ACTIONS = {
+WireAction = Literal["upload", "delete"]
+
+_WIRE_ACTIONS: dict[IndexingAction, WireAction] = {
     IndexingAction.UPSERT: "upload",
     IndexingAction.REMOVE: "delete",
 }
@@ -356,6 +358,7 @@ __all__ = [
     "DocumentTooLargeError",
     "IndexingBatch",
     "SearchDataPlane",
+    "WireAction",
     "documents_url",
     "index_url",
     "parse_indexing_results",
