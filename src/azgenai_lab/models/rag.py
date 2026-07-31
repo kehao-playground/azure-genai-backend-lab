@@ -130,6 +130,17 @@ class Chunk:
         }
 
 
+def make_parent_id(tenant_id: str, doc_id: str) -> str:
+    """Derive a parent key from tenant and document identifiers.
+
+    The format encodes both lengths to prevent collision: two pairs of
+    (tenant, doc) cannot produce the same key even if their concatenations
+    would (e.g., "a--b" + "c" vs "a" + "b--c"). The length prefix acts as
+    a delimiter within the equality-constrained key alphabet.
+    """
+    return f"t{len(tenant_id)}={tenant_id}d{len(doc_id)}={doc_id}"
+
+
 def make_chunk_id(parent_id: str, ordinal: int) -> str:
     """Derive a chunk key from its parent and position.
 

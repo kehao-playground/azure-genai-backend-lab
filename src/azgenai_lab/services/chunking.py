@@ -55,6 +55,7 @@ from azgenai_lab.models.rag import (
     Chunk,
     SourceDocument,
     make_chunk_id,
+    make_parent_id,
 )
 
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
@@ -207,6 +208,7 @@ def chunk_markdown(
         )
 
     chunks: list[Chunk] = []
+    parent_id = make_parent_id(document.tenant_id, document.doc_id)
     for heading_path, prose in _sections(document):
         budget = max_chars - len(heading_path) - len(EMBEDDING_JOIN)
         if budget <= 0:
@@ -223,8 +225,8 @@ def chunk_markdown(
         for piece in _split_section(prose, budget=budget, overlap=overlap_chars):
             chunks.append(
                 Chunk(
-                    chunk_id=make_chunk_id(document.doc_id, len(chunks)),
-                    parent_id=document.doc_id,
+                    chunk_id=make_chunk_id(parent_id, len(chunks)),
+                    parent_id=parent_id,
                     title=document.title,
                     heading_path=heading_path,
                     content=piece,
