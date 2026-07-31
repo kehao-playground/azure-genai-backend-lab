@@ -8,6 +8,7 @@ so a 422 from FastAPI's own validation can never masquerade as the 401 the
 dependency is supposed to raise.
 """
 
+import logging
 from collections.abc import AsyncGenerator, Generator
 
 import pytest
@@ -126,6 +127,19 @@ def test_valid_headers_without_group_ids_reach_the_handler(
     assert response.status_code != 401
 
 
+@pytest.mark.parametrize(("path", "payload"), _PROTECTED_CASES)
+def test_ows_only_group_ids_header_reaches_the_handler(
+    bare_client: TestClient, path: str, payload: dict[str, str]
+) -> None:
+    # Present but optional-whitespace-only -> () per the parsing rules, same
+    # as an absent header entirely; must not be mistaken for a malformed value.
+    response = bare_client.post(
+        path, json=payload, headers={"X-Tenant-Id": "t1", "X-Group-Ids": " \t"}
+    )
+
+    assert response.status_code != 401
+
+
 # ---------------------------------------------------------------------------
 # Step 5: endpoint matrix assertions — envelope shape, challenge header,
 # health bypass, stream content-type.
@@ -176,3 +190,31 @@ async def test_tenant_id_var_lifecycle_around_the_dependency() -> None:
         await gen.aclose()
 
     assert tenant_id_var.get() == "-"
+
+
+def _emit_record() -> logging.LogRecord:
+    """Build a real LogRecord through the configured global factory (the same
+    one core/logging.py installs at startup), not by constructing one
+    directly — the point is to exercise the factory, matching
+    test_logging_wiring.py's pattern of testing real wiring over stubs."""
+    factory = logging.getLogRecordFactory()
+    return factory(
+        "azgenai_lab.test", logging.INFO, __file__, 0, "probe", (), None
+    )
+
+
+async def test_log_record_carries_tenant_id_inside_the_dependency_scope_only() -> None:
+    outside_before = _emit_record()
+    assert outside_before.tenant_id == "-"  # type: ignore[attr-defined]
+
+    request = _make_request([(b"x-tenant-id", b"t1")])
+    gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
+    try:
+        await anext(gen)
+        inside = _emit_record()
+        assert inside.tenant_id == "t1"  # type: ignore[attr-defined]
+    finally:
+        await gen.aclose()
+
+    outside_after = _emit_record()
+    assert outside_after.tenant_id == "-"  # type: ignore[attr-defined]
