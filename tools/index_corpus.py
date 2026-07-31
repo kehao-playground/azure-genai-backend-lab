@@ -4,8 +4,30 @@ This is the live-session instrument that makes retrieval measurable. It is
 also where the per-document serialized size is *measured* rather than
 estimated — the article may only cite the number this prints.
 
+Two ways to bring the schema up to date, and they are not interchangeable:
+
+* ``--create-index`` is non-destructive: it PUTs the current schema
+  definition (creating the index if absent, updating it in place if
+  present) and nothing else. It does **not** remove documents already in
+  the index, and it does not backfill ACL fields onto documents indexed
+  under an older schema — a field added to the schema after those documents
+  were written stays absent on them until they are re-indexed.
+* ``--recreate-index`` is destructive: it deletes the index, then
+  recreates it from the current schema, then runs the full corpus load
+  below. This lab's Day 15 migration (ACL fields added to every document)
+  is genuinely incomplete without it, because ``--create-index`` alone
+  would leave every previously-indexed chunk without the fields the new
+  ACL filter depends on.
+
+Production would not use either flag this way: a production migration
+builds a **new** index generation, loads it in full, and cuts an alias over
+to it, so the old generation keeps serving reads until the new one is
+verified — this lab's single, aliasless index has no such rollback, which
+is why the destructive flag is safe only in a lab.
+
 Usage:
     uv run python tools/index_corpus.py --create-index
+    uv run python tools/index_corpus.py --recreate-index
 """
 
 import argparse
@@ -22,10 +44,36 @@ from azgenai_lab.services.search_data_plane import IndexingBatch, SearchDataPlan
 from azgenai_lab.services.search_indexing import DocumentReplacer
 
 
-async def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--create-index", action="store_true", help="PUT the schema first")
-    arguments = parser.parse_args()
+    schema_group = parser.add_mutually_exclusive_group()
+    schema_group.add_argument(
+        "--create-index",
+        action="store_true",
+        help=(
+            "PUT the schema first (non-destructive: creates the index if "
+            "absent, updates it in place if present). Does not remove stale "
+            "documents already in the index and does not backfill ACL "
+            "fields onto documents indexed under an older schema."
+        ),
+    )
+    schema_group.add_argument(
+        "--recreate-index",
+        action="store_true",
+        help=(
+            "DELETE the index, then recreate it from the current schema, "
+            "before the corpus load below (destructive — every document "
+            "already in the index is gone, including any this run does not "
+            "re-load). Lab-only: production migrates via a new index "
+            "generation plus an alias cutover, not by deleting the one "
+            "serving reads."
+        ),
+    )
+    return parser
+
+
+async def main() -> None:
+    arguments = _build_parser().parse_args()
 
     settings = get_settings()
     if settings.use_fake_embeddings:
@@ -42,13 +90,41 @@ async def main() -> None:
     # The data plane owns its connection pool here, so it is closed on the way
     # out — including when a SystemExit below aborts the run partway.
     async with SearchDataPlane(settings) as plane:
-        await _index(plane, settings, create_index=arguments.create_index)
+        await _index(
+            plane,
+            settings,
+            create_index=arguments.create_index,
+            recreate_index=arguments.recreate_index,
+        )
 
 
-async def _index(plane: SearchDataPlane, settings: Settings, *, create_index: bool) -> None:
-    if create_index:
+async def _rebuild_schema(
+    plane: SearchDataPlane, *, create_index: bool, recreate_index: bool
+) -> None:
+    """The schema half of a run, isolated from the corpus load below.
+
+    Isolated on purpose: this is the part `tests/unit/test_index_recreate.py`
+    pins the call order of, with a fake data plane and no corpus, no
+    embeddings and no network — the two schema calls are the whole surface
+    under test, and a full ingestion run would only obscure that.
+    """
+    if recreate_index:
+        # Strictly delete-then-create: a schema PUT against an index that
+        # still exists is an update, not a rebuild, and would carry forward
+        # exactly the stale documents this flag exists to clear.
+        await plane.delete_index()
+        print("index deleted")
         await plane.create_or_update_index()
         print("index created or updated")
+    elif create_index:
+        await plane.create_or_update_index()
+        print("index created or updated")
+
+
+async def _index(
+    plane: SearchDataPlane, settings: Settings, *, create_index: bool, recreate_index: bool
+) -> None:
+    await _rebuild_schema(plane, create_index=create_index, recreate_index=recreate_index)
 
     embedding_client = build_embedding_client(settings)
     print(

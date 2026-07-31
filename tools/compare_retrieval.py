@@ -18,12 +18,18 @@ Evidence is checkpointed to disk after every call. A live session that dies on
 query four must not lose queries one to three, and the failing call is usually
 the one worth keeping.
 
-Request bodies are written verbatim to a JSON sidecar — the Markdown shows a
-readable summary with the 1536-float vector elided, which is not replayable on
-its own. The sidecar's SHA-256 is recorded so the pair cannot silently drift.
-Anything written from an upstream error has the search service's name and host
-redacted first, because those bodies name the resource and this evidence is
-published.
+Request bodies are written **redacted** to a JSON sidecar — the raw OData
+``filter`` (which spells out the querying principal's tenant id and group
+ids) is stripped from every recorded request and replaced with
+``filter_present``/``filter_sha256``/``vector_filter_mode`` evidence fields;
+the Markdown shows a further readable summary with the 1536-float vector
+elided. Neither is replayable on its own: the vector and every non-ACL field
+are reusable as-is, but a full replay of a recorded call requires rebuilding
+the filter from a `Principal` (`services/acl.py`) — the sidecar deliberately
+does not carry enough to skip that step. The sidecar's SHA-256 is recorded so
+the pair cannot silently drift. Anything written from an upstream error has
+the search service's name and host redacted first, because those bodies name
+the resource and this evidence is published.
 
 Two conditions stop the run before it can spend anything: fake embeddings, and
 pre-registered chunk ids left as placeholders. Either one produces an evidence
@@ -89,6 +95,32 @@ def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
         pattern = rf"(?<![0-9a-z-]){re.escape(bare_name)}(?![0-9a-z-])"
         scrubbed = re.sub(pattern, placeholder, scrubbed)
     return scrubbed
+
+
+def _redact_request_body(body: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a redacted **copy** of a request body — the original is never mutated.
+
+    The raw ``filter`` string names the querying principal's tenant id and
+    (when present) its group ids, and this project's rule is that identifiers
+    like those do not go into published evidence. What the evidence needs
+    from the filter is not its text but three provable facts about it: that
+    one was sent at all, a fingerprint of it (so two runs can be compared
+    without either one disclosing the value), and whether the vector query
+    that accompanied it asked for pre-filtering or post-filtering. Those
+    travel as top-level fields instead.
+    """
+    if body is None:
+        return None
+    redacted = dict(body)
+    raw_filter = redacted.pop("filter", None)
+    redacted["filter_present"] = isinstance(raw_filter, str) and raw_filter != ""
+    redacted["filter_sha256"] = (
+        hashlib.sha256(raw_filter.encode("utf-8")).hexdigest()
+        if isinstance(raw_filter, str) and raw_filter
+        else None
+    )
+    redacted["vector_filter_mode"] = redacted.pop("vectorFilterMode", None)
+    return redacted
 
 
 @dataclass(frozen=True)
@@ -254,7 +286,9 @@ class Evidence:
         self.attempted_queries += 1
 
     def record_request(self, label: str, body: dict[str, Any] | None) -> None:
-        self.requests.append({"label": label, "body": body})
+        # `_redact_request_body` returns a new dict; `body` (and, upstream of
+        # it, `SearchDiagnostics.request_body`) is never touched.
+        self.requests.append({"label": label, "body": _redact_request_body(body)})
 
     def flush(self) -> None:
         self.sidecar.write_text(
@@ -271,11 +305,19 @@ class Evidence:
             "",
             "---",
             "",
-            f"Verbatim request bodies: `{self.sidecar.name}`",
+            f"Redacted request bodies: `{self.sidecar.name}`",
             f"SHA-256: `{digest}`",
             "",
-            "The tables above elide the 1536-float query vector for readability.",
-            "Replay from the sidecar, not from the tables.",
+            "The ACL `filter` this project sends is replaced in the sidecar by "
+            "`filter_present`/`filter_sha256`/`vector_filter_mode` evidence "
+            "fields — the filter text itself, which names the querying "
+            "principal's tenant id and group ids, is never written here.",
+            "The tables above additionally elide the 1536-float query vector "
+            "for readability.",
+            "The vector and every other, non-ACL field in the sidecar are "
+            "reusable as recorded; a full replay of a call also requires "
+            "rebuilding its filter from a `Principal`, which the sidecar "
+            "deliberately does not carry enough to skip.",
             "",
             f"Queries attempted: {self.attempted_queries}/{self.total_queries} "
             "(below total means this file is truncated)",
