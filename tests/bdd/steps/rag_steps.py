@@ -32,13 +32,16 @@ class StubChatService:
         self.call_count += 1
         return ChatResult(message=self._answer, model="stub")
 
+    async def aclose(self) -> None:
+        """No-op: this stub owns no resources to release."""
+
 
 def _override_rag_service(documents: Sequence[dict[str, str]], context) -> None:  # type: ignore[no-untyped-def]
     search_client = FakeSearchClient(documents)
     retriever = Retriever(FakeEmbeddingClient(), search_client, top=5)
     chat = StubChatService()
     context.rag_chat_spy = chat
-    service = RagService(retriever, chat)  # type: ignore[arg-type]
+    service = RagService(retriever, chat)
     app.dependency_overrides[get_rag_service] = lambda: service
 
 
