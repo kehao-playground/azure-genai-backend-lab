@@ -215,7 +215,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RagResponse'
+                oneOf:
+                - $ref: '#/components/schemas/AnsweredRagResponse'
+                - $ref: '#/components/schemas/NoAnswerRagResponse'
+                title: Response Rag Api V1 Rag Post
+                discriminator:
+                  propertyName: status
+                  mapping:
+                    answered: '#/components/schemas/AnsweredRagResponse'
+                    no_answer: '#/components/schemas/NoAnswerRagResponse'
         '422':
           description: Validation Error
           content:
@@ -270,6 +278,47 @@ paths:
                 $ref: '#/components/schemas/ErrorEnvelope'
 components:
   schemas:
+    AnsweredRagResponse:
+      properties:
+        status:
+          type: string
+          const: answered
+          title: Status
+        answer:
+          type: string
+          title: Answer
+        sources:
+          items:
+            $ref: '#/components/schemas/RagSource'
+          type: array
+          minItems: 1
+          title: Sources
+        usage:
+          anyOf:
+          - $ref: '#/components/schemas/TokenUsage'
+          - type: 'null'
+          description: Provider may omit usage even when answered.
+        incomplete_reason:
+          anyOf:
+          - type: string
+            enum:
+            - max_output_tokens
+            - content_filter
+            - other
+          - type: 'null'
+          title: Incomplete Reason
+        correlation_id:
+          type: string
+          title: Correlation Id
+      type: object
+      required:
+      - status
+      - answer
+      - sources
+      - usage
+      - incomplete_reason
+      - correlation_id
+      title: AnsweredRagResponse
     ChatRequest:
       properties:
         message:
@@ -379,6 +428,35 @@ components:
       - status
       - service
       title: HealthResponse
+    NoAnswerRagResponse:
+      properties:
+        status:
+          type: string
+          const: no_answer
+          title: Status
+        answer:
+          type: 'null'
+          title: Answer
+        sources:
+          items:
+            $ref: '#/components/schemas/RagSource'
+          type: array
+          maxItems: 0
+          title: Sources
+        usage:
+          type: 'null'
+          title: Usage
+        incomplete_reason:
+          type: 'null'
+          title: Incomplete Reason
+        correlation_id:
+          type: string
+          title: Correlation Id
+      type: object
+      required:
+      - status
+      - correlation_id
+      title: NoAnswerRagResponse
     RagRequest:
       properties:
         question:
@@ -390,52 +468,6 @@ components:
       required:
       - question
       title: RagRequest
-    RagResponse:
-      properties:
-        answer:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Answer
-          description: The generated answer, or null when status is no_answer.
-        status:
-          type: string
-          enum:
-          - answered
-          - no_answer
-          title: Status
-          description: '''no_answer'' means retrieval found zero hits (structural
-            short-circuit, LLM never called).'
-        incomplete_reason:
-          anyOf:
-          - type: string
-            enum:
-            - max_output_tokens
-            - content_filter
-            - other
-          - type: 'null'
-          title: Incomplete Reason
-        sources:
-          items:
-            $ref: '#/components/schemas/RagSource'
-          type: array
-          title: Sources
-        usage:
-          anyOf:
-          - $ref: '#/components/schemas/TokenUsage'
-          - type: 'null'
-        correlation_id:
-          type: string
-          title: Correlation Id
-      type: object
-      required:
-      - answer
-      - status
-      - incomplete_reason
-      - sources
-      - usage
-      - correlation_id
-      title: RagResponse
     RagSource:
       properties:
         number:

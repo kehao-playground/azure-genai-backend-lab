@@ -209,10 +209,34 @@ def test_rag_incomplete_reason_flows_through_real_service_to_http(
 
 def test_openapi_schema_marks_usage_and_incomplete_reason_required() -> None:
     schema = app.openapi()
-    rag_response_schema = schema["components"]["schemas"]["RagResponse"]
-    required = set(rag_response_schema.get("required", []))
+    answered_schema = schema["components"]["schemas"]["AnsweredRagResponse"]
+    required = set(answered_schema.get("required", []))
     assert "usage" in required
     assert "incomplete_reason" in required
+
+
+def test_openapi_schema_discriminates_rag_response_on_status() -> None:
+    schema = app.openapi()
+    rag_path = schema["paths"]["/api/v1/rag"]["post"]
+    ok_schema = rag_path["responses"]["200"]["content"]["application/json"]["schema"]
+    assert "oneOf" in ok_schema
+    assert ok_schema["discriminator"]["propertyName"] == "status"
+
+
+def test_answered_rag_response_rejects_empty_sources() -> None:
+    from pydantic import ValidationError
+
+    from azgenai_lab.api.rag import AnsweredRagResponse
+
+    with pytest.raises(ValidationError):
+        AnsweredRagResponse(
+            status="answered",
+            answer="x",
+            sources=[],
+            usage=None,
+            incomplete_reason=None,
+            correlation_id="c",
+        )
 
 
 class _OversizedSearchClient:

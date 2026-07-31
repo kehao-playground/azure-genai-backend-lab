@@ -18,6 +18,7 @@ from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.rag import (
     MAX_PROMPT_BYTES,
     PROMPT_FRAMING_HEADROOM_BYTES,
+    RagAnswer,
     RagContextOverflowError,
     RagService,
     render_sources,
@@ -78,6 +79,39 @@ def test_render_sources_fences_each_source_exactly_once() -> None:
 def test_render_user_message_wraps_sources_and_question() -> None:
     text = render_user_message("what is alpha?", [HIT])
     assert text.index("[1]") < text.index("Question: what is alpha?")
+
+
+def test_rag_answer_rejects_no_answer_status_with_nonempty_hits() -> None:
+    with pytest.raises(ValueError, match="hits"):
+        RagAnswer(
+            status="no_answer",
+            answer=None,
+            hits=(HIT,),
+            usage=None,
+            incomplete_reason=None,
+        )
+
+
+def test_rag_answer_rejects_answered_status_with_no_hits() -> None:
+    with pytest.raises(ValueError, match="hit"):
+        RagAnswer(
+            status="answered",
+            answer="text",
+            hits=(),
+            usage=None,
+            incomplete_reason=None,
+        )
+
+
+def test_rag_answer_rejects_answered_status_with_no_answer_text() -> None:
+    with pytest.raises(ValueError, match="answer"):
+        RagAnswer(
+            status="answered",
+            answer=None,
+            hits=(HIT,),
+            usage=None,
+            incomplete_reason=None,
+        )
 
 
 async def test_answer_returns_no_answer_without_calling_llm_on_zero_hits() -> None:
