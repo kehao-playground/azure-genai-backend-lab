@@ -2,7 +2,7 @@
 
 The decision procedure from the [Agent Decision Guide](../agent-decision-guide.md), as a flowchart. Deliberately self-referential: every edge in this graph is decided by a program rule — no node asks a model to select an action — which is exactly why this decision is a checklist, not an agent.
 
-This English diagram is the semantic companion to the article's published figure. The publication PNG is rendered from a localized (zh-TW) Mermaid source tracked in the planning repo alongside the article assets; changes here must be mirrored there.
+This English diagram is the semantic companion to the article's published figure. The publication PNG is rendered from the localized source [`agent-decision-flow.zh-tw.mmd`](agent-decision-flow.zh-tw.mmd) in this same directory — both sources are public and canonical here; the planning repo stores only the rendered PNG snapshot (proposal 005). Changes to either file must keep the two topologies identical.
 
 ```mermaid
 flowchart TB

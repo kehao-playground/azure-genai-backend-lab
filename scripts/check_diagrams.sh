@@ -9,9 +9,10 @@ trap 'rm -rf "$tmp"' EXIT
 # renders repo-authored diagrams, so --no-sandbox is acceptable.
 printf '{"args":["--no-sandbox"]}\n' > "$tmp/puppeteer-config.json"
 status=0
-for f in docs/diagrams/*.md; do
+for f in docs/diagrams/*.md docs/diagrams/*.mmd; do
+  [ -e "$f" ] || continue
   if ! npx --yes --package @mermaid-js/mermaid-cli@11.12.0 \
-      mmdc -i "$f" -o "$tmp/$(basename "$f")" --quiet \
+      mmdc -i "$f" -o "$tmp/$(basename "$f").png" --quiet \
       -p "$tmp/puppeteer-config.json"; then
     echo "mermaid syntax failure: $f" >&2
     status=1
