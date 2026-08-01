@@ -369,10 +369,17 @@ global id space.
 ## Rebuild procedure
 
 Adding `allowed_groups` to the schema does not retroactively populate it on documents indexed
-before Day 15, and the ACL filter's public branch (`not allowed_groups/any()`) reads a missing/null
-value the same way it reads an explicit empty list — so an old document with no `allowed_groups`
-would be treated as tenant-wide readable the moment ACL-aware queries go live, silently granting
-access nobody explicitly asked for. Two different procedures apply, chosen by how strict the
+before Day 15. For documents *uploaded* without the field, the upload contract is explicit:
+collection fields cannot store null and are automatically set to empty (`[]`) when omitted (checked
+2026-08, [supported-data-types](https://learn.microsoft.com/en-us/rest/api/searchservice/supported-data-types)),
+and `not allowed_groups/any()` matches an empty collection — the tenant-wide public branch. For
+documents that already existed when the field was *added to the schema*, the reindexing docs
+describe new fields as returning null until documents are reindexed without resolving the
+collection-specific behaviour, and this lab ran no probe of that migration state — so "old
+documents silently become tenant-wide readable" is an unverified risk, not a demonstrated
+mechanism. The rebuild procedures below are therefore a fail-closed precaution: rather than
+reasoning about an ambiguous migration state, do not let ACL-aware queries run against an index
+whose documents predate the ACL fields. Two different procedures apply, chosen by how strict the
 no-public-window guarantee needs to be:
 
 - **This lab** — `tools/index_corpus.py --recreate-index` drops the index outright and rebuilds it

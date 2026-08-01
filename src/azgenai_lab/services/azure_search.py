@@ -180,13 +180,16 @@ def build_search_body(
     so a missing authorization scope is a type error rather than a silent
     cross-tenant read.
 
-    ``vectorFilterMode: preFilter`` accompanies every vector query. The
-    default is post-filtering, which applies the filter *after* the ANN
-    search has already picked its k neighbours — so a tenant whose documents
-    lose the neighbour race gets fewer results, or none, rather than the
-    top-k of what it is allowed to see. That is a correctness bug dressed as
-    a relevance one, and it only appears once an index holds enough foreign
-    documents to crowd the candidate list.
+    ``vectorFilterMode: preFilter`` accompanies every vector query, rather
+    than relying on the index's creation-date-dependent default. GA
+    ``postFilter`` runs the unfiltered HNSW traversal per shard, filters each
+    shard's local top-k, then aggregates — so documents outside a tenant's
+    ACL consume local top-k slots before filtering, and a selective filter
+    yields fewer than k results, or none (checked 2026-08,
+    https://learn.microsoft.com/en-us/azure/search/vector-search-filters).
+    That is a correctness bug dressed as a relevance one, and it grows with
+    the share of foreign documents per shard. Pre-filtering applies the ACL
+    during traversal, so the k neighbours returned are already scoped.
     """
     validate_search_arguments(query_text, query_vector, mode=mode, top=top, vector_k=vector_k)
 
@@ -419,13 +422,16 @@ class FakeSearchClient:
     unfaithful stand-in — an honest fake beats a plausible one. Retrieval
     quality observed here means nothing.
 
-    Access control is the one thing it does enforce. It applies the same
-    ``services/acl.py`` policy the real filter expresses, via
-    ``is_document_visible`` — evaluated in Python rather than by the service,
-    so agreement between the two is a property of that shared module, not of
-    this fake. ``last_filter`` records the OData expression the real adapter
-    would have sent for the same principal, which is an assertion about the
-    wire, not about what was enforced here.
+    Access control is the one thing it does enforce, via
+    ``is_document_visible`` — a Python re-encoding of the policy that
+    ``build_acl_filter`` expresses in OData. Both live in ``services/acl.py``
+    so the review surface is one module, but they remain two independent
+    encodings: nothing mechanical keeps them in sync, and their agreement is
+    evidenced by unit tests plus scoped live probes, not proven structurally.
+    Visibility is applied *before* scoring (not post-top-k), matching the
+    pre-filter shape of the real path. ``last_filter`` records the OData
+    expression the real adapter would have sent for the same principal, which
+    is an assertion about the wire, not about what was enforced here.
     """
 
     def __init__(self, documents: Sequence[dict[str, Any]] = ()) -> None:

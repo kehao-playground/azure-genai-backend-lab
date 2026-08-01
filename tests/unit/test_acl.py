@@ -24,6 +24,24 @@ def test_filter_escapes_even_if_validation_bypassed() -> None:
     )
 
 
+def test_search_in_delimiter_safety_depends_on_charset() -> None:
+    # escape_odata_literal handles only the string-literal layer (quote doubling).
+    # The search.in value list is comma-delimited, so a comma inside a group id
+    # would split one id into two — that layer is protected solely by the
+    # Principal identifier charset. This test pins both halves of the contract.
+    with pytest.raises(ValueError):
+        Principal(tenant_id="tenant-a", group_ids=("finance,support",))
+    with pytest.raises(ValueError):
+        Principal(tenant_id="tenant-a", group_ids=("finance support",))
+    # If validation were bypassed, the filter WOULD be corrupted: the joined
+    # list is indistinguishable from two separate ids. Loosening the charset
+    # without moving to an explicit delimiter must revisit this.
+    hostile = Principal.model_construct(tenant_id="tenant-a", group_ids=("finance,support",))
+    assert (
+        "search.in(g, 'finance,support')" in build_acl_filter(hostile)
+    ), "delimiter collision is real when charset validation is bypassed"
+
+
 def test_visibility_wrong_tenant_false_even_with_group() -> None:
     doc = {"tenant_id": "tenant-b", "allowed_groups": ["finance"]}
     assert not is_document_visible(doc, Principal(tenant_id="tenant-a", group_ids=("finance",)))
