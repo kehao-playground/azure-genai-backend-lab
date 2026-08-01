@@ -211,28 +211,47 @@ Tenant match is unconditional; the group clause's public branch (`not allowed_gr
 to *every* principal regardless of its own groups, because an `allowed_groups: []` document is
 tenant-wide readable by definition. When the principal itself carries no groups, the filter
 simplifies to `tenant_id eq '...' and not allowed_groups/any()` — such a principal can only ever see
-tenant-wide documents, never a group-scoped one. Every literal embedded in the filter — the tenant
-id, the joined group list — passes through `escape_odata_literal()` (`'` doubled to `''`) before
-it reaches the string, the same escaping indexing enumeration already used; `services/acl.py` and
-`services/search_data_plane.py` share that one function rather than each carrying its own copy.
+tenant-wide documents, never a group-scoped one. Escaping is a two-layer invariant, and only one
+layer is handled by code. `escape_odata_literal()` (`'` doubled to `''`) covers the OData
+string-literal grammar, and every literal embedded in the filter passes through it — the same
+function indexing enumeration already uses, shared by `services/acl.py` and
+`services/search_data_plane.py` rather than each carrying its own copy. But the group list travels
+as a *comma-joined* second argument to `search.in`, whose value-list delimiter grammar (comma /
+space) `escape_odata_literal()` does not touch (checked 2026-08,
+[search-query-odata-search-in-function](https://learn.microsoft.com/en-us/azure/search/search-query-odata-search-in-function)).
+That second layer is protected by the `Principal` identifier charset `[A-Za-z0-9_-]{1,64}`, which
+forbids commas and whitespace — a deliberate dependency on the validation boundary, asserted by a
+hostile-bypass unit test (`tests/unit/test_acl.py`) so that loosening the charset without revisiting
+the delimiter contract fails loudly instead of silently corrupting the group list.
 
 **`vectorFilterMode: preFilter` accompanies every vector query, explicitly, rather than relying on
-whatever the index's creation-time default happens to be.** The alternative — post-filtering —
-applies the ACL filter *after* the ANN search has already chosen its `k` nearest neighbours, so a
-tenant whose documents lose that neighbour race against a large shared index gets fewer results, or
-none, instead of the top-`k` of what it is actually allowed to see. That reads as a relevance
-regression, not a bug, until someone traces it back to the filter mode — and it only manifests once
-the index holds enough documents belonging to *other* tenants to crowd the candidate list, which is
-exactly the shape a shared, multi-tenant index has by design. Pre-filtering restricts the candidate
-pool before the ANN search runs, so the `k` neighbours it returns are already scoped correctly.
+whatever the index's creation-date-dependent default happens to be.** The GA alternative —
+`postFilter` — runs the unfiltered HNSW traversal on each shard first, applies the filter to each
+shard's *unfiltered local top-`k`*, then aggregates the survivors into the global top-`k` (checked
+2026-08, [vector-search-filters](https://learn.microsoft.com/en-us/azure/search/vector-search-filters);
+the preview `strictPostFilter` mode goes further and filters only after an unfiltered *global*
+top-`k` is formed). Under `postFilter`, documents outside the caller's ACL consume local top-`k`
+slots before the filter runs, so a tenant whose documents lose that per-shard neighbour race gets
+fewer results, or none — false negatives, not the top-`k` of what it is actually allowed to see.
+That reads as a relevance regression, not a bug, until someone traces it back to the filter mode —
+and it worsens as the index accumulates documents belonging to *other* tenants, which is exactly
+the shape a shared, multi-tenant index has by design. Pre-filtering applies the filter during each
+shard's traversal, so the `k` neighbours returned are already scoped correctly. The trade-off is
+performance, not correctness: Microsoft's own benchmarks show pre-filtering slower than
+post-filtering as index size grows and filters become selective — this lab's corpus is far below
+the scale where that matters, but the cost is real and unmeasured here.
 
 `FakeSearchClient` does not parse OData — nothing in the fake ever builds a filter string. Instead it
-enforces the identical policy via `is_document_visible(document, principal)`, a pure-Python
-predicate reading the same `tenant_id`/`allowed_groups` semantics as `build_acl_filter()`. Agreement
-between the real filter and the fake's enforcement is therefore a property of `services/acl.py`
-being the one shared policy module, not a property either client re-derives on its own; the fake
-still records `last_filter` — the OData expression the real adapter would have sent for the same
-principal — purely as an assertion about the wire, not as what was actually enforced in the test.
+enforces the policy via `is_document_visible(document, principal)`, a pure-Python predicate encoding
+the same `tenant_id`/`allowed_groups` semantics that `build_acl_filter()` encodes in OData. Both
+functions live in `services/acl.py`, which concentrates the review surface in one module — but they
+remain two independent encodings of one policy: nothing mechanical prevents one from drifting if the
+other changes. Their agreement is evidenced by the unit tests that exercise both against shared
+cases and by the scoped live probes, which is bounded evidence, not a structural guarantee of
+equivalence over all inputs. The fake applies visibility *before* scoring (matching the pre-filter
+shape, never post-top-`k` discard), and still records `last_filter` — the OData expression the real
+adapter would have sent for the same principal — purely as an assertion about the wire, not as what
+was actually enforced in the test.
 
 There is no "access denied" outcome anywhere in this pipeline. A document outside the caller's
 tenant/group scope is excluded by the filter before it is ever scored, and it comes back
