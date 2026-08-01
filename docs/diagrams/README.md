@@ -9,4 +9,5 @@ Mermaid-first diagrams: the reference architecture, then sequence diagrams for t
 - [Streaming Sequence](streaming-sequence.md)
 - [Retrieval Stages](retrieval-stages.md)
 - [RAG Query Sequence](rag-query-sequence.md) (placeholder)
+- [Agent Decision Flow](agent-decision-flow.md)
 - [Agent Tool-Call Sequence](agent-tool-call-sequence.md) (placeholder)
