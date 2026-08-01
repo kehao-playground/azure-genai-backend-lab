@@ -1,0 +1,16 @@
+%% Publication source (zh-TW) for the Day 16 article figure.
+%% English semantic companion: agent-decision-flow.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    req["需求進來"] --> q1{"一次模型呼叫＋<br/>好的 prompt 就能解？"}
+    q1 -- "是" --> direct["直接呼叫模型<br/>（Day 5–10 的 /chat）"]
+    q1 -- "否" --> q2{"每一步走哪條邊，都能<br/>由程式規則決定？<br/>（不需要模型選 action）"}
+    q2 -- "是" --> pipe["code-owned pipeline<br/>（Day 11–15 的 /rag）"]
+    q2 -- "否" --> q3{"五題都答得出來？<br/>（具體 request／tool 最小權限／<br/>迭代上限／成本上界／保證取捨）"}
+    q3 -- "是" --> agent["single agent + tools<br/>（Day 17–18）"]
+    q3 -- "否" --> back["需求還不成立<br/>回去把選邊規則寫出來"]
+    back -.-> q2
+    style direct fill:#d3f0d8,stroke:#2e7d32
+    style pipe fill:#d3f0d8,stroke:#2e7d32
+    style agent fill:#fff3cd,stroke:#b26a00
+    style back fill:#fde3e0,stroke:#c62828
