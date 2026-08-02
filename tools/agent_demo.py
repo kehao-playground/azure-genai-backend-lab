@@ -767,7 +767,7 @@ def assert_suite(
     _check(
         results,
         "config-only:answer_contains_llm_max_output_tokens",
-        max_output in config_only.answer,
+        _figure_in(config_only.answer, max_output),
         f"expected {max_output!r} in the answer",
     )
     _check(
@@ -782,7 +782,7 @@ def assert_suite(
     _check(
         results,
         "config+docs:answer_contains_demo_token_budget",
-        budget in config_docs.answer,
+        _figure_in(config_docs.answer, budget),
         f"expected {budget!r} in the answer",
     )
     _check(

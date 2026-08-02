@@ -450,6 +450,42 @@ def test_answer_direction_requires_the_figure_on_a_word_boundary() -> None:
     assert outcomes["diagnostic-near:answer_direction"] == "failed"
 
 
+def test_config_only_answer_contains_llm_max_output_tokens_requires_word_boundary() -> None:
+    # Same defect class as the diagnostic figures above, on the other pair of
+    # assertions: a digit run inside a longer number is not the configured
+    # max-output-tokens figure. "1000" inside "10000" says nothing about what
+    # get_runtime_config returned.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["config-only"] = _record(
+        "config-only",
+        "The service enforces a ceiling of 10000 output tokens per call.",
+        records["config-only"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
+    assert outcomes["config-only:answer_contains_llm_max_output_tokens"] == "failed"
+
+
+def test_config_docs_answer_contains_demo_token_budget_requires_word_boundary() -> None:
+    # "400" is not just a digit run that can hide inside a longer number
+    # ("4000-series"): it is also a live HTTP status code that this repo's own
+    # error-contract docs discuss (`docs/api-conventions.md`'s "400
+    # invalid_input" contract). An answer that gestures at HTTP 400-class
+    # errors from the docs, without ever landing on the standalone budget
+    # figure, must not be read as having found the budget via
+    # get_runtime_config.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["config+docs"] = _record(
+        "config+docs",
+        "It documents an HTTP 4000-series response for invalid input, but "
+        "never states the token budget.",
+        records["config+docs"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
+    assert outcomes["config+docs:answer_contains_demo_token_budget"] == "failed"
+
+
 def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> None:
     # The pass condition is the ledger-derived figure alone; "429"/"exhaust"
     # wording is a recorded signal, not a requirement. A live answer phrased
