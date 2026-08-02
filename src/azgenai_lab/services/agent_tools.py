@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 
+from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.retrieval import Retriever
 
@@ -88,6 +89,31 @@ def make_search_docs(retriever: Retriever, principal: Principal) -> AgentToolFn:
     return search_docs
 
 
+def make_get_runtime_config(settings: Settings, demo_token_budget: int) -> AgentToolFn:
+    async def get_runtime_config() -> str:
+        """Report the guardrail configuration this deployment actually applies.
+
+        Returns JSON with output caps, timeouts, the conversation token
+        budget, and the agent loop limits. These are the applied values,
+        not documentation.
+        """
+        # Explicit allowlist — never serialize Settings. The budget reported
+        # is the single-source demo budget actually applied to this run's
+        # conversations (spec §1), so no tool can describe a guardrail the
+        # run does not enforce.
+        snapshot = {
+            "llm_max_output_tokens": settings.llm_max_output_tokens,
+            "conversation_token_budget": demo_token_budget,
+            "llm_timeout_seconds": settings.llm_timeout_seconds,
+            "deployment_name": settings.azure_openai_deployment_name,
+            "agent_max_iterations": settings.agent_max_iterations,
+            "agent_max_tool_calls": settings.agent_max_tool_calls,
+        }
+        return truncate_utf8(json.dumps(snapshot), MAX_TOOL_RESULT_BYTES)
+
+    return get_runtime_config
+
+
 __all__ = [
     "MAX_REFUSAL_RESULT_BYTES",
     "MAX_SEARCH_HITS",
@@ -95,6 +121,7 @@ __all__ = [
     "MAX_TOOL_RESULT_BYTES",
     "NEAR_EXHAUSTED_THRESHOLD",
     "AgentToolFn",
+    "make_get_runtime_config",
     "make_search_docs",
     "truncate_utf8",
 ]
