@@ -30,3 +30,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Demo evidence (tools/agent_demo.py --capture default): a run artifact, kept
+# with the run that produced it, never committed here
+agent-demo-capture.json
