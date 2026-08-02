@@ -312,8 +312,13 @@ async def test_provider_error_becomes_agent_run_error() -> None:
     service = _service()
     _make_mock_raise(service)  # harness: transport raises APIError
     try:
-        with pytest.raises(AgentRunError):
+        with pytest.raises(AgentRunError) as err:
             await service.run("hello")
+        # usage=None is deliberate here (see the raise site's comment), not
+        # an omission, and the provider exception must still be reachable
+        # via the standard `raise ... from exc` chain.
+        assert err.value.usage is None
+        assert err.value.__cause__ is not None
     finally:
         await service.aclose()
 
