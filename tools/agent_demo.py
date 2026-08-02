@@ -88,6 +88,14 @@ CONFIG_TOOL = "get_runtime_config"
 SEARCH_TOOL = "search_docs"
 NO_LEDGER_SENTINEL = [("<no-ledger-call>", "")]
 
+# Conversation-id masks. The capture keeps the two apart for a reader;
+# a comparison must not tell them apart at all (see `comparison_redactions`).
+# None of the three contains a digit, so no mask can ever look like a ledger
+# figure to the matchers below.
+CONV_NEAR = "conv-near"
+CONV_FRESH = "conv-fresh"
+CONV_ANY = "<conversation-id>"
+
 # Assertion outcomes. `skipped_fake` and `no_branch_observed` are both
 # *unverified*: nothing failed, and nothing was proved either.
 OUTCOME_PASSED = "passed"
@@ -135,8 +143,37 @@ def _config_error(message: str) -> NoReturn:
 # --------------------------------------------------------------------------
 
 
-def _normalized_arguments(call: Mapping[str, Any]) -> str:
-    """Canonical argument text with `conversation_id` normalized out.
+def neutralize(text: str, replacements: Sequence[tuple[str, str]]) -> str:
+    """The capture's own redaction, reused as a comparison guard.
+
+    Same substitution as `redact` applies when writing the capture — including
+    its GUID mask, which catches any conversation id, seeded or not. Reused
+    rather than reimplemented: a second, weaker copy of this rule is exactly
+    how a conversation id gets back into a comparison.
+    """
+    neutral: str = redact(text, replacements)
+    return neutral
+
+
+def _figure_in(text: str, figure: str) -> bool:
+    """Whether `text` states `figure` — on a word boundary, not as a substring.
+
+    `80` inside `1809` is not the remainder, and a bare `in` test would say it
+    was. The figures are one to three digits, so this matters.
+    """
+    return re.search(rf"\b{re.escape(figure)}\b", text) is not None
+
+
+def _normalized_arguments(
+    call: Mapping[str, Any], replacements: Sequence[tuple[str, str]] = ()
+) -> str:
+    """Canonical argument text with the conversation id normalized out.
+
+    Dropping the `conversation_id` *key* is not enough: the diagnostic
+    question names the conversation, so the id plausibly reappears inside
+    another argument's value (`search_docs(query="conversation <id> 429")`),
+    where it would make two behaviourally identical traces differ. Argument
+    values therefore go through the same redaction the capture uses.
 
     `arguments=None` means the model's arguments were unparseable; the raw
     canonical text is kept so such a call stays distinguishable from a
@@ -144,18 +181,23 @@ def _normalized_arguments(call: Mapping[str, Any]) -> str:
     """
     arguments = call.get("arguments")
     if arguments is None:
-        return str(call.get("arguments_canonical_json", ""))
+        return neutralize(str(call.get("arguments_canonical_json", "")), replacements)
     args = {k: v for k, v in arguments.items() if k != "conversation_id"}
-    return json.dumps(args, sort_keys=True)
+    return json.dumps(redact(args, replacements), sort_keys=True)
 
 
-def normalized_trace(tool_calls: Sequence[Mapping[str, Any]]) -> list[tuple[str, str]]:
+def normalized_trace(
+    tool_calls: Sequence[Mapping[str, Any]], replacements: Sequence[tuple[str, str]] = ()
+) -> list[tuple[str, str]]:
     """Whole trace as (tool_name, normalized arguments) pairs."""
-    return [(str(call["tool_name"]), _normalized_arguments(call)) for call in tool_calls]
+    return [
+        (str(call["tool_name"]), _normalized_arguments(call, replacements)) for call in tool_calls
+    ]
 
 
 def normalized_post_ledger_trace(
     tool_calls: Sequence[Mapping[str, Any]],
+    replacements: Sequence[tuple[str, str]] = (),
 ) -> list[tuple[str, str]]:
     """Trace suffix after the first ledger call, conversation_id normalized out.
 
@@ -168,7 +210,7 @@ def normalized_post_ledger_trace(
             break
     else:
         return list(NO_LEDGER_SENTINEL)
-    return normalized_trace(suffix)
+    return normalized_trace(suffix, replacements)
 
 
 def ledger_figures(spent: int, budget: int) -> set[str]:
@@ -196,6 +238,7 @@ def branch_evidence(
     fresh_answer: str,
     near_figures: set[str],
     fresh_figures: set[str],
+    replacements: Sequence[tuple[str, str]],
 ) -> BranchEvidence:
     """Graded observation of whether the two diagnostics actually branched.
 
@@ -212,12 +255,18 @@ def branch_evidence(
     When neither holds the outcome is `BRANCH_NONE`, which the caller records
     as unverified: absence of observed branching is not proof of its absence,
     and it is certainly not a pass.
+
+    `replacements` (from `comparison_redactions`) neutralizes the two seeded
+    conversation ids on both channels first. Without it each channel yields a
+    false positive from the ids alone: two traces that only name their own
+    conversation would "diverge", and two answers that only echo their own
+    conversation id would "carry" a ledger figure.
     """
-    near_full = normalized_trace(near_trace)
-    fresh_full = normalized_trace(fresh_trace)
+    near_full = normalized_trace(near_trace, replacements)
+    fresh_full = normalized_trace(fresh_trace, replacements)
     consulted_ledger = (
-        normalized_post_ledger_trace(near_trace) != NO_LEDGER_SENTINEL
-        or normalized_post_ledger_trace(fresh_trace) != NO_LEDGER_SENTINEL
+        normalized_post_ledger_trace(near_trace, replacements) != NO_LEDGER_SENTINEL
+        or normalized_post_ledger_trace(fresh_trace, replacements) != NO_LEDGER_SENTINEL
     )
     traces_differ = near_full != fresh_full
     if traces_differ and consulted_ledger:
@@ -227,8 +276,10 @@ def branch_evidence(
         )
     near_only = sorted(near_figures - fresh_figures)
     fresh_only = sorted(fresh_figures - near_figures)
-    near_hits = [figure for figure in near_only if figure in near_answer]
-    fresh_hits = [figure for figure in fresh_only if figure in fresh_answer]
+    near_clean = neutralize(near_answer, replacements)
+    fresh_clean = neutralize(fresh_answer, replacements)
+    near_hits = [figure for figure in near_only if _figure_in(near_clean, figure)]
+    fresh_hits = [figure for figure in fresh_only if _figure_in(fresh_clean, figure)]
     if near_hits and fresh_hits:
         return BranchEvidence(
             BRANCH_ANSWER,
@@ -311,18 +362,18 @@ def usage_of(result: AgentRunResult) -> dict[str, int | None] | None:
     }
 
 
-def build_redactions(
-    settings: Settings, *, near_id: str, fresh_id: str
+def _conversation_pairs(
+    near_id: str, fresh_id: str, near_mask: str, fresh_mask: str
 ) -> list[tuple[str, str]]:
-    """Literal replacements applied to every string in the capture.
+    # An empty id is dropped: `"".replace` would inject the mask between every
+    # character rather than protect anything.
+    return [(cid, mask) for cid, mask in ((near_id, near_mask), (fresh_id, fresh_mask)) if cid]
 
-    Conversation ids first, so they become stable placeholders rather than
-    being swallowed by the GUID mask that runs afterwards. `opsdemo` is
-    deliberately *not* masked: it is a sample-corpus tenant published in this
-    repo, not a customer or Entra tenant id — those are GUIDs and are masked
-    by pattern.
-    """
-    replacements = [(near_id, "conv-near"), (fresh_id, "conv-fresh")]
+
+def _redactions(
+    settings: Settings, conversation_pairs: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    replacements = list(conversation_pairs)
     for value in (
         settings.azure_openai_endpoint,
         settings.azure_search_endpoint,
@@ -336,6 +387,39 @@ def build_redactions(
     # must not shadow the endpoint's own replacement.
     replacements.sort(key=lambda pair: len(pair[0]), reverse=True)
     return replacements
+
+
+def build_redactions(settings: Settings, *, near_id: str, fresh_id: str) -> list[tuple[str, str]]:
+    """Literal replacements applied to every string in the capture.
+
+    Every literal replacement here runs before the GUID mask in `redact`, so a
+    conversation id becomes its own stable placeholder instead of being
+    swallowed by `<redacted-guid>`; ordering *within* this list is by needle
+    length (longest first) so a deployment name that is a substring of the
+    endpoint cannot shadow the endpoint's own replacement. `opsdemo` is
+    deliberately *not* masked: it is a sample-corpus tenant published in this
+    repo, not a customer or Entra tenant id — those are GUIDs and are masked
+    by pattern.
+    """
+    return _redactions(settings, _conversation_pairs(near_id, fresh_id, CONV_NEAR, CONV_FRESH))
+
+
+def comparison_redactions(
+    settings: Settings, *, near_id: str, fresh_id: str
+) -> list[tuple[str, str]]:
+    """The capture's redaction, with both conversation ids collapsed into one.
+
+    The same substitution mechanism, aimed at a different question. A capture
+    is *read*, so it keeps the two conversations distinguishable (`conv-near`
+    vs `conv-fresh`). An assertion *compares*, and there the ids are precisely
+    what must not count: the seed contract puts spend in [320, 400), so the
+    remainder is one or two digits, and such a short digit run sits inside a
+    32-hex-character uuid most of the time (~87% for a single digit), so
+    an answer that merely echoes the question would otherwise "carry" a ledger
+    figure, and two traces naming their own conversation would otherwise
+    "diverge". Both ids therefore become the same token here.
+    """
+    return _redactions(settings, _conversation_pairs(near_id, fresh_id, CONV_ANY, CONV_ANY))
 
 
 def redact(value: Any, replacements: Sequence[tuple[str, str]]) -> Any:
@@ -721,6 +805,9 @@ def assert_suite(
     if live:
         near_figures = ledger_figures(seed_outcome.near_spent, DEMO_TOKEN_BUDGET)
         fresh_figures = ledger_figures(seed_outcome.fresh_spent, DEMO_TOKEN_BUDGET)
+        replacements = comparison_redactions(
+            settings, near_id=seed_outcome.near_id, fresh_id=seed_outcome.fresh_id
+        )
         evidence = branch_evidence(
             near_trace=near.trace,
             fresh_trace=fresh.trace,
@@ -728,6 +815,7 @@ def assert_suite(
             fresh_answer=fresh.answer,
             near_figures=near_figures,
             fresh_figures=fresh_figures,
+            replacements=replacements,
         )
         results.append(
             Assertion(
@@ -743,7 +831,14 @@ def assert_suite(
         # "429"/"exhaust" wording is recorded for the article but is not part
         # of the pass condition — a correct live answer phrased without that
         # vocabulary must not fail on a wording preference.
-        near_hits = sorted(figure for figure in near_figures if figure in near.answer)
+        #
+        # The same restatement carries the conversation id, and the figures are
+        # short (remainder <= 80 under the seed contract), so the id is
+        # neutralized before matching and the figure must land on a word
+        # boundary. Otherwise the paraphrase earns the assertion again, one
+        # token further along.
+        near_clean = neutralize(near.answer, replacements)
+        near_hits = sorted(figure for figure in near_figures if _figure_in(near_clean, figure))
         near_lower = near.answer.lower()
         wording_hits = [word for word in ("429", "exhaust") if word in near_lower]
         wording_note = f"observed (saw {wording_hits})" if wording_hits else "not observed"
@@ -754,7 +849,8 @@ def assert_suite(
             f"expected a ledger figure from {sorted(near_figures)} (saw {near_hits}); "
             f"429/exhaustion wording {wording_note}",
         )
-        fresh_hits = sorted(figure for figure in fresh_figures if figure in fresh.answer)
+        fresh_clean = neutralize(fresh.answer, replacements)
+        fresh_hits = sorted(figure for figure in fresh_figures if _figure_in(fresh_clean, figure))
         _check(
             results,
             "diagnostic-fresh:answer_direction",

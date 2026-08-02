@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import inspect
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,6 +34,7 @@ _SPEC.loader.exec_module(agent_demo)
 assert_suite = agent_demo.assert_suite
 branch_evidence = agent_demo.branch_evidence
 build_redactions = agent_demo.build_redactions
+comparison_redactions = agent_demo.comparison_redactions
 ledger_figures = agent_demo.ledger_figures
 normalized_post_ledger_trace = agent_demo.normalized_post_ledger_trace
 normalized_trace = agent_demo.normalized_trace
@@ -166,7 +168,7 @@ def test_redaction_masks_ids_endpoints_and_guids() -> None:
     assert redacted["question"] == "Conversation conv-near: why 429?"
     assert redacted["nested"][0] == "conv-fresh"
     assert "azgenai-lab" not in redacted["nested"][1]
-    assert redacted["deployment"] != "chat-mini"
+    assert redacted["deployment"] == "<redacted>"  # the mask, not merely "changed"
     assert redacted["subscription"] == "<redacted-guid>"
     assert redacted["count"] == 3  # non-strings pass through untouched
 
@@ -207,6 +209,20 @@ async def test_recorder_preserves_tool_identity_and_captures_output() -> None:
     ]
 
 
+# Realistic seeded conversation ids. Both deliberately CONTAIN every ledger
+# figure these tests use ("320", "80", "30", "370") as a bare substring, which
+# is exactly the trap the real ids set: the seed contract forces spent into
+# [320, 400), so the remainder is one or two digits, and a short digit run
+# appears somewhere inside a 32-hex-character uuid most of the time. An id
+# made of letters only ("near-uuid") cannot catch a substring match.
+_NEAR_ID = "3208030f-3702-4bd6-8f23-d348fdb5a694"
+_FRESH_ID = "3703080f-3202-4bd6-8f23-d348fdb5a694"
+
+
+def _comparison_replacements() -> list[tuple[str, str]]:
+    return comparison_redactions(Settings(), near_id=_NEAR_ID, fresh_id=_FRESH_ID)  # type: ignore[no-any-return]
+
+
 def _record(label: str, answer: str, trace: list[dict[str, object]]) -> object:
     return agent_demo.RunRecord(
         label=label,
@@ -221,8 +237,8 @@ def _record(label: str, answer: str, trace: list[dict[str, object]]) -> object:
 
 def _seed_outcome() -> object:
     return agent_demo.SeedOutcome(
-        near_id="near-uuid",
-        fresh_id="fresh-uuid",
+        near_id=_NEAR_ID,
+        fresh_id=_FRESH_ID,
         near_spent=320,
         fresh_spent=30,
         near_turns=3,
@@ -250,13 +266,13 @@ def _passing_records(settings: Settings) -> dict[str, object]:
         "diagnostic-near": _record(
             "diagnostic-near",
             "It has spent 320 tokens and has 80 left, so the next call is rejected with 429.",
-            [_call(_LEDGER, {"conversation_id": "near-uuid"}), _call(_SEARCH, {"query": "429"})],
+            [_call(_LEDGER, {"conversation_id": _NEAR_ID}), _call(_SEARCH, {"query": "429"})],
         ),
         # fresh: ledger figures 30 spent / 370 remaining
         "diagnostic-fresh": _record(
             "diagnostic-fresh",
             "It has spent 30 tokens and can still spend 370.",
-            [_call(_LEDGER, {"conversation_id": "fresh-uuid"})],
+            [_call(_LEDGER, {"conversation_id": _FRESH_ID})],
         ),
         "no-hit": _record(
             "no-hit",
@@ -287,8 +303,52 @@ def test_branch_evidence_prefers_full_trace_divergence() -> None:
         fresh_answer="",
         near_figures={"320", "80"},
         fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
     )
     assert evidence.form == "trace_divergence"
+
+
+def test_branch_evidence_ignores_a_conversation_id_inside_an_argument_value() -> None:
+    # Stripping the `conversation_id` KEY is not enough: the diagnostic question
+    # names the conversation, so the id plausibly travels inside another
+    # argument's value. Two traces differing only by which id they carry are
+    # the same behaviour and must not be reported as trace_divergence — the
+    # strongest evidence form, the one an article would quote.
+    near_trace = [
+        _call(_LEDGER, {"conversation_id": _NEAR_ID}),
+        _call(_SEARCH, {"query": f"conversation {_NEAR_ID} 429"}),
+    ]
+    fresh_trace = [
+        _call(_LEDGER, {"conversation_id": _FRESH_ID}),
+        _call(_SEARCH, {"query": f"conversation {_FRESH_ID} 429"}),
+    ]
+    evidence = branch_evidence(
+        near_trace=near_trace,
+        fresh_trace=fresh_trace,
+        near_answer="",
+        fresh_answer="",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
+    )
+    assert evidence.form == "none"
+
+
+def test_branch_evidence_answer_channel_ignores_an_echoed_conversation_id() -> None:
+    # Same defect on the answer channel: two ungrounded answers, each merely
+    # echoing its own conversation id, must not supply figure "hits" and turn
+    # into answer_content_divergence.
+    trace = [_call(_LEDGER, {"conversation_id": "X"})]
+    evidence = branch_evidence(
+        near_trace=trace,
+        fresh_trace=trace,
+        near_answer=f"Conversation {_NEAR_ID}: it may be rejected with 429.",
+        fresh_answer=f"Conversation {_FRESH_ID}: it may be rejected with 429.",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
+    )
+    assert evidence.form == "none"
 
 
 def test_branch_evidence_never_counts_two_ledgerless_runs() -> None:
@@ -302,6 +362,7 @@ def test_branch_evidence_never_counts_two_ledgerless_runs() -> None:
         fresh_answer="",
         near_figures={"320", "80"},
         fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
 
@@ -317,6 +378,7 @@ def test_branch_evidence_accepts_answer_content_divergence() -> None:
         fresh_answer="spent 30, 370 still available",
         near_figures={"320", "80"},
         fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
     )
     assert evidence.form == "answer_content_divergence"
     assert "320" in evidence.detail
@@ -331,19 +393,57 @@ def test_branch_evidence_reports_no_branch_rather_than_failing() -> None:
         fresh_answer="the budget may be exhausted",
         near_figures={"320", "80"},
         fresh_figures={"30", "370"},
+        replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
     assert "identical" in evidence.detail
 
 
 def test_near_answer_direction_is_not_satisfied_by_echoing_the_question() -> None:
-    # DIAGNOSTIC_TEMPLATE itself contains "429": restating the question must
-    # not pass an assertion that claims the agent read the ledger.
+    # DIAGNOSTIC_TEMPLATE itself contains "429" AND the conversation id:
+    # restating the question must not pass an assertion that claims the agent
+    # read the ledger.
     settings = Settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
-        agent_demo.DIAGNOSTIC_TEMPLATE.format(cid="near-uuid"),
+        agent_demo.DIAGNOSTIC_TEMPLATE.format(cid=_NEAR_ID),
+        records["diagnostic-near"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert outcomes["diagnostic-near:answer_direction"] == "failed"
+
+
+def test_answer_direction_is_not_satisfied_by_an_echoed_conversation_id() -> None:
+    # The ledger figures are short (remainder in [1, 80] by the seed contract),
+    # so a bare substring test finds them inside the conversation uuid the
+    # answer echoes back. An answer carrying the id and no ledger content is
+    # ungrounded on both sides and must fail on both sides.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        f"Conversation {_NEAR_ID}: it may be rejected with 429.",
+        records["diagnostic-near"].trace,  # type: ignore[attr-defined]
+    )
+    records["diagnostic-fresh"] = _record(
+        "diagnostic-fresh",
+        f"Conversation {_FRESH_ID}: it can keep going.",
+        records["diagnostic-fresh"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert outcomes["diagnostic-near:answer_direction"] == "failed"
+    assert outcomes["diagnostic-fresh:answer_direction"] == "failed"
+
+
+def test_answer_direction_requires_the_figure_on_a_word_boundary() -> None:
+    # A digit run inside a longer number is not the ledger figure: "320" inside
+    # "4320" and "80" inside "1809" say nothing about what the agent read.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        "The conversation ran 4320 milliseconds and holds 1809 characters.",
         records["diagnostic-near"].trace,  # type: ignore[attr-defined]
     )
     outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
@@ -385,7 +485,7 @@ def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None
     settings = Settings()
     records = _passing_records(settings)
     seed_outcome = agent_demo.SeedOutcome(
-        near_id="near-uuid", fresh_id="fresh-uuid", near_spent=320, fresh_spent=80, near_turns=3
+        near_id=_NEAR_ID, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=80, near_turns=3
     )
     trace = records["diagnostic-near"].trace  # type: ignore[attr-defined]
     records["diagnostic-fresh"] = _record(
@@ -430,6 +530,39 @@ def test_summary_never_claims_all_passed_when_something_was_unverified() -> None
     assert "all assertions passed" not in line
     # a live run must not be told anything about fake mode
     assert "--live" not in line
+
+
+def _run_demo(tmp_path: Path, *extra: str) -> "subprocess.CompletedProcess[str]":
+    """A real fake-mode run of the script — zero network by construction."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            "--fake",
+            "--capture",
+            str(tmp_path / "capture.json"),
+            *extra,
+        ],
+        cwd=str(_MODULE_PATH.parents[1]),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_require_live_assertions_turns_unverified_into_a_non_zero_exit(tmp_path: Path) -> None:
+    # `summarize_assertions` and UNVERIFIED_OUTCOMES are unit-tested, but the
+    # wiring that turns an unverified assertion into exit 1 is the part an
+    # operator actually depends on, and it was evidenced only by a manual run.
+    # Fake mode always leaves the four model-behaviour claims unverified, so it
+    # is the honest fixture for both halves of the contract.
+    default_run = _run_demo(tmp_path)
+    assert default_run.returncode == 0, default_run.stdout + default_run.stderr
+    assert "unverified" in default_run.stdout
+    strict = _run_demo(tmp_path, "--require-live-assertions")
+    assert strict.returncode == 1, strict.stdout + strict.stderr
+    assert "--require-live-assertions: 4 assertion(s) unverified" in strict.stdout
+    assert "diagnostic:branch_evidence" in strict.stdout
 
 
 def test_mode_resolution_is_atomic() -> None:
