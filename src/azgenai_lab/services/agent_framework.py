@@ -16,8 +16,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
-from azgenai_lab.services.agent_tools import AgentToolFn
+from azgenai_lab.services.agent_tools import AgentToolFn, AgentToolset
 
 logger = logging.getLogger(__name__)
 
@@ -379,3 +380,66 @@ def derive_stop(
     if "function_call_limit" in reasons:
         return "function_call_limit", frozenset(reasons)
     return "natural", frozenset()
+
+
+class FakeAgentService:
+    """Deterministic stand-in that really invokes the injected tools.
+
+    One simulated round: every tool is called once (search gets the task as
+    its query), results are embedded in the answer so contract tests prove
+    the wiring -- the fake never talks to any provider."""
+
+    def __init__(self, toolset: AgentToolset) -> None:
+        self._toolset = toolset
+        self._closed = False
+
+    async def run(self, task: str) -> AgentRunResult:
+        validate_task(task)
+        tool_calls: list[AgentToolCall] = []
+        outputs: list[str] = []
+        for tool in self._toolset.tools:
+            name = tool.__name__
+            kwargs: dict[str, Any] = {}
+            if name == "search_docs":
+                kwargs = {"query": task}
+            elif name == "get_conversation_usage":
+                kwargs = {"conversation_id": "fake-conversation"}
+            output = await tool(**kwargs)
+            outputs.append(output)
+            tool_calls.append(
+                AgentToolCall(
+                    tool_name=name,
+                    arguments=kwargs,
+                    arguments_canonical_json=json.dumps(kwargs, sort_keys=True),
+                    round_index=1,
+                    executed=True,
+                )
+            )
+        usage = TokenUsage(
+            input_tokens=20, output_tokens=10, total_tokens=30, reasoning_tokens=0
+        )
+        return AgentRunResult(
+            answer=f"[fake-agent] {task} (tools={len(tool_calls)}) " + " ".join(outputs),
+            model_call_count=2,  # one tool round + one final answer
+            tool_round_count=1,
+            tool_call_count=len(tool_calls),
+            refused_call_count=0,
+            stop_reason="natural",
+            limit_reasons=frozenset(),
+            tool_calls=tuple(tool_calls),
+            usage=usage,
+            per_round=None,
+        )
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._toolset.retriever.aclose()
+
+
+def build_agent_service(settings: Settings, toolset: AgentToolset) -> AgentService:
+    """Composition point: the only place that decides fake vs. real."""
+    if settings.use_fake_llm:
+        return FakeAgentService(toolset)
+    raise NotImplementedError("real adapter lands in Task 13")
