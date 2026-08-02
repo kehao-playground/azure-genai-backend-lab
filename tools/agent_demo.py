@@ -4,10 +4,16 @@ Modes (atomic — no mixed composition):
   --fake  (default) forces use_fake_llm/search/embeddings True; zero network.
   --live  forces all three real; requires Azure env (chat-mini + search).
 
-Flow: build shared store -> seed two conversations through the REAL
-ConversationChatService commit path (near-exhausted + fresh, preconditions
-asserted) -> run the question suite -> assert -> print measurements ->
+Flow: build shared store -> seed the near-exhausted conversation through the
+REAL ConversationChatService commit path (SEED_NEAR_TURNS turns) -> measure
+what it spent and DERIVE the token budget from that measurement -> build the
+toolset with the derived budget -> seed the fresh conversation -> assert both
+preconditions -> run the question suite -> assert -> print measurements ->
 write redacted JSON capture (--capture PATH).
+
+The budget is derived rather than fixed because the near-exhausted state is a
+window whose width is a fraction of the budget, and one real turn can cost
+more than a fixed window is wide (see `derive_token_budget`).
 
 Exit codes: 0 no assertion failed; 1 assertion/seed-contract failure;
 2 configuration error. An assertion that was never exercised is reported as
@@ -69,9 +75,21 @@ from azgenai_lab.services.azure_openai import ChatService, build_chat_service
 from azgenai_lab.services.conversation import ConversationChatService
 from azgenai_lab.services.conversation_store import ConversationStore, build_conversation_store
 
-DEMO_TOKEN_BUDGET = 400          # single source (spec §1): seed service,
-                                 # config tool, usage tool, evidence manifest
-SEED_MAX_TURNS = 10
+# The demo's token budget is MEASURED, not fixed. A fixed budget of 400 made
+# the near-exhausted window [320, 400) exactly 80 tokens wide, while one real
+# turn of the deployed reasoning model costs 126-535 tokens (measured: 29 in /
+# 506 out / 256 reasoning). The step is larger than the window, so the state
+# the demo is built to show was reachable only by coincidence — the first live
+# turn overshot the entire budget by 34%. Nothing caught it because the
+# constant had been calibrated against the fake, whose deterministic ladder
+# (15/50/105/180/275/390) happens to land 10 tokens under it.
+#
+# So the dependency is inverted: seed a fixed, small number of REAL turns,
+# measure what they actually spent, and derive the budget from that
+# measurement (`derive_token_budget`). The window then scales with the model's
+# verbosity instead of being contradicted by it.
+SEED_NEAR_TURNS = 3
+NEAR_TARGET_RATIO = 0.9  # where the seeded near conversation lands in the budget
 # Same constant as the tools apply, imported rather than re-typed: a demo that
 # defined its own 0.8 could seed against a threshold the tools do not use.
 NEAR_LOW = NEAR_EXHAUSTED_THRESHOLD
@@ -168,8 +186,10 @@ def neutralize(text: str, replacements: Sequence[tuple[str, str]]) -> str:
 def _figure_in(text: str, figure: str) -> bool:
     """Whether `text` states `figure` — on a word boundary, not as a substring.
 
-    `80` inside `1809` is not the remainder, and a bare `in` test would say it
-    was. The figures are one to three digits, so this matters.
+    `168` inside `1683` is not the remainder, and a bare `in` test would say
+    it was. The figures run from a two-digit remainder (fake mode) to a
+    four-digit derived budget, and every one of those widths occurs inside a
+    32-hex-character conversation id, so this matters at every size.
     """
     return re.search(rf"\b{re.escape(figure)}\b", text) is not None
 
@@ -345,6 +365,37 @@ def seed_precondition_ok(kind: str, *, spent: int, budget: int) -> bool:
     raise ValueError(kind)
 
 
+def derive_token_budget(near_spent: int) -> int:
+    """The budget that puts a measured spend at `NEAR_TARGET_RATIO` of itself.
+
+    This is the whole point of the change recorded at the top of the file: the
+    near-exhausted window is `[NEAR_LOW * budget, budget)`, so fixing the
+    budget fixes the window's width, and a model whose single turn costs more
+    than that width can only land inside it by luck. Deriving the budget from
+    what the seed actually spent makes the window scale with the model —
+    at 0.9 of a `NEAR_LOW = 0.8` budget the measurement sits in the middle of
+    the window with room on both sides, whatever the turn cost.
+
+    The result is checked against the very contract it exists to satisfy and
+    the derivation refuses rather than returning a budget that fails it. Two
+    inputs reach that guard: a spend of 0 (a provider that reported no usage
+    at all — with no measurement there is nothing to derive from), and spends
+    of 1-4 tokens, where rounding `spent / 0.9` back down to `spent` would
+    describe an *exhausted* conversation, not a near-exhausted one. Both are
+    derivation failures the caller must report loudly; silently handing such a
+    number to the tools would produce a demo that proves nothing.
+    """
+    budget = round(near_spent / NEAR_TARGET_RATIO)
+    if not seed_precondition_ok("near_exhausted", spent=near_spent, budget=budget):
+        raise ValueError(
+            f"cannot derive a token budget from a measured spend of {near_spent}: "
+            f"round({near_spent} / {NEAR_TARGET_RATIO}) = {budget}, which does not put "
+            f"{near_spent} inside the near-exhausted window "
+            f"[{NEAR_LOW * budget}, {budget})"
+        )
+    return budget
+
+
 def trace_of(result: AgentRunResult) -> list[dict[str, Any]]:
     """The run's tool calls as plain dicts — the capture's trace shape."""
     return [
@@ -448,12 +499,19 @@ def comparison_redactions(
     The same substitution mechanism, aimed at a different question. A capture
     is *read*, so it keeps the two conversations distinguishable (`conv-near`
     vs `conv-fresh`). An assertion *compares*, and there the ids are precisely
-    what must not count: the seed contract puts spend in [320, 400), so the
-    remainder is one or two digits, and such a short digit run sits inside a
-    32-hex-character uuid most of the time (~87% for a single digit), so
-    an answer that merely echoes the question would otherwise "carry" a ledger
-    figure, and two traces naming their own conversation would otherwise
-    "diverge". Both ids therefore become the same token here.
+    what must not count: an answer that merely echoes the question would
+    otherwise "carry" a ledger figure, and two traces naming their own
+    conversation would otherwise "diverge".
+
+    The figures are no longer the one- or two-digit remainders a fixed budget
+    of 400 produced; a derived budget and its remainder are typically three or
+    four digits. That makes the collision *more* likely to survive matching,
+    not less. A conversation id is 32 hex characters, so a three-digit run
+    still appears inside one most of the time — and a uuid's middle groups are
+    exactly four characters wide, so a four-digit figure can be a whole group
+    (`...-1512-...`), where it is `\\b`-delimited and word-boundary matching
+    cannot reject it at all. Neutralizing both ids into the same token is what
+    rejects it, and it is why the boundary matcher is not enough on its own.
     """
     return _redactions(settings, _conversation_pairs(near_id, fresh_id, CONV_ANY, CONV_ANY))
 
@@ -541,12 +599,31 @@ def wrap_tools_with_recorder(
 
 
 @dataclass
+class NearSeed:
+    """The near conversation as seeded, before any budget exists.
+
+    `spent` is the measurement the budget is derived from, so this type is
+    what separates "what the model actually cost" from "what the demo then
+    calls the budget" — the two used to be the same hardcoded number.
+    """
+
+    conversation_id: str
+    spent: int
+    turns: int
+    usage_totals: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class SeedOutcome:
     near_id: str
     fresh_id: str
     near_spent: int
     fresh_spent: int
     near_turns: int
+    # The derived budget, carried with the measurement it came from: the same
+    # number the toolset was built with, so an assertion can never compare a
+    # spend against a budget the tools did not report.
+    token_budget: int
     usage_totals: dict[str, int] = field(default_factory=dict)
 
 
@@ -563,54 +640,93 @@ def _add_usage(totals: dict[str, int], result_usage: Any) -> None:
     totals["total_tokens"] = totals.get("total_tokens", 0) + result_usage.total_tokens
 
 
-async def seed(store: ConversationStore, seed_service: ConversationChatService) -> SeedOutcome:
-    """Seed through the real commit path — `ChatService.complete` never commits.
+async def seed_near(store: ConversationStore, seed_service: ConversationChatService) -> NearSeed:
+    """`SEED_NEAR_TURNS` real turns, then read what they spent.
 
-    `store` is the same instance the toolset closed over, so what the seed
-    commits is exactly what `get_conversation_usage` later reads.
+    Seeding goes through the real commit path — `ChatService.complete` never
+    commits, and `store` is the same instance the toolset closes over, so what
+    this writes is exactly what `get_conversation_usage` later reads. Going
+    through the real ledger is the design, not a convenience: a demo that
+    poked a number into the store would be demonstrating its own fixture.
 
-    The near-exhausted conversation is turned until the ledger the tools read
-    shows spent >= 80% of the budget, hard-capped at SEED_MAX_TURNS so a live
-    run's nondeterministic usage still terminates. Both preconditions are a
-    contract: failing them here is a seed-contract failure, not a confusing
-    branch failure three assertions later.
+    The turn count is FIXED rather than a loop against a threshold. There is
+    nothing to loop against any more — the threshold is a fraction of a budget
+    this measurement has yet to produce — and a fixed count also makes a live
+    run's cost predictable instead of "up to SEED_MAX_TURNS turns, depending
+    on how terse the model felt". (`SEED_MAX_TURNS` existed only as that
+    loop's safety cap and is gone with it.)
     """
     totals: dict[str, int] = {}
-    near_id, result = await seed_service.complete("seed turn 1", None, tenant_id=DEMO_TENANT)
+    conversation_id, result = await seed_service.complete(
+        "seed turn 1", None, tenant_id=DEMO_TENANT
+    )
     _add_usage(totals, result.usage)
-    turns = 1
-    for _ in range(SEED_MAX_TURNS - 1):
-        conversation = await store.get(DEMO_TENANT, near_id)
-        if conversation is None:
-            _fail(f"seed contract: conversation {near_id} vanished from the store")
-        if conversation.total_tokens >= NEAR_LOW * DEMO_TOKEN_BUDGET:
-            break
-        _, result = await seed_service.complete("seed turn", near_id, tenant_id=DEMO_TENANT)
+    for turn in range(2, SEED_NEAR_TURNS + 1):
+        _, result = await seed_service.complete(
+            f"seed turn {turn}", conversation_id, tenant_id=DEMO_TENANT
+        )
         _add_usage(totals, result.usage)
-        turns += 1
+    conversation = await store.get(DEMO_TENANT, conversation_id)
+    if conversation is None:
+        _fail(f"seed contract: conversation {conversation_id} vanished from the store")
+    return NearSeed(
+        conversation_id=conversation_id,
+        spent=conversation.total_tokens,
+        turns=SEED_NEAR_TURNS,
+        usage_totals=totals,
+    )
+
+
+async def seed_fresh(
+    store: ConversationStore,
+    seed_service: ConversationChatService,
+    near: NearSeed,
+    *,
+    budget: int,
+) -> SeedOutcome:
+    """One fresh turn, then both preconditions as a hard contract.
+
+    The near conversation lands at `NEAR_TARGET_RATIO` of `budget` by
+    construction and the fresh one clears `NEAR_LOW * budget` with roughly
+    `SEED_NEAR_TURNS - 1` turns of margin — but both are asserted anyway. A
+    bug in the derivation must fail loudly here rather than silently produce a
+    demo whose "near-exhausted" conversation is nothing of the sort; that
+    silent version is exactly what the fixed budget shipped.
+
+    The near ledger is re-read rather than trusted from `near.spent`: the
+    budget was derived from that figure, so if the two disagree the budget
+    describes a state the store no longer holds.
+    """
+    totals = dict(near.usage_totals)
     fresh_id, result = await seed_service.complete("hello", None, tenant_id=DEMO_TENANT)
     _add_usage(totals, result.usage)
 
-    # preconditions (spec §1): fail as seed-contract failure, not later
-    near_conversation = await store.get(DEMO_TENANT, near_id)
+    near_conversation = await store.get(DEMO_TENANT, near.conversation_id)
     fresh_conversation = await store.get(DEMO_TENANT, fresh_id)
     if near_conversation is None or fresh_conversation is None:
         _fail("seed contract: a seeded conversation is not visible in the shared store")
-    near = near_conversation.total_tokens
-    fresh = fresh_conversation.total_tokens
-    if not seed_precondition_ok("near_exhausted", spent=near, budget=DEMO_TOKEN_BUDGET):
+    near_spent = near_conversation.total_tokens
+    fresh_spent = fresh_conversation.total_tokens
+    if near_spent != near.spent:
         _fail(
-            f"seed contract: near-exhausted spent={near} budget={DEMO_TOKEN_BUDGET} "
-            f"after {turns} turns (cap {SEED_MAX_TURNS})"
+            f"seed contract: the near ledger moved between measurement and assertion "
+            f"({near.spent} -> {near_spent}), so budget {budget} was derived from a "
+            "spend the store no longer reports"
         )
-    if not seed_precondition_ok("fresh", spent=fresh, budget=DEMO_TOKEN_BUDGET):
-        _fail(f"seed contract: fresh spent={fresh}")
+    if not seed_precondition_ok("near_exhausted", spent=near_spent, budget=budget):
+        _fail(
+            f"seed contract: near-exhausted spent={near_spent} budget={budget} "
+            f"after {near.turns} turns"
+        )
+    if not seed_precondition_ok("fresh", spent=fresh_spent, budget=budget):
+        _fail(f"seed contract: fresh spent={fresh_spent} budget={budget}")
     return SeedOutcome(
-        near_id=near_id,
+        near_id=near.conversation_id,
         fresh_id=fresh_id,
-        near_spent=near,
-        fresh_spent=fresh,
-        near_turns=turns,
+        near_spent=near_spent,
+        fresh_spent=fresh_spent,
+        near_turns=near.turns,
+        token_budget=budget,
         usage_totals=totals,
     )
 
@@ -837,20 +953,27 @@ def assert_suite(
     )
 
     config_docs = records["config+docs"]
-    budget = str(DEMO_TOKEN_BUDGET)
+    budget = str(seed_outcome.token_budget)
     _check(
         results,
         "config+docs:answer_contains_demo_token_budget",
         _figure_in(neutralize(config_docs.answer, replacements), budget),
-        # Known residual, stated where it is asserted: DEMO_TOKEN_BUDGET is
-        # 400, which is also an HTTP status code, and a word boundary cannot
-        # tell a standalone budget figure from a standalone status code. So
-        # this is a CORROBORATING SIGNAL, not proof; the structural proof that
-        # the agent read the figure from get_runtime_config is
-        # config+docs:runtime_config_executed, which runs in both modes.
+        # Known residual, stated where it is asserted. It used to be specific:
+        # the budget was the constant 400, which is also an HTTP status code,
+        # so EVERY run carried a collision a word boundary could not resolve.
+        # The budget is now derived from the seed's measured spend, so nothing
+        # ties it to a status code and that particular collision is gone. The
+        # class is not: any derived value can coincide with a figure the answer
+        # states for another reason (an HTTP status such as 429, a latency in
+        # ms, a byte count), and a boundary rule cannot tell those apart
+        # either. So this stays a CORROBORATING SIGNAL, not proof; the
+        # structural proof that the agent read the figure from
+        # get_runtime_config is config+docs:runtime_config_executed, which runs
+        # in both modes.
         f"expected {budget!r} in the answer — corroborating signal only: a bare "
-        f"{budget!r} is indistinguishable from an HTTP status of the same "
-        "digits, so the structural proof is config+docs:runtime_config_executed",
+        f"{budget!r} on a word boundary is indistinguishable from the same digits "
+        "used as an HTTP status, a latency or a byte count, so the structural "
+        "proof is config+docs:runtime_config_executed",
     )
     _check(
         results,
@@ -890,8 +1013,8 @@ def assert_suite(
             _skip(results, targeted_name, _FAKE_LEDGER_TARGET_REASON)
 
     if live:
-        near_figures = ledger_figures(seed_outcome.near_spent, DEMO_TOKEN_BUDGET)
-        fresh_figures = ledger_figures(seed_outcome.fresh_spent, DEMO_TOKEN_BUDGET)
+        near_figures = ledger_figures(seed_outcome.near_spent, seed_outcome.token_budget)
+        fresh_figures = ledger_figures(seed_outcome.fresh_spent, seed_outcome.token_budget)
         evidence = branch_evidence(
             near_trace=near.trace,
             fresh_trace=fresh.trace,
@@ -916,11 +1039,13 @@ def assert_suite(
         # of the pass condition — a correct live answer phrased without that
         # vocabulary must not fail on a wording preference.
         #
-        # The same restatement carries the conversation id, and the figures are
-        # short (remainder <= 80 under the seed contract), so the id is
-        # neutralized before matching and the figure must land on a word
-        # boundary. Otherwise the paraphrase earns the assertion again, one
-        # token further along.
+        # The same restatement carries the conversation id, and at a derived
+        # budget the remainder is typically three or four digits — wide enough
+        # to sit inside a 32-hex-character id, and at four digits wide enough
+        # to BE one of its dash-delimited groups, where a word boundary would
+        # accept it. So the id is neutralized before matching *and* the figure
+        # must land on a word boundary; either rule alone lets the paraphrase
+        # earn the assertion again, one token further along.
         near_clean = neutralize(near.answer, replacements)
         near_hits = sorted(figure for figure in near_figures if _figure_in(near_clean, figure))
         near_lower = near_clean.lower()
@@ -1196,21 +1321,63 @@ async def main() -> None:
         seed_chat_service = build_chat_service(settings)
     except (ValueError, ConfigurationError) as exc:
         _config_error(str(exc))
-    seed_service = ConversationChatService(seed_chat_service, store, token_budget=DEMO_TOKEN_BUDGET)
+    # No budget on the seed service: the budget is DERIVED from what these
+    # turns spend, so it does not exist yet — and a gate here would reject the
+    # very turns that define it. The tools' budget is unaffected; it is the
+    # derived number, threaded from the single place it is computed below.
+    seed_service = ConversationChatService(seed_chat_service, store, token_budget=None)
     try:
         baseline_service = build_chat_service(settings)
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         _config_error(str(exc))
+
+    # Ordering forced by the derivation: both budget-carrying tools take the
+    # budget at construction, so the near conversation must be seeded and
+    # measured BEFORE the toolset exists. Nothing downstream has been built
+    # yet, so a failure here closes only these two services.
+    try:
+        near_seed = await seed_near(store, seed_service)
+        try:
+            budget = derive_token_budget(near_seed.spent)
+        except ValueError as exc:
+            _fail(f"seed contract: {exc}")
+    except BaseException:
+        await seed_service.aclose()
+        await baseline_service.aclose()
+        raise
+    print(
+        f"budget: {budget} derived from {near_seed.spent} tokens spent over "
+        f"{near_seed.turns} seed turns (target {NEAR_TARGET_RATIO:.0%} of budget, "
+        f"near-exhausted window [{NEAR_LOW * budget:g}, {budget}))"
+    )
+
     try:
         built = build_agent_toolset(
-            settings, DEMO_PRINCIPAL, conversation_store=store, token_budget=DEMO_TOKEN_BUDGET
+            settings, DEMO_PRINCIPAL, conversation_store=store, token_budget=budget
         )
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         await baseline_service.aclose()
         _config_error(str(exc))
     toolset = replace(built, tools=wrap_tools_with_recorder(built.tools, sink))
+
+    # The fresh conversation and both preconditions, now that there is a budget
+    # to hold them against. Still before the agent service exists, so its own
+    # cleanup is not owed yet — the retriever is, since the toolset holds it.
+    try:
+        seed_outcome = await seed_fresh(store, seed_service, near_seed, budget=budget)
+    except BaseException:
+        await seed_service.aclose()
+        await baseline_service.aclose()
+        await toolset.retriever.aclose()
+        raise
+    print(
+        f"seed: near-exhausted spent={seed_outcome.near_spent}/{budget} "
+        f"({seed_outcome.near_turns} turns), fresh spent={seed_outcome.fresh_spent}/"
+        f"{budget} (1 turn)\n"
+    )
+
     try:
         agent_service: AgentService = build_agent_service(settings, toolset)
     except (ValueError, ConfigurationError) as exc:
@@ -1220,13 +1387,6 @@ async def main() -> None:
         _config_error(str(exc))
 
     try:
-        seed_outcome = await seed(store, seed_service)
-        print(
-            f"seed: near-exhausted spent={seed_outcome.near_spent}/{DEMO_TOKEN_BUDGET} "
-            f"({seed_outcome.near_turns} turns), fresh spent={seed_outcome.fresh_spent}/"
-            f"{DEMO_TOKEN_BUDGET} (1 turn)\n"
-        )
-
         records: dict[str, RunRecord] = {}
         for label, question in build_questions(seed_outcome.near_id, seed_outcome.fresh_id):
             record = await run_question(agent_service, label, question, sink)
@@ -1277,7 +1437,16 @@ async def main() -> None:
                     name: _package_version(name)
                     for name in ("agent-framework-core", "agent-framework-openai", "openai")
                 },
-                "demo_token_budget": DEMO_TOKEN_BUDGET,
+                # Derived, not configured — so the manifest says so rather
+                # than letting a reader take it for a constant of the demo.
+                "demo_token_budget": seed_outcome.token_budget,
+                "demo_token_budget_source": (
+                    f"derived: round(near_spent / {NEAR_TARGET_RATIO}), where near_spent "
+                    f"is what {SEED_NEAR_TURNS} real seed turns actually spent"
+                ),
+                "seed_near_turns": SEED_NEAR_TURNS,
+                "near_target_ratio": NEAR_TARGET_RATIO,
+                "near_exhausted_threshold": NEAR_LOW,
                 "agent_max_iterations": settings.agent_max_iterations,
                 "agent_max_tool_calls": settings.agent_max_tool_calls,
                 "llm_max_output_tokens": settings.llm_max_output_tokens,
@@ -1297,7 +1466,12 @@ async def main() -> None:
                 "usage_totals": seed_outcome.usage_totals,
                 "note": (
                     "seed turns are setup: excluded from every per-question "
-                    "measurement and from the baseline comparison"
+                    "measurement and from the baseline comparison. "
+                    "run_conditions.demo_token_budget is DERIVED from "
+                    "near_spent_tokens (see demo_token_budget_source), so the "
+                    "near conversation sits at the target ratio of the budget "
+                    "whatever the model's turns cost — it is not a constant the "
+                    "seed had to reach"
                 ),
             },
             "questions": [

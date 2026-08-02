@@ -25,6 +25,9 @@ from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_framework import AgentRoundMetrics, AgentRunResult
+from azgenai_lab.services.azure_openai import FakeChatService
+from azgenai_lab.services.conversation import ConversationChatService
+from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "agent_demo.py"
 _SPEC = importlib.util.spec_from_file_location("agent_demo", _MODULE_PATH)
@@ -37,6 +40,7 @@ assert_suite = agent_demo.assert_suite
 branch_evidence = agent_demo.branch_evidence
 build_redactions = agent_demo.build_redactions
 comparison_redactions = agent_demo.comparison_redactions
+derive_token_budget = agent_demo.derive_token_budget
 ledger_figures = agent_demo.ledger_figures
 normalized_post_ledger_trace = agent_demo.normalized_post_ledger_trace
 normalized_trace = agent_demo.normalized_trace
@@ -84,6 +88,27 @@ def _result(per_round: tuple[AgentRoundMetrics, ...] | None) -> AgentRunResult:
         usage=TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2, reasoning_tokens=None),
         per_round=per_round,
     )
+
+
+# --------------------------------------------------------------------------
+# The seed model these tests stand on.
+#
+# Every figure below is DERIVED, not chosen. The demo no longer fixes the
+# budget: it seeds SEED_NEAR_TURNS real turns, measures what they spent, and
+# sets the budget so that measurement lands at NEAR_TARGET_RATIO of it. A
+# fixture that hand-picked `near_spent=320, fresh_spent=30` against a fixed
+# budget of 400 satisfied a contract the production path could not reach —
+# one real turn of the deployed reasoning model costs 126-535 tokens, so the
+# 80-token-wide window [320, 400) was cleared only by coincidence, and the
+# first live run overshot the whole budget. So `_NEAR_SPENT` is a measured
+# live figure (3 turns), everything else follows from it by the same
+# arithmetic the script performs, and `test_the_seed_fixture_is_internally
+# _consistent_with_the_derivation` pins that it still does.
+_NEAR_SPENT = 1512
+_BUDGET = 1680  # == round(1512 / 0.9)
+_NEAR_REMAINDER = _BUDGET - _NEAR_SPENT  # 168
+_FRESH_SPENT = 535  # one turn, the measured worst case of a single live turn
+_FRESH_REMAINDER = _BUDGET - _FRESH_SPENT  # 1145
 
 
 def test_post_ledger_trace_normalizes_conversation_id() -> None:
@@ -141,16 +166,44 @@ def test_normalized_trace_detects_divergence_across_repeats() -> None:
 
 
 def test_seed_preconditions() -> None:
-    assert seed_precondition_ok("fresh", spent=100, budget=400)
-    assert not seed_precondition_ok("fresh", spent=320, budget=400)
-    assert seed_precondition_ok("near_exhausted", spent=320, budget=400)
-    assert not seed_precondition_ok("near_exhausted", spent=400, budget=400)  # exhausted
-    assert not seed_precondition_ok("near_exhausted", spent=100, budget=400)
+    assert seed_precondition_ok("fresh", spent=_FRESH_SPENT, budget=_BUDGET)
+    assert not seed_precondition_ok("fresh", spent=_NEAR_SPENT, budget=_BUDGET)
+    assert seed_precondition_ok("near_exhausted", spent=_NEAR_SPENT, budget=_BUDGET)
+    assert not seed_precondition_ok("near_exhausted", spent=_BUDGET, budget=_BUDGET)  # exhausted
+    assert not seed_precondition_ok("near_exhausted", spent=_FRESH_SPENT, budget=_BUDGET)
 
 
 def test_seed_precondition_rejects_an_unknown_kind() -> None:
     with pytest.raises(ValueError):
-        seed_precondition_ok("whatever", spent=1, budget=400)
+        seed_precondition_ok("whatever", spent=1, budget=_BUDGET)
+
+
+def test_derived_budget_puts_any_measured_spend_inside_the_near_window() -> None:
+    # The property the whole change exists for: the near-exhausted window is
+    # [0.8 * budget, budget), and with a FIXED budget of 400 it was 80 tokens
+    # wide while one live turn cost 126-535 — a step larger than the window,
+    # so landing in it was luck. Deriving the budget from the measurement
+    # inverts that: the window scales with whatever the model actually spent,
+    # so the seeded conversation lands inside it by construction. The spends
+    # below span the fake's deterministic ladder (105) and measured live turn
+    # costs (126 for a bare "hello", 535 for the verbose case) at 1-3 turns.
+    for spent in (105, 126, 378, 535, 1512, 1605, 4200):
+        budget = derive_token_budget(spent)
+        assert seed_precondition_ok("near_exhausted", spent=spent, budget=budget), spent
+        # lands at the target ratio, up to the rounding to a whole token
+        assert abs(spent / budget - agent_demo.NEAR_TARGET_RATIO) < 0.005, spent
+
+
+def test_derived_budget_refuses_a_measurement_it_cannot_satisfy() -> None:
+    # A budget that does not put the measurement inside the window would give
+    # a demo that proves nothing, so the derivation refuses to return one
+    # instead of handing it to the tools. Zero is the real case (a provider
+    # that reported no usage at all); 1-4 tokens is the arithmetic edge, where
+    # rounding 1/0.9 back down to 1 would leave spent == budget, i.e. already
+    # exhausted rather than near-exhausted.
+    for spent in (0, 1, 4, -10):
+        with pytest.raises(ValueError):
+            derive_token_budget(spent)
 
 
 def test_tool_ms_is_unavailable_rather_than_zero_when_per_round_is_none() -> None:
@@ -241,13 +294,21 @@ async def test_recorder_preserves_tool_identity_and_captures_output() -> None:
 
 
 # Realistic seeded conversation ids. Both deliberately CONTAIN every ledger
-# figure these tests use ("320", "80", "30", "370") as a bare substring, which
-# is exactly the trap the real ids set: the seed contract forces spent into
-# [320, 400), so the remainder is one or two digits, and a short digit run
-# appears somewhere inside a 32-hex-character uuid most of the time. An id
-# made of letters only ("near-uuid") cannot catch a substring match.
-_NEAR_ID = "3208030f-3702-4bd6-8f23-d348fdb5a694"
-_FRESH_ID = "3703080f-3202-4bd6-8f23-d348fdb5a694"
+# figure these tests use ("1512", "168", "535", "1145") as a bare substring,
+# which is exactly the trap the real ids set: a uuid is 32 hex characters, so
+# a short digit run appears inside one most of the time. At a derived budget
+# the figures are larger than they were under the old fixed-400 contract, and
+# the trap gets *worse* rather than better — a uuid's middle groups are
+# exactly four hex characters, so a four-digit figure can be a whole group
+# (`-1512-` here) and is then `\b`-delimited, which word-boundary matching
+# cannot reject at all. Neutralizing the ids before matching is what rejects
+# it. An id made of letters only ("near-uuid") catches neither form.
+_NEAR_ID = "1512168a-1512-4bd6-8f23-d348fdb5a694"
+_FRESH_ID = "53511450-1145-4bd6-8f23-d348fdb5a694"
+
+# What each conversation's own ledger entry can supply, and nothing else can.
+_NEAR_FIGURES = {str(_NEAR_SPENT), str(_NEAR_REMAINDER)}
+_FRESH_FIGURES = {str(_FRESH_SPENT), str(_FRESH_REMAINDER)}
 
 
 def _comparison_replacements() -> list[tuple[str, str]]:
@@ -266,14 +327,48 @@ def _record(label: str, answer: str, trace: list[dict[str, object]]) -> object:
     )
 
 
-def _seed_outcome() -> object:
-    return agent_demo.SeedOutcome(
-        near_id=_NEAR_ID,
-        fresh_id=_FRESH_ID,
-        near_spent=320,
-        fresh_spent=30,
-        near_turns=3,
+def _seed_outcome(**overrides: Any) -> Any:
+    """The outcome a real run produces, with the run's own derived budget.
+
+    Not a hand-picked pair of figures any more: `near_spent` is a measured
+    live spend, the budget is what `derive_token_budget` returns for it, and
+    the near-exhausted precondition therefore holds by construction rather
+    than by the fixture's choice — see the seed-model block at the top.
+    """
+    near_spent = int(overrides.pop("near_spent", _NEAR_SPENT))
+    fields: dict[str, Any] = {
+        "near_id": _NEAR_ID,
+        "fresh_id": _FRESH_ID,
+        "near_spent": near_spent,
+        "fresh_spent": _FRESH_SPENT,
+        "near_turns": agent_demo.SEED_NEAR_TURNS,
+        # derived from `near_spent`, never chosen: the fixture cannot describe
+        # a state the script's own derivation would refuse to produce.
+        "token_budget": derive_token_budget(near_spent),
+    }
+    fields.update(overrides)
+    return agent_demo.SeedOutcome(**fields)
+
+
+def test_the_seed_fixture_is_internally_consistent_with_the_derivation() -> None:
+    # The old fixture encoded a state the production path could not reach, and
+    # every live-mode assertion test below stands on this one. So the fixture's
+    # own numbers are checked against the script's derivation and its seed
+    # contract, rather than being trusted because they look plausible.
+    outcome = _seed_outcome()
+    assert derive_token_budget(outcome.near_spent) == outcome.token_budget == _BUDGET
+    assert seed_precondition_ok(
+        "near_exhausted", spent=outcome.near_spent, budget=outcome.token_budget
     )
+    assert seed_precondition_ok("fresh", spent=outcome.fresh_spent, budget=outcome.token_budget)
+    assert ledger_figures(outcome.near_spent, outcome.token_budget) == {
+        str(_NEAR_SPENT),
+        str(_NEAR_REMAINDER),
+    }
+    assert ledger_figures(outcome.fresh_spent, outcome.token_budget) == {
+        str(_FRESH_SPENT),
+        str(_FRESH_REMAINDER),
+    }
 
 
 _LEDGER = "get_conversation_usage"
@@ -291,18 +386,21 @@ def _passing_records(settings: Settings) -> dict[str, object]:
         ),
         "docs-only": _record("docs-only", "ignore unknown event names", [_call(_SEARCH, {})]),
         "config+docs": _record(
-            "config+docs", "The budget is 400 tokens.", [_call(_CONFIG, {}), _call(_SEARCH, {})]
+            "config+docs",
+            f"The budget is {_BUDGET} tokens.",
+            [_call(_CONFIG, {}), _call(_SEARCH, {})],
         ),
-        # near: ledger figures 320 spent / 80 remaining, plus the 429 wording
+        # near: ledger figures 1512 spent / 168 remaining, plus the 429 wording
         "diagnostic-near": _record(
             "diagnostic-near",
-            "It has spent 320 tokens and has 80 left, so the next call is rejected with 429.",
+            f"It has spent {_NEAR_SPENT} tokens and has {_NEAR_REMAINDER} left, "
+            "so the next call is rejected with 429.",
             [_call(_LEDGER, {"conversation_id": _NEAR_ID}), _call(_SEARCH, {"query": "429"})],
         ),
-        # fresh: ledger figures 30 spent / 370 remaining
+        # fresh: ledger figures 535 spent / 1145 remaining
         "diagnostic-fresh": _record(
             "diagnostic-fresh",
-            "It has spent 30 tokens and can still spend 370.",
+            f"It has spent {_FRESH_SPENT} tokens and can still spend {_FRESH_REMAINDER}.",
             [_call(_LEDGER, {"conversation_id": _FRESH_ID})],
         ),
         "no-hit": _record(
@@ -318,7 +416,7 @@ def _outcomes(assertions: list[object]) -> dict[str, str]:
 
 
 def test_ledger_figures_are_the_two_numbers_only_the_ledger_supplies() -> None:
-    assert ledger_figures(320, 400) == {"320", "80"}
+    assert ledger_figures(_NEAR_SPENT, _BUDGET) == {"1512", "168"}
 
 
 def test_branch_evidence_prefers_full_trace_divergence() -> None:
@@ -332,8 +430,8 @@ def test_branch_evidence_prefers_full_trace_divergence() -> None:
         fresh_trace=fresh_trace,
         near_answer="",
         fresh_answer="",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "trace_divergence"
@@ -358,8 +456,8 @@ def test_branch_evidence_ignores_a_conversation_id_inside_an_argument_value() ->
         fresh_trace=fresh_trace,
         near_answer="",
         fresh_answer="",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
@@ -375,8 +473,8 @@ def test_branch_evidence_answer_channel_ignores_an_echoed_conversation_id() -> N
         fresh_trace=trace,
         near_answer=f"Conversation {_NEAR_ID}: it may be rejected with 429.",
         fresh_answer=f"Conversation {_FRESH_ID}: it may be rejected with 429.",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
@@ -391,8 +489,8 @@ def test_branch_evidence_never_counts_two_ledgerless_runs() -> None:
         fresh_trace=[_call(_CONFIG, {})],
         near_answer="",
         fresh_answer="",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
@@ -405,14 +503,14 @@ def test_branch_evidence_accepts_answer_content_divergence() -> None:
     evidence = branch_evidence(
         near_trace=trace_shape,
         fresh_trace=[_call(_SEARCH, {"query": "429"}), _call(_LEDGER, {"conversation_id": "Y"})],
-        near_answer="spent 320, only 80 left",
-        fresh_answer="spent 30, 370 still available",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_answer=f"spent {_NEAR_SPENT}, only {_NEAR_REMAINDER} left",
+        fresh_answer=f"spent {_FRESH_SPENT}, {_FRESH_REMAINDER} still available",
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "answer_content_divergence"
-    assert "320" in evidence.detail
+    assert str(_NEAR_SPENT) in evidence.detail
 
 
 def test_branch_evidence_reports_no_branch_rather_than_failing() -> None:
@@ -422,8 +520,8 @@ def test_branch_evidence_reports_no_branch_rather_than_failing() -> None:
         fresh_trace=[_call(_LEDGER, {"conversation_id": "Y"})],
         near_answer="the budget may be exhausted",
         fresh_answer="the budget may be exhausted",
-        near_figures={"320", "80"},
-        fresh_figures={"30", "370"},
+        near_figures=_NEAR_FIGURES,
+        fresh_figures=_FRESH_FIGURES,
         replacements=_comparison_replacements(),
     )
     assert evidence.form == "none"
@@ -446,10 +544,12 @@ def test_near_answer_direction_is_not_satisfied_by_echoing_the_question() -> Non
 
 
 def test_answer_direction_is_not_satisfied_by_an_echoed_conversation_id() -> None:
-    # The ledger figures are short (remainder in [1, 80] by the seed contract),
-    # so a bare substring test finds them inside the conversation uuid the
-    # answer echoes back. An answer carrying the id and no ledger content is
-    # ungrounded on both sides and must fail on both sides.
+    # The ledger figures are three to four digits at a derived budget, and a
+    # uuid is 32 hex characters in dash-delimited groups: a bare substring test
+    # finds a figure inside the id the answer echoes back, and for a four-digit
+    # figure that matches a whole group (`-1512-`) even a word-boundary test
+    # does. An answer carrying the id and no ledger content is ungrounded on
+    # both sides and must fail on both sides.
     settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
@@ -462,19 +562,24 @@ def test_answer_direction_is_not_satisfied_by_an_echoed_conversation_id() -> Non
         f"Conversation {_FRESH_ID}: it can keep going.",
         records["diagnostic-fresh"].trace,  # type: ignore[attr-defined]
     )
+    # Not a substring-only trap any more: `\b1512\b` matches the near id's
+    # second group outright, so word-boundary matching alone would report this
+    # ungrounded answer as grounded. Only the neutralization stops it.
+    assert agent_demo._figure_in(_NEAR_ID, str(_NEAR_SPENT))
     outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
     assert outcomes["diagnostic-near:answer_direction"] == "failed"
     assert outcomes["diagnostic-fresh:answer_direction"] == "failed"
 
 
 def test_answer_direction_requires_the_figure_on_a_word_boundary() -> None:
-    # A digit run inside a longer number is not the ledger figure: "320" inside
-    # "4320" and "80" inside "1809" say nothing about what the agent read.
+    # A digit run inside a longer number is not the ledger figure: "1512"
+    # inside "15120" and "168" inside "1683" say nothing about what the agent
+    # read.
     settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
-        "The conversation ran 4320 milliseconds and holds 1809 characters.",
+        "The conversation ran 15120 milliseconds and holds 1683 characters.",
         records["diagnostic-near"].trace,  # type: ignore[attr-defined]
     )
     outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
@@ -498,44 +603,70 @@ def test_config_only_answer_contains_llm_max_output_tokens_requires_word_boundar
 
 
 def test_config_docs_answer_contains_demo_token_budget_requires_word_boundary() -> None:
-    # Embedded-digit sub-case only: "400" hidden inside a longer number
-    # ("4000-series") is not the budget figure. This says nothing about the
-    # *standalone* HTTP-400 collision, which word-boundary matching cannot
-    # reject by construction — see the known-gap test below.
+    # Embedded-digit sub-case: the budget figure hidden inside a longer number
+    # ("16800") is not the budget figure. This says nothing about a
+    # *standalone* figure of the same digits in another role, which
+    # word-boundary matching cannot reject by construction — see the
+    # known-gap test below.
     settings = _settings()
     records = _passing_records(settings)
     records["config+docs"] = _record(
         "config+docs",
-        "It documents an HTTP 4000-series response for invalid input, but "
-        "never states the token budget.",
+        f"It documents a {_BUDGET}0-byte response ceiling for invalid input, "
+        "but never states the token budget.",
         records["config+docs"].trace,  # type: ignore[attr-defined]
     )
     outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
     assert outcomes["config+docs:answer_contains_demo_token_budget"] == "failed"
 
 
-def test_config_docs_budget_assertion_accepts_a_standalone_http_400_known_gap() -> None:
-    """Pins a KNOWN-ACCEPTED gap rather than a rejection.
+def test_config_docs_budget_assertion_no_longer_collides_with_http_400() -> None:
+    """The specific HTTP-400 residual this file used to accept is gone.
 
-    `DEMO_TOKEN_BUDGET` is 400, which is also an HTTP status code. An answer
-    that says "a malformed request comes back as 400 invalid_input" states a
-    standalone `400` on a word boundary, and no boundary rule can tell it
-    apart from the budget figure. The constant is spec-fixed and a
-    wording-proximity heuristic was removed from this file twice already, so
-    the gap is recorded here instead of papered over: this answer passes.
+    It was accepted because the budget was the *constant* 400, which is also
+    an HTTP status code: "a malformed request comes back as 400 invalid_input"
+    states a standalone `400` on a word boundary, no boundary rule can tell it
+    from the budget figure, and because the constant never changed, every
+    single run carried that collision. The budget is now derived from the
+    seed's measured spend, so nothing pins it to a status code, and that
+    answer fails here — the collision is no longer baked into the demo.
 
-    What keeps the claim honest is that the assertion is documented as a
-    corroborating signal, and the structural proof that the agent read
-    `get_runtime_config` is `config+docs:runtime_config_executed`, asserted
-    in both modes. (The demo's own corpus, `data/sample-docs/opsdemo/`,
-    contains no `400` at all — the collision can only come from the model's
-    general HTTP knowledge.)
+    What survives is the weaker, run-dependent form pinned by the test below:
+    a derived value can still happen to equal some other figure an answer
+    legitimately states.
     """
     settings = _settings()
     records = _passing_records(settings)
     records["config+docs"] = _record(
         "config+docs",
         "A malformed request comes back as 400 invalid_input.",
+        records["config+docs"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
+    assert outcomes["config+docs:answer_contains_demo_token_budget"] == "failed"
+
+
+def test_config_docs_budget_assertion_accepts_the_figure_in_another_role_known_gap() -> None:
+    """Pins the residual that a derived budget does NOT remove.
+
+    A word boundary tells `1680` apart from `16800`; it cannot tell the budget
+    figure apart from the same digits used as a latency, a byte count or a
+    status code. Deriving the budget removed the *guaranteed* collision (see
+    the test above), not the class: any derived value can coincide with a
+    figure the answer states for another reason. A wording-proximity heuristic
+    was removed from this file twice already, so the gap is recorded here
+    instead of papered over: this answer passes.
+
+    What keeps the claim honest is that the assertion is documented as a
+    corroborating signal, and the structural proof that the agent read
+    `get_runtime_config` is `config+docs:runtime_config_executed`, asserted
+    in both modes.
+    """
+    settings = _settings()
+    records = _passing_records(settings)
+    records["config+docs"] = _record(
+        "config+docs",
+        f"The slowest recorded request took {_BUDGET} ms.",
         records["config+docs"].trace,  # type: ignore[attr-defined]
     )
     assertions = assert_suite(records, settings, _seed_outcome(), live=False)
@@ -555,9 +686,10 @@ def test_config_answer_matching_neutralizes_the_conversation_ids() -> None:
     # defensive — but a seeded uuid whose group is literally "1000"-shaped
     # produces a `\b`-delimited digit run, and an answer that merely echoed
     # that id would otherwise "state" the configured max-output figure. The
-    # budget assertion gets the identical treatment for the same reason; a
-    # three-digit run cannot be `\b`-delimited inside a dashed uuid, so only
-    # the four-digit case is demonstrable here.
+    # budget assertion gets the identical treatment for the same reason, and
+    # at a derived budget it is no longer hypothetical there either: a derived
+    # budget is commonly four digits, which is exactly the width of a uuid's
+    # middle group.
     settings = _settings()
     digit_id = "10000030-1000-4bd6-8f23-d348fdb5a694"
     assert str(settings.llm_max_output_tokens) == "1000"
@@ -567,9 +699,7 @@ def test_config_answer_matching_neutralizes_the_conversation_ids() -> None:
         f"Conversation {digit_id} did not report a ceiling.",
         records["config-only"].trace,  # type: ignore[attr-defined]
     )
-    seed_outcome = agent_demo.SeedOutcome(
-        near_id=digit_id, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=30, near_turns=3
-    )
+    seed_outcome = _seed_outcome(near_id=digit_id)
     outcomes = _outcomes(assert_suite(records, settings, seed_outcome, live=False))
     assert outcomes["config-only:answer_contains_llm_max_output_tokens"] == "failed"
 
@@ -584,12 +714,11 @@ def test_wording_signal_is_measured_on_the_neutralized_answer() -> None:
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
-        f"Conversation {near_id} has spent 320 tokens and has 80 remaining.",
+        f"Conversation {near_id} has spent {_NEAR_SPENT} tokens and has "
+        f"{_NEAR_REMAINDER} remaining.",
         [_call(_LEDGER, {"conversation_id": near_id})],
     )
-    seed_outcome = agent_demo.SeedOutcome(
-        near_id=near_id, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=30, near_turns=3
-    )
+    seed_outcome = _seed_outcome(near_id=near_id)
     assertions = assert_suite(records, settings, seed_outcome, live=True)
     (direction,) = [a for a in assertions if a.name == "diagnostic-near:answer_direction"]
     assert direction.outcome == "passed"  # type: ignore[attr-defined]
@@ -664,7 +793,7 @@ def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> 
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
-        "It has spent 320 tokens and has 80 remaining.",
+        f"It has spent {_NEAR_SPENT} tokens and has {_NEAR_REMAINDER} remaining.",
         records["diagnostic-near"].trace,  # type: ignore[attr-defined]
     )
     assertions = assert_suite(records, settings, _seed_outcome(), live=True)
@@ -684,18 +813,17 @@ def test_live_suite_passes_when_the_answers_carry_ledger_figures() -> None:
 def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None:
     # A plausible correct run with nothing to distinguish: the same trace on
     # both sides (rule 3 makes search_docs -> ledger -> answer plausible for
-    # both diagnostics) and, at spent=320/80, ledger figure sets that
-    # coincide. Both answers are grounded, yet no branch is observable — that
-    # must be recorded as unverified, never as a failure.
+    # both diagnostics) and, at a fresh spend equal to the near conversation's
+    # REMAINDER, ledger figure sets that coincide ({1512, 168} on both sides).
+    # Both answers are grounded, yet no branch is observable — that must be
+    # recorded as unverified, never as a failure.
     settings = _settings()
     records = _passing_records(settings)
-    seed_outcome = agent_demo.SeedOutcome(
-        near_id=_NEAR_ID, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=80, near_turns=3
-    )
+    seed_outcome = _seed_outcome(fresh_spent=_NEAR_REMAINDER)
     # same trace SHAPE on both sides, each still targeting its own conversation
     records["diagnostic-fresh"] = _record(
         "diagnostic-fresh",
-        "It has spent 80 tokens and can still spend 320.",
+        f"It has spent {_NEAR_REMAINDER} tokens and can still spend {_NEAR_SPENT}.",
         [_call(_LEDGER, {"conversation_id": _FRESH_ID}), _call(_SEARCH, {"query": "429"})],
     )
     assertions = assert_suite(records, settings, seed_outcome, live=True)
@@ -742,6 +870,57 @@ def test_summary_never_claims_all_passed_when_something_was_unverified() -> None
     assert "all assertions passed" not in line
     # a live run must not be told anything about fake mode
     assert "--live" not in line
+
+
+async def test_fake_mode_seeding_derives_a_budget_that_satisfies_the_contract() -> None:
+    """The whole flow, on the fake's deterministic ladder, without `main()`.
+
+    Both seeding steps go through the REAL `ConversationChatService` commit
+    path — the ledger the tools read is the one the seed writes, and that is
+    the design, not an implementation detail. The fake's usage is
+    history-proportional (10 tokens per replay item + 5 output), so three
+    turns spend 15 + 35 + 55 = 105 and one fresh turn spends 15; the numbers
+    below are those, not a guess. Fake mode is the only mode CI can run, so
+    "the contract holds in fake mode" is checked rather than assumed.
+    """
+    store = InMemoryConversationStore()
+    # token_budget=None on purpose: the budget is derived from what these
+    # turns spend, so a gate here would reject the turns that define it.
+    seed_service = ConversationChatService(FakeChatService(), store, token_budget=None)
+    near = await agent_demo.seed_near(store, seed_service)
+    assert near.turns == agent_demo.SEED_NEAR_TURNS == 3
+    assert near.spent == 105
+    assert near.usage_totals["model_calls"] == 3
+
+    budget = derive_token_budget(near.spent)
+    assert budget == 117  # round(105 / 0.9)
+
+    outcome = await agent_demo.seed_fresh(store, seed_service, near, budget=budget)
+    assert (outcome.near_spent, outcome.fresh_spent) == (105, 15)
+    assert outcome.token_budget == budget
+    # the seeded state is exactly what the demo claims it is
+    assert seed_precondition_ok("near_exhausted", spent=outcome.near_spent, budget=budget)
+    assert seed_precondition_ok("fresh", spent=outcome.fresh_spent, budget=budget)
+    assert outcome.usage_totals["model_calls"] == 4  # three near turns + one fresh
+
+
+async def test_seed_fresh_fails_loudly_when_a_seeded_conversation_vanished() -> None:
+    # The vanished-conversation failure is a hard seed-contract failure (exit
+    # 1), not a confusing branch failure three assertions later.
+    store = InMemoryConversationStore()
+    seed_service = ConversationChatService(FakeChatService(), store, token_budget=None)
+    near = await agent_demo.seed_near(store, seed_service)
+    vanished = agent_demo.NearSeed(
+        conversation_id="never-committed",
+        spent=near.spent,
+        turns=near.turns,
+        usage_totals=near.usage_totals,
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        await agent_demo.seed_fresh(
+            store, seed_service, vanished, budget=derive_token_budget(near.spent)
+        )
+    assert exit_info.value.code == 1
 
 
 def _run_demo(tmp_path: Path, *extra: str) -> "subprocess.CompletedProcess[str]":
