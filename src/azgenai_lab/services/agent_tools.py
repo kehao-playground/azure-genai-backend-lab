@@ -32,25 +32,58 @@ def truncate_utf8(text: str, max_bytes: int) -> str:
     return data[:max_bytes].decode("utf-8", errors="ignore")
 
 
+def _envelope_bytes(hits: list[dict[str, str]], candidate: dict[str, str]) -> int:
+    """UTF-8 byte length of {"hits": [...hits, candidate]}."""
+    envelope = json.dumps({"hits": [*hits, candidate]}, ensure_ascii=False)
+    return len(envelope.encode("utf-8"))
+
+
+def _fit_within_budget(
+    hits: list[dict[str, str]], candidate: dict[str, str]
+) -> dict[str, str] | None:
+    """Byte-clamp `candidate`'s snippet so hits + candidate fits the cap.
+
+    Tries the candidate as-is first. If it overflows, repeatedly shrinks the
+    snippet by the measured overflow (accounting for JSON-escaping overhead)
+    until it fits. Returns None if it does not fit even with an empty
+    snippet — the caller stops there rather than adding a mangled hit.
+    """
+    snippet = candidate["snippet"]
+    budget = len(snippet.encode("utf-8"))
+    while True:
+        overflow = _envelope_bytes(hits, candidate) - MAX_TOOL_RESULT_BYTES
+        if overflow <= 0:
+            return candidate
+        if budget <= 0:
+            return None
+        budget = max(0, budget - overflow)
+        candidate = {**candidate, "snippet": truncate_utf8(snippet, budget)}
+
+
 def make_search_docs(retriever: Retriever, principal: Principal) -> AgentToolFn:
     async def search_docs(query: str) -> str:
         """Search this backend's operations documentation.
 
         Returns JSON: {"hits": [{"source", "heading_path", "snippet"}, ...]}.
-        An empty "hits" list means no document matched the query.
+        An empty "hits" list means no document matched the query. The result
+        is always valid JSON no larger than MAX_TOOL_RESULT_BYTES: hits are
+        considered in rank order, a hit's snippet is byte-clamped as needed
+        to make that hit fit, and a hit that does not fit even with an empty
+        snippet is dropped along with every hit that would have followed it.
         """
         result = await retriever.retrieve(query, principal)
-        hits = [
-            {
+        hits: list[dict[str, str]] = []
+        for hit in result.hits[:MAX_SEARCH_HITS]:
+            candidate = {
                 "source": hit.parent_id,
                 "heading_path": hit.heading_path,
                 "snippet": hit.content[:MAX_SNIPPET_CHARS],
             }
-            for hit in result.hits[:MAX_SEARCH_HITS]
-        ]
-        return truncate_utf8(
-            json.dumps({"hits": hits}, ensure_ascii=False), MAX_TOOL_RESULT_BYTES
-        )
+            fitted = _fit_within_budget(hits, candidate)
+            if fitted is None:
+                break
+            hits.append(fitted)
+        return json.dumps({"hits": hits}, ensure_ascii=False)
 
     return search_docs
 
