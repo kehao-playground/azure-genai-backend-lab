@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     # instead of an unbounded multiple of chunk_max_chars.
     rag_top: int = Field(default=5, gt=0, le=50)
 
+    # Day 17 agent loop guardrails. The framework defaults (40 iterations,
+    # unlimited tool calls) are never silently accepted; these are the values
+    # the article's Q4 cost-ceiling answer quotes.
+    agent_max_iterations: int = Field(default=5, gt=0)
+    agent_max_tool_calls: int = Field(default=10, gt=0)
+
     @model_validator(mode="after")
     def _overlap_must_leave_room_to_advance(self) -> "Settings":
         if self.chunk_overlap_chars * 2 >= self.chunk_max_chars:
