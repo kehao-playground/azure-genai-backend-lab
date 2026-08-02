@@ -106,6 +106,27 @@ CONFIG_TOOL = "get_runtime_config"
 SEARCH_TOOL = "search_docs"
 NO_LEDGER_SENTINEL = [("<no-ledger-call>", "")]
 
+# Wording family for the no-hit admission. The prompt asks for "no supporting
+# evidence"; the first live run said "found no supporting material" — the same
+# behaviour in a synonym. Asserting one literal phrase tests the model's word
+# choice, not whether it admitted the gap, so it fails on a correct run. The
+# behavioural claim is paired with a structural one below: a no-hit answer must
+# carry no citation, because there was nothing to cite.
+ABSENCE_MARKERS = frozenset(
+    {
+        "no supporting",
+        "couldn't find",
+        "could not find",
+        "found no",
+        "no documentation",
+        "not documented",
+        "no information",
+    }
+)
+# Every grounded answer in this suite cites a parent id, which starts with the
+# length-prefixed tenant segment. See models/rag.py's make_parent_id.
+CITATION_PREFIX = "t7=opsdemo"
+
 # Conversation-id masks. The capture keeps the two apart for a reader;
 # a comparison must not tell them apart at all (see `comparison_redactions`).
 # None of the three contains a digit, so no mask can ever look like a ledger
@@ -1080,11 +1101,21 @@ def assert_suite(
         f"expected <= 2 {SEARCH_TOOL} calls, saw {search_calls}",
     )
     if live:
+        lowered = no_hit.answer.lower()
+        admissions = sorted(m for m in ABSENCE_MARKERS if m in lowered)
+        cited = CITATION_PREFIX in no_hit.answer
         _check(
             results,
             "no-hit:answer_admits_missing_evidence",
-            "no supporting evidence" in no_hit.answer.lower(),
-            "expected the prompt's no-evidence wording in the answer",
+            bool(admissions) and not cited,
+            f"expected an absence admission from {sorted(ABSENCE_MARKERS)} "
+            f"(saw {admissions}) and no fabricated citation "
+            f"(cited={cited}). The prompt asks for the words 'no supporting "
+            f"evidence', but a synonym is the same behaviour — what this "
+            f"asserts is that the agent admitted the gap and did not answer "
+            f"from general knowledge. The absence of a citation is the "
+            f"structural half: every grounded answer in this suite carries a "
+            f"{CITATION_PREFIX!r} source, and a no-hit run has nothing to cite.",
         )
     else:
         _skip(results, "no-hit:answer_admits_missing_evidence", _FAKE_REASON)
