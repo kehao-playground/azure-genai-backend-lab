@@ -14,10 +14,13 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
+
+import openai
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_tools import AgentToolFn, AgentToolset
 
 logger = logging.getLogger(__name__)
@@ -438,8 +441,117 @@ class FakeAgentService:
         await self._toolset.retriever.aclose()
 
 
+class AgentFrameworkService:
+    """Real adapter over the pinned Microsoft Agent Framework.
+
+    Sequential tool mode (allow_multiple_tool_calls=False -> provider
+    parallel_tool_calls=false) is the primary cost bound; the per-run
+    admission counter is defense-in-depth; the framework's own
+    max_function_calls is the third layer (between-batch, best-effort).
+    """
+
+    def __init__(self, settings: Settings, toolset: AgentToolset) -> None:
+        if not (
+            settings.azure_openai_endpoint
+            and settings.azure_openai_api_key
+            and settings.azure_openai_deployment_name
+        ):
+            raise ValueError(
+                "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT, "
+                "AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME"
+            )
+        from agent_framework import Agent
+        from agent_framework.openai import OpenAIChatClient
+
+        self._settings = settings
+        self._toolset = toolset
+        self._prompt = load_prompt("ops_agent")
+        self._closed = False
+        # Project-owned transport: same timeout/retry policy as the chat
+        # adapter — the framework never reads its own env vars here.
+        self._client = openai.AsyncOpenAI(
+            api_key=settings.azure_openai_api_key.get_secret_value(),
+            base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
+            timeout=settings.llm_timeout_seconds,
+            max_retries=settings.llm_max_retries,
+        )
+        chat_client = OpenAIChatClient(
+            model=settings.azure_openai_deployment_name,
+            async_client=self._client,
+            function_invocation_configuration={
+                "max_iterations": settings.agent_max_iterations,
+                "max_function_calls": settings.agent_max_tool_calls,
+            },
+        )
+        # `max_output_tokens` is a Responses-API passthrough, not one of the
+        # keys the framework's closed ChatOptions TypedDict declares (it
+        # declares `max_tokens`, the chat-completions spelling). The client
+        # forwards unrecognized option keys to the request verbatim, which is
+        # what carries Day 9's per-call cap here — hence the cast, and hence
+        # the wire-payload test that pins all three of these options.
+        default_options = cast(
+            "Any",
+            {
+                "store": False,
+                "max_output_tokens": settings.llm_max_output_tokens,
+                "allow_multiple_tool_calls": False,
+            },
+        )
+        # Tools deliberately absent here: each run() wraps them with a fresh
+        # AdmissionState and passes them per-run (spec §2a).
+        self._agent = Agent(
+            client=chat_client,
+            instructions=self._prompt.text,
+            default_options=default_options,
+        )
+
+    async def run(self, task: str) -> AgentRunResult:
+        validate_task(task)
+        state = AdmissionState(limit=self._settings.agent_max_tool_calls)
+        executions: list[ToolExecution] = []
+        wrapped = wrap_tools_with_admission(self._toolset.tools, state, executions)
+        try:
+            response = await self._agent.run(task, tools=wrapped)
+        except Exception as exc:  # framework/provider terminal failure
+            raise AgentRunError(str(exc), usage=None) from exc
+        shape = extract_run_shape(
+            response.messages, executions, refusal_message=REFUSAL_MESSAGE
+        )
+        executed = sum(1 for e in executions if e.executed)
+        refused = state.refused
+        stop_reason, limit_reasons = derive_stop(
+            shape.model_call_count,
+            executed=executed,
+            refused=refused,
+            max_iterations=self._settings.agent_max_iterations,
+            max_tool_calls=self._settings.agent_max_tool_calls,
+        )
+        return AgentRunResult(
+            answer=shape.answer,
+            model_call_count=shape.model_call_count,
+            tool_round_count=shape.tool_round_count,
+            tool_call_count=executed,
+            refused_call_count=refused,
+            stop_reason=stop_reason,
+            limit_reasons=limit_reasons,
+            tool_calls=shape.tool_calls,
+            # Loop aggregate, not the last call's: FunctionInvocationLayer
+            # sums every iteration's usage into the returned response
+            # (`add_usage_details`), so this is the whole run's bill.
+            usage=map_usage_details(response.usage_details),
+            per_round=shape.per_round,
+        )
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._client.close()
+        await self._toolset.retriever.aclose()
+
+
 def build_agent_service(settings: Settings, toolset: AgentToolset) -> AgentService:
     """Composition point: the only place that decides fake vs. real."""
     if settings.use_fake_llm:
         return FakeAgentService(toolset)
-    raise NotImplementedError("real adapter lands in Task 13")
+    return AgentFrameworkService(settings, toolset)
