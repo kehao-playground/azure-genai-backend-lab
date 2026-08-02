@@ -207,6 +207,74 @@ def _content_attr(content: Any, *names: str) -> Any:
     return None
 
 
+def _parse_call_arguments(raw: Any) -> tuple[Mapping[str, Any] | None, str]:
+    """Parse a function_call's `arguments` per the framework's own
+    three-way split (`Content.parse_arguments`): an absent attribute means
+    no arguments were offered at all (`None`); an empty-but-present value
+    (`""` or `{}`) means an explicit no-arg call (`{}`). Genuinely
+    malformed JSON, and JSON that parses but isn't an object (a list, a
+    bare `null`, a number, a string), both fall through to the same
+    unparseable outcome (`arguments=None`) with the raw text preserved as
+    the canonical field, so they stay distinguishable from the two zero-
+    argument forms above.
+    """
+    if raw is None:
+        return None, ""
+    if isinstance(raw, Mapping):
+        parsed = dict(raw)
+        return parsed, json.dumps(parsed, sort_keys=True)
+    raw_text = str(raw)
+    if raw_text == "":
+        return {}, "{}"
+    try:
+        loaded = json.loads(raw_text)
+    except (ValueError, TypeError):
+        return None, raw_text
+    if isinstance(loaded, dict):
+        return loaded, json.dumps(loaded, sort_keys=True)
+    return None, raw_text
+
+
+def _join_executions_to_rounds(
+    tool_calls: Sequence[AgentToolCall],
+    executions: Sequence[ToolExecution],
+) -> tuple[AgentRoundMetrics, ...] | None:
+    """Positional join of measured tool latency onto rounds.
+
+    `executions` are appended in admission order (`wrap_tools_with_admission`)
+    and tool-call contents are walked in message order above, with the
+    primary mode sequential (`allow_multiple_tool_calls: False`), so index
+    *i* of `executions` corresponds to index *i* of `tool_calls`. A length
+    mismatch or a tool-name mismatch at the same index means the positional
+    assumption doesn't hold here -- reject to `None` (honest absence)
+    rather than attribute latency to the wrong round.
+    """
+    if len(executions) != len(tool_calls):
+        logger.info(
+            "agent per-round latency join rejected: %d executions but %d tool calls",
+            len(executions),
+            len(tool_calls),
+        )
+        return None
+    for index, (call, execution) in enumerate(zip(tool_calls, executions, strict=True)):
+        if call.tool_name != execution.tool_name:
+            logger.info(
+                "agent per-round latency join rejected: tool name mismatch at "
+                "index %d (tool_call=%r, execution=%r)",
+                index,
+                call.tool_name,
+                execution.tool_name,
+            )
+            return None
+    totals: dict[int, float] = {}
+    for call, execution in zip(tool_calls, executions, strict=True):
+        totals[call.round_index] = totals.get(call.round_index, 0.0) + execution.latency_ms
+    return tuple(
+        AgentRoundMetrics(round_index=round_index, latency_ms=latency_ms, usage=None)
+        for round_index, latency_ms in sorted(totals.items())
+    )
+
+
 def extract_run_shape(
     response_messages: Sequence[Any],
     executions: Sequence[ToolExecution],
@@ -225,10 +293,14 @@ def extract_run_shape(
         for content in message.contents:
             if content.type == "function_result":
                 call_id = _content_attr(content, "call_id")
+                if call_id is None:
+                    # Never key a real result under the literal string
+                    # "None" -- two such contents would collide and
+                    # cross-assign each other's results.
+                    continue
                 results_by_call_id[str(call_id)] = str(_content_attr(content, "result"))
 
     tool_calls: list[AgentToolCall] = []
-    per_round_usage: list[TokenUsage | None] = []
     assistant_ordinal = 0
     last_assistant_text = ""
     tool_round_count = 0
@@ -236,26 +308,14 @@ def extract_run_shape(
         if message.role != "assistant":
             continue
         assistant_ordinal += 1
-        round_usage: TokenUsage | None = None
         texts: list[str] = []
         saw_call = False
         for content in message.contents:
             if content.type == "text":
                 texts.append(str(_content_attr(content, "text") or ""))
-            elif content.type == "usage":
-                round_usage = map_usage_details(_content_attr(content, "usage_details"))
             elif content.type == "function_call":
                 saw_call = True
-                raw = _content_attr(content, "arguments") or ""
-                if isinstance(raw, Mapping):
-                    parsed: Mapping[str, Any] | None = dict(raw)
-                    canonical = json.dumps(parsed, sort_keys=True)
-                else:
-                    canonical = str(raw)
-                    try:
-                        parsed = json.loads(canonical)
-                    except (ValueError, TypeError):
-                        parsed = None
+                parsed, canonical = _parse_call_arguments(_content_attr(content, "arguments"))
                 call_id = str(_content_attr(content, "call_id"))
                 result = results_by_call_id.get(call_id, "")
                 tool_calls.append(
@@ -267,19 +327,20 @@ def extract_run_shape(
                         executed=result != refusal_message,
                     )
                 )
+            # Per-response usage is not available at these pins: the
+            # non-streaming client puts `usage` on the response object (not
+            # a message content), and the streaming aggregator strips
+            # `usage` contents out of messages before this function ever
+            # sees them. So `usage` is None on every round below; the
+            # measured signal is per-tool latency, joined in separately.
         if saw_call:
             tool_round_count += 1
-        last_assistant_text = "".join(texts) if texts else last_assistant_text
-        per_round_usage.append(round_usage)
+        # Assign unconditionally: a text-less terminal message (e.g.
+        # reasoning-only output) must yield an honest "", never an earlier
+        # round's aside.
+        last_assistant_text = "".join(texts)
 
-    per_round: tuple[AgentRoundMetrics, ...] | None
-    if any(usage is not None for usage in per_round_usage):
-        per_round = tuple(
-            AgentRoundMetrics(round_index=i + 1, latency_ms=None, usage=usage)
-            for i, usage in enumerate(per_round_usage)
-        )
-    else:
-        per_round = None  # no per-response signal at these pins — never fabricated
+    per_round = _join_executions_to_rounds(tool_calls, executions)
 
     return _RunShape(
         answer=last_assistant_text,
@@ -300,7 +361,14 @@ def derive_stop(
 ) -> tuple[Literal["natural", "iteration_limit", "function_call_limit"], frozenset[str]]:
     """App-owned stop classification (spec §5): a framework forced-final is
     never reported natural. iteration_limit wins the single label when both
-    limits fire; limit_reasons carries every limit that fired."""
+    limits fire; limit_reasons carries every limit that fired.
+
+    Note: `executed >= max_tool_calls` with `refused == 0` still reports
+    `function_call_limit` even if the model went on to answer on its own
+    afterward -- the tool-call budget was exhausted, which is not proof
+    that the limit is what truncated the run. Treat it as a budget signal,
+    not a causal claim.
+    """
     reasons: set[str] = set()
     if model_call_count >= max_iterations + 1:
         reasons.add("iteration_limit")
