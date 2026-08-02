@@ -7,10 +7,8 @@ budget — those are fixed at composition (fail-closed, Day 15 / Day 16 R2).
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Awaitable, Callable, Coroutine
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +18,7 @@ from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.conversation_store import ConversationStore
 from azgenai_lab.services.document_loader import load_documents
-from azgenai_lab.services.embeddings import FakeEmbeddingClient, embed_chunks
+from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.retrieval import Retriever, build_retriever
 
 # Cost-control constants (spec §2). Byte caps, not char caps: a BPE token is
@@ -163,47 +161,36 @@ def make_get_conversation_usage(
     return get_conversation_usage
 
 
-def _run_sync[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Run one async call from this module's synchronous composition code.
-
-    `build_agent_toolset` follows this repo's synchronous `build_*`
-    convention (composition happens once, with no event loop of its own),
-    but seeding the fake retriever must await `embed_chunks` — the same
-    batching call `tools/index_corpus.py` awaits when it builds a live
-    index. A dedicated thread runs its own event loop for that one call, so
-    this also works when `build_agent_toolset` is itself invoked from
-    inside a running loop (as in this module's own async tests), where a
-    bare `asyncio.run()` would raise "cannot be called from a running event
-    loop".
-    """
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coro).result()
-
-
-async def _seed_index_documents(
+def _seed_index_documents(
     embedding_client: FakeEmbeddingClient, settings: Settings
 ) -> list[dict[str, Any]]:
     """Load, chunk and embed every sample document into index-document shape.
 
-    Mirrors the per-document loop in `tools/index_corpus.py` (load ->
-    chunk -> embed -> `to_index_document`) exactly, with a fake embedding
-    client standing in for the live one. Every tenant's corpus is included,
-    not just opsdemo's: the real system is one shared index scoped by a
-    document-level ACL filter (Day 15), and a fake that only ever held one
-    tenant's documents would not exercise that filter at all. Correctness
-    still comes from `FakeSearchClient.search`, which enforces the same
-    `is_document_visible` policy the real service's ACL filter expresses in
-    OData.
+    Mirrors the per-document loop in `tools/index_corpus.py` (load -> chunk
+    -> embed -> `to_index_document`), with one deliberate difference: this
+    calls `FakeEmbeddingClient.pseudo_vector` directly instead of going
+    through `embed_chunks`. `embed_chunks`'s request batching and per-batch
+    failure handling exist for a live upstream call with a request-size
+    limit; a fake client has neither, so there is nothing for batching to
+    buy here, and skipping it keeps this whole function — and therefore
+    `build_agent_toolset` — synchronous. `to_index_document` still enforces
+    the dimension contract (it raises if a vector's width does not match
+    `EMBEDDING_DIMENSIONS`), so that guarantee is not lost.
+    Every tenant's corpus is included, not just opsdemo's: the real system
+    is one shared index scoped by a document-level ACL filter (Day 15), and
+    a fake that only ever held one tenant's documents would not exercise
+    that filter at all. Correctness still comes from `FakeSearchClient.
+    search`, which enforces the same `is_document_visible` policy the real
+    service's ACL filter expresses in OData.
     """
     index_documents: list[dict[str, Any]] = []
     for source in load_documents():
         chunks = chunk_markdown(
             source, max_chars=settings.chunk_max_chars, overlap_chars=settings.chunk_overlap_chars
         )
-        vectors = await embed_chunks(embedding_client, chunks)
         index_documents.extend(
-            chunk.to_index_document(vector)
-            for chunk, vector in zip(chunks, vectors, strict=True)
+            chunk.to_index_document(embedding_client.pseudo_vector(chunk.embedding_input))
+            for chunk in chunks
         )
     return index_documents
 
@@ -218,8 +205,12 @@ def _seeded_fake_retriever(settings: Settings) -> Retriever:
     call. Its vectors carry no semantics (Day 12), which is fine here:
     `FakeSearchClient` scores lexically in every mode and never reads them.
     """
+    # Seeding always uses the fake embedding client here, regardless of
+    # `use_fake_embeddings`: this is a second place fake/real is decided,
+    # but deliberately and boundedly so — paying a real embedding provider
+    # to seed a fake, in-memory search index would be the wrong trade.
     embedding_client = FakeEmbeddingClient()
-    index_documents = _run_sync(_seed_index_documents(embedding_client, settings))
+    index_documents = _seed_index_documents(embedding_client, settings)
     return Retriever(embedding_client, FakeSearchClient(index_documents), top=settings.rag_top)
 
 

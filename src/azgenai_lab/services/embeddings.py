@@ -112,20 +112,26 @@ class FakeEmbeddingClient:
     """
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [_pseudo_vector(text) for text in texts]
+        return [self.pseudo_vector(text) for text in texts]
+
+    def pseudo_vector(self, text: str) -> list[float]:
+        """The same deterministic vector `embed` produces, computed synchronously.
+
+        Public so a caller that only needs to seed an in-memory fake index
+        (no batching, no request-shaped work) can get vectors without going
+        through an event loop at all. `embed` calls this too, so there is
+        exactly one implementation of the hash-to-vector logic.
+        """
+        values: list[float] = []
+        counter = 0
+        while len(values) < EMBEDDING_DIMENSIONS:
+            digest = hashlib.sha256(f"{counter}:{text}".encode()).digest()
+            values.extend(byte / 255.0 * 2.0 - 1.0 for byte in digest)
+            counter += 1
+        return values[:EMBEDDING_DIMENSIONS]
 
     async def aclose(self) -> None:
         """Nothing owned; the fake never opens a client."""
-
-
-def _pseudo_vector(text: str) -> list[float]:
-    values: list[float] = []
-    counter = 0
-    while len(values) < EMBEDDING_DIMENSIONS:
-        digest = hashlib.sha256(f"{counter}:{text}".encode()).digest()
-        values.extend(byte / 255.0 * 2.0 - 1.0 for byte in digest)
-        counter += 1
-    return values[:EMBEDDING_DIMENSIONS]
 
 
 def _batched(chunks: Sequence[Chunk], size: int) -> Iterator[Sequence[Chunk]]:
