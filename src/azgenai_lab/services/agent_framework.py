@@ -7,12 +7,16 @@ AgentService Protocol and plain dataclasses, never agent_framework types
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.services.agent_tools import AgentToolFn
 
 logger = logging.getLogger(__name__)
 
@@ -108,3 +112,72 @@ class AgentService(Protocol):
     async def run(self, task: str) -> AgentRunResult: ...
 
     async def aclose(self) -> None: ...
+
+
+@dataclass
+class ToolExecution:
+    """Wrapper-side record: the only latency source for executed tools."""
+
+    tool_name: str
+    executed: bool
+    latency_ms: float
+
+
+class AdmissionState:
+    """Per-run hard bound on *executed* tool invocations (spec §2a).
+
+    A slot is atomically consumed at admission — immediately before the tool
+    body is invoked — and is never released, including when cancellation
+    lands between admission and the body's first line. Releasing there would
+    let a retrying loop start more than `limit` tool bodies.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.admitted = 0
+        self.refused = 0
+        self._lock = asyncio.Lock()
+
+    async def try_admit(self) -> bool:
+        async with self._lock:
+            if self.admitted >= self.limit:
+                self.refused += 1
+                return False
+            self.admitted += 1
+            return True
+
+
+def wrap_tools_with_admission(
+    tools: Sequence[AgentToolFn],
+    state: AdmissionState,
+    executions: list[ToolExecution],
+    *,
+    _test_pause_after_admit: asyncio.Event | None = None,
+) -> list[AgentToolFn]:
+    """Fresh-per-run wrapping: the counter lives on the run, never on the
+    long-lived toolset (spec §2a)."""
+
+    def _wrap(tool: AgentToolFn) -> AgentToolFn:
+        @functools.wraps(tool)  # preserves name/doc/signature for framework introspection
+        async def admitted_tool(*args: Any, **kwargs: Any) -> str:
+            if not await state.try_admit():
+                executions.append(
+                    ToolExecution(tool.__name__, executed=False, latency_ms=0.0)
+                )
+                return REFUSAL_MESSAGE
+            if _test_pause_after_admit is not None:
+                await _test_pause_after_admit.wait()
+            start = time.perf_counter()
+            result = await tool(*args, **kwargs)
+            executions.append(
+                ToolExecution(
+                    tool.__name__,
+                    executed=True,
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                )
+            )
+            return result
+
+        return admitted_tool
+
+    return [_wrap(tool) for tool in tools]
