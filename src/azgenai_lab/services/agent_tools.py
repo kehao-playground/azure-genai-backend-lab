@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.services.conversation_store import ConversationStore
 from azgenai_lab.services.retrieval import Retriever
 
 # Cost-control constants (spec §2). Byte caps, not char caps: a BPE token is
@@ -114,6 +115,46 @@ def make_get_runtime_config(settings: Settings, demo_token_budget: int) -> Agent
     return get_runtime_config
 
 
+_USAGE_NOT_FOUND = {
+    "found": False, "spent_tokens": None, "budget_tokens": None,
+    "remaining_tokens": None, "budget_state": None,
+}
+
+
+def make_get_conversation_usage(
+    store: ConversationStore, principal: Principal, token_budget: int
+) -> AgentToolFn:
+    async def get_conversation_usage(conversation_id: str) -> str:
+        """Look up a conversation's token spend against its lifetime budget.
+
+        Returns JSON: {"found", "spent_tokens", "budget_tokens",
+        "remaining_tokens", "budget_state"}; budget_state is one of
+        "fresh", "near_exhausted", "exhausted". found=false (all other
+        fields null) means no such conversation is visible to you.
+        """
+        # Tenant is closure-bound: cross-tenant ids and unknown ids are the
+        # same not-found shape, mirroring the API's 404-same-shape rule.
+        conversation = await store.get(principal.tenant_id, conversation_id)
+        if conversation is None:
+            return json.dumps(_USAGE_NOT_FOUND)
+        spent = conversation.total_tokens
+        if spent >= token_budget:
+            state = "exhausted"  # post-paid ledger: one turn can overshoot (Day 9)
+        elif spent >= NEAR_EXHAUSTED_THRESHOLD * token_budget:
+            state = "near_exhausted"
+        else:
+            state = "fresh"
+        return truncate_utf8(
+            json.dumps({
+                "found": True, "spent_tokens": spent, "budget_tokens": token_budget,
+                "remaining_tokens": max(token_budget - spent, 0), "budget_state": state,
+            }),
+            MAX_TOOL_RESULT_BYTES,
+        )
+
+    return get_conversation_usage
+
+
 __all__ = [
     "MAX_REFUSAL_RESULT_BYTES",
     "MAX_SEARCH_HITS",
@@ -121,6 +162,7 @@ __all__ = [
     "MAX_TOOL_RESULT_BYTES",
     "NEAR_EXHAUSTED_THRESHOLD",
     "AgentToolFn",
+    "make_get_conversation_usage",
     "make_get_runtime_config",
     "make_search_docs",
     "truncate_utf8",
