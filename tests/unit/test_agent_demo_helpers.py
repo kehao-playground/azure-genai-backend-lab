@@ -17,11 +17,13 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_framework import AgentRoundMetrics, AgentRunResult
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "agent_demo.py"
@@ -43,6 +45,20 @@ resolve_settings = agent_demo.resolve_settings
 seed_precondition_ok = agent_demo.seed_precondition_ok
 summarize_assertions = agent_demo.summarize_assertions
 tool_ms_from = agent_demo.tool_ms_from
+
+
+def _settings(**overrides: Any) -> Settings:
+    """Settings isolated from the repo-root `.env`.
+
+    Same hazard `_run_demo` documents for the subprocess run, on this side of
+    the process boundary: `Settings` reads `.env` relative to the working
+    directory, `conftest.py` pins only the three fake-adapter flags, and
+    several assertions below depend on the *default* values of fields nobody
+    pins (`llm_max_output_tokens == 1000` is asserted outright). A developer's
+    untracked `.env` would fail them in a way no fresh clone or CI checkout
+    reproduces.
+    """
+    return Settings(_env_file=None, **overrides)
 
 
 def _call(name: str, args: dict[str, object]) -> dict[str, object]:
@@ -151,7 +167,7 @@ def test_tool_ms_sums_measured_rounds() -> None:
 
 
 def test_redaction_masks_ids_endpoints_and_guids() -> None:
-    settings = Settings(
+    settings = _settings(
         azure_openai_endpoint="https://aoai-azgenai-lab.openai.azure.com",
         azure_openai_deployment_name="chat-mini",
         azure_search_endpoint="https://srch-azgenai-lab.search.windows.net",
@@ -191,6 +207,21 @@ def test_provider_provenance_is_not_applicable_in_fake_mode() -> None:
     assert live["context_window_source_checked_at"] == "2026-08-02"
 
 
+def test_agent_prompt_provenance_is_not_applicable_in_fake_mode() -> None:
+    # `FakeAgentService` applies no prompt at all, so recording the loaded
+    # ops_agent values under `run_conditions` would read as the agent's own
+    # provenance for a run that had none. The prompt still reaches the
+    # baseline call in both modes — that copy is recorded under `baseline`.
+    prompt = load_prompt("ops_agent")
+    fake = agent_demo.agent_prompt_provenance(prompt, live=False)
+    assert set(fake) == {"agent_prompt_name", "agent_prompt_version", "agent_prompt_sha256"}
+    assert set(fake.values()) == {"not_applicable"}
+    live = agent_demo.agent_prompt_provenance(prompt, live=True)
+    assert live["agent_prompt_name"] == prompt.name
+    assert live["agent_prompt_version"] == prompt.version
+    assert live["agent_prompt_sha256"] == prompt.sha256
+
+
 async def test_recorder_preserves_tool_identity_and_captures_output() -> None:
     # The admission wrapper joins executions to rounds on `__name__`, and the
     # framework builds each tool's schema from its signature — a recorder that
@@ -220,7 +251,7 @@ _FRESH_ID = "3703080f-3202-4bd6-8f23-d348fdb5a694"
 
 
 def _comparison_replacements() -> list[tuple[str, str]]:
-    return comparison_redactions(Settings(), near_id=_NEAR_ID, fresh_id=_FRESH_ID)  # type: ignore[no-any-return]
+    return comparison_redactions(_settings(), near_id=_NEAR_ID, fresh_id=_FRESH_ID)  # type: ignore[no-any-return]
 
 
 def _record(label: str, answer: str, trace: list[dict[str, object]]) -> object:
@@ -403,7 +434,7 @@ def test_near_answer_direction_is_not_satisfied_by_echoing_the_question() -> Non
     # DIAGNOSTIC_TEMPLATE itself contains "429" AND the conversation id:
     # restating the question must not pass an assertion that claims the agent
     # read the ledger.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
@@ -419,7 +450,7 @@ def test_answer_direction_is_not_satisfied_by_an_echoed_conversation_id() -> Non
     # so a bare substring test finds them inside the conversation uuid the
     # answer echoes back. An answer carrying the id and no ledger content is
     # ungrounded on both sides and must fail on both sides.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
@@ -439,7 +470,7 @@ def test_answer_direction_is_not_satisfied_by_an_echoed_conversation_id() -> Non
 def test_answer_direction_requires_the_figure_on_a_word_boundary() -> None:
     # A digit run inside a longer number is not the ledger figure: "320" inside
     # "4320" and "80" inside "1809" say nothing about what the agent read.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
@@ -455,7 +486,7 @@ def test_config_only_answer_contains_llm_max_output_tokens_requires_word_boundar
     # assertions: a digit run inside a longer number is not the configured
     # max-output-tokens figure. "1000" inside "10000" says nothing about what
     # get_runtime_config returned.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["config-only"] = _record(
         "config-only",
@@ -471,7 +502,7 @@ def test_config_docs_answer_contains_demo_token_budget_requires_word_boundary() 
     # ("4000-series") is not the budget figure. This says nothing about the
     # *standalone* HTTP-400 collision, which word-boundary matching cannot
     # reject by construction — see the known-gap test below.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["config+docs"] = _record(
         "config+docs",
@@ -500,7 +531,7 @@ def test_config_docs_budget_assertion_accepts_a_standalone_http_400_known_gap() 
     contains no `400` at all — the collision can only come from the model's
     general HTTP knowledge.)
     """
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["config+docs"] = _record(
         "config+docs",
@@ -527,7 +558,7 @@ def test_config_answer_matching_neutralizes_the_conversation_ids() -> None:
     # budget assertion gets the identical treatment for the same reason; a
     # three-digit run cannot be `\b`-delimited inside a dashed uuid, so only
     # the four-digit case is demonstrable here.
-    settings = Settings()
+    settings = _settings()
     digit_id = "10000030-1000-4bd6-8f23-d348fdb5a694"
     assert str(settings.llm_max_output_tokens) == "1000"
     records = _passing_records(settings)
@@ -548,7 +579,7 @@ def test_wording_signal_is_measured_on_the_neutralized_answer() -> None:
     # but the article may quote it. A seeded uuid containing "429" would
     # inflate it on a bare-substring test, so the signal is read from the same
     # neutralized text the figures are.
-    settings = Settings()
+    settings = _settings()
     near_id = "429e0a1b-3702-4bd6-8f23-d348fdb5a694"
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
@@ -570,7 +601,7 @@ def test_ledger_call_target_must_be_the_seeded_conversation() -> None:
     # the FRESH ledger while answering the NEAR diagnostic normalizes exactly
     # like a correct run. Only a raw, pre-neutralization comparison of the
     # ledger call's own `conversation_id` argument can see it.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
@@ -588,7 +619,7 @@ def test_ledger_call_target_must_be_the_seeded_conversation() -> None:
 def test_ledger_call_target_is_unverified_when_the_arguments_are_unparseable() -> None:
     # arguments=None means the model's arguments could not be parsed, so there
     # is no id to read. Guessing one would be fabrication; the assertion fails.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-fresh"] = _record(
         "diagnostic-fresh",
@@ -629,7 +660,7 @@ def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> 
     # wording is a recorded signal, not a requirement. A live answer phrased
     # without that vocabulary but with the correct numbers must still pass —
     # otherwise a paid live run fails on a wording preference, not a defect.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     records["diagnostic-near"] = _record(
         "diagnostic-near",
@@ -644,7 +675,7 @@ def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> 
 
 
 def test_live_suite_passes_when_the_answers_carry_ledger_figures() -> None:
-    settings = Settings()
+    settings = _settings()
     assertions = assert_suite(_passing_records(settings), settings, _seed_outcome(), live=True)
     outcomes = _outcomes(assertions)
     assert set(outcomes.values()) == {"passed"}
@@ -656,7 +687,7 @@ def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None
     # both diagnostics) and, at spent=320/80, ledger figure sets that
     # coincide. Both answers are grounded, yet no branch is observable — that
     # must be recorded as unverified, never as a failure.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     seed_outcome = agent_demo.SeedOutcome(
         near_id=_NEAR_ID, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=80, near_turns=3
@@ -681,7 +712,7 @@ def test_assert_suite_fake_live_split_is_exactly_the_model_behaviour_claims() ->
     # else. The two ledger-target claims join that set for a different reason
     # than the model-behaviour ones: FakeAgentService calls the ledger with a
     # hardcoded id, so there is nothing to match against a seeded id.
-    settings = Settings()
+    settings = _settings()
     records = _passing_records(settings)
     fake = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
     expected_skipped = {
@@ -757,7 +788,7 @@ def test_require_live_assertions_turns_unverified_into_a_non_zero_exit(tmp_path:
 
 
 def test_mode_resolution_is_atomic() -> None:
-    base = Settings(use_fake_llm=False, use_fake_search=True, use_fake_embeddings=False)
+    base = _settings(use_fake_llm=False, use_fake_search=True, use_fake_embeddings=False)
     fake = resolve_settings(base, live=False)
     assert (fake.use_fake_llm, fake.use_fake_search, fake.use_fake_embeddings) == (True, True, True)
     live = resolve_settings(base, live=True)

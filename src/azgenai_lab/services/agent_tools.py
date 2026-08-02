@@ -106,8 +106,12 @@ def make_get_runtime_config(settings: Settings, demo_token_budget: int) -> Agent
         """
         # Explicit allowlist — never serialize Settings. The budget reported
         # is the single-source demo budget actually applied to this run's
-        # conversations (spec §1), so no tool can describe a guardrail the
-        # run does not enforce.
+        # conversations (spec §1), so this tool cannot describe a token budget
+        # the run does not enforce. The claim stops at the budget: the two
+        # agent loop limits below are applied by `AgentFrameworkService`
+        # (sequential tool mode + the per-run admission counter), and
+        # `FakeAgentService` applies neither — in fake mode they are reported
+        # configuration, not measured guardrails.
         snapshot = {
             "llm_max_output_tokens": settings.llm_max_output_tokens,
             "conversation_token_budget": demo_token_budget,

@@ -13,9 +13,21 @@ from azgenai_lab.services.conversation_store import InMemoryConversationStore
 OPS = Principal(tenant_id="opsdemo", group_ids=())
 
 
+def _settings() -> Settings:
+    """Settings isolated from the repo-root `.env`.
+
+    `conftest.py` pins only the three fake-adapter flags, so every other
+    field is still ambient: a developer's untracked `.env` would otherwise
+    reach these assertions, and no fresh clone or CI checkout would
+    reproduce the failure (the same hazard `tests/unit/test_config.py`
+    avoids with `_env_file=None`).
+    """
+    return Settings(_env_file=None)
+
+
 def _toolset() -> AgentToolset:
     return build_agent_toolset(
-        Settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+        _settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
     )
 
 
@@ -49,7 +61,7 @@ async def test_fake_agent_validates_task_with_zero_tool_calls() -> None:
 
 async def test_build_selects_fake_by_default_and_aclose_is_idempotent() -> None:
     toolset = _toolset()
-    service = build_agent_service(Settings(), toolset)
+    service = build_agent_service(_settings(), toolset)
     assert isinstance(service, FakeAgentService)
     await service.aclose()
     await service.aclose()  # idempotent
