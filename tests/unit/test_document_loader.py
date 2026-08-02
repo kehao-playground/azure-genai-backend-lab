@@ -208,12 +208,18 @@ def test_load_documents_rejects_an_empty_directory(tmp_path: Path) -> None:
 def test_the_shipped_corpus_loads() -> None:
     documents = load_documents(SAMPLE_DOCS_DIR)
 
-    assert len(documents) == 4
+    # 7, not 4: the opsdemo tenant (3 docs) was added for the Day 17
+    # ops-assistant demo's search_docs tool, alongside the original acme/
+    # globex corpus (4 docs).
+    assert len(documents) == 7
     assert {document.doc_id for document in documents} == {
         "billing-faq",
         "oncall-runbook",
         "returns-policy",
         "service-sla",
+        "error-contract",
+        "streaming-sse",
+        "token-budget",
     }
 
 
@@ -231,9 +237,19 @@ def test_the_shipped_corpus_has_no_cjk_characters() -> None:
         )
 
 
-def test_the_shipped_corpus_splits_tenants_two_and_two() -> None:
+def test_the_shipped_corpus_splits_tenants_two_two_and_three() -> None:
+    # opsdemo (3 docs) joined the original acme/globex split (2 and 2) when
+    # the Day 17 ops-assistant demo corpus was added.
     tenants = [document.tenant_id for document in load_documents(SAMPLE_DOCS_DIR)]
-    assert sorted(tenants) == ["acme", "acme", "globex", "globex"]
+    assert sorted(tenants) == [
+        "acme",
+        "acme",
+        "globex",
+        "globex",
+        "opsdemo",
+        "opsdemo",
+        "opsdemo",
+    ]
 
 
 def test_the_shipped_corpus_has_third_level_headings_in_at_least_two_files() -> None:
