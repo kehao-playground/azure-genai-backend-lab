@@ -168,15 +168,21 @@ def wrap_tools_with_admission(
             if _test_pause_after_admit is not None:
                 await _test_pause_after_admit.wait()
             start = time.perf_counter()
-            result = await tool(*args, **kwargs)
-            executions.append(
-                ToolExecution(
-                    tool.__name__,
-                    executed=True,
-                    latency_ms=(time.perf_counter() - start) * 1000,
+            try:
+                return await tool(*args, **kwargs)
+            finally:
+                # runs on normal return, on a raised exception, and on
+                # cancellation: the slot was consumed and the body ran, so
+                # the sink must not silently lose failing/slow calls. The
+                # exception (if any) propagates unchanged — `finally` here
+                # only records, it never suppresses or converts.
+                executions.append(
+                    ToolExecution(
+                        tool.__name__,
+                        executed=True,
+                        latency_ms=(time.perf_counter() - start) * 1000,
+                    )
                 )
-            )
-            return result
 
         return admitted_tool
 
