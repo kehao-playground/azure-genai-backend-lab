@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -187,3 +188,126 @@ def wrap_tools_with_admission(
         return admitted_tool
 
     return [_wrap(tool) for tool in tools]
+
+
+@dataclass(frozen=True)
+class _RunShape:
+    answer: str
+    model_call_count: int
+    tool_round_count: int
+    tool_calls: tuple[AgentToolCall, ...]
+    per_round: tuple[AgentRoundMetrics, ...] | None
+
+
+def _content_attr(content: Any, *names: str) -> Any:
+    for name in names:
+        value = getattr(content, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def extract_run_shape(
+    response_messages: Sequence[Any],
+    executions: Sequence[ToolExecution],
+    *,
+    refusal_message: str,
+) -> _RunShape:
+    """Derive the app-owned run shape from the framework transcript.
+
+    Rounds are 1-based assistant-message ordinals; a call is `executed`
+    iff its function result is not the refusal constant. The answer is the
+    terminal assistant message's text only — earlier rounds' text never
+    leaks into it (spec §5).
+    """
+    results_by_call_id: dict[str, str] = {}
+    for message in response_messages:
+        for content in message.contents:
+            if content.type == "function_result":
+                call_id = _content_attr(content, "call_id")
+                results_by_call_id[str(call_id)] = str(_content_attr(content, "result"))
+
+    tool_calls: list[AgentToolCall] = []
+    per_round_usage: list[TokenUsage | None] = []
+    assistant_ordinal = 0
+    last_assistant_text = ""
+    tool_round_count = 0
+    for message in response_messages:
+        if message.role != "assistant":
+            continue
+        assistant_ordinal += 1
+        round_usage: TokenUsage | None = None
+        texts: list[str] = []
+        saw_call = False
+        for content in message.contents:
+            if content.type == "text":
+                texts.append(str(_content_attr(content, "text") or ""))
+            elif content.type == "usage":
+                round_usage = map_usage_details(_content_attr(content, "usage_details"))
+            elif content.type == "function_call":
+                saw_call = True
+                raw = _content_attr(content, "arguments") or ""
+                if isinstance(raw, Mapping):
+                    parsed: Mapping[str, Any] | None = dict(raw)
+                    canonical = json.dumps(parsed, sort_keys=True)
+                else:
+                    canonical = str(raw)
+                    try:
+                        parsed = json.loads(canonical)
+                    except (ValueError, TypeError):
+                        parsed = None
+                call_id = str(_content_attr(content, "call_id"))
+                result = results_by_call_id.get(call_id, "")
+                tool_calls.append(
+                    AgentToolCall(
+                        tool_name=str(_content_attr(content, "name")),
+                        arguments=parsed,
+                        arguments_canonical_json=canonical,
+                        round_index=assistant_ordinal,
+                        executed=result != refusal_message,
+                    )
+                )
+        if saw_call:
+            tool_round_count += 1
+        last_assistant_text = "".join(texts) if texts else last_assistant_text
+        per_round_usage.append(round_usage)
+
+    per_round: tuple[AgentRoundMetrics, ...] | None
+    if any(usage is not None for usage in per_round_usage):
+        per_round = tuple(
+            AgentRoundMetrics(round_index=i + 1, latency_ms=None, usage=usage)
+            for i, usage in enumerate(per_round_usage)
+        )
+    else:
+        per_round = None  # no per-response signal at these pins — never fabricated
+
+    return _RunShape(
+        answer=last_assistant_text,
+        model_call_count=assistant_ordinal,
+        tool_round_count=tool_round_count,
+        tool_calls=tuple(tool_calls),
+        per_round=per_round,
+    )
+
+
+def derive_stop(
+    model_call_count: int,
+    *,
+    executed: int,
+    refused: int,
+    max_iterations: int,
+    max_tool_calls: int,
+) -> tuple[Literal["natural", "iteration_limit", "function_call_limit"], frozenset[str]]:
+    """App-owned stop classification (spec §5): a framework forced-final is
+    never reported natural. iteration_limit wins the single label when both
+    limits fire; limit_reasons carries every limit that fired."""
+    reasons: set[str] = set()
+    if model_call_count >= max_iterations + 1:
+        reasons.add("iteration_limit")
+    if refused > 0 or executed >= max_tool_calls:
+        reasons.add("function_call_limit")
+    if "iteration_limit" in reasons:
+        return "iteration_limit", frozenset(reasons)
+    if "function_call_limit" in reasons:
+        return "function_call_limit", frozenset(reasons)
+    return "natural", frozenset()
