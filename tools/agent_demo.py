@@ -1136,17 +1136,32 @@ def _package_version(name: str) -> str:
 
 
 def _lab_commit_sha() -> str:
+    """HEAD, marked `+dirty` when the working tree differs from it.
+
+    A capture that names a commit it does not correspond to is a false
+    provenance claim, and it is not hypothetical: the Day 17 live run that
+    produced the first real evidence ran HEAD *plus* an uncommitted
+    assertion fix, and the capture said only `21a1c42`.
+    """
     repo_root = Path(__file__).resolve().parents[1]
-    completed = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
+
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    head = _git("rev-parse", "HEAD")
+    if head.returncode != 0:
         return "unknown"
-    return completed.stdout.strip()
+    sha = head.stdout.strip()
+    status = _git("status", "--porcelain")
+    if status.returncode != 0:
+        return f"{sha}+dirty_unknown"
+    return f"{sha}+dirty" if status.stdout.strip() else sha
 
 
 _NOT_APPLICABLE = "not_applicable"
