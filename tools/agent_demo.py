@@ -127,6 +127,16 @@ _GUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
+# What the divergence probe cannot see. Its traces go through the same GUID
+# mask as the capture, so two repeats that passed *different* uuid-shaped
+# argument values compare equal here — genuine non-determinism of exactly the
+# kind the probe exists to observe. "not observed" therefore means "no
+# divergence outside the mask", and must not be quoted as "identical".
+MASKED_DIVERGENCE_NOTE = (
+    "GUID-shaped argument values are masked before comparison, so repeats that "
+    "differ only in fabricated uuid-shaped arguments are invisible to this probe"
+)
+
 
 def _fail(message: str) -> NoReturn:
     print(f"FAIL: {message}")
@@ -211,6 +221,32 @@ def normalized_post_ledger_trace(
     else:
         return list(NO_LEDGER_SENTINEL)
     return normalized_trace(suffix, replacements)
+
+
+def ledger_call_conversation_ids(trace: Sequence[Mapping[str, Any]]) -> list[str]:
+    """`conversation_id` of every executed ledger call, raw and un-neutralized.
+
+    Deliberately *not* normalized. Everywhere else in this file the two seeded
+    ids collapse into one token, because a comparison must not tell them
+    apart — and that collapsing is exactly what would hide a run that read the
+    fresh conversation's ledger while answering about the near one. Here the
+    raw value is the whole point.
+
+    A call whose arguments could not be parsed contributes nothing: there is
+    no id to read, and inventing one would be the fabrication this demo
+    exists to avoid, so such a run simply fails to show its target.
+    """
+    ids: list[str] = []
+    for call in trace:
+        if call["tool_name"] != LEDGER_TOOL or not call["executed"]:
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        value = arguments.get("conversation_id")
+        if value is not None:
+            ids.append(str(value))
+    return ids
 
 
 def ledger_figures(spent: int, budget: int) -> set[str]:
@@ -697,6 +733,7 @@ async def run_divergence_probe(
         "divergence_observed": len(unique) > 1,
         "distinct_traces": len(unique),
         "normalized_traces": [[list(step) for step in trace] for trace in traces],
+        "masking_caveat": MASKED_DIVERGENCE_NOTE,
     }
 
 
@@ -729,7 +766,9 @@ def summarize_assertions(assertions: Sequence[Assertion]) -> str:
         return f"all assertions passed ({passed} passed)"
     reasons = []
     if any(a.outcome == OUTCOME_SKIPPED_FAKE for a in unverified):
-        reasons.append("model-behaviour claims require --live")
+        # not only model-behaviour claims any more: the ledger-target checks
+        # skip because the fake's conversation id is hardcoded
+        reasons.append("claims that need a real provider require --live")
     if any(a.outcome == OUTCOME_NO_BRANCH for a in unverified):
         reasons.append("no branch was observed")
     return (
@@ -756,18 +795,30 @@ _FAKE_REASON = (
     "provider (asserted in --live)"
 )
 
+_FAKE_LEDGER_TARGET_REASON = (
+    "FakeAgentService calls the ledger with its own hardcoded conversation id, "
+    "never a seeded one, so there is no target to match here (asserted in --live)"
+)
+
 
 def assert_suite(
     records: Mapping[str, RunRecord], settings: Settings, seed_outcome: SeedOutcome, *, live: bool
 ) -> list[Assertion]:
     results: list[Assertion] = []
+    # Built once, for every answer this function matches figures in. The
+    # config questions carry no conversation id today, but nothing enforces
+    # that, and a seeded uuid whose group is literally "1000"-shaped is a
+    # `\b`-delimited digit run like any other.
+    replacements = comparison_redactions(
+        settings, near_id=seed_outcome.near_id, fresh_id=seed_outcome.fresh_id
+    )
 
     config_only = records["config-only"]
     max_output = str(settings.llm_max_output_tokens)
     _check(
         results,
         "config-only:answer_contains_llm_max_output_tokens",
-        _figure_in(config_only.answer, max_output),
+        _figure_in(neutralize(config_only.answer, replacements), max_output),
         f"expected {max_output!r} in the answer",
     )
     _check(
@@ -782,8 +833,16 @@ def assert_suite(
     _check(
         results,
         "config+docs:answer_contains_demo_token_budget",
-        _figure_in(config_docs.answer, budget),
-        f"expected {budget!r} in the answer",
+        _figure_in(neutralize(config_docs.answer, replacements), budget),
+        # Known residual, stated where it is asserted: DEMO_TOKEN_BUDGET is
+        # 400, which is also an HTTP status code, and a word boundary cannot
+        # tell a standalone budget figure from a standalone status code. So
+        # this is a CORROBORATING SIGNAL, not proof; the structural proof that
+        # the agent read the figure from get_runtime_config is
+        # config+docs:runtime_config_executed, which runs in both modes.
+        f"expected {budget!r} in the answer — corroborating signal only: a bare "
+        f"{budget!r} is indistinguishable from an HTTP status of the same "
+        "digits, so the structural proof is config+docs:runtime_config_executed",
     )
     _check(
         results,
@@ -794,20 +853,37 @@ def assert_suite(
 
     near = records["diagnostic-near"]
     fresh = records["diagnostic-fresh"]
-    for label, record in (("near", near), ("fresh", fresh)):
+    for label, record, seeded_id in (
+        ("near", near, seed_outcome.near_id),
+        ("fresh", fresh, seed_outcome.fresh_id),
+    ):
         _check(
             results,
             f"diagnostic-{label}:ledger_call_executed",
             _executed_calls(record.trace, LEDGER_TOOL) >= 1,
             f"expected an executed {LEDGER_TOOL} call",
         )
+        # Which conversation the ledger call named, checked on the RAW trace:
+        # every comparison in this file collapses the two seeded ids into one
+        # token, so a run that read the other conversation's ledger normalizes
+        # exactly like a correct one. Only the raw argument shows the target.
+        targeted_name = f"diagnostic-{label}:ledger_call_targeted_the_seeded_conversation"
+        if live:
+            targeted = ledger_call_conversation_ids(record.trace)
+            _check(
+                results,
+                targeted_name,
+                seeded_id in targeted,
+                f"expected an executed {LEDGER_TOOL} call naming the seeded "
+                f"{label} conversation {seeded_id!r}; the executed ledger calls "
+                f"named {targeted} (matched raw, before neutralization)",
+            )
+        else:
+            _skip(results, targeted_name, _FAKE_LEDGER_TARGET_REASON)
 
     if live:
         near_figures = ledger_figures(seed_outcome.near_spent, DEMO_TOKEN_BUDGET)
         fresh_figures = ledger_figures(seed_outcome.fresh_spent, DEMO_TOKEN_BUDGET)
-        replacements = comparison_redactions(
-            settings, near_id=seed_outcome.near_id, fresh_id=seed_outcome.fresh_id
-        )
         evidence = branch_evidence(
             near_trace=near.trace,
             fresh_trace=fresh.trace,
@@ -839,7 +915,7 @@ def assert_suite(
         # token further along.
         near_clean = neutralize(near.answer, replacements)
         near_hits = sorted(figure for figure in near_figures if _figure_in(near_clean, figure))
-        near_lower = near.answer.lower()
+        near_lower = near_clean.lower()
         wording_hits = [word for word in ("429", "exhaust") if word in near_lower]
         wording_note = f"observed (saw {wording_hits})" if wording_hits else "not observed"
         _check(
@@ -1134,11 +1210,16 @@ async def main() -> None:
         divergence = await run_divergence_probe(
             agent_service, records[BASELINE_LABEL].question, sink
         )
+        observed = bool(divergence["divergence_observed"])
         print(
             f"divergence over K={K_REPEATS} repeats of {BASELINE_LABEL}: "
-            f"{'observed' if divergence['divergence_observed'] else 'not observed'} "
-            f"({divergence['distinct_traces']} distinct trace(s))\n"
+            f"{'observed' if observed else 'not observed'} "
+            f"({divergence['distinct_traces']} distinct trace(s))"
         )
+        if not observed:
+            # Say what "not observed" does not cover, next to the claim itself.
+            print(f"  caveat: {divergence['masking_caveat']}")
+        print()
 
         assertions = assert_suite(records, settings, seed_outcome, live=live)
         print("assertions:")

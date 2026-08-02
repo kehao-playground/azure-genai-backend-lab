@@ -467,13 +467,10 @@ def test_config_only_answer_contains_llm_max_output_tokens_requires_word_boundar
 
 
 def test_config_docs_answer_contains_demo_token_budget_requires_word_boundary() -> None:
-    # "400" is not just a digit run that can hide inside a longer number
-    # ("4000-series"): it is also a live HTTP status code that this repo's own
-    # error-contract docs discuss (`docs/api-conventions.md`'s "400
-    # invalid_input" contract). An answer that gestures at HTTP 400-class
-    # errors from the docs, without ever landing on the standalone budget
-    # figure, must not be read as having found the budget via
-    # get_runtime_config.
+    # Embedded-digit sub-case only: "400" hidden inside a longer number
+    # ("4000-series") is not the budget figure. This says nothing about the
+    # *standalone* HTTP-400 collision, which word-boundary matching cannot
+    # reject by construction — see the known-gap test below.
     settings = Settings()
     records = _passing_records(settings)
     records["config+docs"] = _record(
@@ -484,6 +481,147 @@ def test_config_docs_answer_contains_demo_token_budget_requires_word_boundary() 
     )
     outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
     assert outcomes["config+docs:answer_contains_demo_token_budget"] == "failed"
+
+
+def test_config_docs_budget_assertion_accepts_a_standalone_http_400_known_gap() -> None:
+    """Pins a KNOWN-ACCEPTED gap rather than a rejection.
+
+    `DEMO_TOKEN_BUDGET` is 400, which is also an HTTP status code. An answer
+    that says "a malformed request comes back as 400 invalid_input" states a
+    standalone `400` on a word boundary, and no boundary rule can tell it
+    apart from the budget figure. The constant is spec-fixed and a
+    wording-proximity heuristic was removed from this file twice already, so
+    the gap is recorded here instead of papered over: this answer passes.
+
+    What keeps the claim honest is that the assertion is documented as a
+    corroborating signal, and the structural proof that the agent read
+    `get_runtime_config` is `config+docs:runtime_config_executed`, asserted
+    in both modes. (The demo's own corpus, `data/sample-docs/opsdemo/`,
+    contains no `400` at all — the collision can only come from the model's
+    general HTTP knowledge.)
+    """
+    settings = Settings()
+    records = _passing_records(settings)
+    records["config+docs"] = _record(
+        "config+docs",
+        "A malformed request comes back as 400 invalid_input.",
+        records["config+docs"].trace,  # type: ignore[attr-defined]
+    )
+    assertions = assert_suite(records, settings, _seed_outcome(), live=False)
+    outcomes = _outcomes(assertions)
+    assert outcomes["config+docs:answer_contains_demo_token_budget"] == "passed"
+    (budget_assertion,) = [
+        a for a in assertions if a.name == "config+docs:answer_contains_demo_token_budget"
+    ]
+    # the detail must own the residual, not hide it
+    detail = budget_assertion.detail  # type: ignore[attr-defined]
+    assert "HTTP status" in detail
+    assert "config+docs:runtime_config_executed" in detail
+
+
+def test_config_answer_matching_neutralizes_the_conversation_ids() -> None:
+    # The config questions carry no conversation id today, so this is
+    # defensive — but a seeded uuid whose group is literally "1000"-shaped
+    # produces a `\b`-delimited digit run, and an answer that merely echoed
+    # that id would otherwise "state" the configured max-output figure. The
+    # budget assertion gets the identical treatment for the same reason; a
+    # three-digit run cannot be `\b`-delimited inside a dashed uuid, so only
+    # the four-digit case is demonstrable here.
+    settings = Settings()
+    digit_id = "10000030-1000-4bd6-8f23-d348fdb5a694"
+    assert str(settings.llm_max_output_tokens) == "1000"
+    records = _passing_records(settings)
+    records["config-only"] = _record(
+        "config-only",
+        f"Conversation {digit_id} did not report a ceiling.",
+        records["config-only"].trace,  # type: ignore[attr-defined]
+    )
+    seed_outcome = agent_demo.SeedOutcome(
+        near_id=digit_id, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=30, near_turns=3
+    )
+    outcomes = _outcomes(assert_suite(records, settings, seed_outcome, live=False))
+    assert outcomes["config-only:answer_contains_llm_max_output_tokens"] == "failed"
+
+
+def test_wording_signal_is_measured_on_the_neutralized_answer() -> None:
+    # The recorded "429/exhaustion wording" signal is not a pass condition,
+    # but the article may quote it. A seeded uuid containing "429" would
+    # inflate it on a bare-substring test, so the signal is read from the same
+    # neutralized text the figures are.
+    settings = Settings()
+    near_id = "429e0a1b-3702-4bd6-8f23-d348fdb5a694"
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        f"Conversation {near_id} has spent 320 tokens and has 80 remaining.",
+        [_call(_LEDGER, {"conversation_id": near_id})],
+    )
+    seed_outcome = agent_demo.SeedOutcome(
+        near_id=near_id, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=30, near_turns=3
+    )
+    assertions = assert_suite(records, settings, seed_outcome, live=True)
+    (direction,) = [a for a in assertions if a.name == "diagnostic-near:answer_direction"]
+    assert direction.outcome == "passed"  # type: ignore[attr-defined]
+    assert "wording not observed" in direction.detail  # type: ignore[attr-defined]
+
+
+def test_ledger_call_target_must_be_the_seeded_conversation() -> None:
+    # Neutralization collapses both ids into one token, so a run that queried
+    # the FRESH ledger while answering the NEAR diagnostic normalizes exactly
+    # like a correct run. Only a raw, pre-neutralization comparison of the
+    # ledger call's own `conversation_id` argument can see it.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        records["diagnostic-near"].answer,  # type: ignore[attr-defined]
+        [_call(_LEDGER, {"conversation_id": _FRESH_ID})],  # wrong conversation
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert outcomes["diagnostic-near:ledger_call_targeted_the_seeded_conversation"] == "failed"
+    assert outcomes["diagnostic-fresh:ledger_call_targeted_the_seeded_conversation"] == "passed"
+    # the ledger call still happened — this is a different defect from not
+    # consulting the ledger at all
+    assert outcomes["diagnostic-near:ledger_call_executed"] == "passed"
+
+
+def test_ledger_call_target_is_unverified_when_the_arguments_are_unparseable() -> None:
+    # arguments=None means the model's arguments could not be parsed, so there
+    # is no id to read. Guessing one would be fabrication; the assertion fails.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-fresh"] = _record(
+        "diagnostic-fresh",
+        records["diagnostic-fresh"].answer,  # type: ignore[attr-defined]
+        [
+            {
+                "tool_name": _LEDGER,
+                "arguments": None,
+                "arguments_canonical_json": "{not json",
+                "executed": True,
+                "round_index": 1,
+            }
+        ],
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert outcomes["diagnostic-fresh:ledger_call_targeted_the_seeded_conversation"] == "failed"
+
+
+async def test_divergence_probe_records_what_its_masking_hides() -> None:
+    # The probe compares GUID-masked traces, so a model fabricating DIFFERENT
+    # uuid-shaped argument values across repeats is invisible to it. That is
+    # real non-determinism the probe exists to observe, so "not observed" must
+    # carry the caveat rather than read as "identical".
+    class _StubService:
+        async def run(self, task: str) -> AgentRunResult:
+            return _result(None)
+
+        async def aclose(self) -> None:
+            return None
+
+    probe = await agent_demo.run_divergence_probe(_StubService(), "q", [])
+    assert probe["divergence_observed"] is False
+    assert "GUID" in probe["masking_caveat"]
 
 
 def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> None:
@@ -523,9 +661,11 @@ def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None
     seed_outcome = agent_demo.SeedOutcome(
         near_id=_NEAR_ID, fresh_id=_FRESH_ID, near_spent=320, fresh_spent=80, near_turns=3
     )
-    trace = records["diagnostic-near"].trace  # type: ignore[attr-defined]
+    # same trace SHAPE on both sides, each still targeting its own conversation
     records["diagnostic-fresh"] = _record(
-        "diagnostic-fresh", "It has spent 80 tokens and can still spend 320.", trace
+        "diagnostic-fresh",
+        "It has spent 80 tokens and can still spend 320.",
+        [_call(_LEDGER, {"conversation_id": _FRESH_ID}), _call(_SEARCH, {"query": "429"})],
     )
     assertions = assert_suite(records, settings, seed_outcome, live=True)
     outcomes = _outcomes(assertions)
@@ -537,7 +677,10 @@ def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None
 
 def test_assert_suite_fake_live_split_is_exactly_the_model_behaviour_claims() -> None:
     # The authorized fake/live deviation rests on this property: fake mode
-    # skips the four model-behaviour claims and asserts everything else.
+    # skips the claims a canned fake cannot exercise and asserts everything
+    # else. The two ledger-target claims join that set for a different reason
+    # than the model-behaviour ones: FakeAgentService calls the ledger with a
+    # hardcoded id, so there is nothing to match against a seeded id.
     settings = Settings()
     records = _passing_records(settings)
     fake = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
@@ -545,6 +688,8 @@ def test_assert_suite_fake_live_split_is_exactly_the_model_behaviour_claims() ->
         "diagnostic:branch_evidence",
         "diagnostic-near:answer_direction",
         "diagnostic-fresh:answer_direction",
+        "diagnostic-near:ledger_call_targeted_the_seeded_conversation",
+        "diagnostic-fresh:ledger_call_targeted_the_seeded_conversation",
         "no-hit:answer_admits_missing_evidence",
     }
     assert {name for name, outcome in fake.items() if outcome == "skipped_fake"} == expected_skipped
@@ -569,7 +714,16 @@ def test_summary_never_claims_all_passed_when_something_was_unverified() -> None
 
 
 def _run_demo(tmp_path: Path, *extra: str) -> "subprocess.CompletedProcess[str]":
-    """A real fake-mode run of the script — zero network by construction."""
+    """A real fake-mode run of the script — zero network by construction.
+
+    `cwd` is the test's temp directory, not the repo root: `Settings` reads
+    `.env` relative to the working directory, and the repo root carries an
+    untracked one on a developer machine. Running there made the exit code
+    depend on a file that exists in no fresh clone and in no CI checkout.
+    Nothing about the run needs it — `--fake` forces all three fake adapters
+    atomically, the script and the capture path are absolute, and the capture's
+    commit sha is read with the repo root as its own cwd.
+    """
     return subprocess.run(
         [
             sys.executable,
@@ -579,7 +733,7 @@ def _run_demo(tmp_path: Path, *extra: str) -> "subprocess.CompletedProcess[str]"
             str(tmp_path / "capture.json"),
             *extra,
         ],
-        cwd=str(_MODULE_PATH.parents[1]),
+        cwd=str(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -592,12 +746,13 @@ def test_require_live_assertions_turns_unverified_into_a_non_zero_exit(tmp_path:
     # operator actually depends on, and it was evidenced only by a manual run.
     # Fake mode always leaves the four model-behaviour claims unverified, so it
     # is the honest fixture for both halves of the contract.
+    assert not (tmp_path / ".env").exists()  # the run stands on no local config
     default_run = _run_demo(tmp_path)
     assert default_run.returncode == 0, default_run.stdout + default_run.stderr
     assert "unverified" in default_run.stdout
     strict = _run_demo(tmp_path, "--require-live-assertions")
     assert strict.returncode == 1, strict.stdout + strict.stderr
-    assert "--require-live-assertions: 4 assertion(s) unverified" in strict.stdout
+    assert "--require-live-assertions: 6 assertion(s) unverified" in strict.stdout
     assert "diagnostic:branch_evidence" in strict.stdout
 
 
