@@ -9,8 +9,11 @@ ConversationChatService commit path (near-exhausted + fresh, preconditions
 asserted) -> run the question suite -> assert -> print measurements ->
 write redacted JSON capture (--capture PATH).
 
-Exit codes: 0 all assertions pass; 1 assertion/seed-contract failure;
-2 configuration error.
+Exit codes: 0 no assertion failed; 1 assertion/seed-contract failure;
+2 configuration error. An assertion that was never exercised is reported as
+*unverified*, never as passed — `--require-live-assertions` turns any
+unverified assertion into exit 1 for anyone who needs a fully-verified run
+(the default invocation keeps the table above).
 
 What each mode can and cannot prove. Fake mode exercises the wiring and the
 *shape* of every trace: which tools ran, in what order, with what arguments,
@@ -85,6 +88,19 @@ CONFIG_TOOL = "get_runtime_config"
 SEARCH_TOOL = "search_docs"
 NO_LEDGER_SENTINEL = [("<no-ledger-call>", "")]
 
+# Assertion outcomes. `skipped_fake` and `no_branch_observed` are both
+# *unverified*: nothing failed, and nothing was proved either.
+OUTCOME_PASSED = "passed"
+OUTCOME_FAILED = "failed"
+OUTCOME_SKIPPED_FAKE = "skipped_fake"
+OUTCOME_NO_BRANCH = "no_branch_observed"
+UNVERIFIED_OUTCOMES = frozenset({OUTCOME_SKIPPED_FAKE, OUTCOME_NO_BRANCH})
+
+# Forms of branch evidence, strongest first (see `branch_evidence`).
+BRANCH_TRACE = "trace_divergence"
+BRANCH_ANSWER = "answer_content_divergence"
+BRANCH_NONE = "none"
+
 QUESTION_SUITE: list[tuple[str, str | None]] = [
     ("config-only", "What is the maximum output tokens per model call here?"),
     ("docs-only", "What does a client have to do with unknown SSE event names?"),
@@ -153,6 +169,85 @@ def normalized_post_ledger_trace(
     else:
         return list(NO_LEDGER_SENTINEL)
     return normalized_trace(suffix)
+
+
+def ledger_figures(spent: int, budget: int) -> set[str]:
+    """The two numbers only the ledger can supply: spend and remainder.
+
+    Neither is in the question, so an answer carrying one of them read the
+    ledger; an answer that merely restates the question carries neither.
+    """
+    return {str(spent), str(budget - spent)}
+
+
+@dataclass(frozen=True)
+class BranchEvidence:
+    """Which *form* of branch was observed, so the article can name it."""
+
+    form: str  # BRANCH_TRACE | BRANCH_ANSWER | BRANCH_NONE
+    detail: str
+
+
+def branch_evidence(
+    *,
+    near_trace: Sequence[Mapping[str, Any]],
+    fresh_trace: Sequence[Mapping[str, Any]],
+    near_answer: str,
+    fresh_answer: str,
+    near_figures: set[str],
+    fresh_figures: set[str],
+) -> BranchEvidence:
+    """Graded observation of whether the two diagnostics actually branched.
+
+    Trace divergence is the strongest form and is looked for over the *full*
+    normalized trace: nothing forces the ledger call to come first (the
+    prompt's rule 3 makes `search_docs -> ledger -> answer` a plausible trace
+    for both diagnostics), so a post-ledger suffix comparison alone would
+    call a perfectly good run a failure. `NO_LEDGER_SENTINEL`'s protection is
+    kept: two runs that never consulted the ledger are never branch evidence,
+    however different their traces look.
+
+    Failing that, an answer-content divergence on the ledger-derived numbers
+    is a real branch too — expressed in the answer instead of in the trace.
+    When neither holds the outcome is `BRANCH_NONE`, which the caller records
+    as unverified: absence of observed branching is not proof of its absence,
+    and it is certainly not a pass.
+    """
+    near_full = normalized_trace(near_trace)
+    fresh_full = normalized_trace(fresh_trace)
+    consulted_ledger = (
+        normalized_post_ledger_trace(near_trace) != NO_LEDGER_SENTINEL
+        or normalized_post_ledger_trace(fresh_trace) != NO_LEDGER_SENTINEL
+    )
+    traces_differ = near_full != fresh_full
+    if traces_differ and consulted_ledger:
+        return BranchEvidence(
+            BRANCH_TRACE,
+            f"full traces differ: near={near_full} fresh={fresh_full}",
+        )
+    near_only = sorted(near_figures - fresh_figures)
+    fresh_only = sorted(fresh_figures - near_figures)
+    near_hits = [figure for figure in near_only if figure in near_answer]
+    fresh_hits = [figure for figure in fresh_only if figure in fresh_answer]
+    if near_hits and fresh_hits:
+        return BranchEvidence(
+            BRANCH_ANSWER,
+            f"traces match, answers do not: the near answer carries {near_hits} "
+            f"and the fresh answer carries {fresh_hits}, and those figures are "
+            "obtainable only from each conversation's own ledger entry",
+        )
+    reason = (
+        "traces are identical"
+        if not traces_differ
+        else "traces differ but neither run consulted the ledger, so the "
+        "difference is not evidence of a ledger-driven branch"
+    )
+    return BranchEvidence(
+        BRANCH_NONE,
+        f"{reason}; ledger figures unique to near {near_only} seen in the near "
+        f"answer: {near_hits}, unique to fresh {fresh_only} seen in the fresh "
+        f"answer: {fresh_hits}",
+    )
 
 
 def seed_precondition_ok(kind: str, *, spent: int, budget: int) -> bool:
@@ -529,8 +624,34 @@ async def run_divergence_probe(
 @dataclass
 class Assertion:
     name: str
-    outcome: str  # "passed" | "failed" | "skipped_fake"
+    # OUTCOME_PASSED | OUTCOME_FAILED | OUTCOME_SKIPPED_FAKE | OUTCOME_NO_BRANCH
+    outcome: str
     detail: str
+    # Only branch evidence carries one: which form was observed, so the
+    # article can say what was seen rather than "it branched".
+    evidence_form: str | None = None
+
+
+def summarize_assertions(assertions: Sequence[Assertion]) -> str:
+    """The closing line — it must never claim more than was exercised.
+
+    A partially-verified run and a fully-verified one printed the same line
+    once; `tools/tenant_smoke.py` already settled how this project treats an
+    unexercised probe (INCONCLUSIVE, never PASS), and this is the same rule.
+    """
+    passed = sum(1 for a in assertions if a.outcome == OUTCOME_PASSED)
+    unverified = [a for a in assertions if a.outcome in UNVERIFIED_OUTCOMES]
+    if not unverified:
+        return f"all assertions passed ({passed} passed)"
+    reasons = []
+    if any(a.outcome == OUTCOME_SKIPPED_FAKE for a in unverified):
+        reasons.append("model-behaviour claims require --live")
+    if any(a.outcome == OUTCOME_NO_BRANCH for a in unverified):
+        reasons.append("no branch was observed")
+    return (
+        f"no assertion failed ({passed} passed, {len(unverified)} unverified — "
+        f"{'; '.join(reasons)})"
+    )
 
 
 def _executed_calls(trace: Sequence[Mapping[str, Any]], tool_name: str) -> int:
@@ -538,11 +659,11 @@ def _executed_calls(trace: Sequence[Mapping[str, Any]], tool_name: str) -> int:
 
 
 def _check(results: list[Assertion], name: str, ok: bool, detail: str) -> None:
-    results.append(Assertion(name, "passed" if ok else "failed", detail))
+    results.append(Assertion(name, OUTCOME_PASSED if ok else OUTCOME_FAILED, detail))
 
 
 def _skip(results: list[Assertion], name: str, reason: str) -> None:
-    results.append(Assertion(name, "skipped_fake", reason))
+    results.append(Assertion(name, OUTCOME_SKIPPED_FAKE, reason))
 
 
 _FAKE_REASON = (
@@ -598,28 +719,43 @@ def assert_suite(
         )
 
     if live:
-        near_suffix = normalized_post_ledger_trace(near.trace)
-        fresh_suffix = normalized_post_ledger_trace(fresh.trace)
-        _check(
-            results,
-            "diagnostic:branch_evidence",
-            near_suffix != fresh_suffix,
-            f"post-ledger suffixes near={near_suffix} fresh={fresh_suffix}",
+        near_figures = ledger_figures(seed_outcome.near_spent, DEMO_TOKEN_BUDGET)
+        fresh_figures = ledger_figures(seed_outcome.fresh_spent, DEMO_TOKEN_BUDGET)
+        evidence = branch_evidence(
+            near_trace=near.trace,
+            fresh_trace=fresh.trace,
+            near_answer=near.answer,
+            fresh_answer=fresh.answer,
+            near_figures=near_figures,
+            fresh_figures=fresh_figures,
         )
-        near_answer = near.answer.lower()
+        results.append(
+            Assertion(
+                "diagnostic:branch_evidence",
+                OUTCOME_PASSED if evidence.form != BRANCH_NONE else OUTCOME_NO_BRANCH,
+                f"{evidence.form}: {evidence.detail}",
+                evidence_form=evidence.form,
+            )
+        )
+        # The ledger figures are what makes this unearnable by paraphrase:
+        # DIAGNOSTIC_TEMPLATE already contains "429", so the wording alone is
+        # satisfied by an answer that only restates the question.
+        near_hits = sorted(figure for figure in near_figures if figure in near.answer)
+        near_lower = near.answer.lower()
+        wording_hits = [word for word in ("429", "exhaust") if word in near_lower]
         _check(
             results,
             "diagnostic-near:answer_direction",
-            "429" in near_answer or "exhaust" in near_answer,
-            "expected the near-exhausted answer to mention 429 or exhaustion",
+            bool(near_hits) and bool(wording_hits),
+            f"expected a ledger figure from {sorted(near_figures)} (saw {near_hits}) "
+            f"and 429/exhaustion wording (saw {wording_hits})",
         )
-        remaining = str(DEMO_TOKEN_BUDGET - seed_outcome.fresh_spent)
-        spent = str(seed_outcome.fresh_spent)
+        fresh_hits = sorted(figure for figure in fresh_figures if figure in fresh.answer)
         _check(
             results,
             "diagnostic-fresh:answer_direction",
-            remaining in fresh.answer or spent in fresh.answer,
-            f"expected the fresh answer to carry {remaining!r} or {spent!r}",
+            bool(fresh_hits),
+            f"expected a ledger figure from {sorted(fresh_figures)} (saw {fresh_hits})",
         )
     else:
         _skip(results, "diagnostic:branch_evidence", _FAKE_REASON)
@@ -703,6 +839,9 @@ def provider_provenance(arguments: argparse.Namespace, *, live: bool) -> dict[st
 
 # --------------------------------------------------------------------------
 # Printing
+#
+# Console output is deliberately UNREDACTED — redaction is scoped to the
+# capture file, so quote the capture into the article, never this output.
 # --------------------------------------------------------------------------
 
 
@@ -755,6 +894,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--capture",
         default=DEFAULT_CAPTURE,
         help=f"path for the redacted JSON capture (default: {DEFAULT_CAPTURE})",
+    )
+    parser.add_argument(
+        "--require-live-assertions",
+        action="store_true",
+        help=(
+            "exit non-zero unless every assertion was verified (skipped in fake "
+            "mode and no_branch_observed both count as unverified)"
+        ),
     )
     parser.add_argument("--model-name", help="live only: model name from the deployment inventory")
     parser.add_argument("--model-version", help="live only: model version from the same inventory")
@@ -877,8 +1024,8 @@ async def main() -> None:
             records[label] = record
             _print_run(record)
 
-        instructions = load_prompt("ops_agent").text
-        baseline = await run_baseline(baseline_service, instructions, records[BASELINE_LABEL])
+        prompt = load_prompt("ops_agent")
+        baseline = await run_baseline(baseline_service, prompt.text, records[BASELINE_LABEL])
         print(
             f"baseline ({baseline['baseline_kind']}, {BASELINE_LABEL}): "
             f"model_ms={baseline['baseline_model_ms']} usage={baseline['usage']}"
@@ -896,13 +1043,15 @@ async def main() -> None:
         assertions = assert_suite(records, settings, seed_outcome, live=live)
         print("assertions:")
         for assertion in assertions:
-            marker = {"passed": "PASS", "failed": "FAIL", "skipped_fake": "SKIP"}[
-                assertion.outcome
-            ]
+            marker = {
+                OUTCOME_PASSED: "PASS",
+                OUTCOME_FAILED: "FAIL",
+                OUTCOME_SKIPPED_FAKE: "SKIP (unverified)",
+                OUTCOME_NO_BRANCH: "UNVERIFIED",
+            }[assertion.outcome]
             print(f"  {marker} {assertion.name} — {assertion.detail}")
         print()
 
-        prompt = load_prompt("ops_agent")
         capture = {
             "run_conditions": {
                 "mode": "live" if live else "fake",
@@ -953,7 +1102,14 @@ async def main() -> None:
             "baseline": baseline,
             "divergence": divergence,
             "assertions": [
-                {"name": a.name, "outcome": a.outcome, "detail": a.detail} for a in assertions
+                {
+                    "name": a.name,
+                    "outcome": a.outcome,
+                    "detail": a.detail,
+                    # present only where a form of evidence is meaningful
+                    **({} if a.evidence_form is None else {"evidence_form": a.evidence_form}),
+                }
+                for a in assertions
             ],
         }
         replacements = build_redactions(
@@ -966,14 +1122,18 @@ async def main() -> None:
         )
         print(f"capture written: {capture_path.resolve()}")
 
-        failed = [a for a in assertions if a.outcome == "failed"]
+        failed = [a for a in assertions if a.outcome == OUTCOME_FAILED]
         if failed:
             # The capture is written first on purpose: a failing run is the one
             # whose evidence is most worth keeping.
             _fail(f"{len(failed)} assertion(s) failed: {', '.join(a.name for a in failed)}")
-        skipped = sum(1 for a in assertions if a.outcome == "skipped_fake")
-        passed = sum(1 for a in assertions if a.outcome == "passed")
-        print(f"all assertions passed ({passed} passed, {skipped} skipped in fake mode)")
+        print(summarize_assertions(assertions))
+        unverified = [a for a in assertions if a.outcome in UNVERIFIED_OUTCOMES]
+        if unverified and arguments.require_live_assertions:
+            _fail(
+                f"--require-live-assertions: {len(unverified)} assertion(s) unverified: "
+                f"{', '.join(a.name for a in unverified)}"
+            )
     finally:
         # Each created service closed exactly once, and every close is
         # attempted even if an earlier one raises — the agent composite owns

@@ -30,12 +30,16 @@ agent_demo = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = agent_demo
 _SPEC.loader.exec_module(agent_demo)
 
+assert_suite = agent_demo.assert_suite
+branch_evidence = agent_demo.branch_evidence
 build_redactions = agent_demo.build_redactions
+ledger_figures = agent_demo.ledger_figures
 normalized_post_ledger_trace = agent_demo.normalized_post_ledger_trace
 normalized_trace = agent_demo.normalized_trace
 redact = agent_demo.redact
 resolve_settings = agent_demo.resolve_settings
 seed_precondition_ok = agent_demo.seed_precondition_ok
+summarize_assertions = agent_demo.summarize_assertions
 tool_ms_from = agent_demo.tool_ms_from
 
 
@@ -201,6 +205,212 @@ async def test_recorder_preserves_tool_identity_and_captures_output() -> None:
     assert [(r.tool_name, r.arguments, r.output) for r in sink] == [
         ("search_docs", {"query": "sse"}, "result for sse")
     ]
+
+
+def _record(label: str, answer: str, trace: list[dict[str, object]]) -> object:
+    return agent_demo.RunRecord(
+        label=label,
+        question="q",
+        answer=answer,
+        trace=trace,
+        tool_outputs=[],
+        measurements={},
+        shape={},
+    )
+
+
+def _seed_outcome() -> object:
+    return agent_demo.SeedOutcome(
+        near_id="near-uuid",
+        fresh_id="fresh-uuid",
+        near_spent=320,
+        fresh_spent=30,
+        near_turns=3,
+    )
+
+
+_LEDGER = "get_conversation_usage"
+_CONFIG = "get_runtime_config"
+_SEARCH = "search_docs"
+
+
+def _passing_records(settings: Settings) -> dict[str, object]:
+    """A record set where every live assertion has something real to hold."""
+    return {
+        "config-only": _record(
+            "config-only",
+            f"The cap is {settings.llm_max_output_tokens} output tokens.",
+            [_call(_CONFIG, {})],
+        ),
+        "docs-only": _record("docs-only", "ignore unknown event names", [_call(_SEARCH, {})]),
+        "config+docs": _record(
+            "config+docs", "The budget is 400 tokens.", [_call(_CONFIG, {}), _call(_SEARCH, {})]
+        ),
+        # near: ledger figures 320 spent / 80 remaining, plus the 429 wording
+        "diagnostic-near": _record(
+            "diagnostic-near",
+            "It has spent 320 tokens and has 80 left, so the next call is rejected with 429.",
+            [_call(_LEDGER, {"conversation_id": "near-uuid"}), _call(_SEARCH, {"query": "429"})],
+        ),
+        # fresh: ledger figures 30 spent / 370 remaining
+        "diagnostic-fresh": _record(
+            "diagnostic-fresh",
+            "It has spent 30 tokens and can still spend 370.",
+            [_call(_LEDGER, {"conversation_id": "fresh-uuid"})],
+        ),
+        "no-hit": _record(
+            "no-hit",
+            "I found no supporting evidence in the documentation.",
+            [_call(_SEARCH, {"query": "a"}), _call(_SEARCH, {"query": "b"})],
+        ),
+    }
+
+
+def _outcomes(assertions: list[object]) -> dict[str, str]:
+    return {a.name: a.outcome for a in assertions}  # type: ignore[attr-defined]
+
+
+def test_ledger_figures_are_the_two_numbers_only_the_ledger_supplies() -> None:
+    assert ledger_figures(320, 400) == {"320", "80"}
+
+
+def test_branch_evidence_prefers_full_trace_divergence() -> None:
+    # The divergence must be found over the FULL trace: nothing forces the
+    # ledger call to come first, so the post-ledger suffix alone can be empty
+    # on both sides of a genuinely different run.
+    near_trace = [_call(_SEARCH, {"query": "429"}), _call(_LEDGER, {"conversation_id": "A"})]
+    fresh_trace = [_call(_LEDGER, {"conversation_id": "B"})]
+    evidence = branch_evidence(
+        near_trace=near_trace,
+        fresh_trace=fresh_trace,
+        near_answer="",
+        fresh_answer="",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+    )
+    assert evidence.form == "trace_divergence"
+
+
+def test_branch_evidence_never_counts_two_ledgerless_runs() -> None:
+    # NO_LEDGER_SENTINEL's protection, carried over to the full-trace compare:
+    # two runs that never consulted the ledger cannot be evidence of a
+    # ledger-driven branch however different their traces look.
+    evidence = branch_evidence(
+        near_trace=[_call(_SEARCH, {"query": "a"})],
+        fresh_trace=[_call(_CONFIG, {})],
+        near_answer="",
+        fresh_answer="",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+    )
+    assert evidence.form == "none"
+
+
+def test_branch_evidence_accepts_answer_content_divergence() -> None:
+    # Identical traces (search_docs -> ledger -> answer is plausible for both
+    # diagnostics), but each answer carries its own conversation's numbers.
+    trace_shape = [_call(_SEARCH, {"query": "429"}), _call(_LEDGER, {"conversation_id": "X"})]
+    evidence = branch_evidence(
+        near_trace=trace_shape,
+        fresh_trace=[_call(_SEARCH, {"query": "429"}), _call(_LEDGER, {"conversation_id": "Y"})],
+        near_answer="spent 320, only 80 left",
+        fresh_answer="spent 30, 370 still available",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+    )
+    assert evidence.form == "answer_content_divergence"
+    assert "320" in evidence.detail
+
+
+def test_branch_evidence_reports_no_branch_rather_than_failing() -> None:
+    trace_shape = [_call(_LEDGER, {"conversation_id": "X"})]
+    evidence = branch_evidence(
+        near_trace=trace_shape,
+        fresh_trace=[_call(_LEDGER, {"conversation_id": "Y"})],
+        near_answer="the budget may be exhausted",
+        fresh_answer="the budget may be exhausted",
+        near_figures={"320", "80"},
+        fresh_figures={"30", "370"},
+    )
+    assert evidence.form == "none"
+    assert "identical" in evidence.detail
+
+
+def test_near_answer_direction_is_not_satisfied_by_echoing_the_question() -> None:
+    # DIAGNOSTIC_TEMPLATE itself contains "429": restating the question must
+    # not pass an assertion that claims the agent read the ledger.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        agent_demo.DIAGNOSTIC_TEMPLATE.format(cid="near-uuid"),
+        records["diagnostic-near"].trace,  # type: ignore[attr-defined]
+    )
+    outcomes = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert outcomes["diagnostic-near:answer_direction"] == "failed"
+
+
+def test_live_suite_passes_when_the_answers_carry_ledger_figures() -> None:
+    settings = Settings()
+    assertions = assert_suite(_passing_records(settings), settings, _seed_outcome(), live=True)
+    outcomes = _outcomes(assertions)
+    assert set(outcomes.values()) == {"passed"}
+
+
+def test_branch_evidence_degrades_to_no_branch_observed_not_to_failure() -> None:
+    # A plausible correct run with nothing to distinguish: the same trace on
+    # both sides (rule 3 makes search_docs -> ledger -> answer plausible for
+    # both diagnostics) and, at spent=320/80, ledger figure sets that
+    # coincide. Both answers are grounded, yet no branch is observable — that
+    # must be recorded as unverified, never as a failure.
+    settings = Settings()
+    records = _passing_records(settings)
+    seed_outcome = agent_demo.SeedOutcome(
+        near_id="near-uuid", fresh_id="fresh-uuid", near_spent=320, fresh_spent=80, near_turns=3
+    )
+    trace = records["diagnostic-near"].trace  # type: ignore[attr-defined]
+    records["diagnostic-fresh"] = _record(
+        "diagnostic-fresh", "It has spent 80 tokens and can still spend 320.", trace
+    )
+    assertions = assert_suite(records, settings, seed_outcome, live=True)
+    outcomes = _outcomes(assertions)
+    assert outcomes["diagnostic:branch_evidence"] == "no_branch_observed"
+    assert "failed" not in outcomes.values()
+    (branch,) = [a for a in assertions if a.name == "diagnostic:branch_evidence"]
+    assert branch.evidence_form == "none"  # type: ignore[attr-defined]
+
+
+def test_assert_suite_fake_live_split_is_exactly_the_model_behaviour_claims() -> None:
+    # The authorized fake/live deviation rests on this property: fake mode
+    # skips the four model-behaviour claims and asserts everything else.
+    settings = Settings()
+    records = _passing_records(settings)
+    fake = _outcomes(assert_suite(records, settings, _seed_outcome(), live=False))
+    expected_skipped = {
+        "diagnostic:branch_evidence",
+        "diagnostic-near:answer_direction",
+        "diagnostic-fresh:answer_direction",
+        "no-hit:answer_admits_missing_evidence",
+    }
+    assert {name for name, outcome in fake.items() if outcome == "skipped_fake"} == expected_skipped
+    assert not expected_skipped & {name for name, outcome in fake.items() if outcome == "passed"}
+    live = _outcomes(assert_suite(records, settings, _seed_outcome(), live=True))
+    assert "skipped_fake" not in live.values()
+    assert set(live) == set(fake)
+
+
+def test_summary_never_claims_all_passed_when_something_was_unverified() -> None:
+    passed = [agent_demo.Assertion("a", "passed", "")]
+    assert summarize_assertions(passed) == "all assertions passed (1 passed)"
+    mixed = [*passed, agent_demo.Assertion("b", "skipped_fake", "")]
+    line = summarize_assertions(mixed)
+    assert "all assertions passed" not in line
+    assert "1 unverified" in line and "--live" in line
+    unobserved = [*passed, agent_demo.Assertion("b", "no_branch_observed", "")]
+    line = summarize_assertions(unobserved)
+    assert "all assertions passed" not in line
+    # a live run must not be told anything about fake mode
+    assert "--live" not in line
 
 
 def test_mode_resolution_is_atomic() -> None:
