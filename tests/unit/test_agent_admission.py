@@ -19,17 +19,25 @@ from azgenai_lab.services.agent_framework import (
     ToolExecution,
     wrap_tools_with_admission,
 )
+from azgenai_lab.services.agent_tools import MAX_REFUSAL_RESULT_BYTES
 
 
-def _tools_with_probe(started: list[int], gate: asyncio.Event | None = None):
+def _tools_with_probe(started: list[int]):
     async def probe() -> str:
         """Probe tool."""
         started.append(1)
-        if gate is not None:
-            await gate.wait()
         return "ok"
 
     return [probe]
+
+
+def test_refusal_message_fits_the_published_refusal_cap() -> None:
+    # `MAX_REFUSAL_RESULT_BYTES` is published in the demo capture's
+    # `run_conditions` next to caps that code applies at runtime, but no code
+    # path applies this one: the refusal string is a fixed constant, so the
+    # cap can only be a claim about it. This test is what makes that published
+    # claim true — without it the number is documentation, not a bound.
+    assert len(REFUSAL_MESSAGE.encode("utf-8")) < MAX_REFUSAL_RESULT_BYTES
 
 
 async def test_sequential_11th_refused() -> None:

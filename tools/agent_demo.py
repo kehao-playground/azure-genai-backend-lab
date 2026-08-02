@@ -48,7 +48,7 @@ from azgenai_lab.core.errors import ConfigurationError
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search_index import INDEX_NAME
-from azgenai_lab.prompts.loader import load_prompt
+from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services.agent_framework import (
     AGENT_MAX_TASK_BYTES,
     AgentRunError,
@@ -682,14 +682,14 @@ def _baseline_input(instructions: str, record: RunRecord) -> str:
 
 
 async def run_baseline(
-    chat_service: ChatService, instructions: str, record: RunRecord
+    chat_service: ChatService, prompt: PromptTemplate, record: RunRecord
 ) -> dict[str, Any]:
     """One model call over the same instructions and the agent's tool outputs.
 
     This is a **model/token loop-overhead comparison, not an end-to-end
     latency baseline**: the tool work is already done and simply pasted in.
     """
-    items = [{"role": "user", "content": _baseline_input(instructions, record)}]
+    items = [{"role": "user", "content": _baseline_input(prompt.text, record)}]
     started = time.perf_counter()
     result = await chat_service.complete(items)
     baseline_model_ms = (time.perf_counter() - started) * 1000
@@ -697,6 +697,14 @@ async def run_baseline(
     return {
         "baseline_kind": "model_token_overhead_comparison",
         "for_question": record.label,
+        # The ops_agent prompt reaches this call in BOTH modes (it travels
+        # inside the input item above, not as the provider's `instructions`),
+        # so its provenance belongs here rather than under `run_conditions`,
+        # where it would read as the agent's — and in fake mode the agent
+        # applied no prompt at all (see `agent_prompt_provenance`).
+        "prompt_name": prompt.name,
+        "prompt_version": prompt.version,
+        "prompt_sha256": prompt.sha256,
         "baseline_model_ms": round(baseline_model_ms, 1),
         "usage": (
             None
@@ -1013,6 +1021,31 @@ def provider_provenance(arguments: argparse.Namespace, *, live: bool) -> dict[st
     }
 
 
+def agent_prompt_provenance(prompt: PromptTemplate, *, live: bool) -> dict[str, Any]:
+    """The prompt the *agent* applied, or `not_applicable`.
+
+    `AgentFrameworkService` loads `ops_agent` and hands it to the framework as
+    the provider's `instructions`, so in live mode these three fields are the
+    agent run's own prompt provenance. `FakeAgentService` applies no prompt at
+    all, so a fake run has none to report — recording the loaded values under
+    `run_conditions` anyway would read as "the agent ran on this prompt", which
+    is exactly what did not happen. The same prompt does still reach the
+    baseline call in both modes; that copy's provenance is recorded under
+    `baseline`, where it is unambiguously the baseline's.
+    """
+    if not live:
+        return {
+            "agent_prompt_name": _NOT_APPLICABLE,
+            "agent_prompt_version": _NOT_APPLICABLE,
+            "agent_prompt_sha256": _NOT_APPLICABLE,
+        }
+    return {
+        "agent_prompt_name": prompt.name,
+        "agent_prompt_version": prompt.version,
+        "agent_prompt_sha256": prompt.sha256,
+    }
+
+
 # --------------------------------------------------------------------------
 # Printing
 #
@@ -1201,7 +1234,7 @@ async def main() -> None:
             _print_run(record)
 
         prompt = load_prompt("ops_agent")
-        baseline = await run_baseline(baseline_service, prompt.text, records[BASELINE_LABEL])
+        baseline = await run_baseline(baseline_service, prompt, records[BASELINE_LABEL])
         print(
             f"baseline ({baseline['baseline_kind']}, {BASELINE_LABEL}): "
             f"model_ms={baseline['baseline_model_ms']} usage={baseline['usage']}"
@@ -1253,9 +1286,7 @@ async def main() -> None:
                 "max_tool_result_bytes": MAX_TOOL_RESULT_BYTES,
                 "max_refusal_result_bytes": MAX_REFUSAL_RESULT_BYTES,
                 "agent_max_task_bytes": AGENT_MAX_TASK_BYTES,
-                "prompt_name": prompt.name,
-                "prompt_version": prompt.version,
-                "prompt_sha256": prompt.sha256,
+                **agent_prompt_provenance(prompt, live=live),
                 **provider_provenance(arguments, live=live),
             },
             "setup": {

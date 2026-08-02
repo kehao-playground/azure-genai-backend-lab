@@ -55,11 +55,14 @@ def validate_task(task: str) -> str:
 def map_usage_details(details: Mapping[str, Any] | None) -> TokenUsage | None:
     """UsageDetails (all-optional *_token_count fields) -> Day 9 TokenUsage.
 
-    All-or-none for the required trio; reasoning maps when present. Missing
-    block or missing required count -> None plus a log line (honest absence,
-    Day 9 style) — never fabricated zeros.
+    All-or-none for the required trio; reasoning maps when present. Both
+    absence shapes -> None plus a log line (honest absence, Day 9 style) —
+    never fabricated zeros. The two lines are worded distinctly because they
+    mean different things: no usage block at all (nothing was reported) is
+    not the same defect as a block that arrived missing a required count.
     """
     if details is None:
+        logger.info("agent usage absent, dropping: response carried no usage block")
         return None
     input_tokens = details.get("input_token_count")
     output_tokens = details.get("output_token_count")
@@ -265,13 +268,17 @@ def _join_executions_to_rounds(
 ) -> tuple[AgentRoundMetrics, ...] | None:
     """Positional join of measured tool latency onto rounds.
 
-    `executions` are appended in admission order (`wrap_tools_with_admission`)
-    and tool-call contents are walked in message order above, with the
-    primary mode sequential (`allow_multiple_tool_calls: False`), so index
-    *i* of `executions` corresponds to index *i* of `tool_calls`. A length
-    mismatch or a tool-name mismatch at the same index means the positional
-    assumption doesn't hold here -- reject to `None` (honest absence)
-    rather than attribute latency to the wrong round.
+    `wrap_tools_with_admission` appends an executed call's record in the
+    `finally`, i.e. at *completion*, and a refusal's before it returns the
+    refusal constant, i.e. at *admission*. Those two orders are identical
+    only while the run is sequential -- which is the primary mode here
+    (`allow_multiple_tool_calls: False`) and precisely the assumption the
+    guards below exist to protect. Tool-call contents are walked in message
+    order above, so under that assumption index *i* of `executions`
+    corresponds to index *i* of `tool_calls`. A length mismatch or a
+    tool-name mismatch at the same index means the positional assumption
+    doesn't hold here -- reject to `None` (honest absence) rather than
+    attribute latency to the wrong round.
     """
     if len(executions) != len(tool_calls):
         logger.info(
@@ -441,6 +448,17 @@ class FakeAgentService:
         usage = TokenUsage(
             input_tokens=20, output_tokens=10, total_tokens=30, reasoning_tokens=0
         )
+        # The stop shape below is hardcoded, and it is honest only by
+        # coincidence at the *default* constants: the fake makes one call per
+        # tool in one round (3 <= AGENT_MAX_TOOL_CALLS = 10) and reports two
+        # model calls (2 <= AGENT_MAX_ITERATIONS + 1 = 6), so `derive_stop`
+        # would return exactly this. The fake applies no admission counter and
+        # holds no Settings, so lowering either limit (e.g.
+        # AGENT_MAX_TOOL_CALLS=2) leaves it still reporting a natural stop with
+        # zero refusals while `get_runtime_config` tells the model the limit is
+        # 2. Deriving these would mean giving the fake the settings it
+        # deliberately does not take; the applied-guardrail claim is narrowed at
+        # its source instead (see `make_get_runtime_config`).
         return AgentRunResult(
             answer=f"[fake-agent] {task} (tools={len(tool_calls)}) " + " ".join(outputs),
             model_call_count=2,  # one tool round + one final answer
@@ -582,8 +600,14 @@ class AgentFrameworkService:
         if self._closed:
             return
         self._closed = True
-        await self._client.close()
-        await self._toolset.retriever.aclose()
+        # Both handles are owned from construction, so both must be released:
+        # a raising transport close must not strand the retriever (`__init__`
+        # already guards the mirror case). `_closed` is set above, so this
+        # stays idempotent whichever close raises.
+        try:
+            await self._client.close()
+        finally:
+            await self._toolset.retriever.aclose()
 
 
 def build_agent_service(settings: Settings, toolset: AgentToolset) -> AgentService:
@@ -591,3 +615,25 @@ def build_agent_service(settings: Settings, toolset: AgentToolset) -> AgentServi
     if settings.use_fake_llm:
         return FakeAgentService(toolset)
     return AgentFrameworkService(settings, toolset)
+
+
+__all__ = [
+    "AGENT_MAX_TASK_BYTES",
+    "REFUSAL_MESSAGE",
+    "AdmissionState",
+    "AgentFrameworkService",
+    "AgentRoundMetrics",
+    "AgentRunError",
+    "AgentRunResult",
+    "AgentService",
+    "AgentTaskTooLargeError",
+    "AgentToolCall",
+    "FakeAgentService",
+    "ToolExecution",
+    "build_agent_service",
+    "derive_stop",
+    "extract_run_shape",
+    "map_usage_details",
+    "validate_task",
+    "wrap_tools_with_admission",
+]

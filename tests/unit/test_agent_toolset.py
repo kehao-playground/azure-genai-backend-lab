@@ -9,6 +9,19 @@ from azgenai_lab.services.embeddings import FakeEmbeddingClient
 
 OPS = Principal(tenant_id="opsdemo", group_ids=())
 
+
+def _settings() -> Settings:
+    """Settings isolated from the repo-root `.env`.
+
+    `conftest.py` pins only the three fake-adapter flags, so every other
+    field is still ambient: a developer's untracked `.env` would otherwise
+    reach these assertions, and no fresh clone or CI checkout would
+    reproduce the failure (the same hazard `tests/unit/test_config.py`
+    avoids with `_env_file=None`).
+    """
+    return Settings(_env_file=None)
+
+
 # The format `make_parent_id` derives a key with (models/rag.py): everything
 # before the doc-id length digit is fixed by the tenant id alone, so this
 # prefix identifies every parent id that belongs to the "opsdemo" tenant
@@ -20,7 +33,7 @@ async def test_fake_toolset_search_finds_ops_corpus() -> None:
     # use_fake_search default builds an *empty* FakeSearchClient; the toolset
     # must seed it with the real corpus so fake-mode demos ground on documents.
     toolset = build_agent_toolset(
-        Settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+        _settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     try:
         search_docs = toolset.tools[0]
@@ -38,7 +51,7 @@ async def test_fake_toolset_search_hits_are_scoped_to_the_caller_tenant() -> Non
     # cross-tenant document out of an opsdemo caller's results — otherwise an
     # ACL regression here would only fail by accident.
     toolset = build_agent_toolset(
-        Settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+        _settings(), OPS, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     try:
         search_docs = toolset.tools[0]
@@ -54,7 +67,7 @@ async def test_fake_toolset_search_hits_are_scoped_to_the_caller_tenant() -> Non
 
 async def test_toolset_shares_the_supplied_store() -> None:
     store = InMemoryConversationStore()
-    toolset = build_agent_toolset(Settings(), OPS, conversation_store=store, token_budget=400)
+    toolset = build_agent_toolset(_settings(), OPS, conversation_store=store, token_budget=400)
     try:
         # Identity check: the toolset reports back the caller's store object.
         assert toolset.conversation_store is store
@@ -86,7 +99,7 @@ async def test_toolset_runtime_config_and_usage_report_the_same_budget() -> None
     await store.append(
         OPS.tenant_id, "c1", turns=[], replay_items=[], expected_revision=0, usage_tokens=10
     )
-    toolset = build_agent_toolset(Settings(), OPS, conversation_store=store, token_budget=777)
+    toolset = build_agent_toolset(_settings(), OPS, conversation_store=store, token_budget=777)
     try:
         get_runtime_config, get_conversation_usage = toolset.tools[1], toolset.tools[2]
         config_payload = json.loads(await get_runtime_config())
