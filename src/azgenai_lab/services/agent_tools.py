@@ -7,13 +7,21 @@ budget — those are fixed at composition (fail-closed, Day 15 / Day 16 R2).
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.services.azure_search import FakeSearchClient
+from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.conversation_store import ConversationStore
-from azgenai_lab.services.retrieval import Retriever
+from azgenai_lab.services.document_loader import load_documents
+from azgenai_lab.services.embeddings import FakeEmbeddingClient, embed_chunks
+from azgenai_lab.services.retrieval import Retriever, build_retriever
 
 # Cost-control constants (spec §2). Byte caps, not char caps: a BPE token is
 # >= 1 UTF-8 byte, so byte caps yield token-denominated upper bounds (Day 14).
@@ -155,6 +163,106 @@ def make_get_conversation_usage(
     return get_conversation_usage
 
 
+def _run_sync[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Run one async call from this module's synchronous composition code.
+
+    `build_agent_toolset` follows this repo's synchronous `build_*`
+    convention (composition happens once, with no event loop of its own),
+    but seeding the fake retriever must await `embed_chunks` — the same
+    batching call `tools/index_corpus.py` awaits when it builds a live
+    index. A dedicated thread runs its own event loop for that one call, so
+    this also works when `build_agent_toolset` is itself invoked from
+    inside a running loop (as in this module's own async tests), where a
+    bare `asyncio.run()` would raise "cannot be called from a running event
+    loop".
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coro).result()
+
+
+async def _seed_index_documents(
+    embedding_client: FakeEmbeddingClient, settings: Settings
+) -> list[dict[str, Any]]:
+    """Load, chunk and embed every sample document into index-document shape.
+
+    Mirrors the per-document loop in `tools/index_corpus.py` (load ->
+    chunk -> embed -> `to_index_document`) exactly, with a fake embedding
+    client standing in for the live one. Every tenant's corpus is included,
+    not just opsdemo's: the real system is one shared index scoped by a
+    document-level ACL filter (Day 15), and a fake that only ever held one
+    tenant's documents would not exercise that filter at all. Correctness
+    still comes from `FakeSearchClient.search`, which enforces the same
+    `is_document_visible` policy the real service's ACL filter expresses in
+    OData.
+    """
+    index_documents: list[dict[str, Any]] = []
+    for source in load_documents():
+        chunks = chunk_markdown(
+            source, max_chars=settings.chunk_max_chars, overlap_chars=settings.chunk_overlap_chars
+        )
+        vectors = await embed_chunks(embedding_client, chunks)
+        index_documents.extend(
+            chunk.to_index_document(vector)
+            for chunk, vector in zip(chunks, vectors, strict=True)
+        )
+    return index_documents
+
+
+def _seeded_fake_retriever(settings: Settings) -> Retriever:
+    """A `Retriever` over a `FakeSearchClient` seeded with the real corpus.
+
+    In fake mode, `build_search_client` returns an **empty**
+    `FakeSearchClient` (Day 13) — a wiring demo over zero documents would
+    prove nothing, so this seeds it through the real chunking pipeline
+    instead, with `FakeEmbeddingClient` standing in for a live embedding
+    call. Its vectors carry no semantics (Day 12), which is fine here:
+    `FakeSearchClient` scores lexically in every mode and never reads them.
+    """
+    embedding_client = FakeEmbeddingClient()
+    index_documents = _run_sync(_seed_index_documents(embedding_client, settings))
+    return Retriever(embedding_client, FakeSearchClient(index_documents), top=settings.rag_top)
+
+
+@dataclass
+class AgentToolset:
+    """Tools plus the ownership handles the composite service must close."""
+
+    tools: tuple[AgentToolFn, ...]
+    retriever: Retriever
+    conversation_store: ConversationStore
+
+
+def build_agent_toolset(
+    settings: Settings,
+    principal: Principal,
+    *,
+    conversation_store: ConversationStore,
+    token_budget: int,
+) -> AgentToolset:
+    """Bind all three least-privilege tools to one shared set of dependencies.
+
+    `principal`, `conversation_store` and `token_budget` are each fixed once
+    here and closed over by every tool that needs them — the agent chooses
+    only the arguments the tool signatures expose (query text, a
+    conversation id), never the tenant, groups, store or budget (Day 15 /
+    Day 16 R2). `token_budget` is one number passed to both
+    `make_get_runtime_config` and `make_get_conversation_usage`, so the
+    guardrail the config tool reports and the one the usage tool checks
+    against can never drift apart. `conversation_store` is the same object
+    the caller seeds a demo conversation into, so that conversation is
+    visible through `get_conversation_usage`.
+    """
+    retriever = (
+        _seeded_fake_retriever(settings) if settings.use_fake_search else build_retriever(settings)
+    )
+    tools = (
+        make_search_docs(retriever, principal),
+        make_get_runtime_config(settings, token_budget),
+        make_get_conversation_usage(conversation_store, principal, token_budget),
+    )
+    return AgentToolset(tools=tools, retriever=retriever, conversation_store=conversation_store)
+
+
 __all__ = [
     "MAX_REFUSAL_RESULT_BYTES",
     "MAX_SEARCH_HITS",
@@ -162,6 +270,8 @@ __all__ = [
     "MAX_TOOL_RESULT_BYTES",
     "NEAR_EXHAUSTED_THRESHOLD",
     "AgentToolFn",
+    "AgentToolset",
+    "build_agent_toolset",
     "make_get_conversation_usage",
     "make_get_runtime_config",
     "make_search_docs",
