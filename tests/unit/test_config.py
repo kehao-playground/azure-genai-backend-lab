@@ -92,3 +92,16 @@ def test_rag_top_upper_bound() -> None:
     assert Settings(_env_file=None, rag_top=50).rag_top == 50
     with pytest.raises(ValidationError):
         Settings(_env_file=None, rag_top=51)
+
+
+def test_agent_limits_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.agent_max_iterations == 5
+    assert settings.agent_max_tool_calls == 10
+
+
+@pytest.mark.parametrize("field", ["agent_max_iterations", "agent_max_tool_calls"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_agent_limits_must_be_positive(field: str, bad: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{"_env_file": None, field: bad})
