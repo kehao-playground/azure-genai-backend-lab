@@ -14,7 +14,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 import openai
 
@@ -111,6 +111,28 @@ class AgentRunError(Exception):
     def __init__(self, message: str, *, usage: TokenUsage | None = None) -> None:
         super().__init__(message)
         self.usage = usage
+
+
+_pending_transport_closes: set[asyncio.Task[None]] = set()
+
+
+def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
+    """Close a transport from synchronous code (partial-construction cleanup).
+
+    `__init__` cannot await, so the client's `close()` coroutine is run to
+    completion when no loop is running and handed to the running loop
+    otherwise, holding a strong reference so the task is not garbage-collected
+    mid-flight. This is only reached before any request has been sent, so the
+    pool holds no live connection and the close is bookkeeping, not I/O.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(client.close())
+        return
+    task = loop.create_task(client.close())
+    _pending_transport_closes.add(task)
+    task.add_done_callback(_pending_transport_closes.discard)
 
 
 class AgentService(Protocol):
@@ -460,9 +482,6 @@ class AgentFrameworkService:
                 "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT, "
                 "AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME"
             )
-        from agent_framework import Agent
-        from agent_framework.openai import OpenAIChatClient
-
         self._settings = settings
         self._toolset = toolset
         self._prompt = load_prompt("ops_agent")
@@ -475,6 +494,20 @@ class AgentFrameworkService:
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+        # Everything after the transport exists runs under this guard: the
+        # transport is owned from the moment it is constructed, and a failure
+        # in either framework constructor would otherwise strand it (aclose()
+        # is only reachable on a service that was fully built).
+        try:
+            self._build_agent(settings)
+        except BaseException:
+            _close_transport_best_effort(self._client)
+            raise
+
+    def _build_agent(self, settings: Settings) -> None:
+        from agent_framework import Agent
+        from agent_framework.openai import OpenAIChatClient, OpenAIChatOptions
+
         chat_client = OpenAIChatClient(
             model=settings.azure_openai_deployment_name,
             async_client=self._client,
@@ -483,20 +516,19 @@ class AgentFrameworkService:
                 "max_function_calls": settings.agent_max_tool_calls,
             },
         )
-        # `max_output_tokens` is a Responses-API passthrough, not one of the
-        # keys the framework's closed ChatOptions TypedDict declares (it
-        # declares `max_tokens`, the chat-completions spelling). The client
-        # forwards unrecognized option keys to the request verbatim, which is
-        # what carries Day 9's per-call cap here — hence the cast, and hence
-        # the wire-payload test that pins all three of these options.
-        default_options = cast(
-            "Any",
-            {
-                "store": False,
-                "max_output_tokens": settings.llm_max_output_tokens,
-                "allow_multiple_tool_calls": False,
-            },
-        )
+        # All three keys are declared on OpenAIChatOptions, so the TypedDict
+        # annotation (no cast) keeps mypy checking every one of them. Two are
+        # renamed on the way to the wire by `_prepare_options`'s translation
+        # table: `max_tokens` -> `max_output_tokens` (the Responses spelling of
+        # Day 9's per-call cap — `max_tokens` is this client's option name for
+        # it, not a chat-completions leftover) and `allow_multiple_tool_calls`
+        # -> `parallel_tool_calls`. The wire-payload test pins the renamed
+        # forms, since the option names alone prove nothing about the request.
+        default_options: OpenAIChatOptions = {
+            "store": False,
+            "max_tokens": settings.llm_max_output_tokens,
+            "allow_multiple_tool_calls": False,
+        }
         # Tools deliberately absent here: each run() wraps them with a fresh
         # AdmissionState and passes them per-run (spec §2a).
         self._agent = Agent(
@@ -513,6 +545,12 @@ class AgentFrameworkService:
         try:
             response = await self._agent.run(task, tools=wrapped)
         except Exception as exc:  # framework/provider terminal failure
+            # usage=None is the honest value, not an omission: the framework's
+            # loop keeps its running `aggregated_usage` as a function local and
+            # attaches it only to a response it returns, never to anything it
+            # raises. A mid-loop failure has already been billed for the calls
+            # that completed, but that number is discarded above us and there is
+            # no supported way to reach it (Day 9: never fabricate counts).
             raise AgentRunError(str(exc), usage=None) from exc
         shape = extract_run_shape(
             response.messages, executions, refusal_message=REFUSAL_MESSAGE

@@ -8,16 +8,30 @@ call the framework makes on it (`responses.with_raw_response.create`) is
 mocked to always answer with function calls, so the run can only end at a
 limit.
 
-The mock answers with a *batch* of `_CALLS_PER_RESPONSE` calls. That is the
-one shape that separates the three layers: the framework's own
-`max_function_calls` is a between-batch check (it sets `tool_choice="none"`
-after a batch lands), so it cannot bound a batch that is already larger than
-what is left of the budget. The per-run admission counter can, and that is
-exactly what `test_function_call_limit_via_admission` pins. A batch of 3
-against a budget of 2 is the smallest overshoot that shows it.
+Two mock shapes are driven, because the limits behave differently under each:
+
+* *Batch* (`CALLS_PER_RESPONSE` calls per response) separates the three
+  layers. The framework's own `max_function_calls` is a between-batch check
+  (it sets `tool_choice="none"` after a batch lands), so it cannot bound a
+  batch that is already larger than what is left of the budget. The per-run
+  admission counter can, and that is exactly what
+  `test_function_call_limit_via_admission` pins. A batch of 3 against a
+  budget of 2 is the smallest overshoot that shows it.
+* *Sequential* (one call per response) is the shape production actually
+  ships: `allow_multiple_tool_calls=False` reaches the wire as
+  `parallel_tool_calls=False` (pinned by
+  `test_guardrail_options_reach_the_request`), so a real provider answers one
+  call at a time. Under that shape admission never refuses anything — the
+  framework disables tools first — and the run ends on the framework's own
+  fallback text. `test_function_call_limit_sequential_mode` pins that
+  outcome, and is also where the trace-derived fields (`answer`,
+  `tool_calls`, `tool_round_count`, `per_round`) are asserted against real
+  framework message assembly.
 """
 
+import asyncio
 import itertools
+from collections.abc import Sequence
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -54,6 +68,29 @@ TOOL_NAME = "get_runtime_config"
 # test (2) for admission to have anything to refuse.
 CALLS_PER_RESPONSE = 3
 
+# Sequential runs alternate two tool names so the positional join's
+# tool-name-mismatch guard (`_join_executions_to_rounds`) is checked against a
+# transcript where a mis-ordered join would actually differ. A single repeated
+# name makes that guard vacuous.
+SEQUENTIAL_TOOL_NAMES = ("get_runtime_config", "get_conversation_usage")
+
+# Arguments the mock emits per tool. Both tools answer without touching a
+# provider: the runtime-config snapshot is pure settings, and an unknown
+# conversation id is the documented not-found shape, not an error.
+TOOL_ARGUMENTS = {
+    "get_runtime_config": "{}",
+    "get_conversation_usage": '{"conversation_id": "no-such-conversation"}',
+}
+
+# `agent_framework._tools._FUNCTION_INVOCATION_LIMIT_FALLBACK_TEXT`, injected by
+# `_ensure_function_invocation_limit_fallback_response` when the tool budget is
+# spent and the response it stripped calls out of had no other visible content.
+# It surfaces verbatim as the app's `answer`: the adapter reports the terminal
+# assistant message's text, and this is that text.
+FUNCTION_LIMIT_FALLBACK = (
+    "Function invocation limit reached before a final answer could be produced."
+)
+
 # Per model call, so a three-call run aggregates to 30 / 15 / 45 / 6.
 INPUT_TOKENS = 10
 OUTPUT_TOKENS = 5
@@ -76,7 +113,10 @@ class _RawResponseStub:
         return self._response
 
 
-def _tool_calling_response(counter: "itertools.count[int]") -> Response:
+def _tool_calling_response(
+    counter: "itertools.count[int]", tool_names: Sequence[str] = ()
+) -> Response:
+    names = tool_names or (TOOL_NAME,) * CALLS_PER_RESPONSE
     return Response(
         id="resp_mock",
         created_at=0.0,
@@ -87,11 +127,11 @@ def _tool_calling_response(counter: "itertools.count[int]") -> Response:
                 type="function_call",
                 id=f"fc_{index}",
                 call_id=f"call_{index}",
-                name=TOOL_NAME,
-                arguments="{}",
+                name=name,
+                arguments=TOOL_ARGUMENTS[name],
                 status="completed",
             )
-            for index in (next(counter) for _ in range(CALLS_PER_RESPONSE))
+            for index, name in ((next(counter), name) for name in names)
         ],
         parallel_tool_calls=False,
         tool_choice="auto",
@@ -124,6 +164,22 @@ def _install_always_tool_calling_mock(service: AgentFrameworkService) -> None:
     service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
 
 
+def _install_sequential_tool_calling_mock(service: AgentFrameworkService) -> None:
+    """Same seam, but one call per response — the production wire shape.
+
+    `parallel_tool_calls=False` is what the service sends, so a provider
+    answers with a single function call per turn; this mock reproduces that,
+    cycling `SEQUENTIAL_TOOL_NAMES` so consecutive rounds differ.
+    """
+    counter = itertools.count()
+    names = itertools.cycle(SEQUENTIAL_TOOL_NAMES)
+
+    async def _create(**_kwargs: Any) -> _RawResponseStub:
+        return _RawResponseStub(_tool_calling_response(counter, (next(names),)))
+
+    service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
+
+
 def _make_mock_raise(service: AgentFrameworkService) -> None:
     request = httpx.Request("POST", "https://masked.example/openai/v1/responses")
     service._client.responses.with_raw_response.create = AsyncMock(
@@ -131,13 +187,16 @@ def _make_mock_raise(service: AgentFrameworkService) -> None:
     )
 
 
-def _service(**overrides: Any) -> AgentFrameworkService:
+def _service(*, sequential: bool = False, **overrides: Any) -> AgentFrameworkService:
     settings = REAL.model_copy(update=overrides)
     toolset = build_agent_toolset(
         settings, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     service = AgentFrameworkService(settings, toolset)
-    _install_always_tool_calling_mock(service)
+    if sequential:
+        _install_sequential_tool_calling_mock(service)
+    else:
+        _install_always_tool_calling_mock(service)
     return service
 
 
@@ -167,12 +226,59 @@ async def test_function_call_limit_via_admission() -> None:
     assert result.refused_call_count >= 1
 
 
+async def test_function_call_limit_sequential_mode() -> None:
+    """The shape production ships: one call per response, no refusals.
+
+    With `parallel_tool_calls=False` on the wire the framework's own
+    between-batch check is enough. After the second call lands,
+    `_disable_tools_at_function_call_limit` sets `tool_choice="none"`; the
+    third response's call is then dropped by
+    `_ensure_function_invocation_limit_fallback_response` *before* dispatch,
+    so admission is never asked and `refused_call_count` stays 0. The budget
+    signal therefore comes from `executed >= max_tool_calls` alone.
+    """
+    service = _service(sequential=True, agent_max_iterations=5, agent_max_tool_calls=2)
+    try:
+        result = await service.run("loop forever")
+    finally:
+        await service.aclose()
+
+    assert result.refused_call_count == 0  # admission never sees the dropped call
+    assert "function_call_limit" in result.limit_reasons
+    assert result.stop_reason == "function_call_limit"
+    assert result.tool_call_count == 2
+    # Two tool rounds plus the forced final response that carries the fallback.
+    assert result.model_call_count == 3
+    assert result.tool_round_count == 2
+    # Not "nice to have": this is the canned string the framework injects when
+    # it strips the over-budget call and the response has nothing else visible.
+    assert result.answer == FUNCTION_LIMIT_FALLBACK
+    assert result.usage is not None
+    assert result.usage.total_tokens == 3 * TOTAL_TOKENS
+
+    assert [call.tool_name for call in result.tool_calls] == list(SEQUENTIAL_TOOL_NAMES)
+    assert all(call.executed for call in result.tool_calls)
+    assert [call.round_index for call in result.tool_calls] == [1, 2]
+    assert result.tool_calls[1].arguments == {"conversation_id": "no-such-conversation"}
+
+    # per_round's failure mode is a silent None: the positional join rejects
+    # rather than mis-attribute. Two differently-named calls make the
+    # tool-name guard meaningful, so a non-None result here says the join
+    # really held against framework-assembled messages.
+    assert result.per_round is not None
+    assert [metrics.round_index for metrics in result.per_round] == [1, 2]
+    assert all(metrics.latency_ms is not None for metrics in result.per_round)
+    assert all(metrics.usage is None for metrics in result.per_round)
+
+
 async def test_guardrail_options_reach_the_request() -> None:
     """The three cost bounds are only real if they reach the wire.
 
-    `max_output_tokens` is not a declared `ChatOptions` key (the service
-    casts around that), and `allow_multiple_tool_calls` is renamed on the
-    way out, so both are asserted on the payload the SDK would have sent.
+    Two of the three are renamed by `_prepare_options` on the way out
+    (`max_tokens` -> `max_output_tokens`, `allow_multiple_tool_calls` ->
+    `parallel_tool_calls`), so the option names the service sets prove
+    nothing on their own; all three are asserted on the payload the SDK
+    would have sent.
     """
     captured: list[dict[str, Any]] = []
     service = _service(agent_max_iterations=1)
@@ -220,6 +326,46 @@ async def test_build_selects_real_adapter_and_aclose_is_idempotent() -> None:
     assert isinstance(service, AgentFrameworkService)
     await service.aclose()
     await service.aclose()  # idempotent
+
+
+async def test_partial_construction_closes_the_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A framework constructor that raises must not strand the transport.
+
+    `aclose()` is only reachable on a service that was fully built, so the
+    transport created before `OpenAIChatClient`/`Agent` has no other owner.
+    """
+    import agent_framework
+
+    created: list[openai.AsyncOpenAI] = []
+    real_client_cls = openai.AsyncOpenAI
+
+    class _CapturingClient(real_client_cls):  # type: ignore[valid-type, misc]
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            created.append(self)
+
+    def _exploding_agent(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("agent construction failed")
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _CapturingClient)
+    monkeypatch.setattr(agent_framework, "Agent", _exploding_agent)
+
+    toolset = build_agent_toolset(
+        REAL, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    with pytest.raises(RuntimeError, match="agent construction failed"):
+        AgentFrameworkService(REAL, toolset)
+    await toolset.retriever.aclose()
+
+    assert len(created) == 1
+    # __init__ is sync, so the close is scheduled on this loop; give it a step.
+    for _ in range(5):
+        if created[0].is_closed():
+            break
+        await asyncio.sleep(0)
+    assert created[0].is_closed()
 
 
 async def test_missing_azure_configuration_fails_fast() -> None:
