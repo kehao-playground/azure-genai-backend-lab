@@ -8,6 +8,7 @@ AgentService Protocol and plain dataclasses, never agent_framework types
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -113,26 +114,23 @@ class AgentRunError(Exception):
         self.usage = usage
 
 
-_pending_transport_closes: set[asyncio.Task[None]] = set()
-
-
 def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
     """Close a transport from synchronous code (partial-construction cleanup).
 
-    `__init__` cannot await, so the client's `close()` coroutine is run to
-    completion when no loop is running and handed to the running loop
-    otherwise, holding a strong reference so the task is not garbage-collected
-    mid-flight. This is only reached before any request has been sent, so the
-    pool holds no live connection and the close is bookkeeping, not I/O.
+    Best-effort only: `__init__` cannot await, and this runs while a real
+    construction error is already propagating, so a failure here must never
+    replace it — `contextlib.suppress` guarantees that. When no loop is
+    running there is nothing to schedule the close on, so the client is left
+    for garbage collection instead: only two pure-sync constructors run
+    between transport creation and here, so no request has been sent and the
+    pool holds no live connection to release.
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        asyncio.run(client.close())
-        return
-    task = loop.create_task(client.close())
-    _pending_transport_closes.add(task)
-    task.add_done_callback(_pending_transport_closes.discard)
+        return  # no running loop: connection-less client, dropped to GC
+    with contextlib.suppress(Exception):
+        loop.create_task(client.close())
 
 
 class AgentService(Protocol):
