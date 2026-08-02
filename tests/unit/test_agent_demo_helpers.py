@@ -350,6 +350,25 @@ def test_near_answer_direction_is_not_satisfied_by_echoing_the_question() -> Non
     assert outcomes["diagnostic-near:answer_direction"] == "failed"
 
 
+def test_near_answer_direction_passes_on_ledger_figure_without_429_wording() -> None:
+    # The pass condition is the ledger-derived figure alone; "429"/"exhaust"
+    # wording is a recorded signal, not a requirement. A live answer phrased
+    # without that vocabulary but with the correct numbers must still pass —
+    # otherwise a paid live run fails on a wording preference, not a defect.
+    settings = Settings()
+    records = _passing_records(settings)
+    records["diagnostic-near"] = _record(
+        "diagnostic-near",
+        "It has spent 320 tokens and has 80 remaining.",
+        records["diagnostic-near"].trace,  # type: ignore[attr-defined]
+    )
+    assertions = assert_suite(records, settings, _seed_outcome(), live=True)
+    outcomes = _outcomes(assertions)
+    assert outcomes["diagnostic-near:answer_direction"] == "passed"
+    (assertion,) = [a for a in assertions if a.name == "diagnostic-near:answer_direction"]
+    assert "not observed" in assertion.detail  # type: ignore[attr-defined]
+
+
 def test_live_suite_passes_when_the_answers_carry_ledger_figures() -> None:
     settings = Settings()
     assertions = assert_suite(_passing_records(settings), settings, _seed_outcome(), live=True)

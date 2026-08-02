@@ -737,18 +737,22 @@ def assert_suite(
                 evidence_form=evidence.form,
             )
         )
-        # The ledger figures are what makes this unearnable by paraphrase:
-        # DIAGNOSTIC_TEMPLATE already contains "429", so the wording alone is
-        # satisfied by an answer that only restates the question.
+        # The ledger figure is what makes this unearnable by paraphrase:
+        # DIAGNOSTIC_TEMPLATE already contains "429", so wording alone is
+        # satisfied by an answer that only restates the question. The
+        # "429"/"exhaust" wording is recorded for the article but is not part
+        # of the pass condition — a correct live answer phrased without that
+        # vocabulary must not fail on a wording preference.
         near_hits = sorted(figure for figure in near_figures if figure in near.answer)
         near_lower = near.answer.lower()
         wording_hits = [word for word in ("429", "exhaust") if word in near_lower]
+        wording_note = f"observed (saw {wording_hits})" if wording_hits else "not observed"
         _check(
             results,
             "diagnostic-near:answer_direction",
-            bool(near_hits) and bool(wording_hits),
-            f"expected a ledger figure from {sorted(near_figures)} (saw {near_hits}) "
-            f"and 429/exhaustion wording (saw {wording_hits})",
+            bool(near_hits),
+            f"expected a ledger figure from {sorted(near_figures)} (saw {near_hits}); "
+            f"429/exhaustion wording {wording_note}",
         )
         fresh_hits = sorted(figure for figure in fresh_figures if figure in fresh.answer)
         _check(
