@@ -4,7 +4,7 @@ Long-lived clients — the Azure OpenAI ``AsyncOpenAI`` instances behind chat
 and embeddings, and the search ``httpx.AsyncClient`` — have no shutdown path
 except an explicit ``aclose()``. Each composed service must forward
 ``aclose()`` to everything it owns exactly once (idempotent), and
-``create_app()``'s lifespan must call it on the two top-level services it
+``create_app()``'s lifespan must call it on the top-level services it
 builds at startup.
 """
 
