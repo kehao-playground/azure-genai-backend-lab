@@ -140,7 +140,11 @@ def _parse_bearer_token(request: Request) -> str:
         raise unauthorized()
 
     raw = values[0]
-    if len(raw.encode("ascii", errors="replace")) > MAX_AUTHORIZATION_HEADER_BYTES:
+    # Characters, which are bytes here: Starlette decodes header values as
+    # latin-1, so the two coincide (see MAX_GROUP_IDS_HEADER_BYTES above).
+    # Encoding first would read as if it were counting something else while
+    # producing the same number.
+    if len(raw) > MAX_AUTHORIZATION_HEADER_BYTES:
         raise unauthorized()
 
     parts = raw.split(" ")
@@ -245,13 +249,21 @@ class EntraJwtPrincipalResolver:
         anywhere to explain it. Resolving the overage properly needs a Graph
         lookup, which is out of scope, so the honest answer is to refuse.
         """
-        hasgroups = claims.get("hasgroups")
-        if hasgroups is not None and hasgroups is not False:
-            # `is not False` rather than truthiness: a `hasgroups` of `"true"`
-            # or `1` is a token shape we do not recognise, and guessing at an
-            # overage signal's meaning is the one thing this must not do.
+        # `hasgroups` is a flag, so only one value means "no overage": exactly
+        # `False`. Present-and-anything-else — `true`, `"true"`, `1`, `null` —
+        # is either the signal itself or a shape we do not recognise, and
+        # guessing at what an unrecognised overage signal meant is the one
+        # thing this must not do. `null` is refused for the same reason `1`
+        # is; it is not treated as absence, because a flag that is present has
+        # already told us the issuer had something to say about groups.
+        if "hasgroups" in claims and claims["hasgroups"] is not False:
             raise unauthorized()
 
+        # `_claim_names` is a *pointer* rather than a flag, which is why its
+        # null is read the other way: a null carries no pointer, so it names
+        # no claim as living elsewhere. Only an entry for `groups` is an
+        # overage signal — Entra also uses this claim for unrelated
+        # distributed claims.
         claim_names = claims.get("_claim_names")
         if claim_names is not None:
             if not isinstance(claim_names, Mapping):
@@ -287,6 +299,19 @@ class EntraJwtPrincipalResolver:
         granted as a delegated scope. The configured value that is `None` never
         matches anything — "not configured" means "this credential type is not
         accepted", not "not checked".
+
+        Residual, stated because the rule above reads stronger than it is:
+        the presence of `scp` is a proxy for "delegated", not proof of it. A
+        user token for an app exposing no delegated scopes carries `roles` and
+        no `scp`, and would be admitted through the app-only gate. What
+        actually bounds this is tenant configuration the code cannot see — an
+        app role whose `allowedMemberTypes` is `["Application"]` cannot be
+        assigned to a user — and the claim that would settle it in the token
+        itself is `idtyp`, which distinguishes an app token from an app+user
+        token. Requesting it means an optional-claims manifest change plus a
+        fallback for its absence, so it is out of scope here; both branches
+        produce the same `Principal`, so the blast radius is which gate a
+        credential passes, not what it becomes.
         """
         if "scp" in claims:
             scp = claims["scp"]
