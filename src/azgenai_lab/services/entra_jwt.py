@@ -239,14 +239,19 @@ class EntraTokenVerifier:
             # window where this reads False and the acquire below still
             # queues behind a draining waiter list.
             #
-            # That window costs event-loop ticks, not a round trip. Waiters
-            # only ever queue here through the unconditional miss path above,
-            # and by the time any of them is woken the holder has already
-            # stamped `_last_refresh_attempt` — so each one returns at a guard
-            # without touching the network. A refresh cannot outlast the
-            # cooldown that suppresses them either: both legs carry
-            # `HTTP_TIMEOUT_SECONDS`, capping a refresh near 20s against a 60s
-            # window.
+            # That window costs event-loop ticks rather than a round trip.
+            # Waiters only ever queue here through the unconditional miss path
+            # above, and by the time any of them is woken the holder has
+            # already stamped `_last_refresh_attempt` — so each returns at a
+            # guard without touching the network, provided the refresh that
+            # stamped it is still inside the cooldown. In practice it is: both
+            # legs carry `HTTP_TIMEOUT_SECONDS`, putting a refresh near 20s
+            # against a 60s window. That is a practical bound and not a
+            # guaranteed one — httpx's timeout is per-operation, not a total
+            # deadline, so a provider trickling bytes could hold a read open
+            # past the window. The cost if it ever happens is bounded anyway:
+            # this one request blocks on a real fetch, which is exactly the
+            # pre-reorder behaviour, for itself instead of for everyone.
             #
             # What this check does buy is the thing that matters: while a
             # fetch is genuinely in flight, a request holding a key we can
