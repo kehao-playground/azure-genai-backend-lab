@@ -217,6 +217,31 @@ async def test_tenant_id_var_lifecycle_around_the_dependency() -> None:
     assert user_id_var.get() == "-"
 
 
+async def test_require_principal_logs_identity_resolved_once_after_both_vars_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Attached-but-unverified is the exact shape the Day 15 tenant_id defect
+    # took (record.tenant_id was set, but nothing rendered it) — this test
+    # exercises the real dependency (not a hand-built record) to prove the
+    # "identity resolved" event actually fires, exactly once, and only after
+    # both ContextVars carry the resolved values rather than their "-"
+    # defaults.
+    request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
+    gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
+    with caplog.at_level(logging.INFO, logger="azgenai_lab.api.principal"):
+        try:
+            await anext(gen)
+        finally:
+            await gen.aclose()
+
+    identity_records = [r for r in caplog.records if r.getMessage() == "identity resolved"]
+    assert len(identity_records) == 1
+    record = identity_records[0]
+    assert record.levelno == logging.INFO
+    assert record.tenant_id == "t1"  # type: ignore[attr-defined]
+    assert record.user_id == "u1"  # type: ignore[attr-defined]
+
+
 def _emit_record() -> logging.LogRecord:
     """Build a real LogRecord through the configured global factory (the same
     one core/logging.py installs at startup), not by constructing one
