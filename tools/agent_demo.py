@@ -774,7 +774,7 @@ async def run_question(
     sink.clear()
     started = time.perf_counter()
     try:
-        result = await service.run(question)
+        result = await service.run(question, (), principal=DEMO_PRINCIPAL)
     except AgentRunError as exc:
         # Redaction (Task 13 carry-forward): AgentRunError's message is
         # str(provider_exception) and can carry the endpoint host. Only the
@@ -1406,11 +1406,10 @@ async def main() -> None:
         await seed_service.aclose()
         await baseline_service.aclose()
         _config_error(str(exc))
-    # TODO(day18-task6/7): the fixed opsdemo principal now binds inside the
-    # adapters' run() (agent_framework.py), so wrap_tools_with_recorder can no
-    # longer wrap the tools the service actually calls at this call site —
-    # `sink` stays empty until per-run principal binding is threaded through
-    # here too.
+    # TODO(day18): the principal now binds per-run inside the adapters'
+    # run() (agent_framework.py), so wrap_tools_with_recorder cannot wrap the
+    # tools the service actually calls at this call site — `sink` stays empty
+    # until a recorder seam is threaded through the per-run binding.
 
     # The fresh conversation and both preconditions, now that there is a budget
     # to hold them against. Still before the agent service exists, so its own

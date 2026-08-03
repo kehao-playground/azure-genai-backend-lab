@@ -47,13 +47,17 @@ from openai.types.responses import (
 from openai.types.responses.response_usage import ResponseUsage
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.agent_framework import (
     AgentFrameworkService,
+    AgentHistoryTurn,
     AgentRunError,
     build_agent_service,
 )
 from azgenai_lab.services.agent_tools import build_agent_tool_deps
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
+
+OPS = Principal(tenant_id="opsdemo", group_ids=())
 
 REAL = Settings(
     use_fake_llm=False,
@@ -257,10 +261,132 @@ def _service(
     return service
 
 
+def _service_capturing_requests(
+    *, sequential: bool = True
+) -> tuple[AgentFrameworkService, list[dict[str, Any]]]:
+    """Same construction as `_service`, but the mocked transport appends each
+    outgoing JSON body to `captured` before answering with a terminal
+    model-authored text response (mirrors the capture point of
+    `test_guardrail_options_reach_the_request`)."""
+    del sequential  # single terminal response: shape is identical either way
+    deps = build_agent_tool_deps(
+        REAL, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    service = AgentFrameworkService(REAL, deps)
+    captured: list[dict[str, Any]] = []
+    counter = itertools.count()
+
+    async def _create(**kwargs: Any) -> _RawResponseStub:
+        captured.append(kwargs)
+        return _RawResponseStub(_final_text_response(counter, "Nothing changed."))
+
+    service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
+    return service, captured
+
+
+def _failing_transport_service() -> AgentFrameworkService:
+    """The provider-error setup of `test_provider_error_becomes_agent_run_error`
+    as a reusable helper."""
+    service = _service()
+    _make_mock_raise(service)
+    return service
+
+
+async def test_history_reaches_the_wire_in_order_before_task() -> None:
+    """[...history, task] maps to framework messages, no session: the request
+    input must carry user/assistant/user in order, the task exactly once,
+    and store=false must survive."""
+    service, captured = _service_capturing_requests(sequential=True)
+    history = (
+        AgentHistoryTurn(role="user", text="Hello"),
+        AgentHistoryTurn(role="assistant", text="Hi there"),
+    )
+    try:
+        await service.run("what changed?", history, principal=OPS)
+    finally:
+        await service.aclose()
+    body = captured[0]
+    assert body["store"] is False
+    roles = [item["role"] for item in body["input"] if item.get("role")]
+    assert roles[:3] == ["user", "assistant", "user"]
+    texts = str(body["input"])
+    assert texts.count("what changed?") == 1
+    assert "Hello" in texts and "Hi there" in texts
+
+
+async def test_tool_execution_lines_for_executed_and_refused(caplog) -> None:  # type: ignore[no-untyped-def]
+    """One agent_tool_execution line per call, executed and refused alike;
+    argument TEXT never appears — only its byte length."""
+    import logging
+
+    service = _service(sequential=False, agent_max_iterations=5, agent_max_tool_calls=2)
+    with caplog.at_level(logging.INFO):
+        try:
+            await service.run("loop forever", (), principal=OPS)
+        finally:
+            await service.aclose()
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("agent_tool_execution")
+    ]
+    assert any("executed=True" in line for line in lines)
+    assert any("executed=False" in line for line in lines)  # refused by admission
+    for field in ("name=", "seq=", "executed=", "latency_ms=", "args_bytes="):
+        assert all(field in line for line in lines), field
+    assert all("no-such-conversation" not in line for line in lines)  # argument text redacted
+
+
+async def test_run_summary_on_success(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    service = _service(sequential=True, agent_max_iterations=5, agent_max_tool_calls=2)
+    with caplog.at_level(logging.INFO):
+        try:
+            await service.run("loop forever", (), principal=OPS)
+        finally:
+            await service.aclose()
+    summaries = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("agent_run_summary")
+    ]
+    assert len(summaries) == 1
+    for field in (
+        "model_calls=", "tool_calls=", "refused=", "stop=", "total_tokens=",
+        "duration_ms=", "prompt_name=", "prompt_version=", "prompt_sha256=",
+    ):
+        assert field in summaries[0], field
+
+
+async def test_run_summary_on_failure_reports_unavailable_never_fabricated(caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    service = _failing_transport_service()  # the file's existing provider-error setup
+    with caplog.at_level(logging.INFO), pytest.raises(AgentRunError):
+        try:
+            await service.run("boom", (), principal=OPS)
+        finally:
+            await service.aclose()
+    summaries = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("agent_run_summary")
+    ]
+    assert len(summaries) == 1
+    for field in (
+        "model_calls=unavailable", "stop=unavailable", "usage=unavailable",
+        "tools_executed=", "duration_ms=", "prompt_name=", "prompt_version=",
+        "prompt_sha256=", "may have incurred billable processing",
+    ):
+        assert field in summaries[0], field
+    assert "stop=natural" not in summaries[0]
+
+
 async def test_iteration_limit_is_never_reported_natural() -> None:
     service = _service(agent_max_iterations=2, agent_max_tool_calls=10)
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
     assert result.stop_reason == "iteration_limit"
@@ -275,7 +401,7 @@ async def test_iteration_limit_is_never_reported_natural() -> None:
 async def test_function_call_limit_via_admission() -> None:
     service = _service(agent_max_iterations=5, agent_max_tool_calls=2)
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
     assert "function_call_limit" in result.limit_reasons
@@ -296,7 +422,7 @@ async def test_function_call_limit_sequential_mode() -> None:
     """
     service = _service(sequential=True, agent_max_iterations=5, agent_max_tool_calls=2)
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
 
@@ -349,7 +475,7 @@ async def test_guardrail_options_reach_the_request() -> None:
 
     service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
     try:
-        await service.run("what are the limits?")
+        await service.run("what are the limits?", (), principal=OPS)
     finally:
         await service.aclose()
 
@@ -372,7 +498,7 @@ async def test_provider_error_becomes_agent_run_error() -> None:
     _make_mock_raise(service)  # harness: transport raises APIError
     try:
         with pytest.raises(AgentRunError) as err:
-            await service.run("hello")
+            await service.run("hello", (), principal=OPS)
         # usage=None is deliberate here (see the raise site's comment), not
         # an omission, and the provider exception must still be reachable
         # via the standard `raise ... from exc` chain.
@@ -447,7 +573,7 @@ async def test_iteration_limit_forced_final_fallback_is_stripped() -> None:
     final also injects the fallback; the adapter must strip it here too."""
     service = _service(sequential=True, agent_max_iterations=1, agent_max_tool_calls=10)
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
     assert result.stop_reason == "iteration_limit"
@@ -457,7 +583,7 @@ async def test_iteration_limit_forced_final_fallback_is_stripped() -> None:
 async def test_both_limits_iteration_precedence_still_strips() -> None:
     service = _service(sequential=True, agent_max_iterations=1, agent_max_tool_calls=1)
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
     assert result.stop_reason == "iteration_limit"
@@ -478,7 +604,7 @@ async def test_limit_with_real_visible_content_is_preserved() -> None:
         final_text="Here is what I found.",
     )
     try:
-        result = await service.run("loop forever")
+        result = await service.run("loop forever", (), principal=OPS)
     finally:
         await service.aclose()
     assert result.stop_reason == "function_call_limit"

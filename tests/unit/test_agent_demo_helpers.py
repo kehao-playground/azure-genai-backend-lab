@@ -23,8 +23,13 @@ import pytest
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts.loader import load_prompt
-from azgenai_lab.services.agent_framework import AgentRoundMetrics, AgentRunResult
+from azgenai_lab.services.agent_framework import (
+    AgentHistoryTurn,
+    AgentRoundMetrics,
+    AgentRunResult,
+)
 from azgenai_lab.services.azure_openai import FakeChatService
 from azgenai_lab.services.conversation import ConversationChatService
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
@@ -773,7 +778,13 @@ async def test_divergence_probe_records_what_its_masking_hides() -> None:
     # real non-determinism the probe exists to observe, so "not observed" must
     # carry the caveat rather than read as "identical".
     class _StubService:
-        async def run(self, task: str) -> AgentRunResult:
+        async def run(
+            self,
+            task: str,
+            history: tuple[AgentHistoryTurn, ...],
+            *,
+            principal: Principal,
+        ) -> AgentRunResult:
             return _result(None)
 
         async def aclose(self) -> None:
