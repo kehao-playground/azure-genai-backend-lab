@@ -141,6 +141,16 @@ class EntraTokenVerifier:
         confusion (`none`, or HS256 keyed on the public key) to reach the
         verification path at all.
         """
+        # A programming error, not a token problem, so it is not
+        # `TokenInvalidError`: an uninitialized verifier has an empty cache and
+        # would otherwise reject every token as an unknown `kid` — a 401 storm
+        # that looks exactly like a client at fault, with nothing in the log
+        # pointing at the wiring. Checked ahead of the header screen because it
+        # is a fact about this object, not about the token, and should not
+        # depend on what the caller happened to present.
+        if self._fetched_at is None:
+            raise RuntimeError("EntraTokenVerifier.initialize() has not completed")
+
         try:
             header = jwt.get_unverified_header(token)
         except (PyJWTError, TypeError, ValueError) as exc:
@@ -191,7 +201,10 @@ class EntraTokenVerifier:
             response = await self._client.get(url, timeout=HTTP_TIMEOUT_SECONDS)
             response.raise_for_status()
             return response.json()
-        except httpx.HTTPError as exc:
+        # `httpx.InvalidURL` is deliberately named alongside `HTTPError`: it is
+        # not a subclass of it, so a URL httpx itself rejects (one over its
+        # length limit, say) would otherwise escape this boundary uncaught.
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise TokenVerifierStartupError(f"{what} request failed: {type(exc).__name__}") from exc
         except ValueError as exc:
             # json.JSONDecodeError; the body is not our data to log.
@@ -210,11 +223,17 @@ class EntraTokenVerifier:
         jwks_uri = metadata.get("jwks_uri")
         if not isinstance(jwks_uri, str) or not jwks_uri:
             raise TokenVerifierStartupError("OIDC discovery response carries no jwks_uri")
-        parts = urlsplit(jwks_uri)
         try:
+            parts = urlsplit(jwks_uri)
             port = parts.port
         except ValueError as exc:
-            raise TokenVerifierStartupError("jwks_uri has a malformed port") from exc
+            # Both calls can raise: `urlsplit` rejects unbalanced brackets
+            # ("Invalid IPv6 URL"), and `.port` rejects a non-numeric port.
+            # Neither may escape as a bare ValueError — `initialize()` only
+            # handles `TokenVerifierStartupError`, so anything else would skip
+            # the owned-client cleanup and reach the composition point as an
+            # unhandled traceback instead of its fatal-startup path.
+            raise TokenVerifierStartupError("jwks_uri is not a well-formed URL") from exc
         if (
             parts.scheme != "https"
             or parts.hostname != OIDC_HOST
