@@ -1,8 +1,9 @@
 """Cryptographic verification of Microsoft Entra ID access tokens.
 
 This module is the whole trust boundary for a bearer token and nothing else:
-it discovers the tenant's OIDC metadata once at startup, caches the published
-signing keys, and answers one question per request — *was this token signed by
+it discovers the tenant's OIDC metadata at startup, caches the published
+signing keys (re-reading them when they age out or when a token names a key it
+has not seen), and answers one question per request — *was this token signed by
 a key this tenant publishes, and are its registered claims (`iss`, `aud`,
 `exp`) the ones we require?* It returns the claims and forms no opinion about
 what they mean.
@@ -23,6 +24,7 @@ not here. The tenant is still pinned at this layer by the exact `iss` match,
 because the tenant-specific issuer URL embeds the tenant GUID.
 """
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -42,10 +44,12 @@ logger = logging.getLogger(__name__)
 # can only ever redirect us within Microsoft's own identity endpoint.
 OIDC_HOST = "login.microsoftonline.com"
 HTTP_TIMEOUT_SECONDS = 10.0
-# Consumed by the rotation work that sits on top of this module: the shortest
-# interval between two key refreshes, and the age past which a cached key set
-# is refreshed even without an unknown `kid` to prompt it. They live here so
-# there is one place that states the cache's timing policy.
+# The cache's timing policy, in one place. The cooldown is the shortest
+# interval between two refresh *attempts* — successful or not — and it is the
+# rate limit on an attacker-driven refresh, not a tuning knob. The max age is
+# the point past which a cached key set is refreshed with nothing prompting it,
+# which is what lets a withdrawn key stop working on a verifier whose traffic
+# only ever names keys it already holds.
 JWKS_REFRESH_COOLDOWN_SECONDS = 60.0
 JWKS_MAX_AGE_SECONDS = 24 * 60 * 60.0
 
@@ -75,7 +79,11 @@ class TokenInvalidError(Exception):
 class EntraTokenVerifier:
     """Verifies RS256 access tokens against a tenant's published JWKS.
 
-    The key set is fetched once by `initialize()` and is static thereafter.
+    The key set is fetched by `initialize()` and refreshed lazily thereafter,
+    on two triggers: a cached set older than `JWKS_MAX_AGE_SECONDS`, and a
+    token naming a `kid` the cache does not hold. Both go through one
+    serialized, rate-limited path — see `_refresh_keys` for why the second
+    trigger cannot be turned into an outbound request amplifier.
     """
 
     def __init__(
@@ -107,11 +115,21 @@ class EntraTokenVerifier:
         # Two separate facts, deliberately not one. `_initialized` answers "has
         # this verifier ever come up", which is a latch: once true it never goes
         # back. `_fetched_at` answers "how old is the cache", which the refresh
-        # work will move around freely. Folding them together would mean a
-        # refresh that invalidates by clearing the timestamp silently turns
-        # every in-flight `verify()` into a RuntimeError.
+        # path moves freely. Folding them together would mean a refresh that
+        # invalidates by clearing the timestamp silently turns every in-flight
+        # `verify()` into a RuntimeError.
         self._initialized = False
         self._fetched_at: float | None = None
+        # And a third: when a fetch was last *attempted*, which is not when one
+        # last succeeded. The cooldown is measured from the attempt, so a
+        # failing endpoint is retried on a timer instead of once per request.
+        # A startup fetch counts as an attempt, which is what covers the window
+        # right after the process comes up.
+        self._last_refresh_attempt: float | None = None
+        # Constructed eagerly: since 3.10 `asyncio.Lock` binds to the running
+        # loop on first use rather than at construction, so a verifier built
+        # outside a loop (the composition point does exactly that) is fine.
+        self._refresh_lock = asyncio.Lock()
         self._closed = False
 
     @property
@@ -146,8 +164,15 @@ class EntraTokenVerifier:
             if not self._initialized:
                 await self.aclose()
             raise
+        # Order matters: the cache is published first and the readiness latch
+        # is set last, so no `verify()` can be admitted against a key set that
+        # is not yet live. The attempt timestamp starts the cooldown here
+        # rather than at the first refresh — a startup fetch is a fetch, and
+        # without this the minute after startup would be the one minute an
+        # attacker could drive a refresh with a single forged `kid`.
         self._keys = keys
         self._fetched_at = self._clock()
+        self._last_refresh_attempt = self._fetched_at
         self._initialized = True
 
     async def verify(self, token: str) -> Mapping[str, Any]:
@@ -157,7 +182,9 @@ class EntraTokenVerifier:
         naming an algorithm we do not accept is rejected without ever being
         looked up, which is what stops an attacker from using algorithm
         confusion (`none`, or HS256 keyed on the public key) to reach the
-        verification path at all.
+        verification path at all. That ordering does double duty now that a
+        cache miss can cost a network request — the header screens are also
+        what keep a junk token from reaching `_refresh_keys`.
         """
         # A programming error, not a token problem, so it is not
         # `TokenInvalidError`: an uninitialized verifier has an empty cache and
@@ -181,7 +208,19 @@ class EntraTokenVerifier:
         if not isinstance(kid, str) or not kid:
             raise TokenInvalidError("token header carries no key id")
 
+        # Both refresh triggers sit *below* the header screens, so a token we
+        # were never going to accept — unsigned, HS256, no `kid` — cannot
+        # reach the network at all. The age check runs first: refreshing on
+        # age before the lookup means a rotation is usually already picked up
+        # by the time a token names the new key, leaving the unknown-`kid`
+        # trigger to cover the rotation that happens inside the age window.
+        if self._is_stale():
+            await self._refresh_keys(None)
+
         key = self._keys.get(kid)
+        if key is None:
+            await self._refresh_keys(kid)
+            key = self._keys.get(kid)
         if key is None:
             raise TokenInvalidError("token key id is not in the published key set")
 
@@ -202,6 +241,83 @@ class EntraTokenVerifier:
         except (PyJWTError, TypeError, ValueError) as exc:
             raise TokenInvalidError("token failed verification") from exc
         return claims
+
+    def _is_stale(self) -> bool:
+        fetched_at = self._fetched_at
+        if fetched_at is None:
+            return True
+        return self._clock() - fetched_at >= JWKS_MAX_AGE_SECONDS
+
+    async def _refresh_keys(self, kid: str | None) -> None:
+        """Re-fetch the key set, at most once per cooldown, never concurrently.
+
+        One path for both triggers, because they need the same two mitigations
+        and a second path would be a second chance to get them wrong.
+
+        The threat this is shaped around: `kid` is attacker-controlled, so a
+        refresh on every unknown one turns any unauthenticated client into an
+        outbound request amplifier aimed at Microsoft — no credentials needed,
+        one forged header per request. The cooldown is what bounds that, and it
+        bounds it on its own: the attempt is stamped before the await, so a
+        simultaneous burst finds the window already closed.
+
+        The lock is not a second copy of that guarantee. It is what makes the
+        waiters *wait*. Without it they would leave this method the moment the
+        cooldown turned them away and read a cache the in-flight refresh has
+        not published yet — so a real rotation would answer 401 to every
+        legitimate request that arrived alongside the first one, while the
+        call count stayed reassuringly at one.
+
+        A failure is deliberately swallowed. The caller is `verify()`, the
+        cache it already has is still good, and a provider outage must not
+        become an authentication outage here — a known key keeps verifying,
+        while an unknown one stays `TokenInvalidError` because the lookup that
+        follows this call simply misses again.
+        """
+        async with self._refresh_lock:
+            # Re-read every condition *inside* the lock: each was last
+            # evaluated before waiting, and the waiter ahead may have already
+            # done the work. All three are refusals, so their relative order is
+            # not observable from outside — but each is independently
+            # load-bearing. Drop the first and a waiter queued behind a refresh
+            # slower than the cooldown finds the window reopened and starts a
+            # second fetch for a key it is already holding.
+            if kid is not None and kid in self._keys:
+                return
+            if kid is None and not self._is_stale():
+                return
+            now = self._clock()
+            if (
+                self._last_refresh_attempt is not None
+                and now - self._last_refresh_attempt < JWKS_REFRESH_COOLDOWN_SECONDS
+            ):
+                return
+
+            # Before the await, not after: a refresh that only recorded its
+            # successes would leave every failure un-rate-limited, which is
+            # precisely the case an attacker (unknown `kid`, nothing to find)
+            # and an outage (endpoint down) both produce.
+            self._last_refresh_attempt = now
+            try:
+                metadata = await self._get_json(self._discovery_url, "OIDC discovery")
+                jwks_uri = self._jwks_uri(metadata)
+                document = await self._get_json(jwks_uri, "JWKS")
+                keys = self._parse_keys(document)
+            except TokenVerifierStartupError as exc:
+                # The class is always the same one; the message is what says
+                # which stage failed, and it is ours — every one of them is a
+                # fixed string, so no provider payload reaches this line.
+                logger.warning(
+                    "JWKS refresh failed exception=%s reason=%s", type(exc).__name__, exc
+                )
+                return
+            # Same publication rule as `initialize()`: a fully-built local dict
+            # replaces the live one in a single rebind, so no request can ever
+            # be served from a partially-parsed key set. The existing cache is
+            # untouched until this line, which is what makes the failure return
+            # above safe.
+            self._keys = keys
+            self._fetched_at = self._clock()
 
     async def aclose(self) -> None:
         """Close an owned client. Idempotent; a no-op for injected clients."""
