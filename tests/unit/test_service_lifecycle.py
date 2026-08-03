@@ -161,25 +161,46 @@ class _RecordingCloser:
         self._closed.append(self._name)
 
 
-async def test_lifespan_isolates_close_failures() -> None:
+class _ExplodingCloser(_RecordingCloser):
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise RuntimeError(f"{self._name} close failed")
+
+
+# The shutdown order, and the app.state attribute each position lives on.
+_CLOSE_ORDER = ["principal", "conversation", "rag", "agent"]
+_STATE_ATTRIBUTES = {
+    "principal": "principal_resolver",
+    "conversation": "conversation_service",
+    "rag": "rag_service",
+    "agent": "agent_turn_service",
+}
+
+
+@pytest.mark.parametrize("failing", _CLOSE_ORDER)
+async def test_lifespan_isolates_close_failures(failing: str) -> None:
+    """Every position, not just one.
+
+    Exercising only the conversation slot would leave the other three
+    untested: hoisting the resolver close out of the nested chain, say, still
+    closes everything on the happy path and only strands the rest when the
+    resolver itself fails — which nothing would have noticed.
+    """
     from azgenai_lab.main import create_app
 
     app = create_app()
     closed: list[str] = []
+    for name in _CLOSE_ORDER:
+        closer_type = _ExplodingCloser if name == failing else _RecordingCloser
+        setattr(app.state, _STATE_ATTRIBUTES[name], closer_type(closed, name))
 
-    class _Exploding:
-        async def aclose(self) -> None:
-            closed.append("conversation")
-            raise RuntimeError("close failed")
-
-    app.state.principal_resolver = _RecordingCloser(closed, "principal")
-    app.state.conversation_service = _Exploding()
-    app.state.rag_service = _RecordingCloser(closed, "rag")
-    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=f"{failing} close failed"):
         async with app.router.lifespan_context(app):
             pass
-    assert closed == ["principal", "conversation", "rag", "agent"]
+
+    # All four, in order, whichever one raised: an isolated close failure
+    # propagates but must not strand the positions after it.
+    assert closed == _CLOSE_ORDER
 
 
 # ---------------------------------------------------------------------------
