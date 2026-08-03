@@ -104,6 +104,13 @@ class EntraTokenVerifier:
         # move the cache's age backwards.
         self._clock = clock
         self._keys: dict[str, PyJWK] = {}
+        # Two separate facts, deliberately not one. `_initialized` answers "has
+        # this verifier ever come up", which is a latch: once true it never goes
+        # back. `_fetched_at` answers "how old is the cache", which the refresh
+        # work will move around freely. Folding them together would mean a
+        # refresh that invalidates by clearing the timestamp silently turns
+        # every in-flight `verify()` into a RuntimeError.
+        self._initialized = False
         self._fetched_at: float | None = None
         self._closed = False
 
@@ -118,6 +125,8 @@ class EntraTokenVerifier:
 
         Nothing is published to the cache until the entire response has
         validated, so a partially-parsed key set can never become the live one.
+        Safe to call again over a live cache: a failure leaves the previous key
+        set serving requests untouched.
         """
         try:
             metadata = await self._get_json(self._discovery_url, "OIDC discovery")
@@ -125,12 +134,21 @@ class EntraTokenVerifier:
             document = await self._get_json(jwks_uri, "JWKS")
             keys = self._parse_keys(document)
         except TokenVerifierStartupError:
-            # A verifier that failed to start is never used again, so an owned
-            # client would otherwise leak for the life of the process.
-            await self.aclose()
+            # Only when the verifier never came up. A first startup that fails
+            # is terminal — nobody will use this object again, so an owned
+            # client would leak for the life of the process. A *re*-initialize
+            # that fails is not terminal: the previous key set is still live and
+            # still serving, so closing the client would leave a verifier that
+            # answers `verify()` correctly but can never refresh again, and
+            # whose next `initialize()` dies on httpx's RuntimeError for a
+            # closed client — which is neither HTTPError nor InvalidURL, and so
+            # escapes `_get_json` uncaught.
+            if not self._initialized:
+                await self.aclose()
             raise
         self._keys = keys
         self._fetched_at = self._clock()
+        self._initialized = True
 
     async def verify(self, token: str) -> Mapping[str, Any]:
         """Return the token's claims, or raise `TokenInvalidError`.
@@ -147,8 +165,9 @@ class EntraTokenVerifier:
         # that looks exactly like a client at fault, with nothing in the log
         # pointing at the wiring. Checked ahead of the header screen because it
         # is a fact about this object, not about the token, and should not
-        # depend on what the caller happened to present.
-        if self._fetched_at is None:
+        # depend on what the caller happened to present. Reads the latch, not
+        # the cache timestamp, so refresh timing can never revoke readiness.
+        if not self._initialized:
             raise RuntimeError("EntraTokenVerifier.initialize() has not completed")
 
         try:
