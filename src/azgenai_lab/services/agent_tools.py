@@ -145,7 +145,15 @@ def make_get_conversation_usage(
         # Tenant is closure-bound: cross-tenant ids and unknown ids are the
         # same not-found shape, mirroring the API's 404-same-shape rule.
         conversation = await store.get(principal.tenant_id, conversation_id)
-        if conversation is None:
+        if (
+            conversation is None
+            or conversation.authorization_group_ids != principal.group_ids
+        ):
+            # Unknown, cross-tenant and scope-mismatched ids share one shape:
+            # the conversation is simply not visible to this run's identity —
+            # mirrors the API's 404-same-shape rule (Day 15 / Day 18). A
+            # distinct shape here would let the model narrate a conversation's
+            # existence into its answer.
             return json.dumps(_USAGE_NOT_FOUND)
         spent = conversation.total_tokens
         if spent >= token_budget:
@@ -177,7 +185,7 @@ def _seed_index_documents(
     failure handling exist for a live upstream call with a request-size
     limit; a fake client has neither, so there is nothing for batching to
     buy here, and skipping it keeps this whole function — and therefore
-    `build_agent_toolset` — synchronous. `to_index_document` still enforces
+    `build_agent_tool_deps` — synchronous. `to_index_document` still enforces
     the dimension contract (it raises if a vector's width does not match
     `EMBEDDING_DIMENSIONS`), so that guarantee is not lost.
     Every tenant's corpus is included, not just opsdemo's: the real system
@@ -218,44 +226,59 @@ def _seeded_fake_retriever(settings: Settings) -> Retriever:
     return Retriever(embedding_client, FakeSearchClient(index_documents), top=settings.rag_top)
 
 
-@dataclass
-class AgentToolset:
-    """Tools plus the ownership handles the composite service must close."""
+@dataclass(frozen=True)
+class AgentToolDeps:
+    """App-wide tool dependencies: everything except the caller's identity.
 
-    tools: tuple[AgentToolFn, ...]
+    Built once at composition; `bind_principal_tools` closes each run's
+    Principal over these shared objects. A fixed principal bound at build
+    time would apply one caller's ACL to every request (Day 18)."""
+
+    settings: Settings
     retriever: Retriever
     conversation_store: ConversationStore
+    token_budget: int | None
 
 
-def build_agent_toolset(
+def build_agent_tool_deps(
     settings: Settings,
-    principal: Principal,
     *,
     conversation_store: ConversationStore,
-    token_budget: int,
-) -> AgentToolset:
-    """Bind all three least-privilege tools to one shared set of dependencies.
+    token_budget: int | None,
+) -> AgentToolDeps:
+    """Build the app-wide dependencies every run's tools are bound over.
 
-    `principal`, `conversation_store` and `token_budget` are each fixed once
-    here and closed over by every tool that needs them — the agent chooses
-    only the arguments the tool signatures expose (query text, a
-    conversation id), never the tenant, groups, store or budget (Day 15 /
-    Day 16 R2). `token_budget` is one number passed to both
-    `make_get_runtime_config` and `make_get_conversation_usage`, so the
-    guardrail the config tool reports and the one the usage tool checks
-    against can never drift apart. `conversation_store` is the same object
-    the caller seeds a demo conversation into, so that conversation is
-    visible through `get_conversation_usage`.
+    `token_budget` is one number that, when not None, reaches both
+    `make_get_runtime_config` and `make_get_conversation_usage` from
+    `bind_principal_tools`, so the guardrail the config tool reports and the
+    one the usage tool checks against can never drift apart.
     """
     retriever = (
         _seeded_fake_retriever(settings) if settings.use_fake_search else build_retriever(settings)
     )
-    tools = (
-        make_search_docs(retriever, principal),
-        make_get_runtime_config(settings, token_budget),
-        make_get_conversation_usage(conversation_store, principal, token_budget),
+    return AgentToolDeps(
+        settings=settings,
+        retriever=retriever,
+        conversation_store=conversation_store,
+        token_budget=token_budget,
     )
-    return AgentToolset(tools=tools, retriever=retriever, conversation_store=conversation_store)
+
+
+def bind_principal_tools(
+    deps: AgentToolDeps, principal: Principal
+) -> tuple[AgentToolFn, ...]:
+    """Per-run binding: cheap closures, no I/O. The budget-reporting tools
+    exist only when a budget exists — with the guardrail disabled they would
+    report a number that governs nothing."""
+    tools: list[AgentToolFn] = [make_search_docs(deps.retriever, principal)]
+    if deps.token_budget is not None:
+        tools.append(make_get_runtime_config(deps.settings, deps.token_budget))
+        tools.append(
+            make_get_conversation_usage(
+                deps.conversation_store, principal, deps.token_budget
+            )
+        )
+    return tuple(tools)
 
 
 __all__ = [
@@ -264,9 +287,10 @@ __all__ = [
     "MAX_SNIPPET_CHARS",
     "MAX_TOOL_RESULT_BYTES",
     "NEAR_EXHAUSTED_THRESHOLD",
+    "AgentToolDeps",
     "AgentToolFn",
-    "AgentToolset",
-    "build_agent_toolset",
+    "bind_principal_tools",
+    "build_agent_tool_deps",
     "make_get_conversation_usage",
     "make_get_runtime_config",
     "make_search_docs",

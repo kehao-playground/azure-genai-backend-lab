@@ -43,7 +43,7 @@ import re
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -69,7 +69,7 @@ from azgenai_lab.services.agent_tools import (
     MAX_TOOL_RESULT_BYTES,
     NEAR_EXHAUSTED_THRESHOLD,
     AgentToolFn,
-    build_agent_toolset,
+    build_agent_tool_deps,
 )
 from azgenai_lab.services.azure_openai import ChatService, build_chat_service
 from azgenai_lab.services.conversation import ConversationChatService
@@ -1399,14 +1399,18 @@ async def main() -> None:
     )
 
     try:
-        built = build_agent_toolset(
-            settings, DEMO_PRINCIPAL, conversation_store=store, token_budget=budget
+        deps = build_agent_tool_deps(
+            settings, conversation_store=store, token_budget=budget
         )
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         await baseline_service.aclose()
         _config_error(str(exc))
-    toolset = replace(built, tools=wrap_tools_with_recorder(built.tools, sink))
+    # TODO(day18-task6/7): the fixed opsdemo principal now binds inside the
+    # adapters' run() (agent_framework.py), so wrap_tools_with_recorder can no
+    # longer wrap the tools the service actually calls at this call site —
+    # `sink` stays empty until per-run principal binding is threaded through
+    # here too.
 
     # The fresh conversation and both preconditions, now that there is a budget
     # to hold them against. Still before the agent service exists, so its own
@@ -1416,7 +1420,7 @@ async def main() -> None:
     except BaseException:
         await seed_service.aclose()
         await baseline_service.aclose()
-        await toolset.retriever.aclose()
+        await deps.retriever.aclose()
         raise
     print(
         f"seed: near-exhausted spent={seed_outcome.near_spent}/{budget} "
@@ -1425,11 +1429,11 @@ async def main() -> None:
     )
 
     try:
-        agent_service: AgentService = build_agent_service(settings, toolset)
+        agent_service: AgentService = build_agent_service(settings, deps)
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         await baseline_service.aclose()
-        await toolset.retriever.aclose()
+        await deps.retriever.aclose()
         _config_error(str(exc))
 
     try:
