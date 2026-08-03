@@ -203,7 +203,10 @@ async def test_tenant_id_var_lifecycle_around_the_dependency() -> None:
     assert user_id_var.get() == "-"
 
     request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
-    gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
+    # The second argument is the OpenAPI-only bearer credential (Day 19). It
+    # is ignored by the dependency — the resolver re-reads the raw header —
+    # so a direct call passes None where FastAPI would inject it.
+    gen: AsyncGenerator = require_principal(request, None)  # type: ignore[type-arg]
     try:
         principal = await anext(gen)
         assert principal.tenant_id == "t1"
@@ -227,7 +230,7 @@ async def test_require_principal_logs_identity_resolved_once_after_both_vars_set
     # both ContextVars carry the resolved values rather than their "-"
     # defaults.
     request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
-    gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
+    gen: AsyncGenerator = require_principal(request, None)  # type: ignore[type-arg]
     with caplog.at_level(logging.INFO, logger="azgenai_lab.api.principal"):
         try:
             await anext(gen)
@@ -258,7 +261,7 @@ async def test_log_record_carries_tenant_id_inside_the_dependency_scope_only() -
     assert outside_before.tenant_id == "-"  # type: ignore[attr-defined]
 
     request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
-    gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
+    gen: AsyncGenerator = require_principal(request, None)  # type: ignore[type-arg]
     try:
         await anext(gen)
         inside = _emit_record()
