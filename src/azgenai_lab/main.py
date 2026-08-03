@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from azgenai_lab.api import chat, health, rag, streaming
+from azgenai_lab.api import agent, chat, health, rag, streaming
 from azgenai_lab.core.config import get_settings
 from azgenai_lab.core.correlation import correlation_id_middleware
 from azgenai_lab.core.errors import (
@@ -18,6 +18,7 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.core.logging import configure_logging
+from azgenai_lab.services.agent_turn import build_agent_turn_service
 from azgenai_lab.services.conversation import build_conversation_service
 from azgenai_lab.services.conversation_store import build_conversation_store
 from azgenai_lab.services.rag import build_rag_service
@@ -37,8 +38,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Long-lived owned clients (AsyncOpenAI, the search httpx.AsyncClient)
     # have no other shutdown path in a running API process (Day 14 review
     # finding 4) — without this, they leak connections until the process exits.
-    await app.state.conversation_service.aclose()
-    await app.state.rag_service.aclose()
+    # Closes are isolated: one service failing to close must not leave the
+    # others' app-wide clients (AsyncOpenAI, httpx) leaking until exit.
+    try:
+        await app.state.conversation_service.aclose()
+    finally:
+        try:
+            await app.state.rag_service.aclose()
+        finally:
+            await app.state.agent_turn_service.aclose()
 
 
 def create_app() -> FastAPI:
@@ -62,6 +70,9 @@ def create_app() -> FastAPI:
         settings, store=shared_store, locks=shared_locks
     )
     app.state.rag_service = build_rag_service(settings)
+    app.state.agent_turn_service = build_agent_turn_service(
+        settings, store=shared_store, locks=shared_locks
+    )
 
     app.middleware("http")(correlation_id_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -75,6 +86,7 @@ def create_app() -> FastAPI:
     # route's text/event-stream media type to it (review r03).
     app.include_router(streaming.router, prefix="/api/v1")
     app.include_router(rag.router, prefix="/api/v1", responses=_VALIDATION_RESPONSES)
+    app.include_router(agent.router, prefix="/api/v1", responses=_VALIDATION_RESPONSES)
 
     @app.get("/", include_in_schema=False)
     async def root() -> dict[str, str]:

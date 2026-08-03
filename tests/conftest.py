@@ -20,7 +20,7 @@ from azgenai_lab.main import app  # noqa: E402
 from azgenai_lab.services.conversation import build_conversation_service  # noqa: E402
 from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 
-# Day 15: the three protected endpoints (chat, chat/stream, rag) now 401
+# Day 15: the four protected endpoints (chat, chat/stream, rag, agent) now 401
 # without identity headers. Every existing unit test exercises the happy
 # path through the shared `client` fixture, so its default headers carry
 # valid identity — tests of the 401 boundary itself use their own
@@ -36,6 +36,7 @@ def client() -> Generator[TestClient]:
     # The app is module-level; rebuild its state so conversations never leak
     # from one test into the next.
     from azgenai_lab.core.keyed_lock import KeyedLock
+    from azgenai_lab.services.agent_turn import build_agent_turn_service
     from azgenai_lab.services.conversation_store import build_conversation_store
 
     settings = get_settings()
@@ -45,3 +46,6 @@ def client() -> Generator[TestClient]:
         settings, store=store, locks=locks
     )
     app.state.rag_service = build_rag_service(settings)
+    app.state.agent_turn_service = build_agent_turn_service(
+        settings, store=store, locks=locks
+    )

@@ -33,6 +33,7 @@ def after_scenario(context, scenario):  # type: ignore[no-untyped-def]
     # The app is module-level; rebuild its state so conversations never leak
     # from one scenario into the next.
     from azgenai_lab.core.keyed_lock import KeyedLock
+    from azgenai_lab.services.agent_turn import build_agent_turn_service
     from azgenai_lab.services.conversation_store import build_conversation_store
 
     settings = get_settings()
@@ -42,3 +43,6 @@ def after_scenario(context, scenario):  # type: ignore[no-untyped-def]
         settings, store=store, locks=locks
     )
     app.state.rag_service = build_rag_service(settings)
+    app.state.agent_turn_service = build_agent_turn_service(
+        settings, store=store, locks=locks
+    )
