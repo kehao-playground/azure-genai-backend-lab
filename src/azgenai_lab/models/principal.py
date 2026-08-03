@@ -1,9 +1,10 @@
 """Validated authorization context for a request.
 
-The Principal is the boundary object formed from trusted gateway headers
-(Day 19 replaces the headers with verified token claims). Validation lives on
-the model itself so the normal validation path cannot produce an illegal
-Principal; ``model_construct()`` deliberately bypasses it and is reserved for
+The Principal is the boundary object formed either from trusted gateway headers
+(Day 15) or from the claims of a verified Entra ID access token (Day 19),
+whichever adapter ``AUTH_MODE`` selected at startup. Validation lives on the
+model itself so the normal validation path cannot produce an illegal Principal;
+``model_construct()`` deliberately bypasses it and is reserved for
 defense-in-depth tests.
 """
 

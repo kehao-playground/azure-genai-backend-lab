@@ -116,7 +116,9 @@ GUID rather than a URI.
 
 Without it, no `groups` claim is issued at all. The claim is not a default: the
 `groupMembershipClaims` property "Configures the `groups` claim issued in a user or
-OAuth 2.0 access token that the app expects", and `SecurityGroup` "Emits security
+OAuth 2.0 access token that the app expects"
+([app manifest reference](https://learn.microsoft.com/en-us/entra/identity-platform/reference-app-manifest#groupmembershipclaims-attribute),
+checked 2026-08), and the value this lab sets, `SecurityGroup`, "Emits security
 groups and Microsoft Entra roles that the user is a member of in the group claim"
 ([configure group claims](https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-fed-group-claims),
 checked 2026-08).
@@ -679,8 +681,10 @@ provider or a live rotation.
    `kid` that arrives during an in-flight fetch queues for the remainder of it and
    is then rejected. The consequence worth stating plainly: someone flooding forged
    `kid`s during a dead-provider window can park many inbound requests for ~20 s
-   each while still costing only two outbound requests. Inbound concurrency, not
-   outbound traffic, is what that costs you.
+   each while still costing only two outbound requests **per 60 s cooldown window
+   per verifier** — the cooldown bounds the outbound side no matter how many
+   requests arrive. Inbound concurrency, not outbound traffic, is what that costs
+   you.
 
 2. **The same token at the same instant can get two different verdicts.** A request
    that triggers an age-based refresh re-reads the key map afterwards, so it is
