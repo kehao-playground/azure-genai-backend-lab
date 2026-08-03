@@ -18,11 +18,21 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 AZURE_PREFIXES = ("AZURE_OPENAI_", "AZURE_SEARCH_")
+# Day 19: a hostile local environment might also have stray ENTRA_* values
+# (e.g. left over from testing entra mode) or AUTH_MODE=entra in the shell;
+# neither should ever leak into a subprocess that expects fake-adapter
+# defaults, so strip them and force headers mode explicitly.
+ENTRA_PREFIX = "ENTRA_"
 
 
 def _hostile_env(*, flag: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(AZURE_PREFIXES)}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(AZURE_PREFIXES) and not k.startswith(ENTRA_PREFIX)
+    }
     env[flag] = "false"
+    env["AUTH_MODE"] = "headers"
     return env
 
 

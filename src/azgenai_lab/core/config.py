@@ -1,6 +1,8 @@
 from functools import lru_cache
+from typing import Literal
+from uuid import UUID
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,6 +76,42 @@ class Settings(BaseSettings):
     agent_max_iterations: int = Field(default=5, gt=0)
     agent_max_tool_calls: int = Field(default=10, gt=0)
 
+    # Day 19: caller authentication mode, selected once at startup. "headers"
+    # is the existing trusted-development path (require_principal reads
+    # X-Tenant-Id/X-User-Id directly); "entra" validates a real Microsoft
+    # Entra ID JWT. The Entra fields below are only required — and only
+    # validated for presence — when auth_mode is "entra"; headers mode never
+    # touches them.
+    auth_mode: Literal["headers", "entra"] = "headers"
+    # GUIDs, not api:// URIs: normalized to canonical lower-case string form
+    # by _canonical_guid below regardless of mode, so a value supplied in
+    # headers mode (e.g. left over in a shared .env) is still validated as a
+    # GUID if present, rather than silently accepted as free text.
+    entra_tenant_id: str | None = None
+    entra_audience: str | None = None
+    # At least one of these two is required in entra mode (checked below);
+    # blank strings normalize to None so ".env" placeholders and unset
+    # values behave identically.
+    entra_required_scope: str | None = None
+    entra_required_app_role: str | None = None
+
+    @field_validator("entra_tenant_id", "entra_audience")
+    @classmethod
+    def _canonical_guid(cls, value: str | None) -> str | None:
+        # Normalizes whenever a value is present, in either mode; whether the
+        # value is *required* is a cross-field question, handled below.
+        if value is None or not value.strip():
+            return None
+        try:
+            return str(UUID(value.strip()))
+        except ValueError as exc:
+            raise ValueError("must be a GUID") from exc
+
+    @field_validator("entra_required_scope", "entra_required_app_role")
+    @classmethod
+    def _blank_is_absent(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
     @model_validator(mode="after")
     def _overlap_must_leave_room_to_advance(self) -> "Settings":
         if self.chunk_overlap_chars * 2 >= self.chunk_max_chars:
@@ -81,6 +119,20 @@ class Settings(BaseSettings):
                 "chunk_overlap_chars must be less than half of chunk_max_chars "
                 f"(got {self.chunk_overlap_chars} against {self.chunk_max_chars})"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _entra_fields_required_in_entra_mode(self) -> "Settings":
+        # Check-only: never assign to self here. Settings is not frozen
+        # today, so mutation would work, but field validators are the
+        # supported normalization mechanism and stay correct if Settings
+        # ever gains frozen=True or validate_assignment=True.
+        if self.auth_mode == "headers":
+            return self
+        if self.entra_tenant_id is None or self.entra_audience is None:
+            raise ValueError("entra_tenant_id and entra_audience are required in entra mode")
+        if self.entra_required_scope is None and self.entra_required_app_role is None:
+            raise ValueError("entra mode requires a delegated scope or application role")
         return self
 
 

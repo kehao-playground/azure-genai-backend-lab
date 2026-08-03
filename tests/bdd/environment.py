@@ -8,6 +8,10 @@ import os
 os.environ["USE_FAKE_LLM"] = "true"
 os.environ["USE_FAKE_SEARCH"] = "true"
 os.environ["USE_FAKE_EMBEDDINGS"] = "true"
+# Day 19: auth_mode is read at Settings construction time too, so pin it
+# alongside the fake-adapter flags rather than leaving it to whatever the
+# developer's shell or .env happens to have set.
+os.environ["AUTH_MODE"] = "headers"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
