@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 from azgenai_lab.api.chat import get_conversation_service
 from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
@@ -29,6 +30,7 @@ from azgenai_lab.services.conversation_store import InMemoryConversationStore
 PROMPT = load_prompt("default_chat")
 
 TENANT_ID = "t1"
+DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, group_ids=())
 
 
 def make_service(response: Any) -> AzureOpenAIChatService:
@@ -143,8 +145,8 @@ async def test_max_output_tokens_truncation_commits_the_partial_turn() -> None:
     scripted = ChatResult(message="par", status="incomplete", incomplete_reason="max_output_tokens")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
-    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
+    _, result = await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
     assert result.status == "incomplete"
     conversation = await store.get(TENANT_ID, conversation_id)
@@ -160,8 +162,8 @@ async def test_content_filter_truncation_leaves_no_trace() -> None:
     scripted = ChatResult(message="bad", status="incomplete", incomplete_reason="content_filter")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
-    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
+    _, result = await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
     assert result.status == "incomplete"
     assert result.incomplete_reason == "content_filter"
@@ -175,9 +177,9 @@ async def test_empty_completed_reply_is_still_an_upstream_failure() -> None:
     scripted = ChatResult(message="", status="completed")
     service, _ = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
     with pytest.raises(UpstreamServiceError):
-        await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+        await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
 
 async def test_empty_max_output_tokens_reply_commits_the_user_turn_only() -> None:
@@ -186,8 +188,8 @@ async def test_empty_max_output_tokens_reply_commits_the_user_turn_only() -> Non
     scripted = ChatResult(message="", status="incomplete", incomplete_reason="max_output_tokens")
     service, store = make_conversation_service(scripted)
 
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
-    _, result = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
+    _, result = await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
     assert result.status == "incomplete"
     conversation = await store.get(TENANT_ID, conversation_id)

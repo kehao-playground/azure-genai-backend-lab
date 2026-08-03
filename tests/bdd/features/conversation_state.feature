@@ -38,3 +38,15 @@ Feature: Conversation state
     Then the response status code should be 200
     And the streaming response should include header "X-Conversation-Id"
     And the streamed text should include the marker "history=2"
+
+  Scenario: A different group set cannot continue the conversation
+    Given a conversation with one completed turn
+    When I submit a follow-up message in the same conversation as group "other"
+    Then the response status code should be 404
+    And the response JSON should contain error "conversation_not_found"
+
+  Scenario: A streaming follow-up with a different group set fails before any stream
+    Given a conversation with one completed turn
+    When I stream a follow-up message in the same conversation as group "other"
+    Then the response status code should be 404
+    And the response JSON should contain error "conversation_not_found"

@@ -19,6 +19,7 @@ from azgenai_lab.core.errors import UpstreamServiceError, UpstreamThrottledError
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
@@ -79,15 +80,15 @@ def override(service: ScriptedChatService) -> None:
 
 
 class SpyConversationService:
-    """Records the tenant_id the route handler passes into open_stream()."""
+    """Records the principal the route handler passes into open_stream()."""
 
     def __init__(self) -> None:
         self.tenant_ids: list[str] = []
 
     async def open_stream(
-        self, message: str, conversation_id: str | None, *, tenant_id: str
+        self, message: str, conversation_id: str | None, *, principal: Principal
     ) -> tuple[str, AsyncIterator[TextDelta | StreamDone]]:
-        self.tenant_ids.append(tenant_id)
+        self.tenant_ids.append(principal.tenant_id)
 
         async def stream() -> AsyncIterator[TextDelta | StreamDone]:
             yield TextDelta("x")

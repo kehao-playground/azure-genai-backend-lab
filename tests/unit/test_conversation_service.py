@@ -18,6 +18,7 @@ from azgenai_lab.core.errors import StorageError, UpstreamServiceError
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatStreamEvent,
@@ -33,6 +34,7 @@ from azgenai_lab.services.conversation import (
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 TENANT_ID = "t1"
+DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, group_ids=())
 
 
 class SpyChatService:
@@ -119,7 +121,7 @@ async def test_first_turn_issues_an_id_and_commits_transcript_and_replay() -> No
     spy = SpyChatService(reply="hello there")
     service, store = make_service(spy)
 
-    conversation_id, result = await service.complete("hi", None, tenant_id=TENANT_ID)
+    conversation_id, result = await service.complete("hi", None, principal=DEFAULT_PRINCIPAL)
 
     assert result.message == "hello there"
     assert spy.received == [[{"role": "user", "content": "hi"}]]
@@ -136,9 +138,9 @@ async def test_first_turn_issues_an_id_and_commits_transcript_and_replay() -> No
 async def test_follow_up_turn_replays_prior_output_items_verbatim() -> None:
     spy = SpyChatService()
     service, _ = make_service(spy)
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
 
-    await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+    await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
     # The second call must resend the full replay context: user item, the
     # response's output item (reasoning context travels here), new user item.
@@ -154,7 +156,7 @@ async def test_unknown_conversation_id_raises_without_calling_the_llm() -> None:
     service, _ = make_service(spy)
 
     with pytest.raises(ConversationNotFoundError):
-        await service.complete("hi", "never-issued", tenant_id=TENANT_ID)
+        await service.complete("hi", "never-issued", principal=DEFAULT_PRINCIPAL)
 
     assert spy.received == []
 
@@ -163,14 +165,16 @@ async def test_cross_tenant_complete_raises_not_found_and_intact_history_survive
     # Tenant A owns the conversation; tenant B presents the same id.
     spy = SpyChatService()
     service, store = make_service(spy)
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
 
     with pytest.raises(ConversationNotFoundError):
-        await service.complete("intruder", conversation_id, tenant_id="t2")
+        await service.complete(
+            "intruder", conversation_id, principal=Principal(tenant_id="t2", group_ids=())
+        )
 
     # B's failed read touched neither B's nor A's storage: A's next turn
     # sees exactly the history it left behind, not B's turn spliced in.
-    conversation_id, _ = await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
     assert await history(store, conversation_id) == [
         ("user", "one"),
         ("assistant", "pong"),
@@ -183,11 +187,11 @@ async def test_cross_tenant_complete_raises_not_found_and_intact_history_survive
 async def test_failed_turn_leaves_no_trace() -> None:
     spy = SpyChatService()
     service, store = make_service(spy)
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
 
     spy._open_error = UpstreamServiceError("boom")
     with pytest.raises(UpstreamServiceError):
-        await service.complete("two", conversation_id, tenant_id=TENANT_ID)
+        await service.complete("two", conversation_id, principal=DEFAULT_PRINCIPAL)
 
     assert len(await history(store, conversation_id)) == 2  # only the first turn
 
@@ -197,7 +201,7 @@ async def test_empty_reply_is_an_upstream_failure_not_a_ghost_id() -> None:
     service, store = make_service(spy)
 
     with pytest.raises(UpstreamServiceError):
-        await service.complete("hi", None, tenant_id=TENANT_ID)
+        await service.complete("hi", None, principal=DEFAULT_PRINCIPAL)
 
     assert store._messages == {}  # nothing committed, no id issued to anyone
 
@@ -207,19 +211,19 @@ async def test_store_failure_maps_to_storage_error() -> None:
     service = ConversationChatService(spy, FailingStore())
 
     with pytest.raises(StorageError):
-        await service.complete("hi", None, tenant_id=TENANT_ID)
+        await service.complete("hi", None, principal=DEFAULT_PRINCIPAL)
 
 
 async def test_concurrent_turns_on_one_conversation_are_serialized() -> None:
     spy = SpyChatService()
     service, store = make_service(spy)
-    conversation_id, _ = await service.complete("first", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("first", None, principal=DEFAULT_PRINCIPAL)
 
     # Fire both turns concurrently; without the per-conversation lock both
     # would read the same 2-item snapshot.
     await asyncio.gather(
-        service.complete("A", conversation_id, tenant_id=TENANT_ID),
-        service.complete("B", conversation_id, tenant_id=TENANT_ID),
+        service.complete("A", conversation_id, principal=DEFAULT_PRINCIPAL),
+        service.complete("B", conversation_id, principal=DEFAULT_PRINCIPAL),
     )
 
     lengths = sorted(len(received) for received in spy.received[1:])
@@ -232,7 +236,7 @@ async def test_stream_completed_commits_transcript_and_replay() -> None:
     spy = SpyChatService(stream_script=[TextDelta("po"), TextDelta("ng"), done(status="completed")])
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     received = [event async for event in events]
 
     assert isinstance(received[-1], StreamDone)
@@ -247,7 +251,7 @@ async def test_stream_commits_before_the_terminal_is_delivered() -> None:
     spy = SpyChatService(stream_script=[TextDelta("pong"), done(status="completed")])
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     async for event in events:
         if isinstance(event, StreamDone):
             # When the client sees message.done the history must already exist.
@@ -263,7 +267,7 @@ async def test_stream_max_output_tokens_commits_the_partial_text() -> None:
     )
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     _ = [event async for event in events]
 
     assert await history(store, conversation_id) == [("user", "hi"), ("assistant", "par")]
@@ -279,7 +283,7 @@ async def test_stream_discarded_text_is_not_committed(reason: str) -> None:
     )
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     _ = [event async for event in events]
 
     assert await history(store, conversation_id) == []
@@ -290,7 +294,7 @@ async def test_mid_stream_failure_is_not_committed() -> None:
     spy = SpyChatService(stream_script=[TextDelta("par"), UpstreamServiceError("died")])
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     with pytest.raises(UpstreamServiceError):
         _ = [event async for event in events]
 
@@ -301,7 +305,7 @@ async def test_stream_store_failure_surfaces_as_storage_error() -> None:
     spy = SpyChatService(stream_script=[TextDelta("pong"), done(status="completed")])
     service = ConversationChatService(spy, FailingStore())
 
-    _, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    _, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     with pytest.raises(StorageError):
         _ = [event async for event in events]
 
@@ -310,7 +314,7 @@ async def test_disconnect_before_terminal_aborts_the_turn_uncommitted() -> None:
     spy = SpyChatService(stream_script=[TextDelta("a"), TextDelta("b"), done(status="completed")])
     service, store = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     async for _ in events:
         break  # client went away after the first delta
     await events.aclose()  # type: ignore[attr-defined]
@@ -322,16 +326,16 @@ async def test_stream_releases_the_lock_after_disconnect() -> None:
     spy = SpyChatService(stream_script=[TextDelta("a"), done(status="completed")])
     service, _ = make_service(spy)
 
-    conversation_id, events = await service.open_stream("hi", None, tenant_id=TENANT_ID)
+    conversation_id, events = await service.open_stream("hi", None, principal=DEFAULT_PRINCIPAL)
     async for _ in events:
         break
     await events.aclose()  # type: ignore[attr-defined]
 
     # A follow-up turn must not deadlock on the abandoned stream's lock.
     async with asyncio.timeout(1):
-        await service.complete("next", None, tenant_id=TENANT_ID)
+        await service.complete("next", None, principal=DEFAULT_PRINCIPAL)
         with pytest.raises(ConversationNotFoundError):
-            await service.complete("next", conversation_id, tenant_id=TENANT_ID)
+            await service.complete("next", conversation_id, principal=DEFAULT_PRINCIPAL)
 
 
 async def test_stream_unknown_conversation_id_raises_before_opening_upstream() -> None:
@@ -339,7 +343,7 @@ async def test_stream_unknown_conversation_id_raises_before_opening_upstream() -
     service, _ = make_service(spy)
 
     with pytest.raises(ConversationNotFoundError):
-        await service.open_stream("hi", "never-issued", tenant_id=TENANT_ID)
+        await service.open_stream("hi", "never-issued", principal=DEFAULT_PRINCIPAL)
 
     assert spy.received == []
 
@@ -347,9 +351,9 @@ async def test_stream_unknown_conversation_id_raises_before_opening_upstream() -
 async def test_stream_follow_up_replays_prior_output_items() -> None:
     spy = SpyChatService(stream_script=[TextDelta("pong"), done(status="completed")])
     service, _ = make_service(spy)
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
 
-    _, events = await service.open_stream("two", conversation_id, tenant_id=TENANT_ID)
+    _, events = await service.open_stream("two", conversation_id, principal=DEFAULT_PRINCIPAL)
     _ = [event async for event in events]
 
     assert spy.received[1] == [
@@ -365,7 +369,7 @@ async def test_lock_registry_does_not_grow_on_unknown_ids() -> None:
 
     for n in range(1000):
         with pytest.raises(ConversationNotFoundError):
-            await service.complete("hi", f"never-issued-{n}", tenant_id=TENANT_ID)
+            await service.complete("hi", f"never-issued-{n}", principal=DEFAULT_PRINCIPAL)
 
     assert len(service._locks) == 0  # probing unknown ids leaves no entries behind
 
@@ -374,8 +378,8 @@ async def test_lock_registry_is_empty_after_normal_turns_and_streams() -> None:
     spy = SpyChatService(stream_script=[TextDelta("pong"), done(status="completed")])
     service, _ = make_service(spy)
 
-    conversation_id, _ = await service.complete("one", None, tenant_id=TENANT_ID)
-    _, events = await service.open_stream("two", conversation_id, tenant_id=TENANT_ID)
+    conversation_id, _ = await service.complete("one", None, principal=DEFAULT_PRINCIPAL)
+    _, events = await service.open_stream("two", conversation_id, principal=DEFAULT_PRINCIPAL)
     _ = [event async for event in events]
 
     assert len(service._locks) == 0
@@ -414,3 +418,43 @@ def test_builder_injects_shared_store_and_locks() -> None:
     service = build_conversation_service(settings, store=store, locks=locks)
     assert service._store is store
     assert service._locks is locks
+
+
+class _EchoChat:
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        return ChatResult(message="ok")
+
+    async def aclose(self) -> None:
+        return None
+
+
+P_G1 = Principal(tenant_id="t1", group_ids=("g1",))
+P_G2 = Principal(tenant_id="t1", group_ids=("g2",))
+
+
+async def test_scope_mismatch_is_not_found_same_shape() -> None:
+    store = InMemoryConversationStore()
+    service = ConversationChatService(_EchoChat(), store)
+    cid, _ = await service.complete("hi", None, principal=P_G1)
+    with pytest.raises(ConversationNotFoundError):
+        await service.complete("again", cid, principal=P_G2)
+
+
+async def test_same_scope_continues_and_scope_is_persisted() -> None:
+    store = InMemoryConversationStore()
+    service = ConversationChatService(_EchoChat(), store)
+    cid, _ = await service.complete("hi", None, principal=P_G1)
+    stored = await store.get("t1", cid)
+    assert stored is not None
+    assert stored.authorization_group_ids == ("g1",)
+    cid2, _ = await service.complete("again", cid, principal=P_G1)
+    assert cid2 == cid
+
+
+async def test_scope_mismatch_on_stream_is_pre_stream_and_releases_lock() -> None:
+    store = InMemoryConversationStore()
+    service = ConversationChatService(_EchoChat(), store)
+    cid, _ = await service.complete("hi", None, principal=P_G1)
+    with pytest.raises(ConversationNotFoundError):
+        await service.open_stream("again", cid, principal=P_G2)
+    assert service._locks.holders(("t1", cid)) == 0

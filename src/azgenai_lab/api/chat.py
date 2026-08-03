@@ -118,7 +118,7 @@ async def chat(
 ) -> ChatResponse:
     try:
         conversation_id, result = await service.complete(
-            payload.message, payload.conversation_id, tenant_id=principal.tenant_id
+            payload.message, payload.conversation_id, principal=principal
         )
     except ConversationNotFoundError:
         raise conversation_not_found() from None
