@@ -246,6 +246,44 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   `context_length_exceeded` despite the headroom), which by definition made
   one provider call before failing.
 
+## Agent endpoint
+
+`POST /api/v1/agent` runs a tool-using agent turn inside a conversation.
+The request carries `task` (422 when blank; 400 `invalid_input` beyond
+4,000 UTF-8 bytes) and an optional `conversation_id` with the same
+semantics as `/chat` — omit to start, unknown ids are 404
+`conversation_not_found`.
+
+**Authorization scope is part of session identity.** A conversation is
+bound at creation to the creating principal's exact group set; every
+continuation — `/chat`, `/chat/stream`, `/agent` — under a different set
+is indistinguishable from a conversation that does not exist (404, same
+shape as unknown and cross-tenant ids). The remedy after a group change
+is a new conversation.
+
+**One run is one turn.** The whole run's provider-reported usage commits
+atomically with the turn; a failed run leaves no trace in the ledger even
+though the completed calls were billed upstream (the invoice and Cost
+Management remain the authority). The budget gate is a single pre-run
+check: an admitted run may overshoot the threshold by up to its entire
+usage — the complete ceiling is 6 × the deployed model's context window.
+
+**Incomplete vocabulary (additive).** `status: incomplete` with
+`incomplete_reason: tool_call_limit` (the tool budget forced the final
+answer) or `iteration_limit` (the model-call budget did). For both, the
+answer is keepable and may be empty — the framework's hardcoded fallback
+sentence never reaches the wire. `natural` stops with an empty answer are
+502 `upstream_error`, mirroring `/chat`'s empty-reply contract.
+
+**Execution trace.** `tool_calls` lists tool names, parsed arguments
+(null when unparseable) and 1-based rounds, including refused calls
+(`executed: false`). Tool outputs are deliberately absent from the wire:
+they reached the model, and re-publishing them would bypass the
+document-ACL reasoning that shaped them.
+
+See [diagrams/agent-turn-sequence.md](diagrams/agent-turn-sequence.md) for
+the full request flow.
+
 ## Correlation ID
 
 The middleware in `azgenai_lab.core.correlation`:
