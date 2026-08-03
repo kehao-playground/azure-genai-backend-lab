@@ -107,6 +107,14 @@ teardown_hint() {
   fi
 }
 trap teardown_hint EXIT
+# Signals are turned into an exit rather than added to the EXIT trap's list.
+# `trap teardown_hint EXIT INT TERM HUP` looks equivalent and is not: measured
+# on this bash, SIGHUP and SIGTERM run the handler TWICE and leave `$?` at 0,
+# so the `status -ne 0` guard below would swallow the teardown hint at exactly
+# the moment it is needed — a closed terminal is the "operator went away" case
+# this whole mechanism exists for. Exiting first gives one invocation with a
+# non-zero status.
+trap 'exit 130' INT TERM HUP
 
 # `az ad app create` returns the whole object; both ids are read from that one
 # response rather than following up with `az ad app show`, which can 404
