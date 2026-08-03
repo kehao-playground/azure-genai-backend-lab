@@ -276,8 +276,168 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/v1/agent:
+    post:
+      tags:
+      - agent
+      summary: Agent Turn
+      operationId: agent_turn_api_v1_agent_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '400':
+          description: Task exceeds the byte boundary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Missing or malformed identity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: Unknown conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '429':
+          description: Conversation token budget exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Conversation storage failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '502':
+          description: Agent run failed upstream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
 components:
   schemas:
+    AgentRequest:
+      properties:
+        task:
+          type: string
+          title: Task
+          description: The agent's task. Whitespace-only is rejected as 422; the 4,000-UTF-8-byte
+            boundary is enforced by the service as 400.
+        conversation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Conversation Id
+          description: Continues an existing conversation (the agent sees prior user/assistant
+            turns, and its own turn is appended). Omit to start a new one. Unknown
+            ids are rejected with 404.
+      type: object
+      required:
+      - task
+      title: AgentRequest
+    AgentResponse:
+      properties:
+        answer:
+          type: string
+          title: Answer
+          description: 'May be empty when incomplete_reason is set: the run hit a
+            limit before the model authored a final text.'
+        conversation_id:
+          type: string
+          title: Conversation Id
+        correlation_id:
+          type: string
+          title: Correlation Id
+        usage:
+          anyOf:
+          - $ref: '#/components/schemas/TokenUsage'
+          - type: 'null'
+        status:
+          type: string
+          enum:
+          - completed
+          - incomplete
+          title: Status
+        incomplete_reason:
+          anyOf:
+          - type: string
+            enum:
+            - tool_call_limit
+            - iteration_limit
+          - type: 'null'
+          title: Incomplete Reason
+          description: "Additive extension of the Day 6 vocabulary: tool_call_limit\
+            \ \u2014 the tool budget forced the final answer; iteration_limit \u2014\
+            \ the model-call budget did. For both the answer is keepable."
+        model_call_count:
+          type: integer
+          title: Model Call Count
+        tool_calls:
+          items:
+            $ref: '#/components/schemas/AgentToolCallModel'
+          type: array
+          title: Tool Calls
+          description: "Execution trace: tool names, parsed arguments and rounds.\
+            \ Tool outputs are deliberately absent \u2014 they reached the model,\
+            \ not the wire."
+      type: object
+      required:
+      - answer
+      - conversation_id
+      - correlation_id
+      - status
+      - model_call_count
+      - tool_calls
+      title: AgentResponse
+    AgentToolCallModel:
+      properties:
+        tool_name:
+          type: string
+          title: Tool Name
+        arguments:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          title: Arguments
+          description: Parsed tool arguments; null when the model emitted unparseable
+            JSON.
+        round_index:
+          type: integer
+          title: Round Index
+        executed:
+          type: boolean
+          title: Executed
+      type: object
+      required:
+      - tool_name
+      - arguments
+      - round_index
+      - executed
+      title: AgentToolCallModel
     AnsweredRagResponse:
       properties:
         status:
