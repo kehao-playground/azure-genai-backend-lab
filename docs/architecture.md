@@ -30,6 +30,8 @@ LLM calls and vector retrieval sit behind thin adapters whose interfaces we defi
 
 This is the cage for nondeterminism: only adapter internals are unpredictable; everything outside is conventional, testable code.
 
+**Dependency rule: `services/` never depends on `api/`.** An adapter answers a protocol-shaped question (e.g. *was this token signed by a key this tenant publishes?*) and forms no opinion about HTTP — no FastAPI imports, no `HTTPException`, no request/response models. Mapping a failure to a status code, or claims to an application identity, is the API layer's job, done by depending on the adapter's return value, never the other way round. This keeps every adapter testable with plain data and no ASGI app in the loop (see `services/entra_jwt.py` and [entra-id-auth.md](entra-id-auth.md) for a worked example).
+
 ### External dependencies and state
 
 Azure OpenAI (model), Azure AI Search (retrieval), and conversation state storage sit outside the system boundary. The LLM API is stateless — "conversation memory" is an illusion the backend assembles from its own state store, and its location, retention, and access are the backend's responsibility.

@@ -5,20 +5,9 @@ capture, no basicConfig from elsewhere)."""
 
 import logging
 
-import pytest
-
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
-
-# Same format string as configure_logging() — duplicated here (rather than
-# imported) because the point of the test below is to catch the format
-# string silently drifting away from what the record factory populates.
-LOG_FORMAT = (
-    "%(asctime)s %(levelname)s %(name)s "
-    "correlation_id=%(correlation_id)s tenant_id=%(tenant_id)s "
-    "user_id=%(user_id)s %(message)s"
-)
 
 
 def test_configure_logging_sets_root_level_to_given_level() -> None:
@@ -56,20 +45,26 @@ def test_create_app_wires_root_logger_to_settings_log_level(monkeypatch) -> None
         configure_logging("WARNING")
 
 
-def test_identity_fields_are_rendered_not_just_attached(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    configure_logging("INFO")
-    formatter = logging.Formatter(LOG_FORMAT)
-    token_t = tenant_id_var.set("t1")
-    token_u = user_id_var.set("u1")
+def test_identity_fields_are_rendered_not_just_attached() -> None:
     try:
-        record = logging.getLogger("test").makeRecord(
-            "test", logging.INFO, __file__, 1, "identity resolved", None, None
-        )
+        configure_logging("INFO")
+        # The formatter configure_logging() actually installed on the root
+        # handler — not a local copy of the format string. A local copy would
+        # only prove the two strings match each other, not that the record
+        # factory's fields survive into what an operator actually sees.
+        formatter = logging.getLogger().handlers[0].formatter
+        assert formatter is not None
+        token_t = tenant_id_var.set("t1")
+        token_u = user_id_var.set("u1")
+        try:
+            record = logging.getLogger("test").makeRecord(
+                "test", logging.INFO, __file__, 1, "identity resolved", None, None
+            )
+        finally:
+            user_id_var.reset(token_u)
+            tenant_id_var.reset(token_t)
+        rendered = formatter.format(record)
+        assert "tenant_id=t1" in rendered
+        assert "user_id=u1" in rendered
     finally:
-        user_id_var.reset(token_u)
-        tenant_id_var.reset(token_t)
-    rendered = formatter.format(record)
-    assert "tenant_id=t1" in rendered
-    assert "user_id=u1" in rendered
+        configure_logging("WARNING")
