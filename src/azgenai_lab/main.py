@@ -16,8 +16,10 @@ from azgenai_lab.core.errors import (
     upstream_error_handler,
     validation_error_handler,
 )
+from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.services.conversation import build_conversation_service
+from azgenai_lab.services.conversation_store import build_conversation_store
 from azgenai_lab.services.rag import build_rag_service
 
 # Documents the real 422 shape: validation errors go through the envelope too.
@@ -54,7 +56,11 @@ def create_app() -> FastAPI:
     )
 
     # Built at startup, not per request: misconfiguration crashes here, not on request #1.
-    app.state.conversation_service = build_conversation_service(settings)
+    shared_store = build_conversation_store(settings)
+    shared_locks: KeyedLock[tuple[str, str]] = KeyedLock()
+    app.state.conversation_service = build_conversation_service(
+        settings, store=shared_store, locks=shared_locks
+    )
     app.state.rag_service = build_rag_service(settings)
 
     app.middleware("http")(correlation_id_middleware)

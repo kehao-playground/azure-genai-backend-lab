@@ -13,7 +13,9 @@ from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
+from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import StorageError, UpstreamServiceError
+from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import (
@@ -26,6 +28,7 @@ from azgenai_lab.services.azure_openai import (
 from azgenai_lab.services.conversation import (
     ConversationChatService,
     ConversationNotFoundError,
+    build_conversation_service,
 )
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
@@ -402,3 +405,12 @@ async def test_cancelled_waiter_does_not_leak_a_lock_entry() -> None:
 
     service._locks.release(lock_key)
     assert len(service._locks) == 0
+
+
+def test_builder_injects_shared_store_and_locks() -> None:
+    settings = Settings(use_fake_llm=True)
+    store = InMemoryConversationStore()
+    locks: KeyedLock[tuple[str, str]] = KeyedLock()
+    service = build_conversation_service(settings, store=store, locks=locks)
+    assert service._store is store
+    assert service._locks is locks

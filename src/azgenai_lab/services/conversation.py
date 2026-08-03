@@ -49,7 +49,7 @@ from azgenai_lab.services.azure_openai import (
     TextDelta,
     build_chat_service,
 )
-from azgenai_lab.services.conversation_store import ConversationStore, build_conversation_store
+from azgenai_lab.services.conversation_store import ConversationStore
 
 
 class ConversationNotFoundError(Exception):
@@ -86,6 +86,7 @@ class ConversationChatService:
         chat_service: ChatService,
         store: ConversationStore,
         token_budget: int | None = None,
+        locks: KeyedLock[tuple[str, str]] | None = None,
     ) -> None:
         self._chat_service = chat_service
         self._store = store
@@ -97,7 +98,7 @@ class ConversationChatService:
         # `hold()` block. Keying on the tenant too (not just the
         # conversation id) means two tenants can never serialize behind each
         # other's turns, even if a conversation_id collided across tenants.
-        self._locks: KeyedLock[tuple[str, str]] = KeyedLock()
+        self._locks = locks if locks is not None else KeyedLock()
 
     async def _load(
         self, tenant_id: str, provided_id: str | None, resolved_id: str
@@ -270,10 +271,22 @@ class ConversationChatService:
         await self._chat_service.aclose()
 
 
-def build_conversation_service(settings: Settings) -> ConversationChatService:
-    """Composition point: the chat adapter wrapped with app-owned state."""
+def build_conversation_service(
+    settings: Settings,
+    *,
+    store: ConversationStore,
+    locks: KeyedLock[tuple[str, str]],
+) -> ConversationChatService:
+    """Composition point: the chat adapter wrapped with app-owned state.
+
+    Store and locks are injected, never built here: /chat and /agent share
+    one store (or cross-endpoint history is silently invisible) and one lock
+    registry (or concurrent turns on one conversation burn a full inference
+    before dying as 500 storage_error). Correctness, not convenience.
+    """
     return ConversationChatService(
         build_chat_service(settings),
-        build_conversation_store(settings),
+        store,
         token_budget=settings.conversation_token_budget,
+        locks=locks,
     )
