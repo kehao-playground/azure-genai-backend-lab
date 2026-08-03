@@ -276,7 +276,10 @@ KNOWN_MEDIA_TYPES = frozenset(
     }
 )
 
-# RFC 6749 §5.2 plus RFC 8628 §3.5, and the two Entra adds this flow meets.
+# RFC 6749 §5.2 plus RFC 8628 §3.5, and the Entra adds this flow meets. The
+# last three are the tenant-policy refusals — the failure mode most likely on a
+# first run against a real tenant, which is exactly when naming the code rather
+# than describing it earns its keep.
 OAUTH_ERROR_CODES = frozenset(
     {
         "access_denied",
@@ -294,6 +297,23 @@ OAUTH_ERROR_CODES = frozenset(
         "temporarily_unavailable",
         "unauthorized_client",
         "unsupported_grant_type",
+        "consent_required",
+        "interaction_required",
+        "invalid_resource",
+    }
+)
+
+# RFC 6750 §3: the bare challenge plus the three error codes the spec defines.
+# Bounded like the others, but the point here is the opposite one — a differing
+# challenge that this API could legitimately have sent is worth naming, because
+# it is the difference between "the server rejected the token" and "the server
+# rejected the request".
+KNOWN_CHALLENGES = frozenset(
+    {
+        "Bearer",
+        'Bearer error="invalid_request"',
+        'Bearer error="invalid_token"',
+        'Bearer error="insufficient_scope"',
     }
 )
 
@@ -349,18 +369,22 @@ def error_code_check(name: str, response: httpx.Response, expected: str) -> Chec
 
 
 def challenge_check(name: str, response: httpx.Response, expected: str) -> Check:
-    """Compared, never echoed.
+    """Compared against a known set, then named or described.
 
-    RFC 6750 §3 lets a challenge carry an `error_description`, so the header
-    an unknown intermediary sets is arbitrary text. Since the check is an
-    equality test, the received value adds nothing the comparison has not
-    already reported.
+    RFC 6750 §3 lets a challenge carry an `error_description`, so the header an
+    unknown intermediary sets is arbitrary text — which is why it cannot be
+    echoed verbatim. But a challenge this API could legitimately have sent
+    (`Bearer error="invalid_token"` rather than the expected
+    `insufficient_scope`) is the whole diagnostic, and refusing to name it
+    would make a real failure undebuggable from either the evidence or the
+    terminal. Both properties hold through the same gate the other channels
+    use.
     """
     actual = response.headers.get("www-authenticate")
     if actual == expected:
         return Check(name, True, "")
-    problem = "no WWW-Authenticate header" if actual is None else "the challenge differed"
-    return Check(name, False, f"expected {expected!r}; {problem}")
+    described = describe(actual, KNOWN_CHALLENGES, "WWW-Authenticate challenge")
+    return Check(name, False, f"expected {expected!r}, got {described}")
 
 
 def rejection_checks(
@@ -968,6 +992,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SmokeError as exc:
         state.checks.append(Check(f"{config.phase}: prerequisite step", False, str(exc)))
     except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+        # The message goes to the terminal, under the same warning
+        # `_oauth_failure` prints for a provider `error_description`: httpx
+        # embeds the request URL in it, so it names the tenant. It is also the
+        # only thing that says WHICH of the three endpoints failed, and an
+        # operator who has just completed an interactive sign-in needs that
+        # far more than the evidence file does.
+        print(
+            "Failure detail (terminal only — names the URL, and with it the "
+            f"tenant; never paste into evidence files or committed text):\n  {exc}",
+            file=sys.stderr,
+        )
         # The transport and the filesystem, not just this tool's own errors. A
         # server that is not running, a mistyped `--base-url` and a log file
         # rotated mid-run are the three likeliest operator mistakes, and in
@@ -994,9 +1029,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         delegated_claim_keys=state.delegated_claim_keys,
         app_claim_keys=state.app_claim_keys,
     )
+    # stdout first, so the artifact exists somewhere even if the write below
+    # cannot happen.
     print(evidence)
     if config.evidence_out is not None:
-        config.evidence_out.write_text(evidence, encoding="utf-8")
+        try:
+            config.evidence_out.write_text(evidence, encoding="utf-8")
+        except OSError as exc:
+            # An unwritable path is the operator's own argument, so naming it
+            # leaks nothing. Escaping as a traceback would be the third way
+            # this tool could die after a completed sign-in.
+            print(
+                f"Could not write {config.evidence_out}: {type(exc).__name__}.",
+                file=sys.stderr,
+            )
+            # Non-zero even if every check passed: an operator who asked for an
+            # artifact and did not get one must not read this as a clean run.
+            return EXIT_FAIL
         print(f"evidence written to {config.evidence_out}")
 
     return EXIT_PASS if state.checks and all(check.passed for check in state.checks) else EXIT_FAIL

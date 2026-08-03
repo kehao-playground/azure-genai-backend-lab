@@ -97,6 +97,33 @@ def _accepted_response(correlation_id: str) -> httpx.Response:
     )
 
 
+class _StubClient:
+    """Stands in for `httpx.Client` in the `main()` wiring tests.
+
+    Answers every request with `_StubClient.response`, which defaults to the
+    403 the `no-role` phase expects — so a run through it passes every check,
+    and any non-zero exit in those tests comes from the thing under test.
+    """
+
+    response: httpx.Response = _response(
+        403,
+        json_body={"error": {"code": "insufficient_scope", "message": "..."}},
+        headers={"WWW-Authenticate": INSUFFICIENT_SCOPE_CHALLENGE},
+    )
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> "_StubClient":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def post(self, *_args: object, **_kwargs: object) -> httpx.Response:
+        return _StubClient.response
+
+
 # ---------------------------------------------------------------------------
 # Claim inventory and evidence redaction: the committed-artifact boundary.
 # ---------------------------------------------------------------------------
@@ -371,10 +398,17 @@ def test_the_error_envelope_is_only_read_from_a_json_response() -> None:
 # `redact_sensitive` is a denylist of three shapes, and these two values are
 # the holes in it: an opaque refresh token and a device `user_code` are neither
 # GUID-, JWT- nor tilde-shaped, so masking would not save them. What keeps them
-# out of the evidence is that every provider- and server-supplied string is
-# compared against a known set and *described* rather than quoted when it does
-# not belong. These tests pin that property on each of the four channels that
-# carry such a string.
+# out of the evidence is that the four channels carrying a provider- or
+# server-supplied VALUE — media type, `error.code`, the WWW-Authenticate
+# challenge, and the OAuth `error` field — compare it against a known set and
+# *describe* it rather than quote it when it does not belong. These tests pin
+# that property on each of those four.
+#
+# Scope, stated because the sentence above is easy to over-read: claim KEY
+# NAMES also originate in provider data and reach the evidence through
+# `render_evidence` gated by `redact_sensitive` alone, not by `describe`. That
+# channel carries names, never values, which is why it is bounded by what it
+# transports rather than by a set.
 # ---------------------------------------------------------------------------
 
 REFRESH_TOKEN = "0.AXoAV2K3mQx1TEqYtNQ8jRZ2AbCdEfGhIjKlMnOpQrStUvWxYz1234567890"
@@ -422,7 +456,7 @@ def test_an_unrecognized_media_type_is_described_not_quoted() -> None:
     assert "an unrecognized media type" in check.detail
 
 
-def test_the_challenge_is_compared_and_never_echoed() -> None:
+def test_an_unrecognized_challenge_is_described_not_echoed() -> None:
     # RFC 6750 §3 lets a challenge carry an `error_description`, so the header
     # an unknown intermediary sets is arbitrary text on the wire.
     response = _response(
@@ -431,14 +465,27 @@ def test_the_challenge_is_compared_and_never_echoed() -> None:
     check = entra_smoke.challenge_check("x", response, UNAUTHORIZED_CHALLENGE)
     assert not check.passed
     assert USER_CODE not in check.detail
-    assert "the challenge differed" in check.detail
+    assert "an unrecognized WWW-Authenticate challenge" in check.detail
     assert UNAUTHORIZED_CHALLENGE in check.detail  # the expectation is still stated
+
+
+def test_a_challenge_this_api_could_have_sent_is_named() -> None:
+    # The diagnostic the constraint must not cost: `invalid_token` where
+    # `insufficient_scope` was expected is the difference between "the server
+    # rejected the token" and "the server rejected the permission", and a run
+    # that only said "it differed" would leave that undebuggable.
+    response = _response(
+        401, json_body={}, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'}
+    )
+    check = entra_smoke.challenge_check("x", response, INSUFFICIENT_SCOPE_CHALLENGE)
+    assert not check.passed
+    assert 'Bearer error="invalid_token"' in check.detail
 
 
 def test_a_missing_challenge_is_distinguishable_from_a_different_one() -> None:
     check = entra_smoke.challenge_check("x", _response(401, json_body={}), "Bearer")
     assert not check.passed
-    assert "no WWW-Authenticate header" in check.detail
+    assert "no WWW-Authenticate challenge" in check.detail
 
 
 def test_an_unrecognized_oauth_error_is_described_not_quoted() -> None:
@@ -461,6 +508,31 @@ def test_an_unrecognized_oauth_error_is_described_not_quoted() -> None:
         )
     assert REFRESH_TOKEN not in str(raised.value)
     assert "an unrecognized OAuth error" in str(raised.value)
+
+
+@pytest.mark.parametrize("code", ["consent_required", "interaction_required", "invalid_resource"])
+def test_the_tenant_policy_refusals_are_named_not_described(code: str) -> None:
+    # These three are the likeliest first-run failure against a real tenant, so
+    # they are exactly the codes worth naming: "an unrecognized OAuth error"
+    # would send an operator hunting for a fault that Entra already named.
+    request = httpx.Request("POST", "https://login.example/token")
+
+    class FakeClient:
+        def post(self, url: str, *, data: dict[str, str]) -> httpx.Response:
+            return httpx.Response(400, request=request, json={"error": code})
+
+    with pytest.raises(SmokeError) as raised:
+        poll_device_token(
+            FakeClient(),  # type: ignore[arg-type]
+            token_url="https://login.example/token",
+            client_id="client-id",
+            device_code="device-code",
+            interval=1,
+            expires_in=60,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 0.0,
+        )
+    assert code in str(raised.value)
 
 
 def test_describe_is_the_single_gate_every_channel_passes_through() -> None:
@@ -808,6 +880,71 @@ def test_a_transport_failure_still_writes_evidence_and_exits_one(
     assert "All connection attempts failed" not in written
 
 
+def test_the_transport_failure_message_reaches_the_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Kept out of the file, but not thrown away.
+
+    `ConnectError` alone does not say WHICH of the token endpoint, the API and
+    the server log failed, and in `--phase full` the operator learns this after
+    already completing an interactive sign-in. So the message goes to stderr
+    under the same terminal-only warning `_oauth_failure` prints — the one
+    place it is allowed to name the tenant.
+    """
+
+    def refuse(*_args: object, **_kwargs: object) -> str:
+        raise httpx.ConnectError(f"All connection attempts failed for {TENANT_ID}")
+
+    monkeypatch.setattr(entra_smoke, "acquire_app_token", refuse)
+    monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
+
+    entra_smoke.main(
+        [
+            "--phase", "no-role",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert "All connection attempts failed" in captured.err
+    assert "terminal only" in captured.err
+    # and still not on stdout, which is the evidence text an operator copies
+    assert "All connection attempts failed" not in captured.out
+
+
+def test_an_unwritable_evidence_path_is_reported_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A directory where a file was asked for: `write_text` raises `IsADirectoryError`.
+    # Escaping as a traceback would be the third way this tool can die after a
+    # completed sign-in, and it would print the path in a stack frame anyway.
+    monkeypatch.setattr(
+        entra_smoke, "acquire_app_token", lambda *_a, **_k: unsigned_test_token({"aud": "api"})
+    )
+    monkeypatch.setattr(entra_smoke.httpx, "Client", _StubClient)
+    monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
+    blocked = tmp_path / "evidence.txt"
+    blocked.mkdir()
+
+    exit_code = entra_smoke.main(
+        [
+            "--phase", "no-role",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+            "--evidence-out", str(blocked),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Could not write" in captured.err
+    # the evidence itself still reached stdout, so nothing measured was lost
+    assert "# Entra ID live smoke evidence" in captured.out
+
+
 def test_a_rotated_log_file_is_a_failed_check_not_a_traceback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -827,20 +964,8 @@ def test_a_rotated_log_file_is_a_failed_check_not_a_traceback(
     log = tmp_path / "server.log"
     log.write_text("", encoding="utf-8")
 
-    class _DeadClient:
-        def __init__(self, *_a: object, **_k: object) -> None:
-            pass
-
-        def __enter__(self) -> "_DeadClient":
-            return self
-
-        def __exit__(self, *_a: object) -> None:
-            return None
-
-        def post(self, *_a: object, **_k: object) -> httpx.Response:
-            return _accepted_response("corr-1")
-
-    monkeypatch.setattr(entra_smoke.httpx, "Client", _DeadClient)
+    monkeypatch.setattr(_StubClient, "response", _accepted_response("corr-1"))
+    monkeypatch.setattr(entra_smoke.httpx, "Client", _StubClient)
     monkeypatch.setattr(
         entra_smoke,
         "request_device_code",
@@ -1065,6 +1190,46 @@ def test_device_poll_raises_on_a_terminal_oauth_error() -> None:
         )
     assert "authorization_declined" in str(raised.value)
     assert TENANT_ID not in str(raised.value)
+
+
+def test_the_provider_description_goes_to_stderr_not_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The stream matters, not just the exclusion from the exception.
+
+    stdout is the evidence text an operator copies out of the terminal, so a
+    description naming the tenant must not land there. stderr is the one
+    channel it is allowed on, under the warning.
+    """
+    request = httpx.Request("POST", "https://login.example/token")
+
+    class FakeClient:
+        def post(self, url: str, *, data: dict[str, str]) -> httpx.Response:
+            return httpx.Response(
+                400,
+                request=request,
+                json={
+                    "error": "invalid_client",
+                    "error_description": f"AADSTS7000215 tenant {TENANT_ID}",
+                },
+            )
+
+    with pytest.raises(SmokeError):
+        poll_device_token(
+            FakeClient(),  # type: ignore[arg-type]
+            token_url="https://login.example/token",
+            client_id="client-id",
+            device_code="device-code",
+            interval=1,
+            expires_in=60,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 0.0,
+        )
+    captured = capsys.readouterr()
+    assert TENANT_ID in captured.err
+    assert "terminal only" in captured.err
+    assert TENANT_ID not in captured.out
+    assert "AADSTS7000215" not in captured.out
 
 
 def test_device_poll_stops_at_expiry_instead_of_looping_forever() -> None:
