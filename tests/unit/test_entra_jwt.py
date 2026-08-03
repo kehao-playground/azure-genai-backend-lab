@@ -7,9 +7,12 @@ a red run that says nothing about this code.
 """
 
 import ast
+import asyncio
 import json
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -260,9 +263,13 @@ async def test_verify_rejects_a_token_signed_by_another_key(
 async def test_verify_rejects_an_unknown_kid() -> None:
     """An unknown `kid` is rejected from the cache alone — no refetch here.
 
-    The cache is static after `initialize()` in this module; recovering from a
-    key rotation is a separate concern, and asserting the call count pins that
-    boundary rather than leaving it implied.
+    Not because the cache is static (it is not, since the refresh path
+    landed), but because the cooldown starts at the startup fetch and this
+    verify happens immediately after it. That is the same property
+    `test_unknown_kid_inside_cooldown_does_not_refresh` states directly with a
+    manual clock; kept here because the call count is what pins that a
+    rejection on this path is a rejection, not a rejection plus an outbound
+    request.
     """
     private_key, jwk = signing_material("kid-1")
     calls: list[str] = []
@@ -283,13 +290,19 @@ async def test_verify_rejects_an_unknown_kid() -> None:
 async def test_verify_rejects_alg_none(
     ready: tuple[rsa.RSAPrivateKey, EntraTokenVerifier],
 ) -> None:
-    """Rejected at the header screen — though not *only* there today.
+    """Rejected at the header screen — though not *only* there.
 
     `algorithms=["RS256"]` would refuse this token anyway, so deleting the
-    header screen would not turn this test red. The screen is what stops the
-    token before key lookup, and from Task 4 onward that ordering is
-    load-bearing: an unsigned token must not be able to trigger a JWKS
-    refresh. Kept as a contract test, not as proof of the ordering.
+    header screen would not turn this test red, and the arrival of the refresh
+    path did not change that: the `kid` here is one we publish, so the lookup
+    hits and the request ends before any refresh could be triggered no matter
+    what order the checks run in.
+
+    The ordering *is* load-bearing now — an unsigned token must not be able to
+    drive JWKS traffic — but the test that proves it needs an unknown `kid`
+    and an expired cooldown, which is
+    `test_a_forged_algorithm_with_an_unknown_kid_drives_no_jwks_traffic`. This
+    stays a contract test: `alg: none` is rejected, full stop.
     """
     _, verifier = ready
     unsigned = jwt.encode(
@@ -310,11 +323,15 @@ async def test_verify_rejects_hs256_before_touching_the_key_cache() -> None:
     an HMAC secret and a token anyone can mint would verify. That part is
     real, and `algorithms=["RS256"]` backs it up independently.
 
-    The `calls == []` assertion is weaker than it looks *today*: `verify()`
-    makes no requests on any path in this task, so it holds whatever the
-    ordering is. It is here to be inherited — once Task 4 lets an unknown
-    `kid` trigger a refresh, this becomes the assertion that an attacker
-    cannot drive JWKS traffic with a token we never had to look at.
+    The `calls == []` assertion is still weaker than it looks. `verify()` can
+    now reach the network, but not on this token's path: the forged header
+    names `kid-1`, which is in the cache, so the lookup hits and no refresh is
+    reachable whatever the ordering. The clause pins that a *hit* costs no
+    request — worth holding, and not the anti-amplification proof it was
+    expected to grow into.
+
+    That proof needs a `kid` the cache does not hold, which is
+    `test_a_forged_algorithm_with_an_unknown_kid_drives_no_jwks_traffic`.
     """
     _, jwk = signing_material("kid-1")
     calls: list[str] = []
@@ -355,8 +372,13 @@ async def test_verify_rejects_a_header_without_a_kid(
     """A contract test, not a proof that the explicit check is doing the work.
 
     `self._keys.get(None)` misses regardless, so removing the `kid` screen
-    leaves this green. It earns its keep from Task 4 onward, when a lookup
-    miss stops being a dead end and starts costing a refresh.
+    leaves this green — including now that a miss can cost a refresh, because
+    a missing `kid` reaches `_refresh_keys(None)`, and `None` there means the
+    cache-age trigger, which declines on a fresh cache. So the screen is not
+    an anti-amplification control; what it prevents is subtler and worth
+    keeping: a token with *no* key id being silently spelled as a refresh for
+    *no particular* key id, conflating two unrelated meanings of the same
+    argument. Type checking catches that too. This holds the contract.
     """
     private_key, verifier = ready
     claims = {"iss": ISSUER, "aud": AUDIENCE, "exp": datetime.now(UTC) + timedelta(minutes=5)}
@@ -713,10 +735,13 @@ def owned_verifier(
     def factory(**kwargs: Any) -> httpx.AsyncClient:
         return real_client(transport=httpx.MockTransport(handler), **kwargs)
 
-    monkeypatch.setattr(httpx, "AsyncClient", factory)
-    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE)
-    monkeypatch.undo()
-    return verifier
+    # Scoped rather than `monkeypatch.undo()`, which reverts *every* patch
+    # registered on the fixture instance, not just this one. Today's only
+    # caller registers nothing else; a future one that does would have its
+    # patch silently torn down here.
+    with monkeypatch.context() as patched:
+        patched.setattr(httpx, "AsyncClient", factory)
+        return EntraTokenVerifier(TENANT_ID, AUDIENCE)
 
 
 async def test_a_failed_reinitialize_keeps_an_owned_client_usable(
@@ -794,6 +819,412 @@ async def test_verify_after_a_failed_startup_is_a_programming_error() -> None:
             await verifier.verify(access_token(private_key, kid="kid-1"))
     finally:
         await client.aclose()
+
+
+# --- rotation, cooldown and max age ---------------------------------------------
+
+
+@dataclass
+class ManualClock:
+    """A monotonic clock the test moves by hand.
+
+    Cache age and cooldown are the entire subject of this section, and they are
+    measured in hours and minutes; sleeping through them is not an option, and
+    patching `time.monotonic` globally would reach every other clock in the
+    process. The verifier takes its clock as a constructor argument precisely
+    so this can be a local substitution.
+    """
+
+    value: float = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class RotatingJwks:
+    """A JWKS endpoint whose published key set can change mid-test.
+
+    `jwks_calls` counts requests to the keys endpoint only. Discovery is
+    deliberately not counted, so "one refresh" reads as one increment whether
+    or not the refresh path re-reads the metadata document first — the count
+    stays a statement about refreshes rather than about their internal shape.
+    """
+
+    def __init__(self, keys: list[dict[str, object]]) -> None:
+        self.current_keys = list(keys)
+        self.jwks_calls = 0
+        self.fail = False
+        # Runs while the keys request is in flight, which is the only moment a
+        # test can act on a half-finished refresh.
+        self.before_response: Callable[[], None] | None = None
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        # Async, and yielding, on purpose. `MockTransport` awaits an async
+        # handler; a sync one never reaches the event loop, so a burst of
+        # "concurrent" verifies would run strictly one after another — the
+        # first finishing its entire refresh before the second began. Every
+        # serialization property would then hold whether or not the code
+        # serializes anything, and the lock would be untested. This is the
+        # suspension point that makes the interleaving real.
+        await asyncio.sleep(0)
+        if str(request.url) == DISCOVERY_URL:
+            return httpx.Response(200, json=DISCOVERY_BODY)
+        if str(request.url) == JWKS_URL:
+            self.jwks_calls += 1
+            if self.before_response is not None:
+                self.before_response()
+            if self.fail:
+                return httpx.Response(503, json={"error": "nope"})
+            return httpx.Response(200, json={"keys": self.current_keys})
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+
+@asynccontextmanager
+async def rotating_verifier(
+    source: RotatingJwks, clock: ManualClock
+) -> AsyncIterator[EntraTokenVerifier]:
+    """A verifier wired to `source` and `clock`, with the client always closed."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(source.handler))
+    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client, clock=clock)
+    try:
+        yield verifier
+    finally:
+        await client.aclose()
+
+
+async def test_concurrent_unknown_kid_causes_one_refresh() -> None:
+    """Twenty simultaneous unknown-`kid` requests share a single fetch.
+
+    The lock is not an optimization. `kid` is attacker-controlled, so an
+    unknown one that always fetched would make this service a request
+    amplifier pointed at Microsoft: N concurrent forged tokens, N outbound
+    requests, no credentials needed.
+
+    All twenty must also *succeed*, and that half is what the lock is for.
+    The cooldown alone would hold the call count down — the first arrival
+    stamps the attempt before it awaits, so the other nineteen are inside the
+    window — but they would then fall straight through to a lookup against the
+    cache the refresh has not published yet, and a rotation would answer 401
+    to nineteen legitimate requests. The lock is what makes them wait for the
+    answer instead of racing past it.
+    """
+    _, old_jwk = signing_material("kid-1")
+    new_key, new_jwk = signing_material("kid-2")
+    source = RotatingJwks([old_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        source.current_keys = [new_jwk]
+        token = access_token(new_key, kid="kid-2")
+        results = await asyncio.gather(*(verifier.verify(token) for _ in range(20)))
+    assert all(result["oid"] == "33333333-3333-3333-3333-333333333333" for result in results)
+    assert source.jwks_calls == 2  # startup + one shared refresh
+
+
+async def test_unknown_kid_inside_cooldown_does_not_refresh() -> None:
+    """A forged `kid` moments after startup buys the attacker nothing.
+
+    The cooldown clock starts at the startup fetch rather than at the first
+    refresh, so the window right after a process comes up — the one an
+    attacker can aim at by watching for a deploy — is covered like any other.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(private_key, kid="kid-unknown"))
+    assert source.jwks_calls == 1
+
+
+async def test_stale_known_key_refreshes_after_24_hours() -> None:
+    """Age alone refreshes the cache; no unknown `kid` has to ask for it.
+
+    Without this trigger a verifier whose traffic all names keys it already
+    holds would never notice a withdrawal, and would keep honouring a revoked
+    key until the process restarted.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert claims["tid"] == TENANT_ID
+    assert source.jwks_calls == 2
+
+
+async def test_failed_stale_refresh_keeps_known_key_and_starts_cooldown() -> None:
+    """An unreachable JWKS endpoint must not take authentication down with it.
+
+    Two properties in one arrangement: the cache that failed to refresh still
+    verifies (a provider outage is not an outage here), and the *failed*
+    attempt starts the cooldown, so a persistently broken endpoint is retried
+    on a timer rather than once per request. The second is why the attempt
+    timestamp is written before the network await and not after it.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.fail = True
+        first = await verifier.verify(access_token(private_key, kid="kid-1"))
+        second = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert first["tid"] == TENANT_ID
+    assert second["tid"] == TENANT_ID
+    assert source.jwks_calls == 2  # startup + one failed attempt
+
+
+async def test_successful_refresh_replaces_instead_of_merging_keys() -> None:
+    """The refreshed key set replaces the cache; it is not merged into it.
+
+    A merge is invisible on the happy path and wrong in exactly the case that
+    matters: the tenant withdrew `kid-1`, and a verifier that kept it would go
+    on accepting tokens signed by a retired key. The call count pins the other
+    half — the miss triggers one refresh, not a second one after the first
+    already ran in this same `verify()`.
+    """
+    old_key, old_jwk = signing_material("kid-1")
+    _, new_jwk = signing_material("kid-2")
+    source = RotatingJwks([old_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.current_keys = [new_jwk]
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(old_key, kid="kid-1"))
+    assert source.jwks_calls == 2
+
+
+# --- rotation under an adversary ------------------------------------------------
+
+
+async def test_concurrent_failed_unknown_kid_requests_make_one_attempt() -> None:
+    """The amplifier is closed on the failure path too.
+
+    The success path is the easy half: the first waiter publishes the key and
+    the rest find it, so they never reach the network. When the refresh
+    *fails* there is nothing to find, every waiter re-enters the refresh method
+    with the same unknown `kid`, and the cooldown — set before the network
+    await — is the only thing standing between twenty forged tokens and twenty
+    outbound requests.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        source.fail = True
+        token = access_token(private_key, kid="kid-unknown")
+        results = await asyncio.gather(
+            *(verifier.verify(token) for _ in range(20)), return_exceptions=True
+        )
+    assert all(isinstance(result, TokenInvalidError) for result in results)
+    assert source.jwks_calls == 2  # startup + one failed attempt shared by all twenty
+
+
+async def test_a_second_unknown_kid_during_cooldown_makes_no_attempt() -> None:
+    """Rotating the forged `kid` does not rotate past the cooldown.
+
+    The cooldown is a property of the cache, not of the `kid` that prompted
+    it. A per-`kid` cooldown would be an amplifier with one extra step, since
+    the attacker is the one choosing the `kid` — nine more forgeries here, and
+    the call count does not move.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(private_key, kid="forged-a"))
+        assert source.jwks_calls == 2
+        for suffix in "bcdefghij":
+            with pytest.raises(TokenInvalidError):
+                await verifier.verify(access_token(private_key, kid=f"forged-{suffix}"))
+    assert source.jwks_calls == 2
+
+
+async def test_each_cooldown_window_permits_exactly_one_attempt() -> None:
+    """Sustained forged traffic costs one outbound request per minute, no more.
+
+    Three windows rather than one, because a cooldown that is armed once and
+    never re-armed passes a single-window test. Each window also probes just
+    short of the boundary, so the timestamp being refreshed on every attempt —
+    not only on the first — is what the count is measuring.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        expected = 1  # the startup fetch
+        for _ in range(3):
+            clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+            expected += 1
+            for _ in range(5):
+                with pytest.raises(TokenInvalidError):
+                    await verifier.verify(access_token(private_key, kid="forged"))
+                assert source.jwks_calls == expected
+            # Just short of the next window opening: still nothing.
+            clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS - 1)
+            with pytest.raises(TokenInvalidError):
+                await verifier.verify(access_token(private_key, kid="forged"))
+            assert source.jwks_calls == expected
+
+
+async def test_a_malformed_refresh_response_retains_the_previous_cache() -> None:
+    """A 200 that parses but contradicts itself must not empty the cache.
+
+    A different failure shape from the dead endpoint above: the request
+    succeeds, the JSON is well formed, and the *key set* is the thing that is
+    wrong. The refresh path validates the whole document before publishing
+    anything, so the old key keeps working and no half-built key set ever
+    becomes the live one — the same property `initialize()` holds, now on the
+    path that runs while requests are being served.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.current_keys = [jwk, jwk]  # duplicate kid: rejected wholesale
+        claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert claims["tid"] == TENANT_ID
+    assert source.jwks_calls == 2
+
+
+async def test_a_successful_refresh_withdraws_a_retired_key() -> None:
+    """The retired key stops verifying while its replacement carries on.
+
+    `test_successful_refresh_replaces_instead_of_merging_keys` shows the
+    withdrawn key being rejected, but with an empty overlap it cannot tell
+    "the retired key was dropped" apart from "the refresh broke everything".
+    Here one key survives the rotation and one does not, in the same key set.
+    """
+    retired_key, retired_jwk = signing_material("kid-retired")
+    kept_key, kept_jwk = signing_material("kid-kept")
+    source = RotatingJwks([retired_jwk, kept_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        await verifier.verify(access_token(retired_key, kid="kid-retired"))
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.current_keys = [kept_jwk]
+        claims = await verifier.verify(access_token(kept_key, kid="kid-kept"))
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(retired_key, kid="kid-retired"))
+    assert claims["tid"] == TENANT_ID
+    assert source.jwks_calls == 2
+
+
+async def test_a_waiter_does_not_refetch_after_a_slow_refresh_publishes_its_key() -> None:
+    """A refresh slower than its own cooldown is not repeated by its waiters.
+
+    Every waiter behind the lock is holding a `kid` that has just been
+    published, and "is the key here now?" is the check that lets them out.
+    Usually the cooldown would cover for its absence — the waiters are inside
+    the window the fetch opened. Not here: the fetch outlasts its own cooldown
+    (a slow provider, which is exactly when a queue forms), so by the time the
+    queue drains the rate limit has expired and nothing else would stop each
+    waiter from starting a fresh fetch for a key it already holds.
+
+    The clock jumps *during* the keys request, so the window closes on the
+    refresh that is still in flight. Note this pins the check's presence, not
+    its position: all three guards return, so reordering them is not
+    observable from the outside.
+    """
+    _, old_jwk = signing_material("kid-1")
+    new_key, new_jwk = signing_material("kid-2")
+    source = RotatingJwks([old_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        source.current_keys = [new_jwk]
+        source.before_response = lambda: clock.advance(
+            entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1
+        )
+        token = access_token(new_key, kid="kid-2")
+        results = await asyncio.gather(*(verifier.verify(token) for _ in range(5)))
+    assert all(result["oid"] == "33333333-3333-3333-3333-333333333333" for result in results)
+    assert source.jwks_calls == 2  # startup + one refresh, not one per waiter
+
+
+async def test_a_forged_algorithm_with_an_unknown_kid_drives_no_jwks_traffic() -> None:
+    """The load-bearing form of the header-screen ordering.
+
+    `test_verify_rejects_alg_none` and
+    `test_verify_rejects_hs256_before_touching_the_key_cache` both present a
+    `kid` we publish, so a cache hit ends the request whatever order the checks
+    run in, and `algorithms=["RS256"]` rejects the token either way. Neither
+    can fail if the screens are deleted.
+
+    This one can. The `kid` is unknown and the cooldown has expired, so a
+    lookup miss costs a real outbound request — and the backstop that makes
+    those two green, PyJWT's own algorithm list, does not run until after that
+    request would already have been made. An attacker mints these for free.
+    """
+    _, jwk = signing_material("kid-1")
+    claims: dict[str, object] = {
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "exp": datetime.now(UTC) + timedelta(minutes=5),
+    }
+    header = {"kid": "kid-unknown"}
+    forged = [
+        jwt.encode(claims, None, algorithm="none", headers=header),  # type: ignore[arg-type]
+        jwt.encode(claims, secrets.token_bytes(32), algorithm="HS256", headers=header),
+    ]
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        # Every gate that could stop a refresh for an unrelated reason is open:
+        # the cooldown has lapsed, so only the header screens are left.
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        for token in forged:
+            with pytest.raises(TokenInvalidError):
+                await verifier.verify(token)
+    assert source.jwks_calls == 1
+
+
+async def test_a_refresh_failure_does_not_revoke_readiness() -> None:
+    """A failed refresh leaves a working verifier, not an uninitialized one.
+
+    `verify()` raises `RuntimeError` for a verifier that never came up. If the
+    refresh path touched the readiness latch or cleared the cache timestamp to
+    force a retry, that programming-error signal would start firing at real
+    clients over a cache that is still perfectly serviceable — and it would
+    arrive as a 500, not a 401.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.fail = True
+        await verifier.verify(access_token(private_key, kid="kid-1"))
+        source.fail = False
+        # The next window opens and the retry succeeds: a failed refresh does
+        # not wedge the path either.
+        clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+        claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert claims["tid"] == TENANT_ID
+    assert source.jwks_calls == 3
 
 
 # --- lifecycle ------------------------------------------------------------------
