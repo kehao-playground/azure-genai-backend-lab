@@ -248,6 +248,23 @@ async def test_startup_error_propagates_even_though_it_is_a_runtime_error() -> N
 # ---------------------------------------------------------------------------
 
 
+async def test_entra_resolver_ignores_day_15_identity_headers() -> None:
+    # The mirror of the sentinel's rule: with a token present, spoofed
+    # `X-Tenant-Id` / `X-User-Id` headers must contribute nothing. Identity
+    # comes from the verified claims or from nowhere.
+    principal = await _resolve(
+        DELEGATED_CLAIMS,
+        headers=[
+            (b"authorization", b"Bearer token"),
+            (b"x-tenant-id", b"attacker"),
+            (b"x-user-id", b"attacker"),
+            (b"x-group-ids", b"admins"),
+        ],
+    )
+
+    assert principal == Principal(tenant_id=TENANT_ID, user_id=USER_ID, group_ids=())
+
+
 async def test_delegated_and_app_only_produce_the_same_principal() -> None:
     delegated = await _resolve(DELEGATED_CLAIMS)
     app_only = await _resolve(APP_ONLY_CLAIMS)
@@ -290,18 +307,19 @@ async def test_configured_tenant_is_compared_exactly() -> None:
     await _expect_status(claims, 401)
 
 
-_GROUP_CLAIM_CASES: dict[str, tuple[dict[str, Any], tuple[str, ...]]] = {
+_GROUP_CLAIM_CASES: dict[str, tuple[dict[str, Any], tuple[str, ...] | None]] = {
     "absent": ({}, ()),
     "empty": ({"groups": []}, ()),
     "sorted_and_deduplicated": ({"groups": ["g2", "g1", "g2", "g10"]}, ("g1", "g10", "g2")),
+    # None means "check the count instead", for a case whose expected value
+    # would otherwise be a hundred literals.
     "at_the_limit": ({"groups": [f"g{i}" for i in range(100)]}, None),
+    # `_claim_names` is a pointer: an entry for something other than groups
+    # is not an overage signal, and a null points at nothing at all. Compare
+    # `hasgroups`, a flag, where null *is* refused — see the rejection table.
     "unrelated_claim_names": ({"_claim_names": {"upn": "src1"}}, ()),
-    # A null claim is an absent claim: neither of these points at groups
-    # living somewhere else, which is the only thing the overage rule reacts
-    # to. Entra emits `_claim_names: {"groups": ...}` / `hasgroups: true` and
-    # nothing else, and a token shaped any other way cannot pass the
-    # signature check in the first place.
     "null_claim_names": ({"_claim_names": None}, ()),
+    # The one value of the flag that means "no overage".
     "hasgroups_false": ({"hasgroups": False}, ()),
 }
 
@@ -339,6 +357,9 @@ _BAD_GROUP_CLAIMS: dict[str, dict[str, Any]] = {
     "hasgroups_true": {"hasgroups": True},
     "hasgroups_malformed_string": {"hasgroups": "true"},
     "hasgroups_malformed_number": {"hasgroups": 1},
+    # A present flag whose value is not `False`, by the same rule as the two
+    # above: the issuer said something about groups and we cannot read it.
+    "hasgroups_null": {"hasgroups": None},
 }
 
 
@@ -588,6 +609,20 @@ async def test_build_entra_resolver_returns_an_initialized_adapter(
     await resolver.aclose()
 
 
+async def test_build_entra_resolver_refuses_settings_without_a_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Settings' own model validator makes this unreachable in Entra mode, so
+    # the narrowing exists for a caller handing over headers-mode Settings.
+    # The exploding stand-in proves the refusal happens *before* a verifier
+    # (and its httpx client) is built, which is what stops the branch from
+    # leaking one on the way out.
+    monkeypatch.setattr(principal_module, "EntraTokenVerifier", _ExplodingVerifier)
+
+    with pytest.raises(ValueError, match="entra_tenant_id"):
+        await build_entra_resolver(Settings(_env_file=None, auth_mode="headers"))
+
+
 @pytest.mark.parametrize(
     "failure", [TokenVerifierStartupError("discovery failed"), asyncio.CancelledError()]
 )
@@ -621,36 +656,50 @@ async def test_build_entra_resolver_closes_the_verifier_when_startup_fails(
 # ---------------------------------------------------------------------------
 
 
-def _build_interim_for(monkeypatch: pytest.MonkeyPatch, mode: str) -> object:
+def _build_interim_for(mode: str) -> object:
     """Re-derive the module-level interim resolver under a given AUTH_MODE.
 
-    `get_settings()` is cached, so the mode is changed in the environment and
-    the cache cleared on both sides — the surrounding suite runs in headers
-    mode and must not inherit an Entra-mode Settings.
+    `get_settings()` is cached, so the environment is patched and the cache
+    cleared on both sides — the surrounding suite runs in headers mode and
+    must not inherit an Entra-mode Settings.
+
+    The patching is scoped here rather than taken from the `monkeypatch`
+    fixture so the final `cache_clear()` provably runs *after* the
+    environment is restored: `return` inside the `with` triggers its exit
+    first, then the `finally`. With fixture teardown the two orders depend on
+    instantiation order, leaving a window in which anything calling
+    `get_settings()` would cache Entra-mode settings for the rest of the
+    session.
     """
-    monkeypatch.setenv("AUTH_MODE", mode)
-    monkeypatch.setenv("ENTRA_TENANT_ID", TENANT_ID)
-    monkeypatch.setenv("ENTRA_AUDIENCE", AUDIENCE)
-    monkeypatch.setenv("ENTRA_REQUIRED_SCOPE", REQUIRED_SCOPE)
-    get_settings.cache_clear()
     try:
-        return build_initial_resolver(get_settings())
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("AUTH_MODE", mode)
+            patch.setenv("ENTRA_TENANT_ID", TENANT_ID)
+            patch.setenv("ENTRA_AUDIENCE", AUDIENCE)
+            patch.setenv("ENTRA_REQUIRED_SCOPE", REQUIRED_SCOPE)
+            get_settings.cache_clear()
+            return build_initial_resolver(get_settings())
     finally:
         get_settings.cache_clear()
 
 
-def test_interim_resolver_is_not_header_trust_in_entra_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_interim_resolver_is_not_header_trust_in_entra_mode() -> None:
     # With AUTH_MODE=entra, the module-level interim resolver must be the
     # sentinel, never a HeaderPrincipalResolver.
-    assert isinstance(_build_interim_for(monkeypatch, "entra"), UninitializedResolver)
+    assert isinstance(_build_interim_for("entra"), UninitializedResolver)
 
 
-def test_interim_resolver_is_usable_in_headers_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assert isinstance(_build_interim_for(monkeypatch, "headers"), HeaderPrincipalResolver)
+def test_interim_resolver_is_usable_in_headers_mode() -> None:
+    assert isinstance(_build_interim_for("headers"), HeaderPrincipalResolver)
+
+
+def test_the_settings_cache_survives_the_interim_probe() -> None:
+    # The probe above is the only thing in the suite that clears the cache,
+    # so this pins the half its own assertions cannot: whatever it leaves
+    # behind must be the ambient headers-mode configuration.
+    _build_interim_for("entra")
+
+    assert get_settings().auth_mode == "headers"
 
 
 def test_interim_resolver_is_assigned_from_the_mode_aware_factory() -> None:
@@ -663,6 +712,11 @@ def test_interim_resolver_is_assigned_from_the_mode_aware_factory() -> None:
     The assignment is a single module-level statement executed at import, so
     the source is where it can be pinned without re-importing the module the
     routers already hold a reference into.
+
+    The argument is pinned too, and it is not a formality: passing a
+    literal `Settings(auth_mode="headers")` reaches the factory, satisfies
+    every behavioural test in this file, and reintroduces exactly the same
+    trust downgrade one level out.
     """
     tree = ast.parse(Path(principal_module.__file__ or "").read_text(encoding="utf-8"))
     assignments = [
@@ -680,6 +734,15 @@ def test_interim_resolver_is_assigned_from_the_mode_aware_factory() -> None:
     assert isinstance(value, ast.Call)
     assert isinstance(value.func, ast.Name)
     assert value.func.id == "build_initial_resolver"
+
+    # Positional or keyword is not the point and is not pinned; that the one
+    # argument is the live `get_settings()` call is.
+    arguments = [*value.args, *(keyword.value for keyword in value.keywords)]
+    assert len(arguments) == 1
+    argument = arguments[0]
+    assert isinstance(argument, ast.Call)
+    assert isinstance(argument.func, ast.Name)
+    assert argument.func.id == "get_settings"
 
 
 def test_bearer_scheme_never_errors_on_its_own() -> None:
