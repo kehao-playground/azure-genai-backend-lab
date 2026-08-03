@@ -105,3 +105,52 @@ def test_agent_limits_defaults() -> None:
 def test_agent_limits_must_be_positive(field: str, bad: int) -> None:
     with pytest.raises(ValidationError):
         Settings(**{"_env_file": None, field: bad})
+
+
+TENANT_ID = "11111111-1111-1111-1111-111111111111"
+AUDIENCE = "22222222-2222-2222-2222-222222222222"
+
+
+def _entra_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "_env_file": None,
+        "auth_mode": "entra",
+        "entra_tenant_id": TENANT_ID.upper(),
+        "entra_audience": AUDIENCE.upper(),
+        "entra_required_scope": " access_as_user ",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_auth_defaults_to_headers() -> None:
+    assert Settings(_env_file=None).auth_mode == "headers"
+
+
+def test_entra_ids_and_permissions_are_normalized() -> None:
+    settings = _entra_settings()
+    assert settings.entra_tenant_id == TENANT_ID
+    assert settings.entra_audience == AUDIENCE
+    assert settings.entra_required_scope == "access_as_user"
+    assert settings.entra_required_app_role is None
+
+
+@pytest.mark.parametrize("field", ["entra_tenant_id", "entra_audience"])
+@pytest.mark.parametrize("bad", [None, "", "not-a-guid"])
+def test_entra_requires_guid_tenant_and_audience(field: str, bad: object) -> None:
+    with pytest.raises(ValidationError):
+        _entra_settings(**{field: bad})
+
+
+def test_entra_requires_scope_or_app_role() -> None:
+    with pytest.raises(ValidationError):
+        _entra_settings(entra_required_scope=" ", entra_required_app_role="")
+
+
+def test_entra_accepts_role_only() -> None:
+    settings = _entra_settings(
+        entra_required_scope=None,
+        entra_required_app_role=" Api.Access ",
+    )
+    assert settings.entra_required_scope is None
+    assert settings.entra_required_app_role == "Api.Access"
