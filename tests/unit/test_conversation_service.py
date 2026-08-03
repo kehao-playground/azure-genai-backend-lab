@@ -76,6 +76,8 @@ class FailingStore(InMemoryConversationStore):
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
         usage_tokens: int,
+        *,
+        first_turn_authorization_group_ids: tuple[str, ...] | None,
     ) -> None:
         raise RuntimeError("disk on fire")
 

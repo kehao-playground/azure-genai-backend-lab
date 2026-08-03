@@ -40,3 +40,7 @@ class Conversation(BaseModel):
     # Management meters are the authority), and the gap is disclosed rather
     # than papered over.
     total_tokens: int = 0
+    # Authorization scope captured at first commit (Day 18): the creating
+    # principal's exact (sorted, deduplicated) group set. Scope is part of
+    # session identity — continuation under any other set is 404-same-shape.
+    authorization_group_ids: tuple[str, ...] = ()
