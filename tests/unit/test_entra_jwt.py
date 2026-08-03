@@ -866,6 +866,16 @@ class RotatingJwks:
         # Runs while the keys request is in flight, which is the only moment a
         # test can act on a half-finished refresh.
         self.before_response: Callable[[], None] | None = None
+        # `entered` fires when a keys request arrives; `hold` keeps that
+        # request in flight until the test releases it. Together they pin a
+        # refresh open, which is how "a request arriving while a refresh is
+        # already running" becomes something a test can arrange rather than
+        # something it has to race for. A held request stands in for a dead
+        # provider: `MockTransport` cannot produce a real connect timeout, and
+        # a request that never answers is what a 10-second one looks like from
+        # inside the lock.
+        self.entered: asyncio.Event | None = None
+        self.hold: asyncio.Event | None = None
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         # Async, and yielding, on purpose. `MockTransport` awaits an async
@@ -883,6 +893,10 @@ class RotatingJwks:
             self.jwks_calls += 1
             if self.before_response is not None:
                 self.before_response()
+            if self.entered is not None:
+                self.entered.set()
+            if self.hold is not None:
+                await self.hold.wait()
             if self.fail:
                 return httpx.Response(503, json={"error": "nope"})
             return httpx.Response(200, json={"keys": self.current_keys})
@@ -1229,6 +1243,120 @@ async def test_a_forged_algorithm_with_an_unknown_kid_drives_no_jwks_traffic() -
             with pytest.raises(TokenInvalidError):
                 await verifier.verify(token)
     assert source.jwks_calls == 1
+
+
+async def test_a_cached_kid_is_served_while_a_refresh_is_already_in_flight() -> None:
+    """A cache that can answer the request does not wait for the network.
+
+    The age-triggered refresh used to run ahead of the lookup, which meant an
+    aged-out cache put *every* request behind one round trip — including
+    requests naming a key the cache holds and could answer at once. Against a
+    provider that has stopped responding, that is a ~20 s stall (two 10 s
+    timeouts) for everyone, repeating every cooldown window: a provider outage
+    turned into an authentication outage, which is exactly what this module
+    says it will not do.
+
+    So the lookup runs first and the age refresh is opportunistic. Here one is
+    already in flight, so the arriving request must be served from cache
+    immediately and add no traffic of its own.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.entered = asyncio.Event()
+        source.hold = asyncio.Event()
+        token = access_token(private_key, kid="kid-1")
+
+        # One request takes the refresh and is held there, holding the lock.
+        holder = asyncio.create_task(verifier.verify(token))
+        try:
+            # Every wait here is bounded. These are deadlock guards, not
+            # timing assertions: the behaviours under test either happen
+            # promptly or not at all, and an unbounded wait would turn a
+            # regression into a hung suite instead of a failing test.
+            await asyncio.wait_for(source.entered.wait(), timeout=5)
+            assert source.jwks_calls == 2
+
+            claims = await asyncio.wait_for(verifier.verify(token), timeout=5)
+            # Returned *while* the refresh is still outstanding — the property
+            # that a call count alone cannot show.
+            assert holder.done() is False
+            assert source.jwks_calls == 2
+        finally:
+            # Always release the held request, or a failure above would leave
+            # a task parked on an event nobody sets.
+            source.hold.set()
+            await asyncio.gather(holder, return_exceptions=True)
+    assert claims["tid"] == TENANT_ID
+
+
+async def test_a_stale_cache_stalls_one_request_per_window_not_all_of_them() -> None:
+    """The concurrent form: one request pays for the attempt, the rest do not.
+
+    Twenty simultaneous arrivals for a key the cache holds, against a stale
+    cache and a provider that has gone quiet. All twenty must be answered
+    while the one request that took the refresh is still hanging on it.
+
+    The bound is the pair working together: the lock is what the other
+    nineteen consult to know a fetch is underway, and the attempt stamp —
+    written before the await — is what keeps the *next* window's arrivals from
+    each starting one as the holder finishes.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.entered = asyncio.Event()
+        source.hold = asyncio.Event()
+        token = access_token(private_key, kid="kid-1")
+
+        holder = asyncio.create_task(verifier.verify(token))
+        try:
+            await asyncio.wait_for(source.entered.wait(), timeout=5)
+            results = await asyncio.wait_for(
+                asyncio.gather(*(verifier.verify(token) for _ in range(20))), timeout=5
+            )
+            assert all(result["tid"] == TENANT_ID for result in results)
+            assert holder.done() is False
+            assert source.jwks_calls == 2  # startup + the one in flight
+        finally:
+            source.hold.set()
+            await asyncio.gather(holder, return_exceptions=True)
+
+
+async def test_max_age_still_refreshes_a_cache_that_only_sees_known_kids() -> None:
+    """The property the reorder had to keep, stated on its own.
+
+    If an aged-out cache only refreshed on a lookup *miss*, a service whose
+    traffic always names keys it already holds would never re-read the key
+    set, and a key Entra withdrew would stay trusted for as long as the
+    process ran. Max age exists for exactly that case, so it is asserted
+    directly rather than left to follow from the other tests: a stale cache
+    plus a healthy provider plus a token the cache can answer must still
+    produce a refresh, and that refresh must retire the withdrawn key.
+    """
+    retired_key, retired_jwk = signing_material("kid-retired")
+    kept_key, kept_jwk = signing_material("kid-kept")
+    source = RotatingJwks([retired_jwk, kept_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.current_keys = [kept_jwk]
+
+        # A token naming a key the stale cache holds: a miss-only refresh
+        # would never fire here.
+        await verifier.verify(access_token(kept_key, kid="kid-kept"))
+        assert source.jwks_calls == 2
+
+        # The withdrawn key is gone from the live cache, not merely unused.
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(retired_key, kid="kid-retired"))
 
 
 async def test_an_unknown_kid_after_aclose_is_a_rejection_not_a_crash(

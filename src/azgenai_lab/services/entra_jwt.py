@@ -84,6 +84,10 @@ class EntraTokenVerifier:
     token naming a `kid` the cache does not hold. Both go through one
     serialized, rate-limited path — see `_refresh_keys` for why the second
     trigger cannot be turned into an outbound request amplifier.
+
+    They differ in how much a request will *wait* for that path, which
+    `verify()` decides: a cache miss blocks on the fetch, an aged-out cache
+    that can still answer the request does not.
     """
 
     def __init__(
@@ -210,16 +214,37 @@ class EntraTokenVerifier:
 
         # Both refresh triggers sit *below* the header screens, so a token we
         # were never going to accept — unsigned, HS256, no `kid` — cannot
-        # reach the network at all. The age check runs first: refreshing on
-        # age before the lookup means a rotation is usually already picked up
-        # by the time a token names the new key, leaving the unknown-`kid`
-        # trigger to cover the rotation that happens inside the age window.
-        if self._is_stale():
-            await self._refresh_keys(None)
-
+        # reach the network at all.
+        #
+        # The lookup comes first, and the two triggers are deliberately not
+        # symmetric. A miss has nothing to serve, so waiting for the fetch is
+        # the only way that caller ever gets an answer: full blocking
+        # single-flight. A hit can be answered right now, so the age-triggered
+        # refresh is opportunistic — it is taken only when nobody else is
+        # already fetching. Refreshing on age *before* the lookup would put
+        # every request behind one 20-second round trip on a dead provider,
+        # including the ones holding a key the cache can serve, which would
+        # turn a provider outage into the authentication outage this module
+        # promises it is not.
         key = self._keys.get(kid)
         if key is None:
             await self._refresh_keys(kid)
+            key = self._keys.get(kid)
+        elif self._is_stale() and not self._refresh_lock.locked():
+            # `locked()` and the acquire inside are not separated by any
+            # suspension point — `Lock.acquire` returns on a fast path without
+            # awaiting when uncontended — so this cannot lose a race and end
+            # up blocking after all. One request per cooldown window pays for
+            # the attempt (the stamp lands before the await, which is what
+            # suppresses the rest of the window); everyone else is served from
+            # cache while it is in flight.
+            await self._refresh_keys(None)
+            # Re-read. This request paid for the fetch, so it is holding a
+            # fresher key set than the lookup above saw, and answering it from
+            # the older one would mean honouring a key we have *just learned*
+            # the tenant withdrew. Waiting is what the reorder gave up; the
+            # verdict is not, and this keeps the accept/reject outcome for
+            # this request identical to refreshing ahead of the lookup.
             key = self._keys.get(kid)
         if key is None:
             raise TokenInvalidError("token key id is not in the published key set")
