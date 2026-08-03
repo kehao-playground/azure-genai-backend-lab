@@ -35,5 +35,13 @@ def client() -> Generator[TestClient]:
     app.dependency_overrides.clear()
     # The app is module-level; rebuild its state so conversations never leak
     # from one test into the next.
-    app.state.conversation_service = build_conversation_service(get_settings())
-    app.state.rag_service = build_rag_service(get_settings())
+    from azgenai_lab.core.keyed_lock import KeyedLock
+    from azgenai_lab.services.conversation_store import build_conversation_store
+
+    settings = get_settings()
+    store = build_conversation_store(settings)
+    locks: KeyedLock[tuple[str, str]] = KeyedLock()
+    app.state.conversation_service = build_conversation_service(
+        settings, store=store, locks=locks
+    )
+    app.state.rag_service = build_rag_service(settings)
