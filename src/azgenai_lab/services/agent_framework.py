@@ -137,10 +137,38 @@ def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
         loop.create_task(client.close())
 
 
+@dataclass(frozen=True)
+class AgentHistoryTurn:
+    """App-owned conversation context for an agent run — projected from the
+    client-visible transcript, never from opaque provider replay items."""
+
+    role: Literal["user", "assistant"]
+    text: str
+
+
 class AgentService(Protocol):
-    async def run(self, task: str) -> AgentRunResult: ...
+    async def run(
+        self,
+        task: str,
+        history: tuple[AgentHistoryTurn, ...],
+        *,
+        principal: Principal,
+    ) -> AgentRunResult: ...
 
     async def aclose(self) -> None: ...
+
+
+def _args_bytes(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> int:
+    """UTF-8 length of the canonical [positional, keyword] serialization —
+    covers positional AND keyword invocation, so the metric cannot silently
+    under-count if the framework ever switches from its current kwargs-only
+    tool dispatch. Byte length only; argument TEXT never reaches a log line
+    (Day 14 redaction)."""
+    return len(
+        json.dumps([list(args), dict(kwargs)], sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+    )
 
 
 @dataclass
@@ -190,8 +218,16 @@ def wrap_tools_with_admission(
         @functools.wraps(tool)  # preserves name/doc/signature for framework introspection
         async def admitted_tool(*args: Any, **kwargs: Any) -> str:
             if not await state.try_admit():
-                executions.append(
-                    ToolExecution(tool.__name__, executed=False, latency_ms=0.0)
+                execution = ToolExecution(tool.__name__, executed=False, latency_ms=0.0)
+                executions.append(execution)
+                logger.info(
+                    "agent_tool_execution name=%s seq=%d executed=%s "
+                    "latency_ms=%.1f args_bytes=%d",
+                    execution.tool_name,
+                    len(executions),
+                    execution.executed,
+                    execution.latency_ms,
+                    _args_bytes(args, kwargs),
                 )
                 return REFUSAL_MESSAGE
             if _test_pause_after_admit is not None:
@@ -205,12 +241,20 @@ def wrap_tools_with_admission(
                 # the sink must not silently lose failing/slow calls. The
                 # exception (if any) propagates unchanged — `finally` here
                 # only records, it never suppresses or converts.
-                executions.append(
-                    ToolExecution(
-                        tool.__name__,
-                        executed=True,
-                        latency_ms=(time.perf_counter() - start) * 1000,
-                    )
+                execution = ToolExecution(
+                    tool.__name__,
+                    executed=True,
+                    latency_ms=(time.perf_counter() - start) * 1000,
+                )
+                executions.append(execution)
+                logger.info(
+                    "agent_tool_execution name=%s seq=%d executed=%s "
+                    "latency_ms=%.1f args_bytes=%d",
+                    execution.tool_name,
+                    len(executions),
+                    execution.executed,
+                    execution.latency_ms,
+                    _args_bytes(args, kwargs),
                 )
 
         return admitted_tool
@@ -447,14 +491,21 @@ class FakeAgentService:
 
     def __init__(self, deps: AgentToolDeps) -> None:
         self._deps = deps
+        self.last_history: tuple[AgentHistoryTurn, ...] | None = None
+        self.last_principal: Principal | None = None
         self._closed = False
 
-    async def run(self, task: str) -> AgentRunResult:
+    async def run(
+        self,
+        task: str,
+        history: tuple[AgentHistoryTurn, ...],
+        *,
+        principal: Principal,
+    ) -> AgentRunResult:
         validate_task(task)
-        # TODO(day18-task6/7): per-run principal, not this demo-fixed one.
-        tools = bind_principal_tools(
-            self._deps, Principal(tenant_id="opsdemo", group_ids=())
-        )
+        self.last_history = history
+        self.last_principal = principal
+        tools = bind_principal_tools(self._deps, principal)
         tool_calls: list[AgentToolCall] = []
         outputs: list[str] = []
         for tool in tools:
@@ -490,7 +541,10 @@ class FakeAgentService:
         # deliberately does not take; the applied-guardrail claim is narrowed at
         # its source instead (see `make_get_runtime_config`).
         return AgentRunResult(
-            answer=f"[fake-agent] {task} (tools={len(tool_calls)}) " + " ".join(outputs),
+            answer=(
+                f"[fake-agent] {task} (history={len(history)}) "
+                f"(tools={len(tool_calls)}) " + " ".join(outputs)
+            ),
             model_call_count=2,  # one tool round + one final answer
             tool_round_count=1,
             tool_call_count=len(tool_calls),
@@ -507,6 +561,21 @@ class FakeAgentService:
             return
         self._closed = True
         await self._deps.retriever.aclose()
+
+
+def _to_framework_messages(
+    history: tuple[AgentHistoryTurn, ...], task: str
+) -> list[Any]:
+    """Assembled inside the adapter so upstream types never cross the
+    boundary: [...history, current task], no session — the pinned framework's
+    Agent.run(messages=...) with session=None is documented stateless."""
+    from agent_framework import Message as FrameworkMessage
+
+    items: list[Any] = [
+        FrameworkMessage(turn.role, [turn.text]) for turn in history
+    ]
+    items.append(FrameworkMessage("user", [task]))
+    return items
 
 
 class AgentFrameworkService:
@@ -583,52 +652,95 @@ class AgentFrameworkService:
             default_options=default_options,
         )
 
-    async def run(self, task: str) -> AgentRunResult:
+    async def run(
+        self,
+        task: str,
+        history: tuple[AgentHistoryTurn, ...],
+        *,
+        principal: Principal,
+    ) -> AgentRunResult:
         validate_task(task)
         state = AdmissionState(limit=self._settings.agent_max_tool_calls)
         executions: list[ToolExecution] = []
-        # TODO(day18-task6/7): per-run principal, not this demo-fixed one.
-        tools = bind_principal_tools(
-            self._deps, Principal(tenant_id="opsdemo", group_ids=())
+        wrapped = wrap_tools_with_admission(
+            bind_principal_tools(self._deps, principal), state, executions
         )
-        wrapped = wrap_tools_with_admission(tools, state, executions)
+        start = time.perf_counter()
+        result: AgentRunResult | None = None
         try:
-            response = await self._agent.run(task, tools=wrapped)
-        except Exception as exc:  # framework/provider terminal failure
-            # usage=None is the honest value, not an omission: the framework's
-            # loop keeps its running `aggregated_usage` as a function local and
-            # attaches it only to a response it returns, never to anything it
-            # raises. A mid-loop failure has already been billed for the calls
-            # that completed, but that number is discarded above us and there is
-            # no supported way to reach it (Day 9: never fabricate counts).
-            raise AgentRunError(str(exc), usage=None) from exc
-        shape = extract_run_shape(
-            response.messages, executions, refusal_message=REFUSAL_MESSAGE
-        )
-        executed = sum(1 for e in executions if e.executed)
-        refused = state.refused
-        stop_reason, limit_reasons = derive_stop(
-            shape.model_call_count,
-            executed=executed,
-            refused=refused,
-            max_iterations=self._settings.agent_max_iterations,
-            max_tool_calls=self._settings.agent_max_tool_calls,
-        )
-        return AgentRunResult(
-            answer=strip_framework_fallback(shape.answer, stop_reason),
-            model_call_count=shape.model_call_count,
-            tool_round_count=shape.tool_round_count,
-            tool_call_count=executed,
-            refused_call_count=refused,
-            stop_reason=stop_reason,
-            limit_reasons=limit_reasons,
-            tool_calls=shape.tool_calls,
-            # Loop aggregate, not the last call's: FunctionInvocationLayer
-            # sums every iteration's usage into the returned response
-            # (`add_usage_details`), so this is the whole run's bill.
-            usage=map_usage_details(response.usage_details),
-            per_round=shape.per_round,
-        )
+            try:
+                response = await self._agent.run(
+                    _to_framework_messages(history, task), tools=wrapped
+                )
+            except Exception as exc:  # framework/provider terminal failure
+                # usage=None is the honest value, not an omission: the framework's
+                # loop keeps its running `aggregated_usage` as a function local and
+                # attaches it only to a response it returns, never to anything it
+                # raises. A mid-loop failure has already been billed for the calls
+                # that completed, but that number is discarded above us and there is
+                # no supported way to reach it (Day 9: never fabricate counts).
+                raise AgentRunError(str(exc), usage=None) from exc
+            shape = extract_run_shape(
+                response.messages, executions, refusal_message=REFUSAL_MESSAGE
+            )
+            executed = sum(1 for e in executions if e.executed)
+            refused = state.refused
+            stop_reason, limit_reasons = derive_stop(
+                shape.model_call_count,
+                executed=executed,
+                refused=refused,
+                max_iterations=self._settings.agent_max_iterations,
+                max_tool_calls=self._settings.agent_max_tool_calls,
+            )
+            result = AgentRunResult(
+                answer=strip_framework_fallback(shape.answer, stop_reason),
+                model_call_count=shape.model_call_count,
+                tool_round_count=shape.tool_round_count,
+                tool_call_count=executed,
+                refused_call_count=refused,
+                stop_reason=stop_reason,
+                limit_reasons=limit_reasons,
+                tool_calls=shape.tool_calls,
+                # Loop aggregate, not the last call's: FunctionInvocationLayer
+                # sums every iteration's usage into the returned response
+                # (`add_usage_details`), so this is the whole run's bill.
+                usage=map_usage_details(response.usage_details),
+                per_round=shape.per_round,
+            )
+            return result
+        finally:
+            # Summary lives here because only the adapter owns prompt
+            # provenance, partial tool executions and the run clock. On
+            # failure the framework exposes no counts, stop or usage —
+            # reported as unavailable, never as 0/natural (Day 9).
+            duration_ms = (time.perf_counter() - start) * 1000
+            if result is not None:
+                logger.info(
+                    "agent_run_summary model_calls=%d tool_calls=%d refused=%d stop=%s "
+                    "total_tokens=%s duration_ms=%.1f prompt_name=%s "
+                    "prompt_version=%d prompt_sha256=%s",
+                    result.model_call_count,
+                    result.tool_call_count,
+                    result.refused_call_count,
+                    result.stop_reason,
+                    result.usage.total_tokens if result.usage else None,
+                    duration_ms,
+                    self._prompt.name,
+                    self._prompt.version,
+                    self._prompt.sha256,
+                )
+            else:
+                logger.info(
+                    "agent_run_summary model_calls=unavailable stop=unavailable "
+                    "usage=unavailable tools_executed=%d duration_ms=%.1f "
+                    "prompt_name=%s prompt_version=%d prompt_sha256=%s "
+                    "(upstream may have incurred billable processing)",
+                    sum(1 for e in executions if e.executed),
+                    duration_ms,
+                    self._prompt.name,
+                    self._prompt.version,
+                    self._prompt.sha256,
+                )
 
     async def aclose(self) -> None:
         if self._closed:
@@ -656,6 +768,7 @@ __all__ = [
     "REFUSAL_MESSAGE",
     "AdmissionState",
     "AgentFrameworkService",
+    "AgentHistoryTurn",
     "AgentRoundMetrics",
     "AgentRunError",
     "AgentRunResult",

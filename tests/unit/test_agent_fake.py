@@ -3,6 +3,7 @@ import pytest
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.agent_framework import (
+    AgentHistoryTurn,
     AgentTaskTooLargeError,
     FakeAgentService,
     build_agent_service,
@@ -39,7 +40,7 @@ async def test_fake_agent_actually_invokes_injected_tools() -> None:
     deps = _deps()
     service = FakeAgentService(deps)
     try:
-        result = await service.run("what is the token budget?")
+        result = await service.run("what is the token budget?", (), principal=OPS)
     finally:
         await service.aclose()
     # wiring proof (Day 8 fake-marker philosophy): tool outputs are embedded
@@ -58,9 +59,30 @@ async def test_fake_agent_validates_task_with_zero_tool_calls() -> None:
     service = FakeAgentService(deps)
     try:
         with pytest.raises(AgentTaskTooLargeError):
-            await service.run("")
+            await service.run("", (), principal=OPS)
     finally:
         await service.aclose()
+
+
+async def test_fake_records_history_and_principal_and_marks_answer() -> None:
+    deps = build_agent_tool_deps(
+        Settings(use_fake_llm=True, use_fake_search=True),
+        conversation_store=InMemoryConversationStore(),
+        token_budget=50_000,
+    )
+    service = FakeAgentService(deps)
+    principal = Principal(tenant_id="t1", group_ids=("g1",))
+    history = (
+        AgentHistoryTurn(role="user", text="Hello"),
+        AgentHistoryTurn(role="assistant", text="Hi"),
+    )
+    try:
+        result = await service.run("what changed?", history, principal=principal)
+    finally:
+        await service.aclose()
+    assert service.last_history == history
+    assert service.last_principal is principal
+    assert "history=2" in result.answer
 
 
 async def test_build_selects_fake_by_default_and_aclose_is_idempotent() -> None:
