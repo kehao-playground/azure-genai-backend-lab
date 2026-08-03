@@ -59,6 +59,7 @@ ENTRA_API_APP_ID=<api-app-id> ENTRA_CLIENT_APP_ID=<client-app-id> ./delete-entra
 Notes:
 
 - The API service principal keeps `appRoleAssignmentRequired=false`. That is what makes step 3 a test of *this API*: Entra will issue a valid-audience token with no `roles` claim, and the 403 comes from the server refusing a credential it authenticated — not from the token endpoint refusing to mint one.
-- The client secret is printed to the terminal exactly once and never written to a file. `ENTRA_CLIENT_SECRET` is read from the environment by the smoke tool, never passed as a command-line argument (`ps` shows another user the whole argv of a running process).
+- `create-entra-app.sh` prints each application id **the moment it is created**, and on any abort it prints the exact `delete-entra-app.sh` command for whatever exists so far. A registration that was never created is passed as `none`, which the teardown script skips — so a half-finished run is still fully reversible without reasoning about which half exists.
+- The client secret expires after **7 days**, matching the ephemeral posture. It is printed to the terminal exactly once and never written to a file. `ENTRA_CLIENT_SECRET` is read from the environment by the smoke tool, never passed as a command-line argument (`ps` shows another user the whole argv of a running process).
 - `--evidence-out` is safe to commit: it carries PASS/FAIL, check names, redacted details and sorted claim *key names* — no tenant id, no app ids, no `oid`, no token, no secret.
 - The server runs with the fake adapters, so the smoke exercises Entra verification only and costs nothing in model tokens.

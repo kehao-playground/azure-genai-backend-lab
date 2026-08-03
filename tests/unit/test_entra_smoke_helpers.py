@@ -135,9 +135,12 @@ def test_evidence_masks_a_secret_that_reaches_a_check_detail() -> None:
             Check("delegated 200", False, f"server said tid={TENANT_ID} oid={USER_ID}"),
             Check("app-only 200", False, f"sent Authorization: Bearer {ACCESS_TOKEN}"),
             Check("token acquisition", False, f"client_secret={CLIENT_SECRET} was rejected"),
+            Check(f"audience {CLIENT_APP_ID}", False, ""),
         ],
     )
-    for forbidden in (TENANT_ID, USER_ID, CLIENT_APP_ID[:8], CLIENT_SECRET, ACCESS_TOKEN):
+    # every one of these is actually present in the input above — an assertion
+    # about a string no input contains passes with the redaction deleted
+    for forbidden in (TENANT_ID, USER_ID, CLIENT_APP_ID, CLIENT_SECRET, ACCESS_TOKEN):
         assert forbidden not in rendered, forbidden
     # masked, not merely dropped — the evidence still says a value was there
     assert "<redacted-guid>" in rendered
@@ -166,6 +169,14 @@ def test_evidence_states_failure_when_any_check_failed() -> None:
     mixed = render_evidence(phase="no-role", checks=[Check("a", True, ""), Check("b", False, "x")])
     assert "result: FAIL" in mixed
     assert "result: PASS" not in mixed
+
+
+def test_a_run_that_decided_nothing_is_a_failure_not_a_pass() -> None:
+    # `all([])` is True, so the empty case has to be excluded explicitly or a
+    # run that never got as far as its first check reports PASS.
+    empty = render_evidence(phase="full", checks=[])
+    assert "result: FAIL" in empty
+    assert "checks: 0/0 passed" in empty
 
 
 def test_claim_keys_refuses_a_string_that_is_not_a_jwt() -> None:
@@ -352,6 +363,115 @@ def test_the_error_envelope_is_only_read_from_a_json_response() -> None:
     assert check.name == "app-only without role: error code"
     assert not check.passed
     assert "text/html" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# The bounded vocabularies.
+#
+# `redact_sensitive` is a denylist of three shapes, and these two values are
+# the holes in it: an opaque refresh token and a device `user_code` are neither
+# GUID-, JWT- nor tilde-shaped, so masking would not save them. What keeps them
+# out of the evidence is that every provider- and server-supplied string is
+# compared against a known set and *described* rather than quoted when it does
+# not belong. These tests pin that property on each of the four channels that
+# carry such a string.
+# ---------------------------------------------------------------------------
+
+REFRESH_TOKEN = "0.AXoAV2K3mQx1TEqYtNQ8jRZ2AbCdEfGhIjKlMnOpQrStUvWxYz1234567890"
+USER_CODE = "F7HKM8QZ4"
+
+
+def test_the_masker_alone_would_not_save_these_values() -> None:
+    # Stated outright, because the guarantee below rests on it being true: if
+    # either of these ever reached a detail, the redactor would pass it
+    # through untouched. Nothing routes them there — that is the point.
+    assert redact_sensitive(REFRESH_TOKEN) == REFRESH_TOKEN
+    assert redact_sensitive(USER_CODE) == USER_CODE
+
+
+def test_an_unrecognized_error_code_is_described_not_quoted() -> None:
+    response = _response(
+        403,
+        json_body={"error": {"code": REFRESH_TOKEN}},
+        headers={"Content-Type": "application/json"},
+    )
+    check = entra_smoke.error_code_check("x", response, "insufficient_scope")
+    assert not check.passed
+    assert REFRESH_TOKEN not in check.detail
+    assert "an unrecognized error code" in check.detail
+
+
+def test_a_recognized_error_code_is_still_named() -> None:
+    # The constraint must not cost the diagnostic: a code this API documents
+    # is exactly the thing an operator needs to read.
+    response = _response(
+        403,
+        json_body={"error": {"code": "upstream_error"}},
+        headers={"Content-Type": "application/json"},
+    )
+    check = entra_smoke.error_code_check("x", response, "insufficient_scope")
+    assert not check.passed
+    assert "upstream_error" in check.detail
+
+
+def test_an_unrecognized_media_type_is_described_not_quoted() -> None:
+    response = _response(403, text="...", headers={"Content-Type": f"x-code/{USER_CODE}"})
+    check = entra_smoke.error_code_check("x", response, "insufficient_scope")
+    assert not check.passed
+    assert USER_CODE not in check.detail
+    assert "an unrecognized media type" in check.detail
+
+
+def test_the_challenge_is_compared_and_never_echoed() -> None:
+    # RFC 6750 §3 lets a challenge carry an `error_description`, so the header
+    # an unknown intermediary sets is arbitrary text on the wire.
+    response = _response(
+        401, json_body={}, headers={"WWW-Authenticate": f'Bearer error_description="{USER_CODE}"'}
+    )
+    check = entra_smoke.challenge_check("x", response, UNAUTHORIZED_CHALLENGE)
+    assert not check.passed
+    assert USER_CODE not in check.detail
+    assert "the challenge differed" in check.detail
+    assert UNAUTHORIZED_CHALLENGE in check.detail  # the expectation is still stated
+
+
+def test_a_missing_challenge_is_distinguishable_from_a_different_one() -> None:
+    check = entra_smoke.challenge_check("x", _response(401, json_body={}), "Bearer")
+    assert not check.passed
+    assert "no WWW-Authenticate header" in check.detail
+
+
+def test_an_unrecognized_oauth_error_is_described_not_quoted() -> None:
+    request = httpx.Request("POST", "https://login.example/token")
+
+    class FakeClient:
+        def post(self, url: str, *, data: dict[str, str]) -> httpx.Response:
+            return httpx.Response(400, request=request, json={"error": REFRESH_TOKEN})
+
+    with pytest.raises(SmokeError) as raised:
+        poll_device_token(
+            FakeClient(),  # type: ignore[arg-type]
+            token_url="https://login.example/token",
+            client_id="client-id",
+            device_code="device-code",
+            interval=1,
+            expires_in=60,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: 0.0,
+        )
+    assert REFRESH_TOKEN not in str(raised.value)
+    assert "an unrecognized OAuth error" in str(raised.value)
+
+
+def test_describe_is_the_single_gate_every_channel_passes_through() -> None:
+    assert entra_smoke.describe("slow_down", entra_smoke.OAUTH_ERROR_CODES, "OAuth error") == (
+        "'slow_down'"
+    )
+    assert (
+        entra_smoke.describe(USER_CODE, entra_smoke.OAUTH_ERROR_CODES, "OAuth error")
+        == "an unrecognized OAuth error"
+    )
+    assert entra_smoke.describe(None, entra_smoke.API_ERROR_CODES, "error code") == "no error code"
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +670,25 @@ def test_a_missing_log_line_stays_a_failure_after_every_retry(tmp_path: Path) ->
     assert len(sleeps) == entra_smoke.LOG_JOIN_ATTEMPTS - 1
 
 
+def test_an_unusable_token_is_not_retried_at_all(tmp_path: Path) -> None:
+    # Only the log join is in flight. A token with no `tid`/`oid` is a fact
+    # about the token, and the verdict is already final on the first read —
+    # sleeping through the whole budget over it would cost seconds and change
+    # nothing.
+    log = tmp_path / "server.log"
+    log.write_text("nothing relevant\n", encoding="utf-8")
+    sleeps: list[float] = []
+    checks = accepted_token_checks(
+        "delegated",
+        token=unsigned_test_token({"scp": "access_as_user"}),  # no tid, no oid
+        response=_accepted_response("corr-9"),
+        log_path=log,
+        sleep=sleeps.append,
+    )
+    assert [check.passed for check in checks] == [False, False]
+    assert sleeps == []
+
+
 # ---------------------------------------------------------------------------
 # App-role claim checks: present after assignment, absent before it.
 # ---------------------------------------------------------------------------
@@ -632,6 +771,113 @@ def test_a_prerequisite_failure_still_writes_evidence_and_exits_one(
     assert CLIENT_SECRET not in written
 
 
+def test_a_transport_failure_still_writes_evidence_and_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The likeliest operator mistake of all: the server is not running.
+
+    `httpx.ConnectError` is not a `SmokeError`, so before this it escaped
+    `main` — no evidence file, and a traceback carrying the token URL (and
+    with it the tenant GUID) on stderr. In `--phase full` that happens after
+    the interactive sign-in has already been completed.
+    """
+
+    def refuse(*_args: object, **_kwargs: object) -> str:
+        raise httpx.ConnectError(f"All connection attempts failed for {TENANT_ID}")
+
+    monkeypatch.setattr(entra_smoke, "acquire_app_token", refuse)
+    monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
+    evidence = tmp_path / "evidence.txt"
+
+    exit_code = entra_smoke.main(
+        [
+            "--phase", "no-role",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+            "--evidence-out", str(evidence),
+        ]
+    )
+
+    assert exit_code == 1
+    written = evidence.read_text(encoding="utf-8")
+    assert "result: FAIL" in written
+    assert "ConnectError" in written
+    # the class, not the message — httpx messages embed the request URL
+    assert TENANT_ID not in written
+    assert "All connection attempts failed" not in written
+
+
+def test_a_rotated_log_file_is_a_failed_check_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `read_log_lines` runs between the API calls and the verdict; a log
+    # rotated in that window used to take the whole run out with an OSError.
+    def vanish(*_args: object, **_kwargs: object) -> list[str]:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(entra_smoke, "read_log_lines", vanish)
+    monkeypatch.setattr(
+        entra_smoke,
+        "acquire_app_token",
+        lambda *_a, **_k: unsigned_test_token({"tid": TENANT_ID, "oid": USER_ID}),
+    )
+    monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
+    evidence = tmp_path / "evidence.txt"
+    log = tmp_path / "server.log"
+    log.write_text("", encoding="utf-8")
+
+    class _DeadClient:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __enter__(self) -> "_DeadClient":
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def post(self, *_a: object, **_k: object) -> httpx.Response:
+            return _accepted_response("corr-1")
+
+    monkeypatch.setattr(entra_smoke.httpx, "Client", _DeadClient)
+    monkeypatch.setattr(
+        entra_smoke,
+        "request_device_code",
+        lambda *_a, **_k: {
+            "device_code": "d",
+            "user_code": USER_CODE,
+            "verification_uri": "https://example.invalid/device",
+            "interval": 1,
+            "expires_in": 60,
+        },
+    )
+    monkeypatch.setattr(
+        entra_smoke,
+        "poll_device_token",
+        lambda *_a, **_k: {
+            "access_token": unsigned_test_token({"tid": TENANT_ID, "oid": USER_ID}),
+            "id_token": unsigned_test_token({"aud": "client"}),
+        },
+    )
+
+    exit_code = entra_smoke.main(
+        [
+            "--phase", "full",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+            "--server-log", str(log),
+            "--evidence-out", str(evidence),
+        ]
+    )
+
+    assert exit_code == 1
+    written = evidence.read_text(encoding="utf-8")
+    assert "FileNotFoundError" in written
+    assert "result: FAIL" in written
+
+
 def test_a_missing_client_secret_is_a_configuration_exit_not_a_failed_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -699,6 +945,66 @@ def test_device_poll_handles_pending_and_slow_down_without_printing_tokens(
     assert result["access_token"] == "sensitive-access-token"
     assert sleeps == [2, 7, 7]  # raised permanently, not just for the next poll
     assert "sensitive-access-token" not in capsys.readouterr().out
+
+
+def _device_code_client(payload: dict[str, Any], status: int = 200) -> Any:
+    request = httpx.Request("POST", "https://login.example/devicecode")
+
+    class FakeClient:
+        sent: list[dict[str, str]] = []
+
+        def post(self, url: str, *, data: dict[str, str]) -> httpx.Response:
+            FakeClient.sent.append(data)
+            return httpx.Response(status, request=request, json=payload)
+
+    return FakeClient()
+
+
+_DEVICE_CODE_RESPONSE: dict[str, Any] = {
+    "device_code": "d",
+    "user_code": USER_CODE,
+    "verification_uri": "https://example.invalid/device",
+    "interval": 5,
+    "expires_in": 900,
+}
+
+
+def test_device_code_request_validates_the_whole_response_shape() -> None:
+    payload = entra_smoke.request_device_code(
+        _device_code_client(_DEVICE_CODE_RESPONSE),
+        tenant_id=TENANT_ID,
+        client_id=CLIENT_APP_ID,
+        api_app_id=CLIENT_APP_ID,
+        scope="access_as_user",
+    )
+    assert payload["user_code"] == USER_CODE
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"interval": "5"},  # the v1 endpoint's string shape
+        {"expires_in": "900"},
+        {"interval": True},  # a bool is an int in Python; it is not a poll interval
+        {"verification_uri": ""},
+        {"device_code": None},
+    ],
+)
+def test_a_malformed_device_code_response_fails_before_the_operator_signs_in(
+    broken: dict[str, Any],
+) -> None:
+    # The caller prints the sign-in prompt as soon as this returns, so every
+    # field the poll loop depends on is validated *here*. Validating `interval`
+    # at the poll site instead would send the operator to a browser, wait for
+    # them to authorize, and only then crash on a field that was already wrong.
+    with pytest.raises(SmokeError):
+        entra_smoke.request_device_code(
+            _device_code_client({**_DEVICE_CODE_RESPONSE, **broken}),
+            tenant_id=TENANT_ID,
+            client_id=CLIENT_APP_ID,
+            api_app_id=CLIENT_APP_ID,
+            scope="access_as_user",
+        )
 
 
 def test_device_poll_sends_the_device_code_grant() -> None:
