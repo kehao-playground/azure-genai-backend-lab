@@ -259,7 +259,10 @@ class EntraTokenVerifier:
         outbound request amplifier aimed at Microsoft — no credentials needed,
         one forged header per request. The cooldown is what bounds that, and it
         bounds it on its own: the attempt is stamped before the await, so a
-        simultaneous burst finds the window already closed.
+        simultaneous burst finds the window already closed. The bound is two
+        requests per window per verifier, not one — this re-reads discovery
+        before the keys, because a rotation can move `jwks_uri` and a cached
+        one would be the stale half of a key rotation.
 
         The lock is not a second copy of that guarantee. It is what makes the
         waiters *wait*. Without it they would leave this method the moment the
@@ -274,6 +277,17 @@ class EntraTokenVerifier:
         while an unknown one stays `TokenInvalidError` because the lookup that
         follows this call simply misses again.
         """
+        # Nothing to refresh through a client we already closed. httpx answers
+        # a closed client with a bare `RuntimeError`, which is neither
+        # `HTTPError` nor `InvalidURL` and so escapes `_get_json` and the
+        # handler below — turning a shutdown-time cache miss into a 500 for
+        # what is really just an unknown key. Declining here lets the lookup
+        # miss cleanly and answer 401. Only owned clients set this flag; an
+        # injected client closed by its owner is that owner's business, and we
+        # cannot see it.
+        if self._closed:
+            return
+
         async with self._refresh_lock:
             # Re-read every condition *inside* the lock: each was last
             # evaluated before waiting, and the waiter ahead may have already
