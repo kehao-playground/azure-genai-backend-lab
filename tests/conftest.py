@@ -25,7 +25,8 @@ from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 # path through the shared `client` fixture, so its default headers carry
 # valid identity — tests of the 401 boundary itself use their own
 # TestClient (see test_auth_endpoints.py) so they can omit or corrupt these.
-AUTH_HEADERS = {"X-Tenant-Id": "t1"}
+# Day 19: X-User-Id joins X-Tenant-Id as a required header.
+AUTH_HEADERS = {"X-Tenant-Id": "t1", "X-User-Id": "u1"}
 
 
 @pytest.fixture

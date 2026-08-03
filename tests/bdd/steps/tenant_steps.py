@@ -2,8 +2,10 @@ from behave import given, then, when
 from tests.bdd.steps.rag_steps import _override_rag_service
 
 
-def _headers(tenant: str, groups: tuple[str, ...] = ()) -> dict[str, str]:
-    headers = {"X-Tenant-Id": tenant}
+def _headers(
+    tenant: str, groups: tuple[str, ...] = (), user_id: str = "u1"
+) -> dict[str, str]:
+    headers = {"X-Tenant-Id": tenant, "X-User-Id": user_id}
     if groups:
         headers["X-Group-Ids"] = ",".join(groups)
     return headers

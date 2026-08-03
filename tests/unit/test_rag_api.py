@@ -115,7 +115,9 @@ def test_rag_whitespace_only_question_is_422_envelope() -> None:
     # this test observe that failure mode directly if the fix regresses,
     # instead of pytest re-raising the exception past the client.
     with TestClient(
-        app, raise_server_exceptions=False, headers={"X-Tenant-Id": "t1"}
+        app,
+        raise_server_exceptions=False,
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
     ) as raw_client:
         response = raw_client.post("/api/v1/rag", json={"question": "   "})
 
@@ -351,7 +353,9 @@ def test_rag_cross_tenant_question_is_no_answer_not_a_leak(client: TestClient) -
     )
     app.dependency_overrides[get_rag_service] = lambda: service
     try:
-        with TestClient(app, headers={"X-Tenant-Id": "tenant-b"}) as tenant_b_client:
+        with TestClient(
+            app, headers={"X-Tenant-Id": "tenant-b", "X-User-Id": "u1"}
+        ) as tenant_b_client:
             response = tenant_b_client.post(
                 "/api/v1/rag", json={"question": "what is the refund policy?"}
             )

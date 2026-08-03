@@ -14,7 +14,7 @@ from azgenai_lab.services.azure_search import (
 
 VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 DOCUMENTS = [
     {
@@ -74,7 +74,7 @@ async def test_fake_enforces_the_same_arguments_the_service_would() -> None:
 
 async def test_fake_records_the_parameters_it_was_called_with() -> None:
     fake = FakeSearchClient(DOCUMENTS)
-    principal = Principal(tenant_id="acme", group_ids=("oncall",))
+    principal = Principal(tenant_id="acme", user_id="u1", group_ids=("oncall",))
     await fake.search(
         "refund",
         VECTOR,
@@ -102,7 +102,7 @@ async def test_fake_hides_another_tenants_documents() -> None:
         VECTOR,
         mode=SearchMode.HYBRID,
         top=5,
-        principal=Principal(tenant_id="t2", group_ids=()),
+        principal=Principal(tenant_id="t2", user_id="u1", group_ids=()),
     )
     assert result.hits == ()
 
@@ -132,7 +132,7 @@ async def test_fake_hides_a_group_restricted_document_from_a_principal_without_t
         VECTOR,
         mode=SearchMode.HYBRID,
         top=5,
-        principal=Principal(tenant_id="t1", group_ids=("oncall",)),
+        principal=Principal(tenant_id="t1", user_id="u1", group_ids=("oncall",)),
     )
     # The group-bearing principal sees both: tenant-wide documents stay
     # visible when a group is added, they are not traded away for it.
@@ -161,7 +161,7 @@ async def test_fake_hides_a_group_restricted_document_from_another_tenants_group
         VECTOR,
         mode=SearchMode.HYBRID,
         top=5,
-        principal=Principal(tenant_id="t2", group_ids=("oncall",)),
+        principal=Principal(tenant_id="t2", user_id="u1", group_ids=("oncall",)),
     )
     assert result.hits == ()
 

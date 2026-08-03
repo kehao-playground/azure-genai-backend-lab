@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from azgenai_lab.main import create_app
 
-HEADERS = {"X-Tenant-Id": "t1"}
+HEADERS = {"X-Tenant-Id": "t1", "X-User-Id": "u1"}
 
 
 def _client() -> TestClient:
@@ -51,7 +51,7 @@ def test_scope_mismatch_is_404_same_shape() -> None:
     response = client.post(
         "/api/v1/agent",
         json={"task": "steal", "conversation_id": cid},
-        headers={"X-Tenant-Id": "t1", "X-Group-Ids": "other"},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": "other"},
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "conversation_not_found"

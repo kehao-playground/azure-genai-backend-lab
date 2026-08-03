@@ -11,7 +11,7 @@ from azgenai_lab.services.agent_tools import (
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
 
-OPS = Principal(tenant_id="opsdemo", group_ids=())
+OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
 
 
 def _settings() -> Settings:
@@ -42,9 +42,13 @@ def _deps(store: InMemoryConversationStore | None = None) -> AgentToolDeps:
 
 
 def test_bind_produces_three_tools_for_a_principal() -> None:
-    tools = bind_principal_tools(_deps(), Principal(tenant_id="t1", group_ids=("g1",)))
+    tools = bind_principal_tools(
+        _deps(), Principal(tenant_id="t1", user_id="u1", group_ids=("g1",))
+    )
     assert [t.__name__ for t in tools] == [
-        "search_docs", "get_runtime_config", "get_conversation_usage",
+        "search_docs",
+        "get_runtime_config",
+        "get_conversation_usage",
     ]
 
 
@@ -54,7 +58,7 @@ def test_no_budget_omits_budget_reporting_tools() -> None:
         conversation_store=InMemoryConversationStore(),
         token_budget=None,
     )
-    tools = bind_principal_tools(deps, Principal(tenant_id="t1", group_ids=()))
+    tools = bind_principal_tools(deps, Principal(tenant_id="t1", user_id="u1", group_ids=()))
     assert [t.__name__ for t in tools] == ["search_docs"]
 
 
@@ -103,8 +107,12 @@ async def test_toolset_shares_the_supplied_store() -> None:
         # built store would still pass the identity assertion above while
         # silently making a seeded conversation invisible to the agent.
         await store.append(
-            OPS.tenant_id, "seeded-convo", turns=[], replay_items=[],
-            expected_revision=0, usage_tokens=123,
+            OPS.tenant_id,
+            "seeded-convo",
+            turns=[],
+            replay_items=[],
+            expected_revision=0,
+            usage_tokens=123,
             first_turn_authorization_group_ids=(),
         )
         get_conversation_usage = bind_principal_tools(deps, OPS)[2]
@@ -123,7 +131,12 @@ async def test_toolset_runtime_config_and_usage_report_the_same_budget() -> None
     # value to one of them without any existing test noticing.
     store = InMemoryConversationStore()
     await store.append(
-        OPS.tenant_id, "c1", turns=[], replay_items=[], expected_revision=0, usage_tokens=10,
+        OPS.tenant_id,
+        "c1",
+        turns=[],
+        replay_items=[],
+        expected_revision=0,
+        usage_tokens=10,
         first_turn_authorization_group_ids=(),
     )
     deps = build_agent_tool_deps(_settings(), conversation_store=store, token_budget=777)

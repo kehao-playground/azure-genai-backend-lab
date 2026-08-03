@@ -111,7 +111,7 @@ def test_rendered_evidence_contains_no_raw_filter_string_and_no_group_id(tmp_pat
 
 
 def test_principal_header_line_never_contains_group_ids_only_a_count() -> None:
-    principal = Principal(tenant_id="acme", group_ids=("oncall", "eng"))
+    principal = Principal(tenant_id="acme", user_id="u1", group_ids=("oncall", "eng"))
     line = _principal_header_line(principal)
     assert "oncall" not in line
     assert "eng" not in line
@@ -121,7 +121,7 @@ def test_principal_header_line_never_contains_group_ids_only_a_count() -> None:
 
 def test_rendered_evidence_markdown_header_never_leaks_group_ids(tmp_path: Path) -> None:
     evidence = Evidence(tmp_path / "out.md", total_queries=1)
-    principal = Principal(tenant_id="acme", group_ids=("oncall",))
+    principal = Principal(tenant_id="acme", user_id="u1", group_ids=("oncall",))
     evidence.add(
         "# Retrieval comparison — live evidence", "", _principal_header_line(principal), ""
     )

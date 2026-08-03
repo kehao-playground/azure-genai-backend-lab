@@ -94,7 +94,7 @@ NEAR_TARGET_RATIO = 0.9  # where the seeded near conversation lands in the budge
 # defined its own 0.8 could seed against a threshold the tools do not use.
 NEAR_LOW = NEAR_EXHAUSTED_THRESHOLD
 DEMO_TENANT = "opsdemo"
-DEMO_PRINCIPAL = Principal(tenant_id=DEMO_TENANT, group_ids=())
+DEMO_PRINCIPAL = Principal(tenant_id=DEMO_TENANT, user_id="opsdemo-user", group_ids=())
 K_REPEATS = 5
 DEFAULT_CAPTURE = "agent-demo-capture.json"
 

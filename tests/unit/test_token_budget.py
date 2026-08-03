@@ -31,7 +31,7 @@ from azgenai_lab.services.conversation import (
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 TENANT_ID = "t1"
-DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, group_ids=())
+DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, user_id="u1", group_ids=())
 
 
 def make_service(

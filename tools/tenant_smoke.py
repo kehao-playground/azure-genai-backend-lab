@@ -101,7 +101,7 @@ async def _run(client: AzureSearchClient, embedding_client: EmbeddingClient) -> 
     print(f"target chunk: {TARGET_CHUNK_ID}")
     print()
 
-    baseline = Principal(tenant_id="globex", group_ids=("oncall",))
+    baseline = Principal(tenant_id="globex", user_id="smoke-user", group_ids=("oncall",))
     baseline_hit = await _probe_has_target(client, vector, baseline)
     print(
         "probe 1 (globex+[oncall], authorized baseline): "
@@ -118,7 +118,7 @@ async def _run(client: AzureSearchClient, embedding_client: EmbeddingClient) -> 
         print("probe 3 (acme+[oncall], cross-tenant): INCONCLUSIVE — same reason")
         raise SystemExit(EXIT_INCONCLUSIVE)
 
-    missing_group = Principal(tenant_id="globex", group_ids=())
+    missing_group = Principal(tenant_id="globex", user_id="smoke-user", group_ids=())
     missing_group_hit = await _probe_has_target(client, vector, missing_group)
     missing_group_pass = not missing_group_hit
     print(
@@ -127,7 +127,7 @@ async def _run(client: AzureSearchClient, embedding_client: EmbeddingClient) -> 
         f"{'NOT in' if missing_group_pass else 'unexpectedly in'} top-{TOP}"
     )
 
-    cross_tenant = Principal(tenant_id="acme", group_ids=("oncall",))
+    cross_tenant = Principal(tenant_id="acme", user_id="smoke-user", group_ids=("oncall",))
     cross_tenant_hit = await _probe_has_target(client, vector, cross_tenant)
     cross_tenant_pass = not cross_tenant_hit
     print(

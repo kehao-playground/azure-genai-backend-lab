@@ -55,7 +55,7 @@ Search = Callable[..., Awaitable[SearchResult]]
 # `search` now requires a principal, so the wrappers below bind one: these
 # tests vary `top` and `vector_k`, and threading an unchanging authorization
 # argument through every case would obscure the one thing each case changes.
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 # Requests that were sent, if any. A bound is only enforced if nothing goes out
 # — a rejection after the request has left has already spent the call.

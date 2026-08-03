@@ -15,7 +15,7 @@ from azgenai_lab.services.agent_tools import (
 )
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
-OPS = Principal(tenant_id="opsdemo", group_ids=())
+OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
 
 
 def _settings() -> Settings:
@@ -71,7 +71,7 @@ async def test_fake_records_history_and_principal_and_marks_answer() -> None:
         token_budget=50_000,
     )
     service = FakeAgentService(deps)
-    principal = Principal(tenant_id="t1", group_ids=("g1",))
+    principal = Principal(tenant_id="t1", user_id="u1", group_ids=("g1",))
     history = (
         AgentHistoryTurn(role="user", text="Hello"),
         AgentHistoryTurn(role="assistant", text="Hi"),

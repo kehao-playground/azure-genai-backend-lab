@@ -37,7 +37,7 @@ import time
 
 import httpx
 
-HEADERS = {"X-Tenant-Id": "smoke"}
+HEADERS = {"X-Tenant-Id": "smoke", "X-User-Id": "smoke-user"}
 
 
 def _budget_mode(client: httpx.Client, checks: list[tuple[str, bool, str]]) -> None:
@@ -135,7 +135,7 @@ def main() -> int:
     mismatch = client.post(
         "/api/v1/agent",
         json={"task": "peek", "conversation_id": cid},
-        headers={"X-Tenant-Id": "smoke", "X-Group-Ids": "other"},
+        headers={"X-Tenant-Id": "smoke", "X-User-Id": "smoke-user", "X-Group-Ids": "other"},
     )
     checks.append(
         ("scope mismatch 404", mismatch.status_code == 404, f"got {mismatch.status_code}")

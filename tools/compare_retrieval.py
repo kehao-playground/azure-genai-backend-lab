@@ -444,6 +444,11 @@ async def main() -> None:
         help="selects both the principal's tenant and the frozen query set",
     )
     parser.add_argument(
+        "--user-id",
+        required=True,
+        help="the principal's user id; identity is required from Day 19 onward",
+    )
+    parser.add_argument(
         "--group-id",
         action="append",
         default=[],
@@ -461,7 +466,11 @@ async def main() -> None:
             "USE_FAKE_EMBEDDINGS=false and provide real Azure OpenAI "
             "embedding credentials before running this tool."
         )
-    principal = Principal(tenant_id=arguments.tenant_id, group_ids=tuple(arguments.group_id))
+    principal = Principal(
+        tenant_id=arguments.tenant_id,
+        user_id=arguments.user_id,
+        group_ids=tuple(arguments.group_id),
+    )
     configure_logging(settings.log_level)
     embedding_client = build_embedding_client(settings)
 

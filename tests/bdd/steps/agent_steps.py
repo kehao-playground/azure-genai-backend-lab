@@ -32,7 +32,7 @@ def step_submit_agent_task_as_group(context, group: str) -> None:  # type: ignor
     context.response = context.client.post(
         "/api/v1/agent",
         json={"task": "recap", "conversation_id": context.conversation_id},
-        headers={"X-Tenant-Id": "t1", "X-Group-Ids": group},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": group},
     )
 
 

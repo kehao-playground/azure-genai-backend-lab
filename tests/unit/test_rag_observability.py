@@ -24,7 +24,7 @@ from azgenai_lab.services.embeddings import EmbeddingRejectedError, FakeEmbeddin
 from azgenai_lab.services.rag import RagService
 from azgenai_lab.services.retrieval import Retriever
 
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 DOC = {
     "chunk_id": "doc-a-0000",

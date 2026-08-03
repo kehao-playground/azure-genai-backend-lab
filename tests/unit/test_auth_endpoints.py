@@ -1,11 +1,12 @@
-"""Identity-header parsing at the API boundary (Day 15).
+"""Identity-header parsing at the API boundary (Day 15; X-User-Id required
+from Day 19).
 
-``require_principal`` turns ``X-Tenant-Id`` / ``X-Group-Ids`` into a
-``Principal`` for the four protected endpoints. Every parsing violation maps
-to 401 ``unauthorized`` (never 422): the bad-header matrix below runs
-parameterized over all four endpoints with each endpoint's own valid body,
-so a 422 from FastAPI's own validation can never masquerade as the 401 the
-dependency is supposed to raise.
+``require_principal`` turns ``X-Tenant-Id`` / ``X-User-Id`` / ``X-Group-Ids``
+into a ``Principal`` for the four protected endpoints. Every parsing
+violation maps to 401 ``unauthorized`` (never 422): the bad-header matrix
+below runs parameterized over all four endpoints with each endpoint's own
+valid body, so a 422 from FastAPI's own validation can never masquerade as
+the 401 the dependency is supposed to raise.
 """
 
 import logging
@@ -16,7 +17,7 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from azgenai_lab.api.principal import require_principal
-from azgenai_lab.core.tenant_context import tenant_id_var
+from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
 from azgenai_lab.main import app
 
 _PROTECTED_CASES = [
@@ -50,42 +51,55 @@ def _make_request(headers: list[tuple[bytes, bytes]]) -> Request:
 # Step 1: bad-header matrix, parameterized over all four protected endpoints.
 # ---------------------------------------------------------------------------
 
+_VALID_IDENTITY = [(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")]
+
 _BAD_HEADER_CASES: dict[str, list[tuple[bytes, bytes]]] = {
-    "missing_tenant": [],
+    "missing_tenant": [(b"x-user-id", b"u1")],
+    "missing_user": [(b"x-tenant-id", b"t1")],
     "duplicate_tenant": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-tenant-id", b"t2"),
     ],
-    "duplicate_group_ids_header": [
+    "duplicate_user": [
         (b"x-tenant-id", b"t1"),
+        (b"x-user-id", b"u1"),
+        (b"x-user-id", b"u2"),
+    ],
+    "duplicate_group_ids_header": [
+        *_VALID_IDENTITY,
         (b"x-group-ids", b"g1"),
         (b"x-group-ids", b"g2"),
     ],
     "group_ids_too_large": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", ("g," * 3000).encode("ascii")),
     ],
     "group_ids_empty_token_leading_comma": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", b",g1"),
     ],
     "group_ids_empty_token_trailing_comma": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", b"g1,"),
     ],
     "group_ids_empty_token_middle": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", b"g1,,g2"),
     ],
     "group_ids_too_many_tokens": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", ",".join(f"g{i}" for i in range(101)).encode("ascii")),
     ],
     "tenant_id_invalid_characters": [
         (b"x-tenant-id", b"bad tenant!"),
+        (b"x-user-id", b"u1"),
+    ],
+    "user_id_invalid_characters": [
+        (b"x-tenant-id", b"t1"),
+        (b"x-user-id", b"bad user!"),
     ],
     "group_id_invalid_characters": [
-        (b"x-tenant-id", b"t1"),
+        *_VALID_IDENTITY,
         (b"x-group-ids", b"bad group!"),
     ],
 }
@@ -113,7 +127,9 @@ def test_valid_headers_reach_the_handler(
     bare_client: TestClient, path: str, payload: dict[str, str]
 ) -> None:
     response = bare_client.post(
-        path, json=payload, headers={"X-Tenant-Id": "t1", "X-Group-Ids": "g1, g2"}
+        path,
+        json=payload,
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": "g1, g2"},
     )
 
     assert response.status_code != 401
@@ -123,7 +139,9 @@ def test_valid_headers_reach_the_handler(
 def test_valid_headers_without_group_ids_reach_the_handler(
     bare_client: TestClient, path: str, payload: dict[str, str]
 ) -> None:
-    response = bare_client.post(path, json=payload, headers={"X-Tenant-Id": "t1"})
+    response = bare_client.post(
+        path, json=payload, headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"}
+    )
 
     assert response.status_code != 401
 
@@ -135,7 +153,9 @@ def test_ows_only_group_ids_header_reaches_the_handler(
     # Present but optional-whitespace-only -> () per the parsing rules, same
     # as an absent header entirely; must not be mistaken for a malformed value.
     response = bare_client.post(
-        path, json=payload, headers={"X-Tenant-Id": "t1", "X-Group-Ids": " \t"}
+        path,
+        json=payload,
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": " \t"},
     )
 
     assert response.status_code != 401
@@ -180,17 +200,21 @@ def test_chat_stream_401_is_plain_json_not_sse(bare_client: TestClient) -> None:
 
 async def test_tenant_id_var_lifecycle_around_the_dependency() -> None:
     assert tenant_id_var.get() == "-"
+    assert user_id_var.get() == "-"
 
-    request = _make_request([(b"x-tenant-id", b"t1")])
+    request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
     gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
     try:
         principal = await anext(gen)
         assert principal.tenant_id == "t1"
+        assert principal.user_id == "u1"
         assert tenant_id_var.get() == "t1"
+        assert user_id_var.get() == "u1"
     finally:
         await gen.aclose()
 
     assert tenant_id_var.get() == "-"
+    assert user_id_var.get() == "-"
 
 
 def _emit_record() -> logging.LogRecord:
@@ -208,7 +232,7 @@ async def test_log_record_carries_tenant_id_inside_the_dependency_scope_only() -
     outside_before = _emit_record()
     assert outside_before.tenant_id == "-"  # type: ignore[attr-defined]
 
-    request = _make_request([(b"x-tenant-id", b"t1")])
+    request = _make_request([(b"x-tenant-id", b"t1"), (b"x-user-id", b"u1")])
     gen: AsyncGenerator = require_principal(request)  # type: ignore[type-arg]
     try:
         await anext(gen)

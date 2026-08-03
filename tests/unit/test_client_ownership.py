@@ -21,7 +21,7 @@ from azgenai_lab.models.search import SearchMode
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.search_data_plane import SearchDataPlane
 
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 
 def _settings() -> Settings:

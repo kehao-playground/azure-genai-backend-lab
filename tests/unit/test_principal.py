@@ -16,26 +16,43 @@ def test_validate_identifier_rejects(value: str) -> None:
 
 
 def test_principal_dedups_and_sorts_groups() -> None:
-    p = Principal(tenant_id="t1", group_ids=("b", "a", "b"))
+    p = Principal(tenant_id="t1", user_id="u1", group_ids=("b", "a", "b"))
     assert p.group_ids == ("a", "b")
 
 
 def test_principal_caps_groups_before_dedup() -> None:
     with pytest.raises(ValidationError):
-        Principal(tenant_id="t1", group_ids=("g",) * 101)
+        Principal(tenant_id="t1", user_id="u1", group_ids=("g",) * 101)
 
 
 def test_principal_rejects_invalid_group() -> None:
     with pytest.raises(ValidationError):
-        Principal(tenant_id="t1", group_ids=("ok", "not ok"))
+        Principal(tenant_id="t1", user_id="u1", group_ids=("ok", "not ok"))
 
 
 def test_principal_rejects_invalid_tenant() -> None:
     with pytest.raises(ValidationError):
-        Principal(tenant_id="", group_ids=())
+        Principal(tenant_id="", user_id="u1", group_ids=())
 
 
 def test_principal_is_frozen() -> None:
-    p = Principal(tenant_id="t1", group_ids=())
+    p = Principal(tenant_id="t1", user_id="u1", group_ids=())
     with pytest.raises(ValidationError):
         p.tenant_id = "t2"  # type: ignore[misc]
+
+
+def test_principal_requires_user_id() -> None:
+    with pytest.raises(ValidationError):
+        Principal(tenant_id="t1", group_ids=())  # type: ignore[call-arg]
+
+
+def test_principal_accepts_and_exposes_user_id() -> None:
+    principal = Principal(tenant_id="t1", user_id="u1", group_ids=("g2", "g1"))
+    assert principal.user_id == "u1"
+    assert principal.group_ids == ("g1", "g2")
+
+
+@pytest.mark.parametrize("value", ["", "x" * 65, "bad user", "日本"])
+def test_principal_rejects_invalid_user_id(value: str) -> None:
+    with pytest.raises(ValidationError):
+        Principal(tenant_id="t1", user_id=value, group_ids=())
