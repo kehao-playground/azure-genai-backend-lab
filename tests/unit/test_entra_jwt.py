@@ -723,6 +723,8 @@ async def test_a_failed_reinitialize_neither_publishes_nor_destroys_the_cache() 
 def owned_verifier(
     monkeypatch: pytest.MonkeyPatch,
     handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    clock: Callable[[], float] | None = None,
 ) -> EntraTokenVerifier:
     """A verifier that *owns* its client, but whose client speaks to a mock.
 
@@ -739,9 +741,10 @@ def owned_verifier(
     # registered on the fixture instance, not just this one. Today's only
     # caller registers nothing else; a future one that does would have its
     # patch silently torn down here.
+    kwargs: dict[str, Any] = {} if clock is None else {"clock": clock}
     with monkeypatch.context() as patched:
         patched.setattr(httpx, "AsyncClient", factory)
-        return EntraTokenVerifier(TENANT_ID, AUDIENCE)
+        return EntraTokenVerifier(TENANT_ID, AUDIENCE, **kwargs)
 
 
 async def test_a_failed_reinitialize_keeps_an_owned_client_usable(
@@ -847,15 +850,18 @@ class ManualClock:
 class RotatingJwks:
     """A JWKS endpoint whose published key set can change mid-test.
 
-    `jwks_calls` counts requests to the keys endpoint only. Discovery is
-    deliberately not counted, so "one refresh" reads as one increment whether
-    or not the refresh path re-reads the metadata document first — the count
-    stays a statement about refreshes rather than about their internal shape.
+    `jwks_calls` counts requests to the keys endpoint, so "one refresh" reads
+    as one increment. `discovery_calls` counts the metadata leg separately,
+    because a refresh is *two* outbound requests, not one: the anti-
+    amplification bound this module offers is two per cooldown window per
+    verifier, and a regression that multiplied only the discovery leg would be
+    invisible to a keys-only count.
     """
 
     def __init__(self, keys: list[dict[str, object]]) -> None:
         self.current_keys = list(keys)
         self.jwks_calls = 0
+        self.discovery_calls = 0
         self.fail = False
         # Runs while the keys request is in flight, which is the only moment a
         # test can act on a half-finished refresh.
@@ -871,6 +877,7 @@ class RotatingJwks:
         # suspension point that makes the interleaving real.
         await asyncio.sleep(0)
         if str(request.url) == DISCOVERY_URL:
+            self.discovery_calls += 1
             return httpx.Response(200, json=DISCOVERY_BODY)
         if str(request.url) == JWKS_URL:
             self.jwks_calls += 1
@@ -923,6 +930,8 @@ async def test_concurrent_unknown_kid_causes_one_refresh() -> None:
         results = await asyncio.gather(*(verifier.verify(token) for _ in range(20)))
     assert all(result["oid"] == "33333333-3333-3333-3333-333333333333" for result in results)
     assert source.jwks_calls == 2  # startup + one shared refresh
+    # Twenty forged tokens buy one discovery request too, not twenty.
+    assert source.discovery_calls == 2
 
 
 async def test_unknown_kid_inside_cooldown_does_not_refresh() -> None:
@@ -1063,6 +1072,11 @@ async def test_each_cooldown_window_permits_exactly_one_attempt() -> None:
     never re-armed passes a single-window test. Each window also probes just
     short of the boundary, so the timestamp being refreshed on every attempt —
     not only on the first — is what the count is measuring.
+
+    Both legs are counted. A refresh re-reads the discovery document before
+    the keys, so the honest bound is *two* requests per window, and holding
+    the two counts equal is what stops that ratio from drifting unnoticed —
+    a keys-only assertion would not move if discovery were retried in a loop.
     """
     private_key, jwk = signing_material("kid-1")
     source = RotatingJwks([jwk])
@@ -1077,11 +1091,13 @@ async def test_each_cooldown_window_permits_exactly_one_attempt() -> None:
                 with pytest.raises(TokenInvalidError):
                     await verifier.verify(access_token(private_key, kid="forged"))
                 assert source.jwks_calls == expected
+                assert source.discovery_calls == expected
             # Just short of the next window opening: still nothing.
             clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS - 1)
             with pytest.raises(TokenInvalidError):
                 await verifier.verify(access_token(private_key, kid="forged"))
             assert source.jwks_calls == expected
+            assert source.discovery_calls == expected
 
 
 async def test_a_malformed_refresh_response_retains_the_previous_cache() -> None:
@@ -1093,15 +1109,29 @@ async def test_a_malformed_refresh_response_retains_the_previous_cache() -> None
     anything, so the old key keeps working and no half-built key set ever
     becomes the live one — the same property `initialize()` holds, now on the
     path that runs while requests are being served.
+
+    Both halves are asserted, and the document is built so that the second one
+    can fail. `_parse_keys` walks the entries in order, so `kid-2` is already
+    in the dict under construction when the duplicate `kid-1` further down
+    raises: a refresh that built into the live cache instead of a local would
+    leave `kid-2` verifiable off a document that was rejected wholesale. With
+    only the duplicate pair in the response there is no new key to leak, and
+    the leak half of the property would be untestable.
     """
     private_key, jwk = signing_material("kid-1")
+    leaked_key, leaked_jwk = signing_material("kid-2")
     source = RotatingJwks([jwk])
     clock = ManualClock()
     async with rotating_verifier(source, clock) as verifier:
         await verifier.initialize()
         clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
-        source.current_keys = [jwk, jwk]  # duplicate kid: rejected wholesale
+        # Valid new key first, then a duplicate `kid` that condemns the set.
+        source.current_keys = [leaked_jwk, jwk, jwk]
+        # Not destroyed: the old key set is still serving.
         claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+        # Not leaked: nothing from the rejected document became live.
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(leaked_key, kid="kid-2"))
     assert claims["tid"] == TENANT_ID
     assert source.jwks_calls == 2
 
@@ -1199,6 +1229,45 @@ async def test_a_forged_algorithm_with_an_unknown_kid_drives_no_jwks_traffic() -
             with pytest.raises(TokenInvalidError):
                 await verifier.verify(token)
     assert source.jwks_calls == 1
+
+
+async def test_an_unknown_kid_after_aclose_is_a_rejection_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown must not convert a bad token into a server error.
+
+    Once `verify()` can reach the network, a closed client is on its path:
+    httpx answers one with a bare `RuntimeError`, which is neither `HTTPError`
+    nor `InvalidURL` and so escapes `_get_json` — a request that is merely
+    unauthenticated would land as a 500 during drain, and in the logs it would
+    look like a defect rather than a forged token.
+
+    Owned client on purpose: `aclose()` is a no-op for an injected one, so
+    `_closed` — the only signal the verifier has — is never set there.
+    """
+    private_key, jwk = signing_material("kid-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == DISCOVERY_URL:
+            return httpx.Response(200, json=DISCOVERY_BODY)
+        if str(request.url) == JWKS_URL:
+            return httpx.Response(200, json={"keys": [jwk]})
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    clock = ManualClock()
+    verifier = owned_verifier(monkeypatch, handler, clock=clock)
+    await verifier.initialize()
+    # Past the cooldown, so nothing but the closed-client guard is left to
+    # stop the refresh this unknown `kid` would otherwise trigger.
+    clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+    await verifier.aclose()
+    assert verifier.closed is True
+
+    with pytest.raises(TokenInvalidError):
+        await verifier.verify(access_token(private_key, kid="kid-unknown"))
+    # The cached key set outlives the client, so a good token still verifies.
+    claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert claims["tid"] == TENANT_ID
 
 
 async def test_a_refresh_failure_does_not_revoke_readiness() -> None:
