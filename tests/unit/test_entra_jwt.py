@@ -47,8 +47,17 @@ def access_token(
     *,
     kid: str,
     overrides: dict[str, object] | None = None,
+    drop: set[str] | None = None,
     algorithm: str = "RS256",
 ) -> str:
+    """Mint a token. `overrides` replaces claims; `drop` removes them entirely.
+
+    The two are not interchangeable. `{"exp": None}` is a *present-but-null*
+    claim, which PyJWT rejects on its own; `drop={"exp"}` produces a token with
+    no `exp` at all, which PyJWT accepts as never-expiring unless the `require`
+    option says otherwise. Only the second shape can tell us whether that
+    option is doing anything.
+    """
     claims: dict[str, object] = {
         "iss": ISSUER,
         "aud": AUDIENCE,
@@ -58,6 +67,8 @@ def access_token(
         "scp": "access_as_user",
     }
     claims.update(overrides or {})
+    for name in drop or set():
+        del claims[name]
     return jwt.encode(claims, private_key, algorithm=algorithm, headers={"kid": kid})
 
 
@@ -197,9 +208,12 @@ async def test_verify_accepts_a_foreign_tid(
         ("expired", {"exp": datetime.now(UTC) - timedelta(minutes=5)}),
         ("wrong_audience", {"aud": "44444444-4444-4444-4444-444444444444"}),
         ("wrong_issuer", {"iss": "https://login.microsoftonline.com/other/v2.0"}),
-        # PyJWT's required-claim check treats a null claim as absent, so this
-        # exercises the `require` option rather than the expiry validator.
-        ("missing_exp", {"exp": None}),
+        # A present-but-null `exp`. A real input, but not a *missing* claim:
+        # PyJWT rejects it either way (with `require`, as a missing claim;
+        # without, as a TypeError from int(None)), so this case says nothing
+        # about the `require` option. The absent-claim tests below are the
+        # ones that do.
+        ("null_exp", {"exp": None}),
     ],
 )
 async def test_verify_rejects_claim_mutations(
@@ -209,6 +223,26 @@ async def test_verify_rejects_claim_mutations(
 ) -> None:
     private_key, verifier = ready
     token = access_token(private_key, kid="kid-1", overrides=overrides)
+    with pytest.raises(TokenInvalidError):
+        await verifier.verify(token)
+
+
+@pytest.mark.parametrize("claim", ["exp", "iss", "aud"])
+async def test_verify_rejects_a_token_missing_a_required_claim(
+    ready: tuple[rsa.RSAPrivateKey, EntraTokenVerifier], claim: str
+) -> None:
+    """A claim that is absent, not null — PyJWT only validates what exists.
+
+    `exp` is the case that carries the `require` option on its own: drop the
+    option and a token with no `exp` at all is **accepted** as never-expiring
+    (verified against PyJWT 2.13.0), which is the whole reason the option is
+    passed. `iss` and `aud` would still be rejected without it, because the
+    `issuer=`/`audience=` arguments make PyJWT demand them — so those two pin
+    the contract rather than the option. Both are worth holding: the contract
+    is what callers depend on, whichever mechanism enforces it.
+    """
+    private_key, verifier = ready
+    token = access_token(private_key, kid="kid-1", drop={claim})
     with pytest.raises(TokenInvalidError):
         await verifier.verify(token)
 
@@ -249,6 +283,14 @@ async def test_verify_rejects_an_unknown_kid() -> None:
 async def test_verify_rejects_alg_none(
     ready: tuple[rsa.RSAPrivateKey, EntraTokenVerifier],
 ) -> None:
+    """Rejected at the header screen — though not *only* there today.
+
+    `algorithms=["RS256"]` would refuse this token anyway, so deleting the
+    header screen would not turn this test red. The screen is what stops the
+    token before key lookup, and from Task 4 onward that ordering is
+    load-bearing: an unsigned token must not be able to trigger a JWKS
+    refresh. Kept as a contract test, not as proof of the ordering.
+    """
     _, verifier = ready
     unsigned = jwt.encode(
         {"iss": ISSUER, "aud": AUDIENCE, "exp": datetime.now(UTC) + timedelta(minutes=5)},
@@ -265,9 +307,14 @@ async def test_verify_rejects_hs256_before_touching_the_key_cache() -> None:
 
     An HS256 token naming a `kid` we publish is the classic attack: if the
     algorithm were taken from the token, the RSA public key would be used as
-    an HMAC secret and a token anyone can mint would verify. The assertion
-    that no request was made is what proves the check ran *before* key lookup
-    rather than after it.
+    an HMAC secret and a token anyone can mint would verify. That part is
+    real, and `algorithms=["RS256"]` backs it up independently.
+
+    The `calls == []` assertion is weaker than it looks *today*: `verify()`
+    makes no requests on any path in this task, so it holds whatever the
+    ordering is. It is here to be inherited — once Task 4 lets an unknown
+    `kid` trigger a refresh, this becomes the assertion that an attacker
+    cannot drive JWKS traffic with a token we never had to look at.
     """
     _, jwk = signing_material("kid-1")
     calls: list[str] = []
@@ -305,6 +352,12 @@ async def test_verify_rejects_malformed_tokens(
 async def test_verify_rejects_a_header_without_a_kid(
     ready: tuple[rsa.RSAPrivateKey, EntraTokenVerifier],
 ) -> None:
+    """A contract test, not a proof that the explicit check is doing the work.
+
+    `self._keys.get(None)` misses regardless, so removing the `kid` screen
+    leaves this green. It earns its keep from Task 4 onward, when a lookup
+    miss stops being a dead end and starts costing a refresh.
+    """
     private_key, verifier = ready
     claims = {"iss": ISSUER, "aud": AUDIENCE, "exp": datetime.now(UTC) + timedelta(minutes=5)}
     token = jwt.encode(claims, private_key, algorithm="RS256")
@@ -425,6 +478,12 @@ async def test_startup_fails_on_issuer_mismatch(issuer: object) -> None:
         f"https://login.microsoftonline.com:8443/{TENANT_ID}/keys",
         # Malformed port.
         f"https://login.microsoftonline.com:notaport/{TENANT_ID}/keys",
+        # Malformed host: an unbalanced bracket makes `urlsplit` itself raise
+        # ValueError("Invalid IPv6 URL") before any field can be read. That
+        # must still surface as a startup error — a bare ValueError would skip
+        # `initialize()`'s handler and leak the owned client.
+        "https://[::1/keys",
+        f"https://login.microsoftonline.com]/{TENANT_ID}/keys",
         # Not a URL at all, and absent.
         "keys",
         "",
@@ -493,14 +552,24 @@ async def test_unusable_key_is_skipped_and_others_still_verify() -> None:
     service's authentication down: the day a key of an unsupported type
     appears in the set, an additive change on their side becomes a total
     failure on ours.
+
+    Both skip branches are in the set, because they are not the same code
+    path. The EC entry short-circuits at the `kty` check and never reaches
+    `PyJWK.from_dict`; the malformed RSA entry is the one that gets there and
+    raises, which is the branch a genuinely novel provider-side key would take.
     """
     private_key, jwk = signing_material("kid-1")
-    unparseable = {"kty": "EC", "crv": "P-256", "x": "AA", "y": "BB", "kid": "kid-ec", "use": "sig"}
-    client = httpx.AsyncClient(transport=mock_transport({"keys": [unparseable, jwk]}))
+    wrong_kty = {"kty": "EC", "crv": "P-256", "x": "AA", "y": "BB", "kid": "kid-ec", "use": "sig"}
+    unparseable = {"kty": "RSA", "n": "!!!", "e": "AQAB", "kid": "kid-bad", "use": "sig"}
+    client = httpx.AsyncClient(transport=mock_transport({"keys": [wrong_kty, unparseable, jwk]}))
     verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client)
     try:
         await verifier.initialize()
         claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+        # Both skipped keys are absent from the cache, not merely unused.
+        for skipped in ("kid-ec", "kid-bad"):
+            with pytest.raises(TokenInvalidError):
+                await verifier.verify(access_token(private_key, kid=skipped))
     finally:
         await client.aclose()
     assert claims["tid"] == TENANT_ID
@@ -546,9 +615,24 @@ async def test_a_signing_key_alongside_an_encryption_key_still_works() -> None:
 async def test_skipped_keys_log_only_the_kid_and_the_reason(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A skip is logged, and the log line carries no key material."""
+    """A skip is logged, and the log line carries no key material.
+
+    Pointed at a malformed **RSA** entry on purpose: that is the branch which
+    formats an exception, and so the only one where a future PyJWT message
+    could carry provider payload. Logging `type(exc).__name__` rather than
+    `exc` is what keeps it out, and the planted marker is what checks it. The
+    `kty`-mismatch branch logs a fixed string and could not leak either way.
+
+    The entry omits `e` rather than corrupting `n`, because PyJWT's base64
+    decoder is lenient enough to accept a marker like this one as a modulus:
+    `{"n": "SECRETX", "e": "AQAB"}` parses successfully. Dropping the exponent
+    is what reliably reaches `InvalidKeyError` with the marker still in the
+    key. (Checked against PyJWT 2.13.0, that message is the constant "Not a
+    public or private key" — it does not embed the JWK today. This test holds
+    the property rather than the current message.)
+    """
     private_key, jwk = signing_material("kid-1")
-    unparseable = {"kty": "EC", "crv": "P-256", "x": "SECRETX", "y": "BB", "kid": "kid-ec"}
+    unparseable = {"kty": "RSA", "n": "SECRETX", "kid": "kid-bad", "use": "sig"}
     client = httpx.AsyncClient(transport=mock_transport({"keys": [unparseable, jwk]}))
     verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client)
     try:
@@ -557,23 +641,84 @@ async def test_skipped_keys_log_only_the_kid_and_the_reason(
     finally:
         await client.aclose()
     messages = [record.getMessage() for record in caplog.records]
-    assert any("kid-ec" in message for message in messages)
+    assert any("kid-bad" in message for message in messages)
     assert not any("SECRETX" in message for message in messages)
 
 
 # --- cache publication ----------------------------------------------------------
 
 
-async def test_a_failed_startup_leaves_no_keys_cached() -> None:
-    """The cache is replaced only after the whole response validates."""
-    _, jwk = signing_material("kid-1")
+async def test_a_failed_reinitialize_neither_publishes_nor_destroys_the_cache() -> None:
+    """The cache is replaced only after the whole response validates.
+
+    Written as a *second* `initialize()` over a working one, because that is
+    the only arrangement in which the property is observable. On a first
+    startup the uninitialized-verifier guard refuses every token regardless of
+    what landed in `_keys`, so a leak would be invisible; here the old key must
+    still verify and the new one must not, and both halves fail if the cache
+    were assigned before the key set finished validating.
+
+    This is the path Task 4 rewrites when it adds refresh, which is why it is
+    pinned behaviorally rather than by reading private state.
+    """
+    old_key, old_jwk = signing_material("kid-old")
+    new_key, new_jwk = signing_material("kid-new")
+    responses = [{"keys": [old_jwk]}, {"keys": [new_jwk, new_jwk]}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == DISCOVERY_URL:
+            return httpx.Response(200, json=DISCOVERY_BODY)
+        if str(request.url) == JWKS_URL:
+            return httpx.Response(200, json=responses.pop(0))
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client)
+    try:
+        await verifier.initialize()
+        await verifier.verify(access_token(old_key, kid="kid-old"))
+
+        # Second key set is self-contradictory (duplicate kid) and must be
+        # rejected wholesale.
+        with pytest.raises(TokenVerifierStartupError):
+            await verifier.initialize()
+
+        # Still the old key set: not half-replaced, and not wiped either.
+        claims = await verifier.verify(access_token(old_key, kid="kid-old"))
+        assert claims["tid"] == TENANT_ID
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(new_key, kid="kid-new"))
+    finally:
+        await client.aclose()
+
+
+async def test_verify_before_initialize_is_a_programming_error() -> None:
+    """Not `TokenInvalidError`: nothing is wrong with the token.
+
+    An unguarded empty cache rejects every token as an unknown `kid`, which
+    reaches the caller as a 401 storm indistinguishable from a client at fault
+    and leaves nothing in the log pointing at the wiring.
+    """
+    private_key, _ = signing_material("kid-1")
+    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await verifier.verify(access_token(private_key, kid="kid-1"))
+        assert not isinstance(caught.value, TokenInvalidError)
+    finally:
+        await verifier.aclose()
+
+
+async def test_verify_after_a_failed_startup_is_a_programming_error() -> None:
+    """A verifier that never came up must not be usable, by the same rule."""
+    private_key, jwk = signing_material("kid-1")
     client = httpx.AsyncClient(transport=scripted_transport(jwks=(200, {"keys": [jwk, jwk]})))
     verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client)
     try:
         with pytest.raises(TokenVerifierStartupError):
             await verifier.initialize()
-        with pytest.raises(TokenInvalidError):
-            await verifier.verify(access_token(signing_material("kid-1")[0], kid="kid-1"))
+        with pytest.raises(RuntimeError):
+            await verifier.verify(access_token(private_key, kid="kid-1"))
     finally:
         await client.aclose()
 
