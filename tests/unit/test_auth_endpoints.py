@@ -282,6 +282,25 @@ def test_entra_mode_without_lifespan_fails_instead_of_trusting_headers(
     assert "conversation_id" not in response.text
 
 
+def test_entra_mode_without_lifespan_raises_the_uninitialized_resolver_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The companion above pins the client-visible outcome; this one pins the
+    # reason. `raise_server_exceptions=False` turns *any* server-side
+    # exception into a 500, so on its own it would also be satisfied by some
+    # unrelated Entra-mode component failing while a header-trust downgrade
+    # sat underneath it. Letting the exception through names the failure.
+    app_under_test = _entra_mode_app(monkeypatch)
+
+    client = TestClient(app_under_test)  # raise_server_exceptions defaults to True
+    with pytest.raises(RuntimeError, match="lifespan did not run"):
+        client.post(
+            "/api/v1/chat",
+            json={"message": "hi"},
+            headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+        )
+
+
 @pytest.mark.parametrize(("path", "payload"), _PROTECTED_CASES)
 def test_protected_endpoints_resolve_through_app_state(
     path: str, payload: dict[str, str]
