@@ -199,7 +199,7 @@ async def stream_chat(
     # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
     try:
         conversation_id, events = await service.open_stream(
-            payload.message, payload.conversation_id, tenant_id=principal.tenant_id
+            payload.message, payload.conversation_id, principal=principal
         )
     except ConversationNotFoundError:
         raise conversation_not_found() from None

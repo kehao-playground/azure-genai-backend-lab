@@ -42,3 +42,21 @@ def step_streaming_response_header(context, header: str) -> None:  # type: ignor
 @then('the streamed text should include the marker "{marker}"')
 def step_streamed_text_marker(context, marker: str) -> None:  # type: ignore[no-untyped-def]
     assert marker in context.response.text
+
+
+@when('I submit a follow-up message in the same conversation as group "{group}"')
+def step_submit_follow_up_as_group(context, group: str) -> None:  # type: ignore[no-untyped-def]
+    context.response = context.client.post(
+        "/api/v1/chat",
+        json={"message": "And again", "conversation_id": context.conversation_id},
+        headers={"X-Tenant-Id": "t1", "X-Group-Ids": group},
+    )
+
+
+@when('I stream a follow-up message in the same conversation as group "{group}"')
+def step_stream_follow_up_as_group(context, group: str) -> None:  # type: ignore[no-untyped-def]
+    context.response = context.client.post(
+        "/api/v1/chat/stream",
+        json={"message": "And again", "conversation_id": context.conversation_id},
+        headers={"X-Tenant-Id": "t1", "X-Group-Ids": group},
+    )

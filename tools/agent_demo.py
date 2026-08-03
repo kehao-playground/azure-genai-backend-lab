@@ -679,12 +679,12 @@ async def seed_near(store: ConversationStore, seed_service: ConversationChatServ
     """
     totals: dict[str, int] = {}
     conversation_id, result = await seed_service.complete(
-        "seed turn 1", None, tenant_id=DEMO_TENANT
+        "seed turn 1", None, principal=DEMO_PRINCIPAL
     )
     _add_usage(totals, result.usage)
     for turn in range(2, SEED_NEAR_TURNS + 1):
         _, result = await seed_service.complete(
-            f"seed turn {turn}", conversation_id, tenant_id=DEMO_TENANT
+            f"seed turn {turn}", conversation_id, principal=DEMO_PRINCIPAL
         )
         _add_usage(totals, result.usage)
     conversation = await store.get(DEMO_TENANT, conversation_id)
@@ -719,7 +719,7 @@ async def seed_fresh(
     describes a state the store no longer holds.
     """
     totals = dict(near.usage_totals)
-    fresh_id, result = await seed_service.complete("hello", None, tenant_id=DEMO_TENANT)
+    fresh_id, result = await seed_service.complete("hello", None, principal=DEMO_PRINCIPAL)
     _add_usage(totals, result.usage)
 
     near_conversation = await store.get(DEMO_TENANT, near.conversation_id)

@@ -41,6 +41,7 @@ from azgenai_lab.core.errors import StorageError, UpstreamServiceError
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import Conversation, ReplayItem
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatService,
@@ -101,21 +102,27 @@ class ConversationChatService:
         self._locks = locks if locks is not None else KeyedLock()
 
     async def _load(
-        self, tenant_id: str, provided_id: str | None, resolved_id: str
+        self, principal: Principal, provided_id: str | None, resolved_id: str
     ) -> Conversation:
         if provided_id is None:
             # The id is issued by the caller path, but the conversation exists
             # only once its first turn commits — a failed first call leaves
-            # nothing behind.
-            return Conversation(id=resolved_id)
+            # nothing behind. The draft carries the creator's scope so the
+            # first commit publishes it atomically with the turn.
+            return Conversation(id=resolved_id, authorization_group_ids=principal.group_ids)
         try:
-            conversation = await self._store.get(tenant_id, provided_id)
+            conversation = await self._store.get(principal.tenant_id, provided_id)
         except Exception as exc:
             raise StorageError(str(exc)) from exc
         if conversation is None:
             # Indistinguishable from a never-issued id: a cross-tenant read
             # of another tenant's conversation_id lands here too, since the
             # store's key space already excludes it (Day 15).
+            raise ConversationNotFoundError(provided_id)
+        if conversation.authorization_group_ids != principal.group_ids:
+            # Scope mismatch is indistinguishable from not-found: the group
+            # set is part of session identity (Day 18), and a distinct error
+            # would leak the conversation's existence.
             raise ConversationNotFoundError(provided_id)
         return conversation
 
@@ -139,6 +146,7 @@ class ConversationChatService:
         replay_items: list[ReplayItem],
         expected_revision: int,
         usage_tokens: int,
+        first_turn_scope: tuple[str, ...] | None,
     ) -> None:
         try:
             await self._store.append(
@@ -148,10 +156,7 @@ class ConversationChatService:
                 replay_items,
                 expected_revision,
                 usage_tokens,
-                # TODO(day18-task3): real scope from principal
-                first_turn_authorization_group_ids=(
-                    () if expected_revision == 0 else None
-                ),
+                first_turn_authorization_group_ids=first_turn_scope,
             )
         except Exception as exc:
             # Includes ConversationConflictError: under the per-process lock a
@@ -160,13 +165,13 @@ class ConversationChatService:
             raise StorageError(str(exc)) from exc
 
     async def complete(
-        self, message: str, conversation_id: str | None, *, tenant_id: str
+        self, message: str, conversation_id: str | None, *, principal: Principal
     ) -> tuple[str, ChatResult]:
         resolved_id = conversation_id or str(uuid4())
-        lock_key = (tenant_id, resolved_id)
+        lock_key = (principal.tenant_id, resolved_id)
         await self._locks.acquire(lock_key)
         try:
-            conversation = await self._load(tenant_id, conversation_id, resolved_id)
+            conversation = await self._load(principal, conversation_id, resolved_id)
             self._check_budget(conversation)
             user_item = _user_item(message)
             result = await self._chat_service.complete([*conversation.replay_items, user_item])
@@ -186,25 +191,28 @@ class ConversationChatService:
                 if result.message:
                     turns.append(Message(role="assistant", content=result.message))
                 await self._commit(
-                    tenant_id,
+                    principal.tenant_id,
                     resolved_id,
                     turns,
                     [user_item, *result.replay_items],
                     expected_revision=conversation.revision,
                     usage_tokens=result.usage.total_tokens if result.usage else 0,
+                    first_turn_scope=(
+                        conversation.authorization_group_ids if conversation.revision == 0 else None
+                    ),
                 )
         finally:
             self._locks.release(lock_key)
         return resolved_id, result
 
     async def open_stream(
-        self, message: str, conversation_id: str | None, *, tenant_id: str
+        self, message: str, conversation_id: str | None, *, principal: Principal
     ) -> tuple[str, AsyncIterator[ChatStreamEvent]]:
         resolved_id = conversation_id or str(uuid4())
-        lock_key = (tenant_id, resolved_id)
+        lock_key = (principal.tenant_id, resolved_id)
         await self._locks.acquire(lock_key)
         try:
-            conversation = await self._load(tenant_id, conversation_id, resolved_id)
+            conversation = await self._load(principal, conversation_id, resolved_id)
             # Budget rejection is pre-stream by design: it raises before any
             # byte reaches the client, so it travels as an HTTP envelope.
             self._check_budget(conversation)
@@ -216,8 +224,17 @@ class ConversationChatService:
         except BaseException:
             self._locks.release(lock_key)
             raise
+        first_turn_scope = (
+            conversation.authorization_group_ids if conversation.revision == 0 else None
+        )
         return resolved_id, self._commit_on_done(
-            tenant_id, resolved_id, message, user_item, events, conversation.revision
+            principal.tenant_id,
+            resolved_id,
+            message,
+            user_item,
+            events,
+            conversation.revision,
+            first_turn_scope,
         )
 
     async def _commit_on_done(
@@ -228,6 +245,7 @@ class ConversationChatService:
         user_item: ReplayItem,
         events: AsyncIterator[ChatStreamEvent],
         expected_revision: int,
+        first_turn_scope: tuple[str, ...] | None,
     ) -> AsyncIterator[ChatStreamEvent]:
         parts: list[str] = []
         try:
@@ -251,6 +269,7 @@ class ConversationChatService:
                             [user_item, *event.replay_items],
                             expected_revision=expected_revision,
                             usage_tokens=event.usage.total_tokens if event.usage else 0,
+                            first_turn_scope=first_turn_scope,
                         )
                     yield event
                     return
