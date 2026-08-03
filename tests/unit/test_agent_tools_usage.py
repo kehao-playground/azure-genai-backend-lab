@@ -14,7 +14,7 @@ NOT_FOUND = {
 async def _store_with(tenant: str, cid: str, tokens: int) -> InMemoryConversationStore:
     store = InMemoryConversationStore()
     await store.append(tenant, cid, turns=[], replay_items=[], expected_revision=0,
-                       usage_tokens=tokens)
+                       usage_tokens=tokens, first_turn_authorization_group_ids=())
     return store
 
 

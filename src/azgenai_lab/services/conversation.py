@@ -141,7 +141,16 @@ class ConversationChatService:
     ) -> None:
         try:
             await self._store.append(
-                tenant_id, conversation_id, turns, replay_items, expected_revision, usage_tokens
+                tenant_id,
+                conversation_id,
+                turns,
+                replay_items,
+                expected_revision,
+                usage_tokens,
+                # TODO(day18-task3): real scope from principal
+                first_turn_authorization_group_ids=(
+                    () if expected_revision == 0 else None
+                ),
             )
         except Exception as exc:
             # Includes ConversationConflictError: under the per-process lock a

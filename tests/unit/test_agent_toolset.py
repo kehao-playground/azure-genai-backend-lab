@@ -80,6 +80,7 @@ async def test_toolset_shares_the_supplied_store() -> None:
         await store.append(
             OPS.tenant_id, "seeded-convo", turns=[], replay_items=[],
             expected_revision=0, usage_tokens=123,
+            first_turn_authorization_group_ids=(),
         )
         get_conversation_usage = toolset.tools[2]
         payload = json.loads(await get_conversation_usage("seeded-convo"))
@@ -97,7 +98,8 @@ async def test_toolset_runtime_config_and_usage_report_the_same_budget() -> None
     # existing test noticing.
     store = InMemoryConversationStore()
     await store.append(
-        OPS.tenant_id, "c1", turns=[], replay_items=[], expected_revision=0, usage_tokens=10
+        OPS.tenant_id, "c1", turns=[], replay_items=[], expected_revision=0, usage_tokens=10,
+        first_turn_authorization_group_ids=(),
     )
     toolset = build_agent_toolset(_settings(), OPS, conversation_store=store, token_budget=777)
     try:

@@ -52,6 +52,8 @@ class ConversationStore(Protocol):
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
         usage_tokens: int,
+        *,
+        first_turn_authorization_group_ids: tuple[str, ...] | None,
     ) -> None: ...
 
 
@@ -66,6 +68,7 @@ class InMemoryConversationStore:
         self._replay_items: dict[tuple[str, str], list[ReplayItem]] = {}
         self._revisions: dict[tuple[str, str], int] = {}
         self._token_totals: dict[tuple[str, str], int] = {}
+        self._scopes: dict[tuple[str, str], tuple[str, ...]] = {}
 
     async def get(self, tenant_id: str, conversation_id: str) -> Conversation | None:
         key = (tenant_id, conversation_id)
@@ -81,6 +84,7 @@ class InMemoryConversationStore:
             replay_items=copy.deepcopy(self._replay_items.get(key, [])),
             revision=self._revisions.get(key, 0),
             total_tokens=self._token_totals.get(key, 0),
+            authorization_group_ids=self._scopes.get(key, ()),
         )
 
     async def append(
@@ -91,11 +95,22 @@ class InMemoryConversationStore:
         replay_items: Sequence[ReplayItem],
         expected_revision: int,
         usage_tokens: int,
+        *,
+        first_turn_authorization_group_ids: tuple[str, ...] | None,
     ) -> None:
         key = (tenant_id, conversation_id)
         current = self._revisions.get(key, 0)
         if expected_revision != current:
             raise ConversationConflictError(conversation_id, expected_revision, current)
+        # Scope sentinel contract (Day 18): None means "not carried"; the empty
+        # tuple is a legal scope value. Validated after the revision conflict
+        # and before any mutation — a violation is a caller bug and must leave
+        # the log untouched, never publish an orphan scope.
+        if current == 0:
+            if first_turn_authorization_group_ids is None:
+                raise ValueError("first append must carry the authorization scope")
+        elif first_turn_authorization_group_ids is not None:
+            raise ValueError("continuation append must not carry an authorization scope")
         # Prepare-then-publish: everything that can fail (the deep copy)
         # happens before the first mutation, so a failed append leaves the
         # log untouched instead of half a two-representation turn.
@@ -103,6 +118,8 @@ class InMemoryConversationStore:
         prepared_replay = copy.deepcopy(list(replay_items))
         self._messages.setdefault(key, []).extend(prepared_turns)
         self._replay_items.setdefault(key, []).extend(prepared_replay)
+        if current == 0 and first_turn_authorization_group_ids is not None:
+            self._scopes[key] = first_turn_authorization_group_ids
         self._revisions[key] = current + 1
         # The ledger commits with the turn: usage is part of the same
         # all-or-nothing append, never a separate write that can drift.
