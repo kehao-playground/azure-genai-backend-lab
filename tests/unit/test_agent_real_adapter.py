@@ -47,16 +47,13 @@ from openai.types.responses import (
 from openai.types.responses.response_usage import ResponseUsage
 
 from azgenai_lab.core.config import Settings
-from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.agent_framework import (
     AgentFrameworkService,
     AgentRunError,
     build_agent_service,
 )
-from azgenai_lab.services.agent_tools import build_agent_toolset
+from azgenai_lab.services.agent_tools import build_agent_tool_deps
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
-
-OPS = Principal(tenant_id="opsdemo", group_ids=())
 
 REAL = Settings(
     use_fake_llm=False,
@@ -245,10 +242,10 @@ def _service(
     *, sequential: bool = False, final_text: str | None = None, **overrides: Any
 ) -> AgentFrameworkService:
     settings = REAL.model_copy(update=overrides)
-    toolset = build_agent_toolset(
-        settings, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
     )
-    service = AgentFrameworkService(settings, toolset)
+    service = AgentFrameworkService(settings, deps)
     if sequential:
         _install_sequential_tool_calling_mock(
             service,
@@ -386,10 +383,10 @@ async def test_provider_error_becomes_agent_run_error() -> None:
 
 
 async def test_build_selects_real_adapter_and_aclose_is_idempotent() -> None:
-    toolset = build_agent_toolset(
-        REAL, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+    deps = build_agent_tool_deps(
+        REAL, conversation_store=InMemoryConversationStore(), token_budget=400
     )
-    service = build_agent_service(REAL, toolset)
+    service = build_agent_service(REAL, deps)
     assert isinstance(service, AgentFrameworkService)
     await service.aclose()
     await service.aclose()  # idempotent
@@ -419,12 +416,12 @@ async def test_partial_construction_closes_the_transport(
     monkeypatch.setattr(openai, "AsyncOpenAI", _CapturingClient)
     monkeypatch.setattr(agent_framework, "Agent", _exploding_agent)
 
-    toolset = build_agent_toolset(
-        REAL, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+    deps = build_agent_tool_deps(
+        REAL, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     with pytest.raises(RuntimeError, match="agent construction failed"):
-        AgentFrameworkService(REAL, toolset)
-    await toolset.retriever.aclose()
+        AgentFrameworkService(REAL, deps)
+    await deps.retriever.aclose()
 
     assert len(created) == 1
     # __init__ is sync, so the close is scheduled on this loop; give it a step.
@@ -437,12 +434,12 @@ async def test_partial_construction_closes_the_transport(
 
 async def test_missing_azure_configuration_fails_fast() -> None:
     settings = REAL.model_copy(update={"azure_openai_api_key": None})
-    toolset = build_agent_toolset(
-        settings, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
-        AgentFrameworkService(settings, toolset)
-    await toolset.retriever.aclose()
+        AgentFrameworkService(settings, deps)
+    await deps.retriever.aclose()
 
 
 async def test_iteration_limit_forced_final_fallback_is_stripped() -> None:

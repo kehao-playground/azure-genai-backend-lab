@@ -1,5 +1,6 @@
 import json
 
+from azgenai_lab.models.chat import Message
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.agent_tools import make_get_conversation_usage
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
@@ -37,3 +38,17 @@ async def test_unknown_and_cross_tenant_are_identical_not_found() -> None:
     tool = make_get_conversation_usage(store, OPS, token_budget=400)
     assert json.loads(await tool("c1")) == NOT_FOUND       # cross-tenant
     assert json.loads(await tool("nope")) == NOT_FOUND     # unknown
+
+
+async def test_usage_scope_mismatch_is_not_found_shape() -> None:
+    store = InMemoryConversationStore()
+    await store.append(
+        "t1", "c1", [Message(role="user", content="hi")], [], 0, 100,
+        first_turn_authorization_group_ids=("g1",),
+    )
+    tool = make_get_conversation_usage(
+        store, Principal(tenant_id="t1", group_ids=("g2",)), 50_000
+    )
+    result = json.loads(await tool(conversation_id="c1"))
+    assert result["found"] is False
+    assert result["spent_tokens"] is None

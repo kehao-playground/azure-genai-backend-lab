@@ -21,8 +21,9 @@ import openai
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts.loader import load_prompt
-from azgenai_lab.services.agent_tools import AgentToolFn, AgentToolset
+from azgenai_lab.services.agent_tools import AgentToolDeps, AgentToolFn, bind_principal_tools
 
 logger = logging.getLogger(__name__)
 
@@ -444,15 +445,19 @@ class FakeAgentService:
     its query), results are embedded in the answer so contract tests prove
     the wiring -- the fake never talks to any provider."""
 
-    def __init__(self, toolset: AgentToolset) -> None:
-        self._toolset = toolset
+    def __init__(self, deps: AgentToolDeps) -> None:
+        self._deps = deps
         self._closed = False
 
     async def run(self, task: str) -> AgentRunResult:
         validate_task(task)
+        # TODO(day18-task6/7): per-run principal, not this demo-fixed one.
+        tools = bind_principal_tools(
+            self._deps, Principal(tenant_id="opsdemo", group_ids=())
+        )
         tool_calls: list[AgentToolCall] = []
         outputs: list[str] = []
-        for tool in self._toolset.tools:
+        for tool in tools:
             name = tool.__name__
             kwargs: dict[str, Any] = {}
             if name == "search_docs":
@@ -501,7 +506,7 @@ class FakeAgentService:
         if self._closed:
             return
         self._closed = True
-        await self._toolset.retriever.aclose()
+        await self._deps.retriever.aclose()
 
 
 class AgentFrameworkService:
@@ -513,7 +518,7 @@ class AgentFrameworkService:
     max_function_calls is the third layer (between-batch, best-effort).
     """
 
-    def __init__(self, settings: Settings, toolset: AgentToolset) -> None:
+    def __init__(self, settings: Settings, deps: AgentToolDeps) -> None:
         if not (
             settings.azure_openai_endpoint
             and settings.azure_openai_api_key
@@ -524,7 +529,7 @@ class AgentFrameworkService:
                 "AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME"
             )
         self._settings = settings
-        self._toolset = toolset
+        self._deps = deps
         self._prompt = load_prompt("ops_agent")
         self._closed = False
         # Project-owned transport: same timeout/retry policy as the chat
@@ -582,7 +587,11 @@ class AgentFrameworkService:
         validate_task(task)
         state = AdmissionState(limit=self._settings.agent_max_tool_calls)
         executions: list[ToolExecution] = []
-        wrapped = wrap_tools_with_admission(self._toolset.tools, state, executions)
+        # TODO(day18-task6/7): per-run principal, not this demo-fixed one.
+        tools = bind_principal_tools(
+            self._deps, Principal(tenant_id="opsdemo", group_ids=())
+        )
+        wrapped = wrap_tools_with_admission(tools, state, executions)
         try:
             response = await self._agent.run(task, tools=wrapped)
         except Exception as exc:  # framework/provider terminal failure
@@ -632,14 +641,14 @@ class AgentFrameworkService:
         try:
             await self._client.close()
         finally:
-            await self._toolset.retriever.aclose()
+            await self._deps.retriever.aclose()
 
 
-def build_agent_service(settings: Settings, toolset: AgentToolset) -> AgentService:
+def build_agent_service(settings: Settings, deps: AgentToolDeps) -> AgentService:
     """Composition point: the only place that decides fake vs. real."""
     if settings.use_fake_llm:
-        return FakeAgentService(toolset)
-    return AgentFrameworkService(settings, toolset)
+        return FakeAgentService(deps)
+    return AgentFrameworkService(settings, deps)
 
 
 __all__ = [
