@@ -75,7 +75,7 @@ docs/openapi/openapi.yaml
 
 - [API Conventions](docs/api-conventions.md)
 - [Architecture](docs/architecture.md)
-- [Architecture Style](docs/architecture-style.md)
+- [Microsoft Entra ID Authentication](docs/entra-id-auth.md)
 - [Testing Strategy](docs/testing-strategy.md)
 - [Production Readiness Checklist](docs/production-readiness-checklist.md)
 - [Traditional Chinese Companion Notes](docs/zh-tw/README.md)
