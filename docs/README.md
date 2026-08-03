@@ -1,6 +1,7 @@
 # Documentation
 
-- [API Conventions](api-conventions.md) — error envelope, correlation ID, path versioning
+- [API Conventions](api-conventions.md) — error envelope, correlation ID, path versioning, identity
+- [Microsoft Entra ID Authentication](entra-id-auth.md) — the two auth modes, app registrations, validation chain, 401/403 contract
 - [Architecture](architecture.md)
 - [Architecture Style](architecture-style.md) — package boundaries and dependency rules
 - [Azure Services Map](azure-services-map.md)

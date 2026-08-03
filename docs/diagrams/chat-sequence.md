@@ -2,6 +2,11 @@
 
 Extended Day 15: every request now resolves a `Principal` before touching `ConversationStore`, and
 every store/lock key is `(tenant_id, conversation_id)` rather than a bare `conversation_id`.
+Extended Day 19: the same dependency resolves that `Principal` either from trusted gateway headers
+or from a verified Microsoft Entra ID access token, chosen once at startup from `AUTH_MODE`. The
+JWT internals are not repeated here — see the
+[Entra authentication sequence](entra-auth-sequence.md) and
+[entra-id-auth.md](../entra-id-auth.md).
 
 ```mermaid
 sequenceDiagram
@@ -11,11 +16,13 @@ sequenceDiagram
     participant Store as ConversationStore
     participant LLM as Azure OpenAI (store=false)
 
-    Client->>Dep: POST /api/v1/chat {message, conversation_id?}<br/>X-Tenant-Id, X-Group-Ids?
-    alt missing/malformed identity headers
+    Client->>Dep: POST /api/v1/chat {message, conversation_id?}<br/>headers mode: X-Tenant-Id, X-User-Id, X-Group-Ids?<br/>entra mode: Authorization: Bearer
+    alt credential missing, malformed or unverifiable
         Dep-->>Client: 401 unauthorized (WWW-Authenticate: Bearer)
-    else valid headers
-        Dep-->>API: Principal(tenant_id, group_ids)
+    else verified, but lacks the required scope/role (entra mode)
+        Dep-->>Client: 403 insufficient_scope
+    else accepted
+        Dep-->>API: Principal(tenant_id, user_id, group_ids)
     end
     alt conversation_id supplied
         API->>Store: get(tenant_id, conversation_id)
@@ -34,6 +41,6 @@ sequenceDiagram
     API-->>Client: ChatResponse {message, conversation_id, correlation_id, usage, status, incomplete_reason?}
 ```
 
-`/api/v1/chat/stream` follows the same `require_principal` step before the stream opens: a missing
-or malformed principal is a pre-stream JSON 401 (the Day 6 two-stage error boundary), never an SSE
-`error` event, and the tenant context stays set for the whole streamed response body.
+`/api/v1/chat/stream` follows the same `require_principal` step before the stream opens: a rejected
+credential is a pre-stream JSON 401 or 403 (the Day 6 two-stage error boundary), never an SSE
+`error` event, and the tenant/user context stays set for the whole streamed response body.

@@ -54,7 +54,7 @@ that passes against the fake cannot be relying on an authorization check the rea
 A cross-tenant or wrong-group question resolves exactly like FP1 below: zero visible hits, `status:
 "no_answer"`, no distinguishable "you asked but were denied" signal. That is a deliberate corollary
 of shared-index, query-time isolation (see [the trust-boundary
-note](api-conventions.md#identity-and-tenancy-day-15)): the index itself does not know the
+note](api-conventions.md#trust-boundary-read-before-deploying-past-a-lab-environment)): the index itself does not know the
 difference between "nothing matched" and "something matched but you may not see it", and this
 pipeline does not manufacture that distinction after the fact.
 

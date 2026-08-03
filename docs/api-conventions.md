@@ -62,54 +62,108 @@ Usage is also logged (`llm usage input_tokens=… output_tokens=… reasoning_to
 
 The executable contract is `tests/bdd/features/token_budget_guardrail.feature` plus `tests/unit/test_token_budget.py` and `tests/unit/test_chat_incomplete.py` (non-streaming truncation contract, also covered by a `chat_api_contract.feature` scenario).
 
-## Identity and tenancy (Day 15)
+## Identity and tenancy
 
-`/api/v1/chat`, `/api/v1/chat/stream`, and `/api/v1/rag` require a `Principal` —
-this series' identity boundary until Day 19 replaces it with verified token
-claims behind the same dependency shape. `/health` does not require one.
+Four endpoints require a `Principal`: `POST /api/v1/chat`,
+`POST /api/v1/chat/stream`, `POST /api/v1/rag`, and `POST /api/v1/agent`.
+`/health` does not.
 
-- The `require_principal` FastAPI dependency reads two trusted gateway
-  headers: exactly one `X-Tenant-Id` and zero-or-one `X-Group-Ids` (a
-  comma-separated list; absent or whitespace-only means `group_ids=()`).
-  Identifiers match `[A-Za-z0-9_-]{1,64}`; at most 100 group tokens before
-  deduplication; the raw `X-Group-Ids` value is capped at 4096 ASCII bytes.
-  Group ids are deduplicated and sorted so the derived ACL filter is
-  deterministic.
-- Any violation — duplicate `X-Tenant-Id` lines, more than one `X-Group-Ids`
-  line, an empty token inside a non-empty CSV (`a,,b`, `,a`, `a,`), an
-  identifier outside the charset/length rule, or too many/too-long group
-  values — maps to `401 unauthorized` through the standard envelope, never
-  `422`: header syntax is not request-body validation, and a 422 here would
-  leak the distinction between "who are you" and "what did you ask for".
-- The 401 response carries a `WWW-Authenticate: Bearer` challenge (RFC 9110
-  §15.5.2), marking it as an authentication failure rather than an
-  authorization one. The stand-in scheme name is provisional: it names the
-  eventual mechanism, not a working Bearer-token check, until Day 19 lands
-  real token validation behind this same header.
-- On `/chat/stream`, a missing or malformed principal is a pre-stream JSON
-  401 (the Day 6 two-stage error boundary), never an SSE `error` event.
-- **Trust boundary (read before deploying past a lab environment).** These
-  headers are trusted-gateway input, not end-user-verifiable credentials: a
-  gateway in front of this backend must strip or override every
-  client-supplied identity header before forwarding a request, and the
-  backend must only be reachable through that gateway. Sent directly to the
-  backend, `X-Tenant-Id`/`X-Group-Ids` are impersonation knobs, not
-  authentication — anyone who can reach the backend can claim any tenant or
-  group. There is no "authorization denied" signal anywhere in this
-  pipeline: a document outside the caller's ACL is filtered at query time
-  and is indistinguishable from a document that does not exist, so silent
-  filtering *is* the absence contract, by design, not a gap to close later.
-  Finally, isolation here is **logical, not physical** — every tenant's
-  chunks live in the same shared Azure AI Search index, separated only by
-  the query-time ACL filter below; a bug in that filter, not a hardware or
-  network boundary, is what stands between tenants.
-- Every application `LogRecord` carries a `tenant_id` field once
-  `require_principal` succeeds, using the same `ContextVar` + `LogRecordFactory`
-  mechanism as the Day 5 correlation id (`core/logging.py`). Startup,
-  background tasks, and any request that never reached a valid principal log
-  `tenant_id=-`. Group ids are never logged.
+`Principal(tenant_id, user_id, group_ids)` is the whole authorization context.
+`tenant_id` and `user_id` are required strings; `group_ids` is a tuple that may be
+empty. All three identifiers match `[A-Za-z0-9_-]{1,64}` (a canonical GUID is 36
+characters and fits), at most 100 group ids are accepted, and group ids are
+deduplicated and sorted so the derived ACL filter is deterministic.
 
-See [rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check)
+### Two modes behind one dependency
+
+`require_principal` is the only identity boundary, and which adapter sits behind it
+is chosen **once at startup** from `AUTH_MODE` — never per request, and never by
+what a request happens to carry.
+
+- **`AUTH_MODE=headers`** (default, development). `HeaderPrincipalResolver` reads
+  exactly one `X-Tenant-Id`, exactly one `X-User-Id`, and zero-or-one
+  `X-Group-Ids` (a comma-separated list; absent or whitespace-only means
+  `group_ids=()`). The raw `X-Group-Ids` value is capped at 4096 ASCII bytes and
+  at 100 tokens before deduplication.
+- **`AUTH_MODE=entra`** (Day 19). `EntraJwtPrincipalResolver` reads
+  `Authorization: Bearer <token>`, verifies it cryptographically against the
+  configured tenant's published signing keys, and builds the `Principal` from the
+  `tid`, `oid` and `groups` claims. The `X-*` identity headers are read by nothing
+  in this mode. Full contract, configuration and provisioning:
+  [entra-id-auth.md](entra-id-auth.md).
+
+`X-User-Id` is required in headers mode — a **breaking change** from Day 15, where
+a `Principal` was `(tenant_id, group_ids)` only. A request that carried working
+identity headers before Day 19 now gets a 401 until it also sends `X-User-Id`.
+
+In Entra mode the raw `Authorization` header value is capped at 16 KiB, checked
+**before** any splitting and **including** the `Bearer ` prefix; bounding the token
+body instead would mean splitting unbounded attacker input first.
+
+### 401 versus 403
+
+- **`401 unauthorized`**, with a `WWW-Authenticate: Bearer` challenge (RFC 9110
+  §15.5.2) — the caller could not be authenticated. Every parsing violation lands
+  here: duplicate `X-Tenant-Id` or `X-User-Id` lines, more than one `X-Group-Ids`
+  line, an empty token inside a non-empty CSV (`a,,b`, `,a`, `a,`), an identifier
+  outside the charset/length rule, too many or too-long group values — and, in
+  Entra mode, a malformed `Authorization` header, an unaccepted algorithm, an
+  unknown key id, a failed signature/issuer/audience/expiry check, a `tid` that is
+  not the configured tenant, or a group-overage claim. Never `422`: header syntax
+  is not request-body validation, and a 422 here would leak the distinction
+  between "who are you" and "what did you ask for". The message
+  (`Missing or invalid credentials.`) deliberately names neither the mechanism nor
+  the reason — two resolvers share this dependency, and telling an unauthenticated
+  caller which check failed is free reconnaissance.
+- **`403 insufficient_scope`**, with `WWW-Authenticate: Bearer error="insufficient_scope"`
+  — Entra mode only. The token verified and the caller *is* authenticated; it just
+  lacks the required delegated scope or application role. Retrying with the same
+  credential is pointless, which is what RFC 6750's `insufficient_scope` challenge
+  says. Identity is resolved before permissions, so an untrusted `tid` or a group
+  overage is 401 even when the scope would also have been refused.
+
+On `/chat/stream`, both rejections are pre-stream JSON responses through the
+standard envelope (the Day 6 two-stage error boundary), never SSE `error` events:
+`require_principal` runs before the `StreamingResponse` is constructed.
+
+The generated OpenAPI declares a `bearerAuth` security scheme on all four protected
+operations **unconditionally**, including under `AUTH_MODE=headers` where the token
+is ignored and the identity headers are documented as no parameter at all — see
+[entra-id-auth.md §7](entra-id-auth.md#what-the-generated-openapi-says-and-where-it-deviates).
+
+### Trust boundary (read before deploying past a lab environment)
+
+In **headers mode**, these headers are trusted-gateway input, not
+end-user-verifiable credentials: a gateway in front of this backend must strip or
+override every client-supplied identity header before forwarding a request, and the
+backend must only be reachable through that gateway. Sent directly to the backend,
+`X-Tenant-Id`/`X-User-Id`/`X-Group-Ids` are impersonation knobs, not authentication
+— anyone who can reach the backend can claim any tenant or group.
+
+In **Entra mode** the backend verifies the credential itself, so that particular
+gap closes; the gateway should still strip all three `X-*` headers, since a future
+change or a misread `AUTH_MODE` should not be one line away from accepting them.
+
+Unchanged in both modes: there is no "authorization denied" signal anywhere in this
+pipeline. A document outside the caller's ACL is filtered at query time and is
+indistinguishable from a document that does not exist, so silent filtering *is* the
+absence contract, by design, not a gap to close later. And isolation is **logical,
+not physical** — every tenant's chunks live in the same shared Azure AI Search
+index, separated only by the query-time ACL filter; a bug in that filter, not a
+hardware or network boundary, is what stands between tenants.
+
+### Logging
+
+Every application `LogRecord` carries `tenant_id` and `user_id` fields once
+`require_principal` succeeds, using the same `ContextVar` + `LogRecordFactory`
+mechanism as the Day 5 correlation id (`core/logging.py`), and the context stays
+set for the entire response — including a streamed body. Startup, background tasks,
+and any request that never reached a valid principal log `-` for both. Group ids
+are never logged. In Entra mode `user_id` is a directory object ID: treat it as
+pseudonymous personal data, not as an opaque request tag.
+
+See [entra-id-auth.md](entra-id-auth.md) for the Entra ID integration in full,
+[rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check)
 for how a `Principal` becomes an OData filter, and
 [rag-indexing.md](rag-indexing.md#tenant-scoped-keys) for how tenancy is
 encoded on the write side.
