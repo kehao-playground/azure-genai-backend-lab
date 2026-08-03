@@ -10,12 +10,14 @@ builds at startup.
 
 from collections.abc import AsyncIterator, Sequence
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+from azgenai_lab.services.agent_turn import AgentTurnService
 from azgenai_lab.services.azure_openai import ChatResult, ChatStreamEvent, FakeChatService
 from azgenai_lab.services.azure_search import AzureSearchClient, FakeSearchClient
 from azgenai_lab.services.conversation import ConversationChatService
@@ -146,3 +148,48 @@ def test_create_app_lifespan_closes_composed_services_on_shutdown() -> None:
 
     assert conversation_chat.close_count == 1
     assert rag_chat.close_count == 1
+
+
+async def test_lifespan_isolates_close_failures() -> None:
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    closed: list[str] = []
+
+    class _Exploding:
+        async def aclose(self) -> None:
+            closed.append("conversation")
+            raise RuntimeError("close failed")
+
+    class _Recording:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        async def aclose(self) -> None:
+            closed.append(self._name)
+
+    app.state.conversation_service = _Exploding()
+    app.state.rag_service = _Recording("rag")
+    app.state.agent_turn_service = _Recording("agent")
+    with pytest.raises(RuntimeError):
+        async with app.router.lifespan_context(app):
+            pass
+    assert closed == ["conversation", "rag", "agent"]
+
+
+async def test_agent_turn_service_aclose_delegates_exactly_once() -> None:
+    calls: list[str] = []
+
+    class _Adapter:
+        async def run(self, task, history, *, principal):  # type: ignore[no-untyped-def]
+            raise AssertionError("not used")
+
+        async def aclose(self) -> None:
+            calls.append("close")
+
+    service = AgentTurnService(_Adapter(), InMemoryConversationStore())
+    await service.aclose()
+    await service.aclose()
+    # The wrapper's own _closed guard (Task 8) — not the adapter's — makes
+    # the second call a no-op before it ever reaches the delegate.
+    assert calls == ["close"]

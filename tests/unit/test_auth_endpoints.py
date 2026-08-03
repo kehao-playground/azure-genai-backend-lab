@@ -1,9 +1,9 @@
 """Identity-header parsing at the API boundary (Day 15).
 
 ``require_principal`` turns ``X-Tenant-Id`` / ``X-Group-Ids`` into a
-``Principal`` for the three protected endpoints. Every parsing violation maps
+``Principal`` for the four protected endpoints. Every parsing violation maps
 to 401 ``unauthorized`` (never 422): the bad-header matrix below runs
-parameterized over all three endpoints with each endpoint's own valid body,
+parameterized over all four endpoints with each endpoint's own valid body,
 so a 422 from FastAPI's own validation can never masquerade as the 401 the
 dependency is supposed to raise.
 """
@@ -23,6 +23,7 @@ _PROTECTED_CASES = [
     ("/api/v1/chat", {"message": "hello"}),
     ("/api/v1/chat/stream", {"message": "hello"}),
     ("/api/v1/rag", {"question": "hello"}),
+    ("/api/v1/agent", {"task": "hello"}),
 ]
 
 
@@ -46,7 +47,7 @@ def _make_request(headers: list[tuple[bytes, bytes]]) -> Request:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: bad-header matrix, parameterized over all three protected endpoints.
+# Step 1: bad-header matrix, parameterized over all four protected endpoints.
 # ---------------------------------------------------------------------------
 
 _BAD_HEADER_CASES: dict[str, list[tuple[bytes, bytes]]] = {
