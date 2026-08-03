@@ -51,8 +51,13 @@ message `Missing or invalid credentials.` Every one of these lands here:
 - The `kid` is not in the published key set, even after a refresh.
 - The signature, `iss`, `aud` or `exp` check fails, or `exp`/`iss`/`aud` is absent.
 - `tid` or `oid` is missing, is not a string, or `tid` is not the configured tenant.
-- A group overage signal is present (`hasgroups`, or `_claim_names.groups`), or the
-  `groups` claim is not an array of at most 100 strings.
+- A group overage signal is present — `hasgroups` present and **not exactly
+  `False`** (`true`, `"true"`, `1` and `null` all count as the signal), or
+  `_claim_names` carrying a `groups` entry. A `_claim_names` that is present but not
+  a JSON object is also 401. The precise rule, and why the two claims read their
+  nulls in opposite directions, is in
+  [entra-id-auth.md §8](../entra-id-auth.md#8-groups-and-overage).
+- The `groups` claim is present but is not an array of at most 100 strings.
 - `Principal` construction fails Day 15's own validation.
 
 The message never names which check failed: two resolvers share this dependency,
