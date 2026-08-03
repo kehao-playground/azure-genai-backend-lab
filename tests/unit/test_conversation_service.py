@@ -34,7 +34,7 @@ from azgenai_lab.services.conversation import (
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 TENANT_ID = "t1"
-DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, group_ids=())
+DEFAULT_PRINCIPAL = Principal(tenant_id=TENANT_ID, user_id="u1", group_ids=())
 
 
 class SpyChatService:
@@ -169,7 +169,9 @@ async def test_cross_tenant_complete_raises_not_found_and_intact_history_survive
 
     with pytest.raises(ConversationNotFoundError):
         await service.complete(
-            "intruder", conversation_id, principal=Principal(tenant_id="t2", group_ids=())
+            "intruder",
+            conversation_id,
+            principal=Principal(tenant_id="t2", user_id="u1", group_ids=()),
         )
 
     # B's failed read touched neither B's nor A's storage: A's next turn
@@ -428,8 +430,8 @@ class _EchoChat:
         return None
 
 
-P_G1 = Principal(tenant_id="t1", group_ids=("g1",))
-P_G2 = Principal(tenant_id="t1", group_ids=("g2",))
+P_G1 = Principal(tenant_id="t1", user_id="u1", group_ids=("g1",))
+P_G2 = Principal(tenant_id="t1", user_id="u1", group_ids=("g2",))
 
 
 async def test_scope_mismatch_is_not_found_same_shape() -> None:

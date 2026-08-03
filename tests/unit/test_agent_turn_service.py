@@ -25,8 +25,8 @@ from azgenai_lab.services.conversation import (
 )
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
-P = Principal(tenant_id="t1", group_ids=("g1",))
-P_OTHER = Principal(tenant_id="t1", group_ids=("g2",))
+P = Principal(tenant_id="t1", user_id="u1", group_ids=("g1",))
+P_OTHER = Principal(tenant_id="t1", user_id="u1", group_ids=("g2",))
 
 USAGE = TokenUsage(input_tokens=20, output_tokens=10, total_tokens=30, reasoning_tokens=0)
 

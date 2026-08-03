@@ -20,7 +20,8 @@ from azgenai_lab.services.rag import build_rag_service  # noqa: E402
 # scenarios exercise the documented contract, not the auth boundary itself
 # (that lives in tests/unit/test_auth_endpoints.py), so the shared client
 # carries valid identity headers by default.
-AUTH_HEADERS = {"X-Tenant-Id": "t1"}
+# Day 19: X-User-Id joins X-Tenant-Id as a required header.
+AUTH_HEADERS = {"X-Tenant-Id": "t1", "X-User-Id": "u1"}
 
 
 def before_scenario(context, scenario):  # type: ignore[no-untyped-def]

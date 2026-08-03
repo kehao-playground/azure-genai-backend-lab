@@ -26,7 +26,7 @@ VECTOR = [0.1] * EMBEDDING_DIMENSIONS
 # Every query is scoped by a principal, so every test here carries one. The
 # plain single-tenant case is the default; tests about the filter itself build
 # their own.
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 
 def _settings() -> Settings:
@@ -255,7 +255,7 @@ async def test_the_adapter_derives_the_filter_from_the_principal() -> None:
         seen["body"] = json.loads(request.content)
         return httpx.Response(200, json={"value": []})
 
-    principal = Principal(tenant_id="acme", group_ids=("oncall", "billing"))
+    principal = Principal(tenant_id="acme", user_id="u1", group_ids=("oncall", "billing"))
     await _client(handler).search("q", mode=SearchMode.KEYWORD, top=5, principal=principal)
 
     body = seen["body"]
@@ -274,7 +274,7 @@ async def test_the_search_log_line_does_not_carry_group_ids_or_query_text(
     # along; neither must the question.
     query_text = "distinctive-query-text-53ab"
     group_id = "distinctive-group-53ab"
-    principal = Principal(tenant_id="distinctive-tenant-53ab", group_ids=(group_id,))
+    principal = Principal(tenant_id="distinctive-tenant-53ab", user_id="u1", group_ids=(group_id,))
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"value": [_hit()]})
@@ -305,7 +305,7 @@ async def test_client_facing_message_does_not_leak_endpoint_key_filter_or_query_
     # filter is gone, so the only way to get a distinctive value into the
     # OData filter is through the principal that derives it.
     group_id = "distinctive-group-a71e"
-    principal = Principal(tenant_id="t1", group_ids=(group_id,))
+    principal = Principal(tenant_id="t1", user_id="u1", group_ids=(group_id,))
 
     def handler(request: httpx.Request) -> httpx.Response:
         detail = (

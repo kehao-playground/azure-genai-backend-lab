@@ -35,7 +35,7 @@ HIT = SearchHit(
     score=1.0,
 )
 
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 
 DOC = {
     "chunk_id": "doc-a-0000",

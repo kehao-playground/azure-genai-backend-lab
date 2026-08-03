@@ -57,7 +57,7 @@ from azgenai_lab.services.agent_framework import (
 from azgenai_lab.services.agent_tools import build_agent_tool_deps
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
-OPS = Principal(tenant_id="opsdemo", group_ids=())
+OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
 
 REAL = Settings(
     use_fake_llm=False,

@@ -29,7 +29,7 @@ _SELECT = b'"select":"chunk_id,parent_id,title,heading_path,content"'
 
 # tenant "t1", no groups: build_acl_filter() renders this exact clause, which
 # is what makes the byte-for-byte pins below reproducible.
-PRINCIPAL = Principal(tenant_id="t1", group_ids=())
+PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
 _FILTER_JSON = b'"filter":"tenant_id eq \'t1\' and not allowed_groups/any()"'
 
 
@@ -109,7 +109,7 @@ async def test_hybrid_semantic_body_is_byte_for_byte_what_it_has_always_been() -
     recorder = _Recorder()
     client = AzureSearchClient(_settings(), client=recorder.transport())
 
-    acme_principal = Principal(tenant_id="acme", group_ids=())
+    acme_principal = Principal(tenant_id="acme", user_id="u1", group_ids=())
     await client.search(
         "refund window",
         VECTOR,

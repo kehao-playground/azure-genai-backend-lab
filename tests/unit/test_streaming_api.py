@@ -140,7 +140,7 @@ def test_stream_endpoint_passes_the_principals_tenant_id_into_open_stream(
     spy = SpyConversationService()
     app.dependency_overrides[get_conversation_service] = lambda: spy
 
-    response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1
+    response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1, X-User-Id: u1
 
     assert response.status_code == 200
     assert spy.tenant_ids == ["t1"]
@@ -159,7 +159,7 @@ def test_log_record_emitted_inside_the_streaming_iterator_carries_tenant_id(
     )
 
     with caplog.at_level(logging.WARNING):
-        response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1
+        response = post_stream(client)  # `client` fixture sends X-Tenant-Id: t1, X-User-Id: u1
 
     assert response.status_code == 200
     mid_stream_records = [

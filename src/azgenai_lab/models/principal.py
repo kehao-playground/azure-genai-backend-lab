@@ -25,12 +25,18 @@ class Principal(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     tenant_id: str
+    user_id: str
     group_ids: tuple[str, ...]
 
     @field_validator("tenant_id")
     @classmethod
     def _valid_tenant(cls, v: str) -> str:
         return validate_identifier(v, field="tenant_id")
+
+    @field_validator("user_id")
+    @classmethod
+    def _valid_user(cls, value: str) -> str:
+        return validate_identifier(value, field="user_id")
 
     @field_validator("group_ids")
     @classmethod

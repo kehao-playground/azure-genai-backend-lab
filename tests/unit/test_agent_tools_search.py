@@ -9,7 +9,7 @@ from azgenai_lab.services.agent_tools import (
     truncate_utf8,
 )
 
-OPS = Principal(tenant_id="opsdemo", group_ids=())
+OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
 
 
 def _hit(i: int, content: str = "budget text") -> SearchHit:

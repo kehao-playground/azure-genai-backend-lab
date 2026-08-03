@@ -1,7 +1,7 @@
 import logging
 
 from azgenai_lab.core.correlation import correlation_id_var
-from azgenai_lab.core.tenant_context import tenant_id_var
+from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
 
 # The stock factory, captured once at import time so the wrapper below can
 # delegate to it instead of hardcoding LogRecord's constructor signature.
@@ -17,10 +17,12 @@ def _correlation_record_factory(*args: object, **kwargs: object) -> logging.LogR
     # always present and greppable rather than sometimes-missing.
     record = _base_record_factory(*args, **kwargs)
     record.correlation_id = correlation_id_var.get() or "-"
-    # tenant_id_var already defaults to "-" outside require_principal's scope,
-    # unlike correlation_id_var's None default, so no `or "-"` fallback is
-    # needed here. Group ids never enter log records — only the tenant id.
+    # tenant_id_var and user_id_var already default to "-" outside
+    # require_principal's scope, unlike correlation_id_var's None default, so
+    # no `or "-"` fallback is needed here. Group ids never enter log
+    # records — only the tenant and user id.
     record.tenant_id = tenant_id_var.get()
+    record.user_id = user_id_var.get()
     return record
 
 
@@ -33,6 +35,10 @@ def configure_logging(level: str = "INFO") -> None:
     # call a silent no-op. This must actually take effect every time.
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)s %(name)s correlation_id=%(correlation_id)s %(message)s",
+        format=(
+            "%(asctime)s %(levelname)s %(name)s "
+            "correlation_id=%(correlation_id)s tenant_id=%(tenant_id)s "
+            "user_id=%(user_id)s %(message)s"
+        ),
         force=True,
     )

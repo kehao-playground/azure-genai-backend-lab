@@ -24,7 +24,11 @@ PROMPT = PromptTemplate(
 # Same format string as configure_logging() — extras aren't rendered by it, so
 # the fields the article/incident responders grep for must be in the message
 # itself, not only in the record's extra attributes.
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+LOG_FORMAT = (
+    "%(asctime)s %(levelname)s %(name)s "
+    "correlation_id=%(correlation_id)s tenant_id=%(tenant_id)s "
+    "user_id=%(user_id)s %(message)s"
+)
 
 
 async def test_complete_logs_prompt_identity(caplog: pytest.LogCaptureFixture) -> None:
@@ -72,3 +76,6 @@ async def test_complete_renders_prompt_identity_in_log_line() -> None:
     assert "prompt_version=1" in line
     assert f"prompt_sha256={PROMPT.sha256[:12]}" in line
     assert "cid-123" in line
+    # Outside any require_principal scope: both identity fields render the
+    # ContextVar defaults, not absence.
+    assert "tenant_id=- user_id=-" in line

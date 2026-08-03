@@ -76,7 +76,9 @@ def test_chat_cross_tenant_conversation_id_maps_to_404(client: TestClient) -> No
 
     from azgenai_lab.main import app as _app
 
-    with TestClient(_app, headers={"X-Tenant-Id": "t2"}) as other_tenant_client:
+    with TestClient(
+        _app, headers={"X-Tenant-Id": "t2", "X-User-Id": "u1"}
+    ) as other_tenant_client:
         response = other_tenant_client.post(
             "/api/v1/chat", json={"message": "intruder", "conversation_id": conversation_id}
         )

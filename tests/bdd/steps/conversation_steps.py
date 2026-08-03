@@ -49,7 +49,7 @@ def step_submit_follow_up_as_group(context, group: str) -> None:  # type: ignore
     context.response = context.client.post(
         "/api/v1/chat",
         json={"message": "And again", "conversation_id": context.conversation_id},
-        headers={"X-Tenant-Id": "t1", "X-Group-Ids": group},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": group},
     )
 
 
@@ -58,5 +58,5 @@ def step_stream_follow_up_as_group(context, group: str) -> None:  # type: ignore
     context.response = context.client.post(
         "/api/v1/chat/stream",
         json={"message": "And again", "conversation_id": context.conversation_id},
-        headers={"X-Tenant-Id": "t1", "X-Group-Ids": group},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1", "X-Group-Ids": group},
     )
