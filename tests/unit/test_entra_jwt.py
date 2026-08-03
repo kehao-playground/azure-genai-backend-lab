@@ -617,11 +617,17 @@ async def test_skipped_keys_log_only_the_kid_and_the_reason(
 ) -> None:
     """A skip is logged, and the log line carries no key material.
 
-    Pointed at a malformed **RSA** entry on purpose: that is the branch which
-    formats an exception, and so the only one where a future PyJWT message
-    could carry provider payload. Logging `type(exc).__name__` rather than
-    `exc` is what keeps it out, and the planted marker is what checks it. The
-    `kty`-mismatch branch logs a fixed string and could not leak either way.
+    A forward regression sentinel, not a proof. Logging `type(exc).__name__`
+    rather than `exc` is what keeps provider payload out of this line — and
+    that is held by construction today, not by the assertion below: PyJWT
+    2.13.0's message here is the constant "Not a public or private key", so
+    the marker would survive even if the code logged `exc` verbatim. No entry
+    shape was found whose exception echoes JWK material. The marker exists to
+    catch a future PyJWT that starts embedding key material in these messages.
+
+    Pointed at a malformed **RSA** entry because that is the only branch which
+    formats an exception at all; the `kty`-mismatch branch logs a fixed string
+    and could not leak under any version.
 
     The entry omits `e` rather than corrupting `n`, because PyJWT's base64
     decoder is lenient enough to accept a marker like this one as a modulus:
@@ -690,6 +696,73 @@ async def test_a_failed_reinitialize_neither_publishes_nor_destroys_the_cache() 
             await verifier.verify(access_token(new_key, kid="kid-new"))
     finally:
         await client.aclose()
+
+
+def owned_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> EntraTokenVerifier:
+    """A verifier that *owns* its client, but whose client speaks to a mock.
+
+    The constructor only owns a client it built itself, so the transport has
+    to be supplied to the constructor rather than to the verifier. Patching
+    the factory keeps the real ownership branch in play.
+    """
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs: Any) -> httpx.AsyncClient:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE)
+    monkeypatch.undo()
+    return verifier
+
+
+async def test_a_failed_reinitialize_keeps_an_owned_client_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown is for a verifier that never came up, not for a live one.
+
+    Closing the owned client here would leave the worst kind of object: one
+    that still answers `verify()` from its live cache, so nothing looks wrong,
+    but can never refresh again — the next `initialize()` dies inside httpx
+    with `RuntimeError("Cannot send a request, as the client has been
+    closed.")`, which is neither `HTTPError` nor `InvalidURL` and so escapes
+    `_get_json` uncaught.
+
+    Uses an owned client on purpose: the injected-client tests cannot reach
+    this path, because `aclose()` is a no-op for a client it does not own.
+    The transport is supplied by patching the constructor's factory rather
+    than by assigning `_client` afterwards, so `_owns_client` is set by the
+    real ownership branch instead of being staged.
+    """
+    key, jwk = signing_material("kid-1")
+    responses: list[dict[str, object]] = [
+        {"keys": [jwk]},  # first startup: fine
+        {"keys": [jwk, jwk]},  # refresh: duplicate kid, rejected wholesale
+        {"keys": [jwk]},  # third call must still be possible
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == DISCOVERY_URL:
+            return httpx.Response(200, json=DISCOVERY_BODY)
+        if str(request.url) == JWKS_URL:
+            return httpx.Response(200, json=responses.pop(0))
+        raise AssertionError(f"unexpected URL: {request.url}")
+
+    verifier = owned_verifier(monkeypatch, handler)
+    try:
+        await verifier.initialize()
+        with pytest.raises(TokenVerifierStartupError):
+            await verifier.initialize()
+        assert verifier.closed is False
+        # The client is still usable: a later refresh can actually happen.
+        await verifier.initialize()
+        await verifier.verify(access_token(key, kid="kid-1"))
+    finally:
+        await verifier.aclose()
+    assert verifier.closed is True
 
 
 async def test_verify_before_initialize_is_a_programming_error() -> None:
