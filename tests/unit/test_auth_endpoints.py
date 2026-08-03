@@ -13,12 +13,14 @@ import logging
 from collections.abc import AsyncGenerator, Generator
 
 import pytest
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from azgenai_lab.api.principal import require_principal
+from azgenai_lab.api.principal import UninitializedResolver, insufficient_scope, require_principal
+from azgenai_lab.core.config import Settings
 from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
-from azgenai_lab.main import app
+from azgenai_lab.main import app, create_app
+from azgenai_lab.models.principal import Principal
 
 _PROTECTED_CASES = [
     ("/api/v1/chat", {"message": "hello"}),
@@ -43,6 +45,10 @@ def _make_request(headers: list[tuple[bytes, bytes]]) -> Request:
         "path": "/",
         "headers": headers,
         "query_string": b"",
+        # Day 19: require_principal reads the resolver off app.state, so a
+        # hand-built scope has to carry the app the way Starlette's own
+        # routing would.
+        "app": app,
     }
     return Request(scope)
 
@@ -191,6 +197,163 @@ def test_chat_stream_401_is_plain_json_not_sse(bare_client: TestClient) -> None:
 
     assert response.status_code == 401
     assert response.headers["content-type"].startswith("application/json")
+
+
+# ---------------------------------------------------------------------------
+# Day 19: the dependency resolves through app.state, and the resolver is
+# chosen by AUTH_MODE at construction — never by what a request carries.
+# ---------------------------------------------------------------------------
+
+
+class _StubResolver:
+    """Records every call and hands back one fixed identity (or raises)."""
+
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.calls = 0
+        self.close_count = 0
+        self._failure = failure
+
+    async def resolve(self, request: Request) -> Principal:
+        self.calls += 1
+        if self._failure is not None:
+            raise self._failure
+        return Principal(tenant_id="t1", user_id="u1", group_ids=())
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+
+
+def _entra_mode_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """An Entra-mode app whose lifespan has deliberately not been run.
+
+    `get_settings` is patched where `main` resolved it rather than through
+    AUTH_MODE in the environment: the function is lru_cached process-wide, so
+    an env-based approach would have to clear that cache and risk leaving
+    Entra-mode settings behind for the rest of the session.
+    """
+    from azgenai_lab import main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            auth_mode="entra",
+            entra_tenant_id="11111111-1111-1111-1111-111111111111",
+            entra_audience="22222222-2222-2222-2222-222222222222",
+            entra_required_scope="access_as_user",
+        ),
+    )
+    return main_module.create_app()
+
+
+def test_headers_mode_resolver_is_usable_without_lifespan() -> None:
+    # The regression guard for tests/bdd/environment.py and
+    # tests/unit/test_agent_api.py, both of which serve this app from a bare
+    # TestClient: headers mode must need no startup work at all.
+    app_under_test = create_app()  # AUTH_MODE defaults to headers in the test env
+    client = TestClient(app_under_test)  # deliberately NOT a context manager
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "hi"},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_entra_mode_without_lifespan_fails_instead_of_trusting_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The failure mode this exists to catch is invisible from the outside:
+    # installing a HeaderPrincipalResolver here would answer 200 to a
+    # perfectly valid-looking header identity that nothing verified.
+    app_under_test = _entra_mode_app(monkeypatch)
+    assert isinstance(app_under_test.state.principal_resolver, UninitializedResolver)
+
+    client = TestClient(app_under_test, raise_server_exceptions=False)
+    response = client.post(
+        "/api/v1/chat",
+        json={"message": "hi"},
+        headers={"X-Tenant-Id": "t1", "X-User-Id": "u1"},
+    )
+
+    assert response.status_code == 500  # never 200, never a header-derived identity
+    assert "conversation_id" not in response.text
+
+
+@pytest.mark.parametrize(("path", "payload"), _PROTECTED_CASES)
+def test_protected_endpoints_resolve_through_app_state(
+    path: str, payload: dict[str, str]
+) -> None:
+    app_under_test = create_app()
+    resolver = _StubResolver()
+    app_under_test.state.principal_resolver = resolver
+
+    with TestClient(app_under_test) as client:
+        # No identity headers at all: reaching the handler proves the
+        # dependency asked app.state, not the request.
+        response = client.post(path, json=payload)
+
+    assert response.status_code != 401
+    assert resolver.calls == 1
+    # Headers mode leaves the installed resolver alone at startup, and the
+    # lifespan closes whatever is installed.
+    assert resolver.close_count == 1
+
+
+def test_health_does_not_resolve_a_principal() -> None:
+    app_under_test = create_app()
+    resolver = _StubResolver()
+    app_under_test.state.principal_resolver = resolver
+
+    with TestClient(app_under_test) as client:
+        assert client.get("/health").status_code == 200
+
+    assert resolver.calls == 0
+
+
+@pytest.mark.parametrize("path", ["/api/v1/chat", "/api/v1/chat/stream"])
+def test_insufficient_scope_is_403_through_the_shared_envelope(path: str) -> None:
+    app_under_test = create_app()
+    app_under_test.state.principal_resolver = _StubResolver(failure=insufficient_scope())
+
+    with TestClient(app_under_test) as client:
+        response = client.post(path, json={"message": "hello"})
+
+    assert response.status_code == 403
+    # Plain JSON on the streaming route too: a 403 is raised before the
+    # StreamingResponse exists, so it must not arrive as SSE.
+    assert response.headers["content-type"].startswith("application/json")
+    body = response.json()
+    assert body["error"]["code"] == "insufficient_scope"
+    assert body["correlation_id"]
+    assert response.headers["www-authenticate"] == 'Bearer error="insufficient_scope"'
+
+
+# ---------------------------------------------------------------------------
+# The documented security contract.
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_documents_the_bearer_scheme_on_protected_operations_only() -> None:
+    schema = create_app().openapi()
+
+    assert schema["components"]["securitySchemes"]["bearerAuth"] == {
+        "type": "http",
+        "description": (
+            "Microsoft Entra ID Bearer token when AUTH_MODE=entra. "
+            "Development AUTH_MODE=headers uses X-Tenant-Id, X-User-Id, "
+            "and optional X-Group-Ids."
+        ),
+        "scheme": "bearer",
+    }
+    for path in ("/api/v1/chat", "/api/v1/chat/stream", "/api/v1/rag", "/api/v1/agent"):
+        operation = schema["paths"][path]["post"]
+        assert operation["security"] == [{"bearerAuth": []}]
+        assert "401" in operation["responses"]
+        assert "403" in operation["responses"]
+    assert "security" not in schema["paths"]["/health"]["get"]
 
 
 # ---------------------------------------------------------------------------

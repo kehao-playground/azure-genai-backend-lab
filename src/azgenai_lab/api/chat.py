@@ -19,9 +19,10 @@ router = APIRouter(tags=["chat"])
 # status code is documented here so the OpenAPI drift check guards it.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Input rejected: content filter or invalid input"},
-    401: {
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid credentials"},
+    403: {
         "model": ErrorEnvelope,
-        "description": "unauthorized (missing or malformed identity headers)",
+        "description": "Authenticated credential lacks required API permission",
     },
     404: {"model": ErrorEnvelope, "description": "Unknown conversation_id"},
     429: {"model": ErrorEnvelope, "description": "Conversation token budget exhausted"},

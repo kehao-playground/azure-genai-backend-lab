@@ -69,9 +69,10 @@ _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
         "content": _ENVELOPE_CONTENT,
         "description": "Input rejected before the stream starts: content filter or invalid input",
     },
-    401: {
+    401: {"content": _ENVELOPE_CONTENT, "description": "Missing or invalid credentials"},
+    403: {
         "content": _ENVELOPE_CONTENT,
-        "description": "unauthorized (missing or malformed identity headers)",
+        "description": "Authenticated credential lacks required API permission",
     },
     404: {"content": _ENVELOPE_CONTENT, "description": "Unknown conversation_id"},
     422: {"content": _ENVELOPE_CONTENT, "description": "Validation Error"},

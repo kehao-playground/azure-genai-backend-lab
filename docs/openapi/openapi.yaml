@@ -49,7 +49,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: unauthorized (missing or malformed identity headers)
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Authenticated credential lacks required API permission
           content:
             application/json:
               schema:
@@ -90,6 +96,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+      security:
+      - bearerAuth: []
   /api/v1/chat/stream:
     post:
       tags:
@@ -149,7 +157,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: unauthorized (missing or malformed identity headers)
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Authenticated credential lacks required API permission
           content:
             application/json:
               schema:
@@ -197,6 +211,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+      security:
+      - bearerAuth: []
   /api/v1/rag:
     post:
       tags:
@@ -231,7 +247,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: unauthorized (missing or malformed identity headers)
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Authenticated credential lacks required API permission
           content:
             application/json:
               schema:
@@ -276,6 +298,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+      security:
+      - bearerAuth: []
   /api/v1/agent:
     post:
       tags:
@@ -308,7 +332,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: Missing or malformed identity
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Authenticated credential lacks required API permission
           content:
             application/json:
               schema:
@@ -337,6 +367,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+      security:
+      - bearerAuth: []
 components:
   schemas:
     AgentRequest:
@@ -714,3 +746,9 @@ components:
         \ invoice and Cost\nManagement meter records remain the source of truth, and\
         \ no per-request\n1:1 reconciliation against them is implied. ``input_tokens``\
         \ covers the\nfull replay context, which grows every turn."
+  securitySchemes:
+    bearerAuth:
+      type: http
+      description: Microsoft Entra ID Bearer token when AUTH_MODE=entra. Development
+        AUTH_MODE=headers uses X-Tenant-Id, X-User-Id, and optional X-Group-Ids.
+      scheme: bearer
