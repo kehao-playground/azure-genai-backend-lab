@@ -1,9 +1,17 @@
 # RAG Query Sequence
 
-Day 14 milestone, extended Day 15. `POST /api/v1/rag` — single-turn, `store=False`, no conversation
-history and no token-budget ledger (that machinery is `/chat`-only, Day 7/Day 9). Day 15 adds a
-mandatory `Principal`, resolved once from trusted headers before any pipeline stage runs, and threads
-it into every call that reaches the search index.
+Day 14 milestone, extended Day 15 and Day 19. `POST /api/v1/rag` — single-turn, `store=False`, no
+conversation history and no token-budget ledger (that machinery is `/chat`-only, Day 7/Day 9).
+Day 15 adds a mandatory `Principal`, resolved once before any pipeline stage runs and threaded into
+every call that reaches the search index. Day 19 adds the second way to resolve it: a verified
+Microsoft Entra ID access token, selected once at startup by `AUTH_MODE`. The JWT internals are not
+duplicated here — see the [Entra authentication sequence](entra-auth-sequence.md) and
+[entra-id-auth.md](../entra-id-auth.md).
+
+One consequence worth carrying into this diagram: in Entra mode `tenant_id` and `group_ids` are
+GUIDs, so an index built with the sample corpus's friendly names (`acme`, `oncall`) matches
+nothing and every question lands in the zero-hits branch below. See
+[entra-id-auth.md §8a](../entra-id-auth.md#8a-identity-namespaces-differ-between-modes--flipping-auth_mode-is-not-a-drop-in-change-for-rag).
 
 ```mermaid
 sequenceDiagram
@@ -16,12 +24,14 @@ sequenceDiagram
     participant RagService
     participant Chat as ChatService (rag_answer prompt)
 
-    Client->>Dep: POST /api/v1/rag {question}<br/>X-Tenant-Id, X-Group-Ids?
-    alt missing/malformed identity headers
+    Client->>Dep: POST /api/v1/rag {question}<br/>headers mode: X-Tenant-Id, X-User-Id, X-Group-Ids?<br/>entra mode: Authorization: Bearer
+    alt credential missing, malformed or unverifiable
         Dep-->>Client: 401 unauthorized (WWW-Authenticate: Bearer)
-        Note right of Dep: pre-stream JSON, standard envelope
-    else valid headers
-        Dep-->>API: Principal(tenant_id, group_ids)
+        Note right of Dep: standard envelope, before any pipeline stage
+    else verified, but lacks the required scope/role (entra mode)
+        Dep-->>Client: 403 insufficient_scope
+    else accepted
+        Dep-->>API: Principal(tenant_id, user_id, group_ids)
     end
     API->>RagService: answer(question, principal)
     RagService->>Retriever: retrieve(question, principal)

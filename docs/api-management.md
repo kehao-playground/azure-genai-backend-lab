@@ -6,7 +6,7 @@ Day 10 adds the layer the application cannot provide for itself. The Day 9 guard
 
 Two placements are commonly conflated:
 
-1. **APIM in front of the FastAPI app** — protects *our* API (auth offload, per-client throttling of `/chat`). Relevant from Day 19 (identity) onward.
+1. **APIM in front of the FastAPI app** — protects *our* API (auth offload, per-client throttling of `/chat`). Technically viable since Day 19: the backend now verifies Microsoft Entra ID access tokens itself ([entra-id-auth.md](entra-id-auth.md)), so a gateway in front of it can pass the caller's token straight through rather than being the only thing that knows who the caller is. Still not implemented here — the APIM configuration and the error-shape harmonization below both remain future work.
 2. **APIM in front of the model endpoint** — the *AI gateway* pattern: this backend (and any future service) calls Azure OpenAI **through** APIM instead of directly. Central credential custody, per-consumer throttling, and token metrics for every model consumer in the organization.
 
 This milestone implements placement 2, because it is the one that changes the security model: after it, **no application holds a model credential at all**. The gateway authenticates to Azure OpenAI with its own system-assigned managed identity (`authentication-managed-identity` with resource `https://cognitiveservices.azure.com`, role `Cognitive Services OpenAI User` on the account — [policy doc](https://learn.microsoft.com/en-us/azure/api-management/authentication-managed-identity-policy), checked 2026-07). Clients authenticate to the gateway with APIM subscription keys (`Ocp-Apim-Subscription-Key` header); one client = one subscription, revocable and throttled independently. Whatever credential a client sends is stripped and replaced at the gateway (see `infra/apim/genai-api-policy.xml`).
@@ -45,7 +45,7 @@ Note on naming: `llm-token-limit` / `llm-emit-token-metric` are the current, pro
 
 **Verified gotcha (live, 2026-07):** an API created with `az apim api create` has `subscriptionRequired=false` by default — the portal import wizard enables it, the CLI does not. Until `--subscription-required true` was added to the setup script, a keyless request passed straight through to the model (HTTP 200): the gateway existed but was an open proxy. First acceptance test for any gateway deployment: call it **without** credentials and expect 401.
 
-Error-shape caveat: a gateway-produced 429 is APIM's error shape, not this project's error envelope. The application only speaks the Day 3 envelope for errors it produces; documenting gateway-versus-application error shapes for clients is part of the Day 19+ auth milestone, when placement 1 becomes real.
+Error-shape caveat: a gateway-produced 429 is APIM's error shape, not this project's error envelope. The application only speaks the Day 3 envelope for errors it produces. Day 19 sharpened the mismatch rather than resolving it — the backend now emits `401 unauthorized` and `403 insufficient_scope` through the envelope, with RFC 6750 challenges, and a `validate-jwt` policy at the gateway would refuse the same tokens in APIM's shape with APIM's challenge. Harmonizing the two (or deciding the gateway must not refuse tokens at all) is still open, and belongs with the placement-1 implementation whenever it happens.
 
 ## Layered guardrails after Day 10
 
