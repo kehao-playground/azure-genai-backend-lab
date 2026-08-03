@@ -382,6 +382,31 @@ def extract_run_shape(
     )
 
 
+# `agent_framework._tools._FUNCTION_INVOCATION_LIMIT_FALLBACK_TEXT`: the
+# framework injects this exact sentence as the terminal answer on BOTH limit
+# paths — the function-call limit and the iteration-exhaustion forced final
+# (Phase 3) — whenever the stripped response has no other visible content.
+# Pinned as our own constant so the boundary rule does not import a private
+# upstream name at runtime; a lock test compares the two.
+FRAMEWORK_FALLBACK_TEXT = (
+    "Function invocation limit reached before a final answer could be produced."
+)
+
+
+def strip_framework_fallback(
+    answer: str,
+    stop_reason: Literal["natural", "iteration_limit", "function_call_limit"],
+) -> str:
+    """Day 6 boundary: the framework's hardcoded English fallback never leaves
+    the adapter. Exact equality only — the framework injects the full constant
+    as the sole visible content or not at all, so substring surgery could only
+    ever eat model-authored text. A natural stop never strips: equality there
+    would mean the model itself typed the sentence."""
+    if stop_reason != "natural" and answer == FRAMEWORK_FALLBACK_TEXT:
+        return ""
+    return answer
+
+
 def derive_stop(
     model_call_count: int,
     *,
@@ -581,7 +606,7 @@ class AgentFrameworkService:
             max_tool_calls=self._settings.agent_max_tool_calls,
         )
         return AgentRunResult(
-            answer=shape.answer,
+            answer=strip_framework_fallback(shape.answer, stop_reason),
             model_call_count=shape.model_call_count,
             tool_round_count=shape.tool_round_count,
             tool_call_count=executed,
@@ -628,12 +653,14 @@ __all__ = [
     "AgentService",
     "AgentTaskTooLargeError",
     "AgentToolCall",
+    "FRAMEWORK_FALLBACK_TEXT",
     "FakeAgentService",
     "ToolExecution",
     "build_agent_service",
     "derive_stop",
     "extract_run_shape",
     "map_usage_details",
+    "strip_framework_fallback",
     "validate_task",
     "wrap_tools_with_admission",
 ]

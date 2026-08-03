@@ -5,8 +5,10 @@ import pytest
 
 from azgenai_lab.services.agent_framework import (
     AGENT_MAX_TASK_BYTES,
+    FRAMEWORK_FALLBACK_TEXT,
     AgentTaskTooLargeError,
     map_usage_details,
+    strip_framework_fallback,
     validate_task,
 )
 
@@ -63,3 +65,28 @@ def test_usage_mapping_reasoning_optional() -> None:
         {"input_token_count": 10, "output_token_count": 5, "total_token_count": 15}
     )
     assert usage is not None and usage.reasoning_tokens is None
+
+
+def test_strip_on_function_call_limit() -> None:
+    assert strip_framework_fallback(FRAMEWORK_FALLBACK_TEXT, "function_call_limit") == ""
+
+
+def test_strip_on_iteration_limit() -> None:
+    assert strip_framework_fallback(FRAMEWORK_FALLBACK_TEXT, "iteration_limit") == ""
+
+
+def test_natural_stop_never_strips() -> None:
+    assert (
+        strip_framework_fallback(FRAMEWORK_FALLBACK_TEXT, "natural")
+        == FRAMEWORK_FALLBACK_TEXT
+    )
+
+
+def test_real_content_never_stripped_even_on_limit() -> None:
+    assert strip_framework_fallback("Real answer.", "iteration_limit") == "Real answer."
+
+
+def test_pinned_text_matches_framework_constant() -> None:
+    from agent_framework._tools import _FUNCTION_INVOCATION_LIMIT_FALLBACK_TEXT
+
+    assert FRAMEWORK_FALLBACK_TEXT == _FUNCTION_INVOCATION_LIMIT_FALLBACK_TEXT
