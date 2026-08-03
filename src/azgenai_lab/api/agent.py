@@ -24,7 +24,11 @@ router = APIRouter(tags=["agent"])
 
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: {"model": ErrorEnvelope, "description": "Task exceeds the byte boundary"},
-    401: {"model": ErrorEnvelope, "description": "Missing or malformed identity"},
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid credentials"},
+    403: {
+        "model": ErrorEnvelope,
+        "description": "Authenticated credential lacks required API permission",
+    },
     404: {"model": ErrorEnvelope, "description": "Unknown conversation"},
     429: {"model": ErrorEnvelope, "description": "Conversation token budget exhausted"},
     500: {"model": ErrorEnvelope, "description": "Conversation storage failed"},

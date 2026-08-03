@@ -20,9 +20,10 @@ router = APIRouter(tags=["rag"])
 # ("storage_error") is deliberately not listed: it is only raised by
 # services/conversation.py, which the /rag path never calls.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    401: {
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid credentials"},
+    403: {
         "model": ErrorEnvelope,
-        "description": "unauthorized (missing or malformed identity headers)",
+        "description": "Authenticated credential lacks required API permission",
     },
     400: {
         "model": ErrorEnvelope,

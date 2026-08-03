@@ -30,7 +30,7 @@ from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
-from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.core.config import Settings
 from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.entra_jwt import EntraTokenVerifier, TokenInvalidError
@@ -399,20 +399,17 @@ _bearer_scheme = HTTPBearer(
     ),
 )
 
-# Task 6 replaces this with `app.state.principal_resolver`. Until then one
-# module-level instance, built through the *mode-aware* factory: a hard-coded
-# `HeaderPrincipalResolver()` would make an `AUTH_MODE=entra` deployment
-# silently accept unverified `X-Tenant-Id` headers as identity — a trust
-# downgrade invisible from the outside, because every request still returns
-# 200.
-_interim_resolver: PrincipalResolver = build_initial_resolver(get_settings())
-
 
 async def require_principal(
     request: Request,
     _credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer_scheme)],
 ) -> AsyncIterator[Principal]:
-    principal = await _interim_resolver.resolve(request)
+    # The one instance `create_app()` installed for this app, and in Entra
+    # mode the one the lifespan swapped in — read per request, chosen once at
+    # startup. The adapter returns data; the request-lifetime context below is
+    # this dependency's to own.
+    resolver: PrincipalResolver = request.app.state.principal_resolver
+    principal = await resolver.resolve(request)
 
     tenant_token = tenant_id_var.set(principal.tenant_id)
     user_token = user_id_var.set(principal.user_id)

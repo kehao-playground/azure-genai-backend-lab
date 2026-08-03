@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from azgenai_lab.api import agent, chat, health, rag, streaming
+from azgenai_lab.api.principal import build_entra_resolver, build_initial_resolver
 from azgenai_lab.core.config import get_settings
 from azgenai_lab.core.correlation import correlation_id_middleware
 from azgenai_lab.core.errors import (
@@ -31,22 +32,32 @@ _VALIDATION_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Built at startup, not per request: misconfiguration crashes here, not on
-    # request #1. Kept in the lifespan (rather than moved into it entirely)
-    # so app.state is populated before startup completes either way.
-    yield
-    # Long-lived owned clients (AsyncOpenAI, the search httpx.AsyncClient)
-    # have no other shutdown path in a running API process (Day 14 review
-    # finding 4) — without this, they leak connections until the process exits.
-    # Closes are isolated: one service failing to close must not leave the
-    # others' app-wide clients (AsyncOpenAI, httpx) leaking until exit.
+    settings = app.state.settings
     try:
-        await app.state.conversation_service.aclose()
+        if settings.auth_mode == "entra":
+            # Replaces the UninitializedResolver installed by create_app().
+            # The only startup work either mode does: headers mode already
+            # has a working adapter, which is what lets the bare-TestClient
+            # entry points (tests/bdd/environment.py) serve without a lifespan.
+            app.state.principal_resolver = await build_entra_resolver(settings)
+        yield
     finally:
+        # Runs for both paths: normal shutdown, and a startup failure that
+        # never reached `yield`. Each close is isolated so one failure cannot
+        # strand the remaining app-wide clients (Day 14 review finding 4) —
+        # AsyncOpenAI and the httpx clients behind search and JWKS have no
+        # other shutdown path in a running API process, and would otherwise
+        # leak connections until the process exits.
         try:
-            await app.state.rag_service.aclose()
+            await app.state.principal_resolver.aclose()
         finally:
-            await app.state.agent_turn_service.aclose()
+            try:
+                await app.state.conversation_service.aclose()
+            finally:
+                try:
+                    await app.state.rag_service.aclose()
+                finally:
+                    await app.state.agent_turn_service.aclose()
 
 
 def create_app() -> FastAPI:
@@ -64,6 +75,11 @@ def create_app() -> FastAPI:
     )
 
     # Built at startup, not per request: misconfiguration crashes here, not on request #1.
+    app.state.settings = settings
+    # Synchronous and offline, so an app is fully usable in headers mode the
+    # moment it is constructed; in Entra mode this is the sentinel the
+    # lifespan replaces, never a header-trust fallback.
+    app.state.principal_resolver = build_initial_resolver(settings)
     shared_store = build_conversation_store(settings)
     shared_locks: KeyedLock[tuple[str, str]] = KeyedLock()
     app.state.conversation_service = build_conversation_service(

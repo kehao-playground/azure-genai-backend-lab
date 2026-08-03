@@ -11,9 +11,11 @@ builds at startup.
 from collections.abc import AsyncIterator, Sequence
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from azgenai_lab.api.principal import HeaderPrincipalResolver, UninitializedResolver
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
@@ -150,6 +152,15 @@ def test_create_app_lifespan_closes_composed_services_on_shutdown() -> None:
     assert rag_chat.close_count == 1
 
 
+class _RecordingCloser:
+    def __init__(self, closed: list[str], name: str) -> None:
+        self._closed = closed
+        self._name = name
+
+    async def aclose(self) -> None:
+        self._closed.append(self._name)
+
+
 async def test_lifespan_isolates_close_failures() -> None:
     from azgenai_lab.main import create_app
 
@@ -161,19 +172,137 @@ async def test_lifespan_isolates_close_failures() -> None:
             closed.append("conversation")
             raise RuntimeError("close failed")
 
-    class _Recording:
-        def __init__(self, name: str) -> None:
-            self._name = name
-
-        async def aclose(self) -> None:
-            closed.append(self._name)
-
+    app.state.principal_resolver = _RecordingCloser(closed, "principal")
     app.state.conversation_service = _Exploding()
-    app.state.rag_service = _Recording("rag")
-    app.state.agent_turn_service = _Recording("agent")
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
     with pytest.raises(RuntimeError):
         async with app.router.lifespan_context(app):
             pass
+    assert closed == ["principal", "conversation", "rag", "agent"]
+
+
+# ---------------------------------------------------------------------------
+# Day 19: the two-stage principal-resolver composition.
+#
+# create_app() installs a resolver synchronously (so the bare-TestClient entry
+# points in tests/bdd/environment.py and tests/unit/test_agent_api.py keep
+# working without a lifespan); the lifespan only *replaces* it, and only in
+# Entra mode.
+# ---------------------------------------------------------------------------
+
+
+def _entra_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        auth_mode="entra",
+        entra_tenant_id="11111111-1111-1111-1111-111111111111",
+        entra_audience="22222222-2222-2222-2222-222222222222",
+        entra_required_scope="access_as_user",
+    )
+
+
+def _entra_mode_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """An Entra-mode app whose lifespan has not run.
+
+    The mode is injected by patching the `get_settings` name `main` resolved
+    at import, not by setting AUTH_MODE in the environment: `get_settings` is
+    lru_cached process-wide, so an env-based approach would have to clear the
+    cache and could leave Entra-mode settings behind for the rest of the
+    session.
+    """
+    from azgenai_lab import main as main_module
+
+    monkeypatch.setattr(main_module, "get_settings", _entra_settings)
+    return main_module.create_app()
+
+
+def test_headers_mode_installs_a_working_resolver_before_any_lifespan() -> None:
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+
+    assert isinstance(app.state.principal_resolver, HeaderPrincipalResolver)
+
+
+def test_entra_mode_installs_the_sentinel_before_any_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _entra_mode_app(monkeypatch)
+
+    assert isinstance(app.state.principal_resolver, UninitializedResolver)
+
+
+async def test_entra_lifespan_replaces_the_sentinel_and_closes_the_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgenai_lab import main as main_module
+
+    app = _entra_mode_app(monkeypatch)
+    closed: list[str] = []
+    built = _RecordingCloser(closed, "entra-resolver")
+    seen_settings: list[Settings] = []
+
+    async def fake_build(settings: Settings) -> object:
+        seen_settings.append(settings)
+        return built
+
+    monkeypatch.setattr(main_module, "build_entra_resolver", fake_build)
+
+    async with app.router.lifespan_context(app):
+        # Not merely "some Entra resolver": the exact object the factory
+        # returned, so a lifespan that built one and installed another
+        # cannot pass.
+        assert app.state.principal_resolver is built
+
+    assert [s.auth_mode for s in seen_settings] == ["entra"]
+    # Closed once, and it is the *replacement* that gets closed — not the
+    # sentinel it displaced.
+    assert closed == ["entra-resolver"]
+
+
+async def test_headers_mode_lifespan_never_builds_an_entra_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azgenai_lab import main as main_module
+
+    async def exploding_build(settings: Settings) -> object:
+        raise AssertionError("headers mode must do no auth startup work")
+
+    monkeypatch.setattr(main_module, "build_entra_resolver", exploding_build)
+
+    app = main_module.create_app()
+    installed = app.state.principal_resolver
+    async with app.router.lifespan_context(app):
+        assert app.state.principal_resolver is installed
+
+
+async def test_entra_startup_failure_still_closes_the_prebuilt_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The `finally` has to wrap the startup call, not just the `yield`:
+    # otherwise a failed auth startup strands the conversation, RAG and agent
+    # clients that create_app() already opened.
+    from azgenai_lab import main as main_module
+
+    app = _entra_mode_app(monkeypatch)
+    closed: list[str] = []
+
+    async def failing_build(settings: Settings) -> object:
+        raise RuntimeError("discovery failed")
+
+    monkeypatch.setattr(main_module, "build_entra_resolver", failing_build)
+    app.state.conversation_service = _RecordingCloser(closed, "conversation")
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        async with app.router.lifespan_context(app):
+            raise AssertionError("startup must not reach the request phase")
+
+    # The sentinel is still what is installed on this path, and closing it is
+    # a no-op — the point is that the other three were not skipped.
+    assert isinstance(app.state.principal_resolver, UninitializedResolver)
     assert closed == ["conversation", "rag", "agent"]
 
 

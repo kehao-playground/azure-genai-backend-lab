@@ -17,11 +17,9 @@ deliberately fatal condition back into a 401 storm that reads as a client
 problem.
 """
 
-import ast
 import asyncio
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -37,7 +35,7 @@ from azgenai_lab.api.principal import (
     build_initial_resolver,
     insufficient_scope,
 )
-from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.entra_jwt import (
     EntraTokenVerifier,
@@ -651,98 +649,12 @@ async def test_build_entra_resolver_closes_the_verifier_when_startup_fails(
     assert closed == ["aclose"]
 
 
-# ---------------------------------------------------------------------------
-# The interim resolver (Task 6 replaces it with app.state wiring).
-# ---------------------------------------------------------------------------
-
-
-def _build_interim_for(mode: str) -> object:
-    """Re-derive the module-level interim resolver under a given AUTH_MODE.
-
-    `get_settings()` is cached, so the environment is patched and the cache
-    cleared on both sides — the surrounding suite runs in headers mode and
-    must not inherit an Entra-mode Settings.
-
-    The patching is scoped here rather than taken from the `monkeypatch`
-    fixture so the final `cache_clear()` provably runs *after* the
-    environment is restored: `return` inside the `with` triggers its exit
-    first, then the `finally`. With fixture teardown the two orders depend on
-    instantiation order, leaving a window in which anything calling
-    `get_settings()` would cache Entra-mode settings for the rest of the
-    session.
-    """
-    try:
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setenv("AUTH_MODE", mode)
-            patch.setenv("ENTRA_TENANT_ID", TENANT_ID)
-            patch.setenv("ENTRA_AUDIENCE", AUDIENCE)
-            patch.setenv("ENTRA_REQUIRED_SCOPE", REQUIRED_SCOPE)
-            get_settings.cache_clear()
-            return build_initial_resolver(get_settings())
-    finally:
-        get_settings.cache_clear()
-
-
-def test_interim_resolver_is_not_header_trust_in_entra_mode() -> None:
-    # With AUTH_MODE=entra, the module-level interim resolver must be the
-    # sentinel, never a HeaderPrincipalResolver.
-    assert isinstance(_build_interim_for("entra"), UninitializedResolver)
-
-
-def test_interim_resolver_is_usable_in_headers_mode() -> None:
-    assert isinstance(_build_interim_for("headers"), HeaderPrincipalResolver)
-
-
-def test_the_settings_cache_survives_the_interim_probe() -> None:
-    # The probe above is the only thing in the suite that clears the cache,
-    # so this pins the half its own assertions cannot: whatever it leaves
-    # behind must be the ambient headers-mode configuration.
-    _build_interim_for("entra")
-
-    assert get_settings().auth_mode == "headers"
-
-
-def test_interim_resolver_is_assigned_from_the_mode_aware_factory() -> None:
-    """The assertion above only reaches the factory; this one reaches the
-    module-level assignment that uses it.
-
-    Hard-coding `_interim_resolver = HeaderPrincipalResolver()` would leave
-    every behavioural test in this file green while an `AUTH_MODE=entra`
-    deployment silently accepted spoofable `X-Tenant-Id` headers as identity.
-    The assignment is a single module-level statement executed at import, so
-    the source is where it can be pinned without re-importing the module the
-    routers already hold a reference into.
-
-    The argument is pinned too, and it is not a formality: passing a
-    literal `Settings(auth_mode="headers")` reaches the factory, satisfies
-    every behavioural test in this file, and reintroduces exactly the same
-    trust downgrade one level out.
-    """
-    tree = ast.parse(Path(principal_module.__file__ or "").read_text(encoding="utf-8"))
-    assignments = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.AnnAssign | ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_interim_resolver"
-            for target in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
-        )
-    ]
-
-    assert len(assignments) == 1
-    value = assignments[0].value
-    assert isinstance(value, ast.Call)
-    assert isinstance(value.func, ast.Name)
-    assert value.func.id == "build_initial_resolver"
-
-    # Positional or keyword is not the point and is not pinned; that the one
-    # argument is the live `get_settings()` call is.
-    arguments = [*value.args, *(keyword.value for keyword in value.keywords)]
-    assert len(arguments) == 1
-    argument = arguments[0]
-    assert isinstance(argument, ast.Call)
-    assert isinstance(argument.func, ast.Name)
-    assert argument.func.id == "get_settings"
+# The module-level interim resolver these tests used to pin is gone: Task 6
+# wired `app.state.principal_resolver`, so the mode-awareness it guarded now
+# lives in `create_app()`. The replacement guard — an Entra-mode app whose
+# lifespan never ran must fail rather than fall back to header trust — is
+# `test_entra_mode_without_lifespan_fails_instead_of_trusting_headers` in
+# tests/unit/test_auth_endpoints.py.
 
 
 def test_bearer_scheme_never_errors_on_its_own() -> None:
