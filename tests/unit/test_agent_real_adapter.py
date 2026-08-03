@@ -38,7 +38,12 @@ from unittest.mock import AsyncMock
 import httpx
 import openai
 import pytest
-from openai.types.responses import Response, ResponseFunctionToolCall
+from openai.types.responses import (
+    Response,
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
 from openai.types.responses.response_usage import ResponseUsage
 
 from azgenai_lab.core.config import Settings
@@ -85,8 +90,9 @@ TOOL_ARGUMENTS = {
 # `agent_framework._tools._FUNCTION_INVOCATION_LIMIT_FALLBACK_TEXT`, injected by
 # `_ensure_function_invocation_limit_fallback_response` when the tool budget is
 # spent and the response it stripped calls out of had no other visible content.
-# It surfaces verbatim as the app's `answer`: the adapter reports the terminal
-# assistant message's text, and this is that text.
+# It used to surface verbatim as the app's `answer`; Task 4 strips it at the
+# adapter boundary (`strip_framework_fallback`), so it is kept here only for
+# reference and is no longer asserted against `result.answer`.
 FUNCTION_LIMIT_FALLBACK = (
     "Function invocation limit reached before a final answer could be produced."
 )
@@ -147,6 +153,39 @@ def _tool_calling_response(
     )
 
 
+def _final_text_response(counter: "itertools.count[int]", text: str) -> Response:
+    """A terminal response carrying model-authored visible text instead of a
+    function call -- the shape the framework produces when it does NOT need
+    to inject its fallback."""
+    index = next(counter)
+    return Response(
+        id="resp_mock",
+        created_at=0.0,
+        model="chat-mini",
+        object="response",
+        output=[
+            ResponseOutputMessage(
+                id=f"msg_{index}",
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+            )
+        ],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+        status="completed",
+        usage=ResponseUsage.model_validate({
+            "input_tokens": INPUT_TOKENS,
+            "output_tokens": OUTPUT_TOKENS,
+            "total_tokens": TOTAL_TOKENS,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": REASONING_TOKENS},
+        }),
+    )
+
+
 def _install_always_tool_calling_mock(service: AgentFrameworkService) -> None:
     """Mock the one transport call the non-streaming framework path makes.
 
@@ -164,17 +203,32 @@ def _install_always_tool_calling_mock(service: AgentFrameworkService) -> None:
     service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
 
 
-def _install_sequential_tool_calling_mock(service: AgentFrameworkService) -> None:
+def _install_sequential_tool_calling_mock(
+    service: AgentFrameworkService,
+    *,
+    final_text: str | None = None,
+    final_after: int = 0,
+) -> None:
     """Same seam, but one call per response — the production wire shape.
 
     `parallel_tool_calls=False` is what the service sends, so a provider
     answers with a single function call per turn; this mock reproduces that,
     cycling `SEQUENTIAL_TOOL_NAMES` so consecutive rounds differ.
+
+    When `final_text` is set, the first `final_after` calls answer with tool
+    calls as usual, and every call after that answers with model-authored
+    visible text instead — reproducing a run where the tool budget is spent
+    but the model still gets to answer on its own, so the framework never
+    injects its fallback.
     """
     counter = itertools.count()
     names = itertools.cycle(SEQUENTIAL_TOOL_NAMES)
+    call_index = itertools.count()
 
     async def _create(**_kwargs: Any) -> _RawResponseStub:
+        idx = next(call_index)
+        if final_text is not None and idx >= final_after:
+            return _RawResponseStub(_final_text_response(counter, final_text))
         return _RawResponseStub(_tool_calling_response(counter, (next(names),)))
 
     service._client.responses.with_raw_response.create = AsyncMock(side_effect=_create)
@@ -187,14 +241,20 @@ def _make_mock_raise(service: AgentFrameworkService) -> None:
     )
 
 
-def _service(*, sequential: bool = False, **overrides: Any) -> AgentFrameworkService:
+def _service(
+    *, sequential: bool = False, final_text: str | None = None, **overrides: Any
+) -> AgentFrameworkService:
     settings = REAL.model_copy(update=overrides)
     toolset = build_agent_toolset(
         settings, OPS, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     service = AgentFrameworkService(settings, toolset)
     if sequential:
-        _install_sequential_tool_calling_mock(service)
+        _install_sequential_tool_calling_mock(
+            service,
+            final_text=final_text,
+            final_after=settings.agent_max_tool_calls,
+        )
     else:
         _install_always_tool_calling_mock(service)
     return service
@@ -250,9 +310,11 @@ async def test_function_call_limit_sequential_mode() -> None:
     # Two tool rounds plus the forced final response that carries the fallback.
     assert result.model_call_count == 3
     assert result.tool_round_count == 2
-    # Not "nice to have": this is the canned string the framework injects when
-    # it strips the over-budget call and the response has nothing else visible.
-    assert result.answer == FUNCTION_LIMIT_FALLBACK
+    # The framework injects the canned string here (it strips the over-budget
+    # call and the response has nothing else visible), but the adapter strips
+    # it at the boundary (Task 4): the structured signal is `stop_reason`, not
+    # this English sentence.
+    assert result.answer == ""
     assert result.usage is not None
     assert result.usage.total_tokens == 3 * TOTAL_TOKENS
 
@@ -381,3 +443,46 @@ async def test_missing_azure_configuration_fails_fast() -> None:
     with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
         AgentFrameworkService(settings, toolset)
     await toolset.retriever.aclose()
+
+
+async def test_iteration_limit_forced_final_fallback_is_stripped() -> None:
+    """Pure iteration exhaustion (tool budget untouched): Phase 3's forced
+    final also injects the fallback; the adapter must strip it here too."""
+    service = _service(sequential=True, agent_max_iterations=1, agent_max_tool_calls=10)
+    try:
+        result = await service.run("loop forever")
+    finally:
+        await service.aclose()
+    assert result.stop_reason == "iteration_limit"
+    assert result.answer == ""
+
+
+async def test_both_limits_iteration_precedence_still_strips() -> None:
+    service = _service(sequential=True, agent_max_iterations=1, agent_max_tool_calls=1)
+    try:
+        result = await service.run("loop forever")
+    finally:
+        await service.aclose()
+    assert result.stop_reason == "iteration_limit"
+    assert "function_call_limit" in result.limit_reasons
+    assert result.answer == ""
+
+
+async def test_limit_with_real_visible_content_is_preserved() -> None:
+    """When the model authored text in the terminal response, the framework
+    does not inject the fallback and the adapter must not strip anything."""
+    # Arrange the mock transport so the LAST response carries visible text
+    # (reuse the file's final-answer response builder) while the tool budget
+    # is already exhausted by the earlier responses.
+    service = _service(
+        sequential=True,
+        agent_max_iterations=5,
+        agent_max_tool_calls=2,
+        final_text="Here is what I found.",
+    )
+    try:
+        result = await service.run("loop forever")
+    finally:
+        await service.aclose()
+    assert result.stop_reason == "function_call_limit"
+    assert result.answer == "Here is what I found."
