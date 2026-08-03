@@ -34,6 +34,14 @@ fi
 
 delete_app() {
   local app_id="$1" label="$2" object_id=""
+  # The literal `none`, which create-entra-app.sh's abort message emits for a
+  # registration it never got as far as creating. Handled here rather than by
+  # the operator editing the command, because the abort case is exactly when
+  # nobody wants to reason about which half exists.
+  if [[ "$app_id" == "none" ]]; then
+    echo "$label: never created — nothing to do."
+    return 0
+  fi
   # `az ad app list --filter` rather than `az ad app show`: an absent
   # registration comes back as an empty result, while a permissions or network
   # failure is still an error. `show` returns non-zero for both, which would

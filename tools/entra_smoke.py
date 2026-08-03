@@ -79,6 +79,12 @@ IDENTITY_MESSAGE = "identity resolved"
 LOG_JOIN_ATTEMPTS = 10
 LOG_JOIN_DELAY_SECONDS = 0.5
 
+# Only used if the device authorization response omits the field, which the
+# v2.0 endpoint does not do; RFC 8628 §3.2 makes `interval` optional with a
+# recommended default of 5.
+DEFAULT_POLL_INTERVAL_SECONDS = 5
+DEFAULT_DEVICE_CODE_LIFETIME_SECONDS = 900
+
 
 class SmokeError(RuntimeError):
     """A step that had to succeed for the run to mean anything did not.
@@ -220,16 +226,103 @@ def status_check(name: str, response: httpx.Response, expected: int) -> Check:
     return Check(name, ok, "" if ok else f"expected {expected}, got {response.status_code}")
 
 
+# The bounded vocabularies. A check detail may echo a provider- or
+# server-supplied string ONLY when that string is a member of one of these
+# sets; anything else is described, never quoted. This is what makes "details
+# are built from a bounded vocabulary" a property of the code rather than a
+# claim about it — `redact_sensitive` is then genuinely the second layer, not
+# the only thing standing between an opaque refresh token or a `user_code`
+# (neither GUID-, JWT- nor tilde-shaped) and a committed file.
+
+# Every `error.code` this API is documented to emit (`core/errors.py` plus the
+# handlers' literals). A code outside the set means something that is not this
+# API answered, which is worth reporting but not worth quoting.
+API_ERROR_CODES = frozenset(
+    {
+        "configuration_error",
+        "content_filtered",
+        "conversation_not_found",
+        "document_too_large",
+        "duplicate_chunk_id",
+        "embedding_rejected",
+        "enumeration_failed",
+        "http_error",
+        "insufficient_scope",
+        "invalid_input",
+        "rag_context_overflow",
+        "search_request_rejected",
+        "search_unavailable",
+        "storage_error",
+        "token_budget_exceeded",
+        "unauthorized",
+        "unsendable_document",
+        "upstream_error",
+        "upstream_throttled",
+        "upstream_timeout",
+        "validation_error",
+    }
+)
+
+# The media types this tool expects to meet in front of, or instead of, the
+# API. Naming the type is the whole diagnostic value here ("a proxy answered
+# with HTML"), and the set keeps that from becoming a free-text channel.
+KNOWN_MEDIA_TYPES = frozenset(
+    {
+        "application/json",
+        "application/problem+json",
+        "application/xml",
+        "text/html",
+        "text/plain",
+    }
+)
+
+# RFC 6749 §5.2 plus RFC 8628 §3.5, and the two Entra adds this flow meets.
+OAUTH_ERROR_CODES = frozenset(
+    {
+        "access_denied",
+        "authorization_declined",
+        "authorization_pending",
+        "bad_verification_code",
+        "expired_token",
+        "invalid_client",
+        "invalid_grant",
+        "invalid_request",
+        "invalid_scope",
+        "invalid_target",
+        "server_error",
+        "slow_down",
+        "temporarily_unavailable",
+        "unauthorized_client",
+        "unsupported_grant_type",
+    }
+)
+
+
+def describe(value: str | None, known: frozenset[str], noun: str) -> str:
+    """Quote `value` only if it is a member of `known`; otherwise describe it.
+
+    The one gate every provider- and server-supplied string passes through
+    before it can reach a check detail.
+    """
+    if value is None:
+        return f"no {noun}"
+    if value in known:
+        return repr(value)
+    return f"an unrecognized {noun}"
+
+
 def _error_code(response: httpx.Response) -> tuple[str | None, str]:
     """The envelope's `error.code`, plus why it could not be read.
 
     The response body is never quoted back: an HTML error page from something
     in front of the API is a realistic failure mode, and it could contain the
-    bearer token that produced it.
+    bearer token that produced it. The media type is named only when it is one
+    this tool knows.
     """
-    content_type = response.headers.get("content-type", "")
-    if content_type.split(";")[0].strip() != "application/json":
-        return None, f"non-JSON response (content-type {content_type!r})"
+    media_type = response.headers.get("content-type", "").split(";")[0].strip()
+    if media_type != "application/json":
+        described = describe(media_type or None, KNOWN_MEDIA_TYPES, "media type")
+        return None, f"non-JSON response (content-type {described})"
     try:
         body = response.json()
     except ValueError:
@@ -249,14 +342,25 @@ def error_code_check(name: str, response: httpx.Response, expected: str) -> Chec
     code, problem = _error_code(response)
     if code is None:
         return Check(name, False, problem)
-    ok = code == expected
-    return Check(name, ok, "" if ok else f"expected {expected!r}, got {code!r}")
+    if code == expected:
+        return Check(name, True, "")
+    described = describe(code, API_ERROR_CODES, "error code")
+    return Check(name, False, f"expected {expected!r}, got {described}")
 
 
 def challenge_check(name: str, response: httpx.Response, expected: str) -> Check:
+    """Compared, never echoed.
+
+    RFC 6750 §3 lets a challenge carry an `error_description`, so the header
+    an unknown intermediary sets is arbitrary text. Since the check is an
+    equality test, the received value adds nothing the comparison has not
+    already reported.
+    """
     actual = response.headers.get("www-authenticate")
-    ok = actual == expected
-    return Check(name, ok, "" if ok else f"expected {expected!r}, got {actual!r}")
+    if actual == expected:
+        return Check(name, True, "")
+    problem = "no WWW-Authenticate header" if actual is None else "the challenge differed"
+    return Check(name, False, f"expected {expected!r}; {problem}")
 
 
 def rejection_checks(
@@ -431,8 +535,8 @@ def _oauth_failure(context: str, response: httpx.Response) -> SmokeError:
             f"trace id; never paste into evidence files or committed text):\n  {description}",
             file=sys.stderr,
         )
-    error = _oauth_error_code(response)
-    return SmokeError(f"{context}: {error or 'unrecognized error'} (HTTP {response.status_code})")
+    described = describe(_oauth_error_code(response), OAUTH_ERROR_CODES, "OAuth error")
+    return SmokeError(f"{context}: {described} (HTTP {response.status_code})")
 
 
 def _require_str(payload: dict[str, Any], key: str, context: str) -> str:
@@ -476,6 +580,14 @@ def request_device_code(
     _require_str(payload, "device_code", context)
     _require_str(payload, "user_code", context)
     _require_str(payload, "verification_uri", context)
+    # Validated here, with the rest of the response shape, rather than at the
+    # call site: the caller prints the sign-in prompt before it starts polling,
+    # and a malformed field discovered after that costs the operator a
+    # completed interactive sign-in for nothing. The v2.0 endpoint returns both
+    # as JSON numbers (it was the v1 endpoint that returned strings, and this
+    # tool never calls it), so a non-integer here is a real surprise.
+    _require_int(payload, "interval", context, DEFAULT_POLL_INTERVAL_SECONDS)
+    _require_int(payload, "expires_in", context, DEFAULT_DEVICE_CODE_LIFETIME_SECONDS)
     return payload
 
 
@@ -621,15 +733,21 @@ def identity_checks_with_retry(
     log_path: Path,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[Check]:
-    """`identity_checks`, retried while the log line is still in flight.
+    """`identity_checks`, retried while the log **line** is still in flight.
 
     The server's stdout reaches the file through a pipe, so a line can arrive
-    a moment after the response did. Bounded: when the attempts run out the
-    last (failing) result is what gets reported.
+    a moment after the response did. Only that half is retried: a token with no
+    `tid`/`oid` is a fact about the token, and no amount of waiting changes it,
+    so retrying there would spend the whole budget sleeping over a verdict
+    already reached. Bounded either way — when the attempts run out the last
+    (failing) result is what gets reported, never a warning.
     """
     checks = identity_checks(
         label, token=token, lines=read_log_lines(log_path), correlation_id=correlation_id
     )
+    claim_check = checks[0]
+    if not claim_check.passed:
+        return checks
     for _attempt in range(LOG_JOIN_ATTEMPTS - 1):
         if all(check.passed for check in checks):
             return checks
@@ -849,6 +967,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_full_phase(config, client_secret, state)
     except SmokeError as exc:
         state.checks.append(Check(f"{config.phase}: prerequisite step", False, str(exc)))
+    except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+        # The transport and the filesystem, not just this tool's own errors. A
+        # server that is not running, a mistyped `--base-url` and a log file
+        # rotated mid-run are the three likeliest operator mistakes, and in
+        # `--phase full` they land AFTER the interactive sign-in — the exact
+        # cost the log-file precheck above exists to avoid paying twice. An
+        # escaping traceback would also print the token URL, and with it the
+        # tenant GUID, to stderr unredacted.
+        #
+        # Only the exception CLASS is recorded: httpx messages embed the
+        # request URL, so quoting one would put the tenant back in the
+        # evidence through a different door.
+        state.checks.append(
+            Check(
+                f"{config.phase}: prerequisite step",
+                False,
+                f"{type(exc).__name__} while contacting the token endpoint, the API, "
+                "or the server log",
+            )
+        )
 
     evidence = render_evidence(
         phase=config.phase,

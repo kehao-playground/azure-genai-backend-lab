@@ -66,13 +66,47 @@ if ! command -v uuidgen >/dev/null 2>&1; then
 fi
 new_guid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
 
+# A scope value or role value is interpolated straight into the JSON bodies
+# below, so it is validated before anything is created: a value containing a
+# quote would produce invalid JSON and a Graph error that says nothing about
+# the cause. The character class is what Entra accepts for these anyway.
+for pair in "ENTRA_SCOPE_VALUE:$ENTRA_SCOPE_VALUE" "ENTRA_APP_ROLE_VALUE:$ENTRA_APP_ROLE_VALUE"; do
+  if [[ ! "${pair#*:}" =~ ^[A-Za-z0-9._-]{1,120}$ ]]; then
+    echo "${pair%%:*} must match [A-Za-z0-9._-]{1,120}; got '${pair#*:}'." >&2
+    exit 1
+  fi
+done
+
 SCOPE_ID="$(new_guid)"
 ROLE_ID="$(new_guid)"
 
 # Graph request bodies only — no secret is ever written to a file, here or
 # anywhere else in this script.
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Everything below this line creates directory objects, and delete-entra-app.sh
+# needs both application ids to remove them. Any abort in between — a tenant
+# policy refusing the public-client flag, admin consent refused, the service
+# principal retry exhausted — would otherwise leave live registrations whose
+# ids the operator never saw, i.e. a teardown that cannot be performed. So the
+# ids are echoed the moment each one exists, and this trap repeats the exact
+# teardown command for whatever got created before the failure.
+API_APP_ID=""
+CLIENT_APP_ID=""
+teardown_hint() {
+  local status=$?
+  rm -rf "$WORK_DIR"
+  if [[ $status -ne 0 && ( -n "$API_APP_ID" || -n "$CLIENT_APP_ID" ) ]]; then
+    echo >&2
+    echo "ABORTED after creating registrations. Tear them down with:" >&2
+    echo "  ENTRA_TENANT_ID=$ENTRA_TENANT_ID \\" >&2
+    echo "    ENTRA_API_APP_ID=${API_APP_ID:-none} \\" >&2
+    echo "    ENTRA_CLIENT_APP_ID=${CLIENT_APP_ID:-none} \\" >&2
+    echo "    $SCRIPT_DIR/delete-entra-app.sh" >&2
+    echo "('none' means that registration was never created; the script skips it.)" >&2
+  fi
+}
+trap teardown_hint EXIT
 
 # `az ad app create` returns the whole object; both ids are read from that one
 # response rather than following up with `az ad app show`, which can 404
@@ -104,6 +138,10 @@ API_APP_PAIR="$(az ad app create \
   --query "[appId,id]" -o tsv)"
 API_APP_ID="$(read_pair "$API_APP_PAIR" 1)"
 API_OBJECT_ID="$(read_pair "$API_APP_PAIR" 2)"
+# Printed here, not only in the summary at the end: from this line on there is
+# something in the tenant that has to be deleted, and the id is the only handle
+# on it.
+echo "  API app id: $API_APP_ID (object $API_OBJECT_ID)"
 
 # requestedAccessTokenVersion 2 is what makes `aud` the application id GUID and
 # `iss` the v2.0 issuer — the exact pair the server's verifier is configured
@@ -137,7 +175,8 @@ JSON
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/applications/${API_OBJECT_ID}" \
   --headers "Content-Type=application/json" \
-  --body @"$WORK_DIR/api-app.json"
+  --body @"$WORK_DIR/api-app.json" \
+  --output none
 
 # After the appRoles PATCH, never before: a service principal copies the
 # application's roles when it is created, so an SP created first would not
@@ -156,7 +195,8 @@ API_SP_ID="$(create_service_principal "$API_APP_ID" "API")" || {
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/servicePrincipals/${API_SP_ID}" \
   --headers "Content-Type=application/json" \
-  --body '{"appRoleAssignmentRequired": false}'
+  --body '{"appRoleAssignmentRequired": false}' \
+  --output none
 
 echo "Creating client app registration '$ENTRA_CLIENT_APP_NAME'..."
 CLIENT_APP_PAIR="$(az ad app create \
@@ -165,6 +205,7 @@ CLIENT_APP_PAIR="$(az ad app create \
   --query "[appId,id]" -o tsv)"
 CLIENT_APP_ID="$(read_pair "$CLIENT_APP_PAIR" 1)"
 CLIENT_OBJECT_ID="$(read_pair "$CLIENT_APP_PAIR" 2)"
+echo "  client app id: $CLIENT_APP_ID (object $CLIENT_OBJECT_ID)"
 
 # isFallbackPublicClient: the device code flow is a public-client grant, and
 # this client also holds a secret for the app-only leg — one registration
@@ -184,7 +225,8 @@ JSON
 az rest --method PATCH \
   --uri "https://graph.microsoft.com/v1.0/applications/${CLIENT_OBJECT_ID}" \
   --headers "Content-Type=application/json" \
-  --body @"$WORK_DIR/client-app.json"
+  --body @"$WORK_DIR/client-app.json" \
+  --output none
 
 echo "Creating client service principal..."
 CLIENT_SP_ID="$(create_service_principal "$CLIENT_APP_ID" "client")" || {
@@ -208,12 +250,19 @@ JSON
 az rest --method POST \
   --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" \
   --headers "Content-Type=application/json" \
-  --body @"$WORK_DIR/grant.json"
+  --body @"$WORK_DIR/grant.json" \
+  --output none
 
+# Seven days, not the `--years 1` default shape: the header calls these
+# registrations ephemeral, and a secret that outlives the experiment by eleven
+# months contradicts that. `date -u -v+7d` is BSD/macOS, `date -u -d` is GNU —
+# the fallback covers both without a third dependency.
+SECRET_END_DATE="$(date -u -v+7d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+  || date -u -d '+7 days' '+%Y-%m-%dT%H:%M:%SZ')"
 CLIENT_SECRET="$(az ad app credential reset \
   --id "$CLIENT_APP_ID" \
   --display-name "azgenai-lab-smoke" \
-  --years 1 \
+  --end-date "$SECRET_END_DATE" \
   --query password -o tsv)"
 
 if [[ "$DEFER_APP_ROLE_ASSIGNMENT" == "true" ]]; then
