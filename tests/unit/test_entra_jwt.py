@@ -10,7 +10,7 @@ import ast
 import asyncio
 import json
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1270,6 +1270,9 @@ async def test_a_cached_kid_is_served_while_a_refresh_is_already_in_flight() -> 
         source.hold = asyncio.Event()
         token = access_token(private_key, kid="kid-1")
 
+        # Bound before the `try`: a failure inside it must surface as its own
+        # assertion, not as a `NameError` from the check after the block.
+        claims: Mapping[str, Any] = {}
         # One request takes the refresh and is held there, holding the lock.
         holder = asyncio.create_task(verifier.verify(token))
         try:
@@ -1327,6 +1330,42 @@ async def test_a_stale_cache_stalls_one_request_per_window_not_all_of_them() -> 
         finally:
             source.hold.set()
             await asyncio.gather(holder, return_exceptions=True)
+
+
+async def test_the_request_that_refreshes_is_judged_by_the_key_set_it_fetched() -> None:
+    """A key withdrawn by the refresh this request paid for does not verify.
+
+    The narrow line this holds: `verify()` re-reads the cache after an
+    opportunistic refresh instead of using the key it looked up beforehand.
+    Delete that re-read and a token signed by a key the tenant has *just*
+    withdrawn is **accepted** — a rejection silently becomes an acceptance,
+    which is the worst direction for a change on this path to move.
+
+    It has its own test because the alternative is a failure message pointing
+    somewhere else: without it, deleting the re-read turns
+    `test_successful_refresh_replaces_instead_of_merging_keys` red, and the
+    next person reads that name and goes looking at `_parse_keys` for a
+    merge-versus-replace bug that is not there.
+
+    The lock is uncontended and the cache is stale, so this request is the one
+    that performs the fetch — which is exactly what earns it the newer answer.
+    """
+    withdrawn_key, withdrawn_jwk = signing_material("kid-withdrawn")
+    _, replacement_jwk = signing_material("kid-replacement")
+    source = RotatingJwks([withdrawn_jwk])
+    clock = ManualClock()
+    async with rotating_verifier(source, clock) as verifier:
+        await verifier.initialize()
+        # Verifiable right up until the refresh: the failure below is the
+        # rotation taking effect, not a token that was never any good.
+        await verifier.verify(access_token(withdrawn_key, kid="kid-withdrawn"))
+
+        clock.advance(entra_jwt.JWKS_MAX_AGE_SECONDS + 1)
+        source.current_keys = [replacement_jwk]
+        with pytest.raises(TokenInvalidError):
+            await verifier.verify(access_token(withdrawn_key, kid="kid-withdrawn"))
+    # One refresh, performed by the rejected request itself.
+    assert source.jwks_calls == 2
 
 
 async def test_max_age_still_refreshes_a_cache_that_only_sees_known_kids() -> None:
@@ -1394,6 +1433,35 @@ async def test_an_unknown_kid_after_aclose_is_a_rejection_not_a_crash(
     with pytest.raises(TokenInvalidError):
         await verifier.verify(access_token(private_key, kid="kid-unknown"))
     # The cached key set outlives the client, so a good token still verifies.
+    claims = await verifier.verify(access_token(private_key, kid="kid-1"))
+    assert claims["tid"] == TENANT_ID
+
+
+async def test_an_unknown_kid_after_the_caller_closed_an_injected_client() -> None:
+    """The same protection when the client is not ours to have closed.
+
+    `aclose()` is a no-op for an injected client, so `_closed` stays False and
+    cannot be what saves this path — the assertion below says so out loud.
+    httpx's own `is_closed` is the only signal available, and without it a
+    caller shutting down its shared client turns every unknown `kid` into a
+    500 while the verifier still looks perfectly healthy.
+    """
+    private_key, jwk = signing_material("kid-1")
+    source = RotatingJwks([jwk])
+    clock = ManualClock()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(source.handler))
+    verifier = EntraTokenVerifier(TENANT_ID, AUDIENCE, client=client, clock=clock)
+    await verifier.initialize()
+    # Past the cooldown, so only the closed-client guard is left to decline
+    # the refresh this unknown `kid` would otherwise trigger.
+    clock.advance(entra_jwt.JWKS_REFRESH_COOLDOWN_SECONDS + 1)
+    await client.aclose()
+
+    # Not our client, so our own flag never moved: `is_closed` is doing the work.
+    assert verifier.closed is False
+    with pytest.raises(TokenInvalidError):
+        await verifier.verify(access_token(private_key, kid="kid-unknown"))
+    # And the cached key set still answers, as it does after our own aclose().
     claims = await verifier.verify(access_token(private_key, kid="kid-1"))
     assert claims["tid"] == TENANT_ID
 

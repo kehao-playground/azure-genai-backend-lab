@@ -231,20 +231,34 @@ class EntraTokenVerifier:
             await self._refresh_keys(kid)
             key = self._keys.get(kid)
         elif self._is_stale() and not self._refresh_lock.locked():
-            # `locked()` and the acquire inside are not separated by any
-            # suspension point — `Lock.acquire` returns on a fast path without
-            # awaiting when uncontended — so this cannot lose a race and end
-            # up blocking after all. One request per cooldown window pays for
-            # the attempt (the stamp lands before the await, which is what
-            # suppresses the rest of the window); everyone else is served from
-            # cache while it is in flight.
+            # `locked()` is a cheaper question than "will acquiring block",
+            # and deliberately so. It reads `_locked` alone, while
+            # `Lock.acquire`'s fast path also demands an empty (or fully
+            # cancelled) waiter queue — and `release()` clears `_locked`
+            # *before* the woken waiter sets it again. So there is a real
+            # window where this reads False and the acquire below still
+            # queues behind a draining waiter list.
+            #
+            # That window costs event-loop ticks, not a round trip. Waiters
+            # only ever queue here through the unconditional miss path above,
+            # and by the time any of them is woken the holder has already
+            # stamped `_last_refresh_attempt` — so each one returns at a guard
+            # without touching the network. A refresh cannot outlast the
+            # cooldown that suppresses them either: both legs carry
+            # `HTTP_TIMEOUT_SECONDS`, capping a refresh near 20s against a 60s
+            # window.
+            #
+            # What this check does buy is the thing that matters: while a
+            # fetch is genuinely in flight, a request holding a key we can
+            # serve is never parked behind it.
             await self._refresh_keys(None)
             # Re-read. This request paid for the fetch, so it is holding a
             # fresher key set than the lookup above saw, and answering it from
             # the older one would mean honouring a key we have *just learned*
-            # the tenant withdrew. Waiting is what the reorder gave up; the
-            # verdict is not, and this keeps the accept/reject outcome for
-            # this request identical to refreshing ahead of the lookup.
+            # the tenant withdrew. This keeps the accept/reject outcome **for
+            # this request** identical to refreshing ahead of the lookup;
+            # requests served from cache while the fetch was in flight are the
+            # case where the two orderings genuinely differ.
             key = self._keys.get(kid)
         if key is None:
             raise TokenInvalidError("token key id is not in the published key set")
@@ -307,10 +321,11 @@ class EntraTokenVerifier:
         # `HTTPError` nor `InvalidURL` and so escapes `_get_json` and the
         # handler below — turning a shutdown-time cache miss into a 500 for
         # what is really just an unknown key. Declining here lets the lookup
-        # miss cleanly and answer 401. Only owned clients set this flag; an
-        # injected client closed by its owner is that owner's business, and we
-        # cannot see it.
-        if self._closed:
+        # miss cleanly and answer 401. Both flags are needed: `_closed` is
+        # ours and covers an owned client, `is_closed` is httpx's and covers
+        # an injected one the caller closed behind our back (it is False for a
+        # client that was never opened, so it costs nothing otherwise).
+        if self._closed or self._client.is_closed:
             return
 
         async with self._refresh_lock:
