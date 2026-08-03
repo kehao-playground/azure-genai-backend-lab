@@ -27,4 +27,3 @@ sequenceDiagram
     A-->>C: 200 (answer, status, trace, usage)
     Note over T: every exit releases the lock
 ```
-</content>

@@ -121,8 +121,9 @@ async def test_run_failure_commits_nothing_and_maps_upstream() -> None:
     service, _, store = _service(agent=agent)
     with pytest.raises(UpstreamServiceError):
         await service.run_turn("task", None, principal=P)
-    # First turn never came into existence.
+    # First turn never came into existence: nothing was published to the store.
     assert len(agent.calls) == 1
+    assert store._messages == {}
 
 
 async def test_natural_empty_answer_is_upstream_failure_no_commit() -> None:
@@ -130,6 +131,7 @@ async def test_natural_empty_answer_is_upstream_failure_no_commit() -> None:
     service, _, store = _service(agent=agent)
     with pytest.raises(UpstreamServiceError):
         await service.run_turn("task", None, principal=P)
+    assert store._messages == {}
 
 
 async def test_limit_empty_answer_commits_user_only_shape() -> None:
