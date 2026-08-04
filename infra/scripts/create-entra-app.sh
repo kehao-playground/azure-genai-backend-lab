@@ -119,7 +119,27 @@ trap 'exit 130' INT TERM HUP
 # `az ad app create` returns the whole object; both ids are read from that one
 # response rather than following up with `az ad app show`, which can 404
 # against a freshly created object while the directory replicates.
-read_pair() { cut -f"$2" <<<"$1"; }
+#
+# The projection is `join(' ', [...])` and not `[appId,id]`, which looks like it
+# yields one tab-separated line and does not: measured on az 2.88.0, an array
+# projection prints one value PER LINE. Reading field 1 of that with `cut` hands
+# back BOTH ids joined by a newline, and the next request URI is malformed —
+# Graph answers with an HTML "Bad Request - Invalid URL" page that says nothing
+# about the cause, after the registration already exists. join() collapses the
+# pair onto one space-separated line.
+#
+# Shape is then checked rather than trusted, so a future CLI change fails here,
+# loudly, instead of somewhere downstream as an unrecognisable error.
+require_guid() {
+  local label="$1" value="$2" display_name="$3"
+  if [[ ! "$value" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo "Expected a GUID for $label; got '$value'." >&2
+    echo "The az CLI output shape may have changed. A registration named" >&2
+    echo "'$display_name' may exist; find its app id with:" >&2
+    echo "  az ad app list --display-name '$display_name' --query '[].appId' -o tsv" >&2
+    exit 1
+  fi
+}
 
 create_service_principal() {
   # Directory replication makes this the flakiest call in the script: the
@@ -143,9 +163,12 @@ echo "Creating API app registration '$ENTRA_API_APP_NAME'..."
 API_APP_PAIR="$(az ad app create \
   --display-name "$ENTRA_API_APP_NAME" \
   --sign-in-audience AzureADMyOrg \
-  --query "[appId,id]" -o tsv)"
-API_APP_ID="$(read_pair "$API_APP_PAIR" 1)"
-API_OBJECT_ID="$(read_pair "$API_APP_PAIR" 2)"
+  --query "join(' ', [appId, id])" -o tsv)"
+read -r PARSED_APP_ID PARSED_OBJECT_ID <<<"$API_APP_PAIR"
+require_guid "API app id" "${PARSED_APP_ID:-}" "$ENTRA_API_APP_NAME"
+require_guid "API app object id" "${PARSED_OBJECT_ID:-}" "$ENTRA_API_APP_NAME"
+API_APP_ID="$PARSED_APP_ID"
+API_OBJECT_ID="$PARSED_OBJECT_ID"
 # Printed here, not only in the summary at the end: from this line on there is
 # something in the tenant that has to be deleted, and the id is the only handle
 # on it.
@@ -210,9 +233,12 @@ echo "Creating client app registration '$ENTRA_CLIENT_APP_NAME'..."
 CLIENT_APP_PAIR="$(az ad app create \
   --display-name "$ENTRA_CLIENT_APP_NAME" \
   --sign-in-audience AzureADMyOrg \
-  --query "[appId,id]" -o tsv)"
-CLIENT_APP_ID="$(read_pair "$CLIENT_APP_PAIR" 1)"
-CLIENT_OBJECT_ID="$(read_pair "$CLIENT_APP_PAIR" 2)"
+  --query "join(' ', [appId, id])" -o tsv)"
+read -r PARSED_APP_ID PARSED_OBJECT_ID <<<"$CLIENT_APP_PAIR"
+require_guid "client app id" "${PARSED_APP_ID:-}" "$ENTRA_CLIENT_APP_NAME"
+require_guid "client app object id" "${PARSED_OBJECT_ID:-}" "$ENTRA_CLIENT_APP_NAME"
+CLIENT_APP_ID="$PARSED_APP_ID"
+CLIENT_OBJECT_ID="$PARSED_OBJECT_ID"
 echo "  client app id: $CLIENT_APP_ID (object $CLIENT_OBJECT_ID)"
 
 # isFallbackPublicClient: the device code flow is a public-client grant, and
