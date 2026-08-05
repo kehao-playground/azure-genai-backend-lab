@@ -53,7 +53,7 @@ silently:
 
 | Decision | Value | Why |
 |---|---|---|
-| Authorization model | **Azure RBAC** (the default) | The default flipped: since control-plane API `2026-02-01`, new vaults default to `enableRbacAuthorization = true` ([access-control-default](https://learn.microsoft.com/en-us/azure/key-vault/general/access-control-default), checked 2026-08). Legacy access policies let anyone with `Microsoft.KeyVault/vaults/write` grant themselves data access — the model is deprecated with a control-plane API retirement date of 2027-02-27 for pre-2026-02-01 versions. |
+| Authorization model | **Azure RBAC** (explicit) | The default flipped: since control-plane API `2026-02-01`, new vaults default to `enableRbacAuthorization = true` ([access-control-default](https://learn.microsoft.com/en-us/azure/key-vault/general/access-control-default), checked 2026-08). Access policies are legacy and not recommended — anyone with `Microsoft.KeyVault/vaults/write` can grant themselves data access — but both models remain supported; the separate 2027-02-27 retirement applies to **pre-2026-02-01 control-plane API versions**, not to the access-policy model itself ([rbac-access-policy](https://learn.microsoft.com/en-us/azure/key-vault/general/rbac-access-policy), checked 2026-08). The script passes the flag explicitly and reads it back rather than inheriting any default. |
 | Soft delete retention | 7 days (minimum) | Soft delete cannot be disabled; the retention window is also how long a deleted vault's globally-unique name stays reserved unless purged. Short retention keeps the lab's teardown honest. |
 | Purge protection | **off** | Enabling it is irreversible and blocks early purge. Production wants it on; an ephemeral lab that promises "every create script has a teardown" cannot have it. This tension is real — state it, don't paper over it. |
 | Data-plane access | explicit role assignment | Under RBAC, creating a vault grants **no** secret access, not even to the creator. The script assigns `Key Vault Secrets Officer` to the signed-in user; production runtimes get `Key Vault Secrets User` (read-only) instead. |
@@ -99,15 +99,21 @@ period is real, and because "we have Key Vault" is the wrong reason to keep keys
 Rotation is where "put the key in Key Vault" quietly stops being a solution and
 becomes plumbing you own. The pieces, each verified against current docs:
 
-**The key side.** Azure OpenAI and AI Search each issue two keys so one can be
-regenerated while clients ride the other. Regeneration is immediate and
+**The key side.** Both services issue two keys so one can be regenerated while
+clients ride the other, but each half of that claim has its own source. For
+Azure OpenAI / AI Services resources, regeneration is immediate and
 unforgiving: "once a key is regenerated, the older version of that key stops
-working immediately" ([rotate-keys](https://learn.microsoft.com/en-us/azure/ai-services/rotate-keys),
-checked 2026-08). Same mistake, different symptom per service: regenerate both
-Search admin keys at once and clients get 403; do it to an AI Services resource
-and they get 401. Storing "the key" as a single vault secret makes zero-downtime
-rotation structurally impossible — the dual-credential pattern needs both keys
-represented.
+working immediately", and clients on the old key get 401
+([rotate-keys](https://learn.microsoft.com/en-us/azure/ai-services/rotate-keys),
+checked 2026-08). For Azure AI Search, two admin keys exist "so that you can
+rotate a primary key while using the secondary key for business continuity",
+only one can be regenerated at a time, and regenerating both at once leaves
+clients failing with 403
+([search-security-api-keys](https://learn.microsoft.com/en-us/azure/search/search-security-api-keys),
+checked 2026-08). Regeneration semantics do not transfer across products —
+each statement above stays inside its own page. What both share: storing "the
+key" as a single vault secret makes zero-downtime rotation structurally
+impossible; the dual-credential pattern needs both keys represented.
 
 **The vault side.** Every `secret set` creates a new **version**; the old version
 stays readable at its versioned URI (verified live: two enabled versions after one
@@ -124,12 +130,16 @@ checked 2026-08). Two traps: near-expiry fires a fixed **30 days** before expiry
 (configurable for keys, not for secrets), and it fires only if the secret has an
 expiration date set at all. A secret without `EXP` never warns.
 
-**The runtime side.** Azure Container Apps closes the loop for its own secrets: a
-Key Vault reference without a pinned version re-fetches "the latest version within
-30 minutes", and revisions referencing it in an environment variable are
-**automatically restarted** ([manage-secrets](https://learn.microsoft.com/en-us/azure/container-apps/manage-secrets),
-checked 2026-08). Rotation is therefore also an availability event — the restart
-is the feature. Pinning a version opts out of both.
+**The runtime side.** Azure Container Apps closes the loop for its own secrets,
+in two distinct layers ([manage-secrets](https://learn.microsoft.com/en-us/azure/container-apps/manage-secrets),
+checked 2026-08). Layer one, the re-fetch: a Key Vault reference without a
+pinned version retrieves "the latest version within 30 minutes" — that is
+general to versionless references. Layer two, the restart: active revisions are
+automatically restarted **specifically when they reference the secret in an
+environment variable**; the cited sentence covers that consumption shape only,
+and says nothing about volume-mounted secrets or scale-rule references. For
+env-var consumption, rotation is therefore also an availability event — the
+restart is the feature. Pinning a version opts out of the re-fetch entirely.
 
 **The exit.** Every paragraph above is a cost that exists only because a key
 exists. A managed identity has no key to regenerate, no version to pin, no
@@ -137,18 +147,23 @@ near-expiry event to miss. That is the strongest argument in the companion doc.
 
 ## 5. Cost
 
-Key Vault Standard bills per operation with no standing charge: **USD 0.03 per
-10,000 operations** (Azure Retail Prices API, japaneast, checked 2026-08; the
-public pricing page renders placeholders, so the API is the citable source).
-Automated **key** rotation is a metered event at USD 1.00 per rotation — secrets
-have no such meter because they have no rotation policy to bill.
+What the Azure Retail Prices API currently lists for japaneast (checked
+2026-08; the public pricing page renders placeholders, so the API is the
+citable source): Standard vault operations at **USD 0.03 per 10,000**, and no
+standing per-vault meter in that query's results. Automated **key** rotation is
+a metered event at USD 1.00 per rotation — secrets have no such meter because
+they have no rotation policy to bill.
 
-This makes Key Vault nearly unique in this series: a resource that costs
-effectively nothing to leave running. The lab keeps it ephemeral anyway —
-`delete-keyvault.sh` deletes *and purges* — because the series' teardown
-discipline is about reproducibility ("a reader can rebuild everything from
-scripts") as much as spend, and because a standing vault with no secrets in it
-guards nothing.
+Scoped the way Day 9 taught: that is the current meter, not a bill. An idle
+Standard vault with no operations has no listed standing meter to accrue on,
+so its incremental vault-operation cost approaches zero — which is a statement
+about today's price list, not a timeless free-tier guarantee, and it says
+nothing about surrounding features (diagnostics, networking) a production
+setup might attach. The billing authority remains Azure Cost Management and
+the invoice. The lab keeps the vault ephemeral anyway — `delete-keyvault.sh`
+deletes *and purges* — because the series' teardown discipline is about
+reproducibility ("a reader can rebuild everything from scripts") as much as
+spend, and because a standing vault with no secrets in it guards nothing.
 
 ## 6. Honest boundaries
 
