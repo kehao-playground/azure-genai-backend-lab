@@ -278,8 +278,13 @@ class EntraTokenVerifier:
                 # Clock skew between Entra and this host, not a grace period
                 # for expired tokens.
                 leeway=60,
-                # A token missing any of these would otherwise pass by having
-                # nothing to check: PyJWT only validates claims that exist.
+                # `require` pins all three as contract requirements. The one
+                # it protects on its own is `exp`: without the option, a token
+                # carrying no `exp` at all is accepted as never-expiring.
+                # `iss` and `aud` would still be rejected, because the
+                # issuer=/audience= arguments above make PyJWT demand them —
+                # for those two the option restates the contract rather than
+                # being the only thing enforcing it.
                 options={"require": ["exp", "iss", "aud"]},
             )
         except (PyJWTError, TypeError, ValueError) as exc:
