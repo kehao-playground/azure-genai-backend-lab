@@ -343,10 +343,12 @@ raises no `HTTPException`, and knows nothing about `Principal`.
 4. Key lookup by `kid`, with the two refresh triggers described in §9.
 5. `jwt.decode(..., algorithms=["RS256"], audience=ENTRA_AUDIENCE,
    issuer=<built issuer>, leeway=60, options={"require": ["exp", "iss", "aud"]})`.
-   The `require` list matters because PyJWT only validates claims that exist — a
-   token missing `aud` would otherwise pass audience validation by having nothing
-   to check. `leeway=60` is clock skew between Entra and this host, not a grace
-   period for expired tokens.
+   The `require` list makes all three presence requirements explicit, but only
+   one of them depends on it: without the option, a token carrying no `exp` at
+   all is accepted as never-expiring (measured on the pinned PyJWT 2.13.0).
+   Missing `iss` or `aud` is rejected either way, because the `issuer=` and
+   `audience=` arguments already demand those claims. `leeway=60` is clock skew
+   between Entra and this host, not a grace period for expired tokens.
 6. Claims → identity: `tid` and `oid` must both be strings, and `tid` must equal
    `ENTRA_TENANT_ID`. Groups per §8. `Principal` construction applies Day 15's own
    validation (charset, length, at most 100 groups, deduplicated and sorted).
