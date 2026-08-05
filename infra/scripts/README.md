@@ -12,6 +12,8 @@
 | `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
 | `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
+| `create-keyvault.sh` | Ephemeral Key Vault (RBAC authorization, 7-day soft delete, purge protection off) + Secrets Officer role for the signed-in user | working |
+| `delete-keyvault.sh` | Delete and purge that vault — purge frees the globally-unique name | working |
 | `create-entra-app.sh` | Create the Day 19 API + client Entra ID app registrations, one client secret, and delegated admin consent | working |
 | `assign-entra-app-role.sh` | Assign the API's application role to the client service principal (idempotent) | working |
 | `delete-entra-app.sh` | Delete those two registrations — and only those two | working |
