@@ -2,6 +2,8 @@
 
 - [API Conventions](api-conventions.md) — error envelope, correlation ID, path versioning, identity
 - [Microsoft Entra ID Authentication](entra-id-auth.md) — the two auth modes, app registrations, validation chain, 401/403 contract
+- [Key Vault Configuration](key-vault-config.md) — secret inventory, vault decisions, rotation reality, what actually belongs in the vault
+- [Managed Identity](managed-identity.md) — keyless auth verified live, DefaultAzureCredential risks, the Day 24 identity plan
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
