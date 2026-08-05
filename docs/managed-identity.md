@@ -51,12 +51,25 @@ token_provider = get_bearer_token_provider(
 )
 client = OpenAI(
     base_url="https://<account>.openai.azure.com/openai/v1/",
-    api_key=token_provider(),
+    api_key=token_provider,
 )
 ```
 
+Note what is passed: **the callable itself, not its result.** The pinned
+`openai` 2.45.0 client accepts `str | Callable[[], str]` for `api_key`; given
+the callable it re-invokes the provider on every request, which is the refresh
+seam a long-running service needs when the first bearer token expires.
+`api_key=token_provider()` would freeze a single token as a static string and
+the service would start failing at that token's expiry.
+`tests/unit/test_openai_callable_api_key.py` pins both behaviors against the
+locked SDK, so an upgrade that changes either fails in CI before this document
+goes stale.
+
 Verified live (2026-08-05): `responses.create` with `store=False` returned 200 with
-a normal `usage` block. No API key was involved anywhere in the call.
+a normal `usage` block. No API key was involved anywhere in the call. The probe's
+calls were short-lived, well inside one token's lifetime — token expiry and
+refresh were **not** exercised live; the refresh claim rests on the pinned SDK
+source and the regression test above.
 
 Two findings worth their own paragraphs:
 
@@ -77,9 +90,19 @@ conclusion. Measurements adjudicate docs only when repeated.
 assignment was verified correct immediately (right principal, right role, right
 scope); the data plane kept answering 401 — with a *different* message than the
 no-role case — for 14 minutes 44 seconds before the first 200. The two token
-audiences flipped to 200 about 30 seconds apart. Treat "verify with a live call
-until it works" as part of the role-assignment procedure, and treat a 401 in the
-first minutes after assignment as "wait", not "misconfigured".
+audiences flipped to 200 about 30 seconds apart. One observation, one account,
+one afternoon: a counterexample to "up to 5 minutes", not a new bound.
+
+What follows from that is a **bounded readiness procedure**, not open-ended
+patience. First verify every input once — principal object id, role, scope,
+tenant, token audience, resource kind — because a control-plane listing proves
+the assignment object exists, not that every data-plane input is right. Then
+retry the live call with backoff against a deadline (this probe would have
+needed ~15 minutes; pick a deadline you can defend, and stop churning
+known-good configuration while it runs). A 401 inside the window *may* be
+propagation; it is never proof the configuration is correct. Past the
+deadline, stop waiting and diagnose — at that point the odds have shifted from
+propagation to one of the inputs being wrong.
 
 The same follows for revocation, with the sign flipped and worse: managed identity
 tokens are cached "for around 24 hours" per resource URI and "Forcing a token
@@ -111,11 +134,17 @@ challenges, performance overhead, unpredictable behavior — and its production
 guidance is now explicit: "replace `DefaultAzureCredential` with a specific
 `TokenCredential` implementation, such as `ManagedIdentityCredential`."
 
-The canonical production incident is the same mechanism with the sign flipped:
-managed identity briefly fails on a production host where someone once ran
-`az login`, the chain silently falls through, and the app now runs as a human.
-Works-locally-fails-in-prod (or worse, works-as-the-wrong-principal) is the
-*expected* behavior of first-token-wins, not bad luck.
+The production-side warning story comes from Microsoft's **.NET** best-practices
+guidance (the same guidance family as the credential-chain pages, checked
+2026-08): managed identity briefly fails on a production host where someone once
+ran `az login`, the chain silently falls through, and the app now runs as a
+human. Treat it here as a cross-SDK caution about first-token-wins, not as a
+reproduced Python fact — this project has not demonstrated that specific
+continuation on the pinned `azure-identity`, whose chain differs from .NET's
+(the wall-of-failures capture above is the same *mechanism*, observed from the
+opposite side: no credential succeeded, so every member reported). The Python
+guidance page independently supports the conclusion that matters — explicit
+credentials in production — on its own three tradeoffs.
 
 This project already has the structural answer: adapters are chosen at **one
 composition point**, from configuration, at startup (Day 4 for fake/real, Day 19
@@ -149,8 +178,10 @@ Decided now, executed when `deploy-container-app.sh` stops being a placeholder:
 - **Role assignments on that identity**: `Cognitive Services OpenAI User` on the
   Azure OpenAI account (verified sufficient for `responses.create`, §2), and the
   Search data-plane roles once Search RBAC is measured (§6). Assignments happen at
-  script time, which also absorbs the propagation delay measured in §2 — by the
-  time a revision boots, the roles are old news.
+  script time, and the script ends with the §2 readiness gate — verify the
+  inputs once, then probe the data plane with backoff to a deadline — so the
+  propagation window closes before any revision boots, and a deadline overrun
+  surfaces as a deploy-script failure instead of a mystery 401 in production.
 - **Secrets, if any remain**, arrive as Key Vault references
   (`keyvaultref:<secret-uri>,identityref:<identity-id>`) resolved by the same
   identity holding `Key Vault Secrets User` — with the rotation/restart semantics

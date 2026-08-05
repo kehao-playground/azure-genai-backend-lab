@@ -12,8 +12,8 @@
 | `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
 | `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
-| `create-keyvault.sh` | Ephemeral Key Vault (RBAC authorization, 7-day soft delete, purge protection off) + Secrets Officer role for the signed-in user | working |
-| `delete-keyvault.sh` | Delete and purge that vault — purge frees the globally-unique name | working |
+| `create-keyvault.sh` | Ephemeral Key Vault (explicit RBAC + purge-protection-off flags, read-back asserted, 7-day soft delete) + idempotent Secrets Officer role for the signed-in user | working |
+| `delete-keyvault.sh` | Delete and purge that vault from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
 | `create-entra-app.sh` | Create the Day 19 API + client Entra ID app registrations, one client secret, and delegated admin consent | working |
 | `assign-entra-app-role.sh` | Assign the API's application role to the client service principal (idempotent) | working |
 | `delete-entra-app.sh` | Delete those two registrations — and only those two | working |
@@ -21,6 +21,44 @@
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
 Every script requires `AZ_SUBSCRIPTION_ID` and passes `--subscription` explicitly on each az call. The default az context is shared mutable state — an `az login` in another terminal can silently repoint it, which is exactly how you delete resources in the wrong subscription.
+
+## Key Vault (Day 20)
+
+A minimal round trip (each variable's contract is in the script headers;
+`AZ_LOCATION` defaults to `japaneast` in **both** scripts — override both or
+neither, because purge needs the same location the vault was created in):
+
+```bash
+export AZ_SUBSCRIPTION_ID=... AZ_RESOURCE_GROUP=rg-azgenai-lab AZ_KEYVAULT_NAME=kv-example-d20
+
+./create-keyvault.sh                                   # validates inputs + tenant BEFORE mutating
+az keyvault secret set --subscription "$AZ_SUBSCRIPTION_ID" \
+  --vault-name "$AZ_KEYVAULT_NAME" --name demo --value example
+az keyvault secret show --subscription "$AZ_SUBSCRIPTION_ID" \
+  --vault-name "$AZ_KEYVAULT_NAME" --name demo --query value -o tsv
+./delete-keyvault.sh                                   # delete -> wait -> purge -> assert absent
+```
+
+The caller's privileges are three **distinct** sets, and missing ones fail at
+different stages: `Microsoft.KeyVault/register/action` on the subscription
+(provider registration, first vault ever only), vault create/delete on the
+resource group, and `Microsoft.Authorization/roleAssignments/write` on the
+vault scope (e.g. Owner or User Access Administrator) for the Secrets Officer
+grant. Reading/writing secrets afterwards needs the **data-plane** role the
+script assigns — under RBAC not even the vault's creator has data access
+without it. The role is granted to the signed-in **user**
+(`--assignee-principal-type User`); running the script as a service principal
+requires changing that step.
+
+Recovery is state-based, not history-based: `create-keyvault.sh` refuses to
+run over an existing live or soft-deleted vault and prints the exact
+`delete-keyvault.sh` command if it fails midway; `delete-keyvault.sh` can be
+re-run from any state — it handles live, soft-deleted (including when the
+resource group is already gone: purge needs only name + location), and absent,
+with bounded waits, and exits by asserting the name is gone from both the
+active and soft-deleted listings. That assertion is the exact teardown claim
+the scripts make — subscription-level provider registration intentionally
+remains.
 
 ## Entra ID (Day 19)
 
