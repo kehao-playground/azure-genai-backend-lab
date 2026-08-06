@@ -35,9 +35,13 @@ checked 2026-08). A vault that accumulates non-secrets stops being an inventory 
 what is dangerous.
 
 **Local development** keeps these in `.env` — gitignored, per-machine, per-developer.
-That is a deliberate posture, not a gap: a laptop has no managed identity, and a
-local `.env` leaks at laptop scope, not at production scope. The failure this guide
-must prevent is the third place a secret can live: **code and container images.**
+That is a deliberate posture with a precisely stated boundary: the `.env` shrinks
+the **exposure surface** (one machine, one gitignored file, one person), not the
+**authorization radius** — a key that does leak replays from any host with the
+full data-plane capability the inventory above describes. Local key auth is
+accepted debt (see the managed-identity doc's rejected-alternatives discussion),
+not a contained blast radius. The failure this guide must prevent outright is
+the third place a secret can live: **code and container images.**
 `Settings` (`core/config.py`) reads secrets from the environment as `SecretStr`;
 nothing in the repository or image ever contains a value.
 

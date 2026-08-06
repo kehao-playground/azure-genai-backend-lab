@@ -193,8 +193,9 @@ Decided now, executed when `deploy-container-app.sh` stops being a placeholder:
   just roles.
 
 What this deletes, per the companion doc: key regeneration ceremony, secret
-versions, near-expiry plumbing, the 30-minute rotation restart. The keyless path
-is not (only) a security posture — it is the removal of an entire operational
+versions, near-expiry plumbing, the 30-minute versionless re-fetch and the
+env-var-scoped rotation restart that rides on it. The keyless path is not
+(only) a security posture — it is the removal of an entire operational
 category.
 
 ## 5. Why the lab still runs on keys today
