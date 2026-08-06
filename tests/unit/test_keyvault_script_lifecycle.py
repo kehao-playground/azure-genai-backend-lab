@@ -76,6 +76,17 @@ if args[:2] == ["keyvault", "list"]:
         done(code=1)
     done("1" if state["vault"] == "live" else "0")
 if args[:2] == ["keyvault", "create"]:
+    # Live API constraint (2026-08-06): enablePurgeProtection cannot be set
+    # to false explicitly — only omitted or true. The fake enforces it so a
+    # regression reintroducing the flag fails here before a live run does.
+    if "--enable-purge-protection" in args:
+        idx = args.index("--enable-purge-protection")
+        if idx + 1 < len(args) and args[idx + 1] == "false":
+            print(
+                'ERROR: The property "enablePurgeProtection" cannot be set to false.',
+                file=sys.stderr,
+            )
+            done(code=1)
     state["vault"] = "live"
     done("{}")
 if args[:2] == ["keyvault", "show"]:
