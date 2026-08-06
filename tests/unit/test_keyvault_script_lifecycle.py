@@ -99,6 +99,9 @@ if args[:2] == ["keyvault", "show"]:
     }
     done(answers.get(query_value(), ""))
 if joined.startswith("role assignment list"):
+    if state.get("fail_role_list"):
+        print("ERROR: injected role-assignment list failure", file=sys.stderr)
+        done(code=1)
     done("0")
 if joined.startswith("role assignment create"):
     done("{}")
@@ -245,6 +248,19 @@ def test_delete_aborts_on_query_failure_before_mutating(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "Failed to query vault state" in result.stderr
     assert not any(call.startswith(("keyvault delete", "keyvault purge")) for call in h.calls)
+
+
+def test_create_aborts_when_role_assignment_query_fails(tmp_path: Path) -> None:
+    # r07 R1: a failed role-list query must be a hard failure — not an empty
+    # string that compares as "already assigned" and silently skips the grant.
+    h = Harness(tmp_path, provider="Registered", vault="absent", fail_role_list=True)
+    result = h.run("create-keyvault.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "Failed to query existing role assignments" in result.stderr
+    assert "already assigned" not in result.stdout
+    assert not any(call.startswith("role assignment create") for call in h.calls)
+    # The script must not report the success tail either.
+    assert "This vault is ephemeral" not in result.stdout
 
 
 @pytest.mark.parametrize("script", ["create-keyvault.sh", "delete-keyvault.sh"])

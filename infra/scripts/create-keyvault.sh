@@ -163,8 +163,17 @@ if [ "$RB_RBAC" != "true" ] || [ "$RB_PURGE" = "true" ] \
 fi
 
 # --- data-plane role for the signed-in user, idempotently ------------------
-if [ "$(az role assignment list --assignee "$CALLER_OBJECT_ID" \
-    --role "Key Vault Secrets Officer" --scope "$VAULT_ID" --query "length([])" -o tsv)" = "0" ]; then
+# Assignment-then-compare, never $(query) inside a condition: a failed query
+# must abort as a query failure, not collapse to an empty string that reads
+# as "already assigned" and silently skips the grant (review r07 R1 — the
+# same class as the state queries above, missed here on the first pass).
+if ! ROLE_COUNT=$(az role assignment list --assignee "$CALLER_OBJECT_ID" \
+    --role "Key Vault Secrets Officer" --scope "$VAULT_ID" --query "length([])" -o tsv); then
+  echo "Failed to query existing role assignments on the vault (see error above)." >&2
+  echo "The vault exists but its data-plane role state is unknown — re-run this script (state checks are idempotent) or clean up with delete-keyvault.sh." >&2
+  exit 1
+fi
+if [ "$ROLE_COUNT" = "0" ]; then
   echo "Assigning 'Key Vault Secrets Officer' on the vault to the signed-in user"
   az role assignment create \
     --assignee-object-id "$CALLER_OBJECT_ID" \
