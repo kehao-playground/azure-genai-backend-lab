@@ -72,27 +72,44 @@ if [ "$TARGET_TENANT" != "$ACTIVE_TENANT" ]; then
 fi
 CALLER_OBJECT_ID=$(az ad signed-in-user show --query id -o tsv)
 
+# --- provider registration BEFORE any Key Vault state query ----------------
+# On a fresh subscription every keyvault query (list, list-deleted, show)
+# fails with MissingSubscriptionRegistration — the Microsoft.KeyVault
+# resource provider is not registered by default (hit live 2026-08). The
+# registration check therefore has to run before the state checks below, or
+# they die first and the pre-check is unreachable (review r05 F1: an earlier
+# revision had exactly that ordering bug).
+REG_STATE=$(az provider show --namespace Microsoft.KeyVault \
+  --subscription "$AZ_SUBSCRIPTION_ID" --query registrationState -o tsv)
+if [ "$REG_STATE" != "Registered" ]; then
+  echo "Registering the Microsoft.KeyVault resource provider (one-time, may take a minute)"
+  az provider register --namespace Microsoft.KeyVault --subscription "$AZ_SUBSCRIPTION_ID" --wait
+fi
+
 # --- vault state check: create must know what already exists ---------------
-if az keyvault show --subscription "$AZ_SUBSCRIPTION_ID" \
-    --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_KEYVAULT_NAME" >/dev/null 2>&1; then
-  echo "Vault '$AZ_KEYVAULT_NAME' already exists live in $AZ_RESOURCE_GROUP. This script only creates from scratch:" >&2
+# Every count query checks its own exit status: a failed query must abort as
+# a query failure, never be read as a count (an empty substitution compares
+# unequal to "0" and would misreport the failure as a name collision —
+# review r05 F1's second half).
+if ! LIVE_COUNT=$(az keyvault list --subscription "$AZ_SUBSCRIPTION_ID" \
+    --query "length([?name=='$AZ_KEYVAULT_NAME'])" -o tsv); then
+  echo "Failed to query live vaults in the subscription (see error above); aborting before any mutation." >&2
+  exit 1
+fi
+if [ "$LIVE_COUNT" != "0" ]; then
+  echo "Vault '$AZ_KEYVAULT_NAME' already exists live in this subscription. This script only creates from scratch:" >&2
   echo "reuse the existing vault as-is, or run delete-keyvault.sh first." >&2
   exit 1
 fi
-if [ "$(az keyvault list-deleted --subscription "$AZ_SUBSCRIPTION_ID" \
-    --query "length([?name=='$AZ_KEYVAULT_NAME'])" -o tsv)" != "0" ]; then
+if ! DELETED_COUNT=$(az keyvault list-deleted --subscription "$AZ_SUBSCRIPTION_ID" \
+    --query "length([?name=='$AZ_KEYVAULT_NAME'])" -o tsv); then
+  echo "Failed to query soft-deleted vaults (see error above); aborting before any mutation." >&2
+  exit 1
+fi
+if [ "$DELETED_COUNT" != "0" ]; then
   echo "The name '$AZ_KEYVAULT_NAME' is held by a soft-deleted vault (soft delete reserves the name until purge)." >&2
   echo "Run delete-keyvault.sh (it purges from this state too), or pick another name." >&2
   exit 1
-fi
-
-# A subscription that has never held a vault fails with
-# MissingSubscriptionRegistration — the Microsoft.KeyVault resource provider
-# is not registered by default on fresh subscriptions (hit live 2026-08).
-if [ "$(az provider show --namespace Microsoft.KeyVault \
-    --subscription "$AZ_SUBSCRIPTION_ID" --query registrationState -o tsv)" != "Registered" ]; then
-  echo "Registering the Microsoft.KeyVault resource provider (one-time, may take a minute)"
-  az provider register --namespace Microsoft.KeyVault --subscription "$AZ_SUBSCRIPTION_ID" --wait
 fi
 
 # From here on a failure can leave a real vault behind: print the exact
