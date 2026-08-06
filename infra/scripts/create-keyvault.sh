@@ -2,11 +2,16 @@
 # Create an ephemeral Azure Key Vault for the Day 20 secret-handling demo.
 #
 # The security posture is explicit, not inherited: the script passes
-# --enable-rbac-authorization true and --enable-purge-protection false and
-# reads the created vault's properties back, so a CLI version with different
-# defaults cannot silently change the contract. Validated live with az CLI
-# 2.88.0 (japaneast, 2026-08-05); the read-back assertions — not a version
-# pin — are what keep other CLI versions safe.
+# --enable-rbac-authorization true and reads the created vault's properties
+# back, so a CLI version with different defaults cannot silently change the
+# contract. Purge protection is the one property that CANNOT be passed
+# explicitly as false — the API rejects it ("cannot be set to false...
+# irreversible action", hit live 2026-08-06); it is either omitted (off) or
+# true (forever). So its OFF posture is enforced the only way possible: the
+# flag is never passed, and the read-back below fails the run if the created
+# vault somehow reports purge protection enabled. Validated live with az CLI
+# 2.88.0 (japaneast, 2026-08); the read-back assertions — not a version pin —
+# are what keep other CLI versions safe.
 #
 # Under RBAC, creating a vault grants NO data-plane access, not even to the
 # creator; the script assigns "Key Vault Secrets Officer" to the signed-in
@@ -127,7 +132,6 @@ az keyvault create \
   --name "$AZ_KEYVAULT_NAME" \
   --location "$AZ_LOCATION" \
   --enable-rbac-authorization true \
-  --enable-purge-protection false \
   --retention-days "$AZ_KV_RETENTION_DAYS" \
   --sku standard >/dev/null
 
