@@ -469,6 +469,48 @@ def test_orchestrator_probe_invoked_from_repo_root_and_relative_evidence_out_lan
         stray.unlink(missing_ok=True)
 
 
+def test_orchestrator_does_not_purge_preexisting_live_account_on_refusal(tmp_path: Path) -> None:
+    # The pre-existence guard in create-content-safety.sh REFUSES when an
+    # account already exists live under this name — it does not create
+    # anything. But the orchestrator's EXIT trap is armed before create runs,
+    # so without a way to distinguish "refused, nothing of mine exists" from
+    # every other failure, the trap would still delete+purge the pre-existing
+    # account it never created. That is the bug this test catches: it must
+    # fail (non-zero) but leave the account, and the subscription, untouched.
+    h = Harness(tmp_path, provider="Registered", account="live")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert not any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert not any(call.startswith("resource delete") for call in h.calls)
+    assert h.state["account"] == "live"  # untouched: this run never owned it
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_does_not_purge_preexisting_soft_deleted_account_on_refusal(
+    tmp_path: Path,
+) -> None:
+    # Same bug, soft-deleted variant: create-content-safety.sh refuses
+    # because the name is held by a soft-deleted account. The orchestrator
+    # must not purge it either — purge is irreversible.
+    h = Harness(tmp_path, provider="Registered", account="deleted")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert not any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert not any(call.startswith("resource delete") for call in h.calls)
+    assert h.state["account"] == "deleted"  # untouched: this run never owned it
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
 def test_orchestrator_teardown_runs_when_create_leaves_partial_resource(tmp_path: Path) -> None:
     # The trap is armed BEFORE create runs: a create that fails after the
     # resource actually got created must not leave it behind.
@@ -614,6 +656,35 @@ def test_orchestrator_fails_fast_on_missing_resolved_cases_file_before_any_mutat
     assert "cases file not readable" in result.stderr
     assert not h.calls  # validated before create-content-safety.sh (or anything else) ran
     assert not evidence.exists()
+
+
+def test_orchestrator_honors_relative_cases_file_override_from_foreign_cwd(
+    tmp_path: Path,
+) -> None:
+    # PROMPT_SHIELDS_CASES_FILE can be overridden with a RELATIVE path. The
+    # readability check (before the script cd's to REPO_ROOT) resolves it
+    # against the caller's cwd, but the probe used to receive the same
+    # relative string unmodified after the cd — silently reinterpreted
+    # against the repo root instead of where the file actually is. Use a
+    # caller cwd that is neither the repo root nor tmp_path itself so a
+    # regression can't coincidentally pass.
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    caller_dir = tmp_path / "caller-relative-cases"
+    caller_dir.mkdir()
+    custom_cases = caller_dir / "custom-cases.json"
+    custom_cases.write_text("{}")
+    evidence = tmp_path / "evidence-relative-cases.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        cwd=str(caller_dir),
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        PROMPT_SHIELDS_CASES_FILE="custom-cases.json",
+    )
+    assert result.returncode == 0, result.stderr
+    probe_calls = [c for c in h.calls if c.startswith("run python -m tools.prompt_shields_probe")]
+    assert len(probe_calls) == 1
+    assert f"--cases-file {custom_cases}" in probe_calls[0]
 
 
 @pytest.mark.parametrize(

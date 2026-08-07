@@ -17,6 +17,13 @@
 # masked — it re-triggers the same cleanup path and the run still ends
 # non-zero.
 #
+# ONE exception to "the trap always tears down": create-content-safety.sh
+# exits 3 when its pre-existence guard refuses because an account already
+# exists under this name (live or soft-deleted). That guard runs before any
+# mutation, so this run created nothing — the trap detects status 3 and
+# skips teardown, or it would purge an account it never created. Every other
+# non-zero status still gets the normal delete+purge cleanup.
+#
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on default context)
 #   AZ_RESOURCE_GROUP      - existing resource group
@@ -27,7 +34,9 @@
 # Optional env vars:
 #   AZ_LOCATION               - defaults to japaneast
 #   PROMPT_SHIELDS_CASES_FILE - defaults to tools/prompt_shields_cases.json
-#                                (the canonical fixture) at the repo root
+#                                (the canonical fixture) at the repo root;
+#                                a relative override is also resolved
+#                                against the CALLER's cwd (see cwd note below)
 #
 # cwd note: `tools/` is not an installed package, so `uv run python -m
 # tools.prompt_shields_probe` only resolves when uv's own cwd is the repo
@@ -49,8 +58,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CASES_FILE="${PROMPT_SHIELDS_CASES_FILE:-$REPO_ROOT/tools/prompt_shields_cases.json}"
 EVIDENCE_OUT="${EVIDENCE_OUT:?Set EVIDENCE_OUT}"
 # Absolutize against the caller's cwd BEFORE the later `cd "$REPO_ROOT"` —
-# otherwise a relative EVIDENCE_OUT would silently be reinterpreted against
-# the repo root instead of where the caller actually meant it.
+# otherwise a relative CASES_FILE or EVIDENCE_OUT would silently be
+# reinterpreted against the repo root instead of where the caller actually
+# meant it. The default CASES_FILE is already absolute (built from
+# REPO_ROOT), so this is a no-op unless PROMPT_SHIELDS_CASES_FILE was
+# overridden with a relative path.
+if [[ "$CASES_FILE" != /* ]]; then
+  CASES_FILE="$CALLER_DIR/$CASES_FILE"
+fi
 if [[ "$EVIDENCE_OUT" != /* ]]; then
   EVIDENCE_OUT="$CALLER_DIR/$EVIDENCE_OUT"
 fi
@@ -60,7 +75,17 @@ fi
 
 cleanup() {
   status=$?
-  "$SCRIPT_DIR/delete-content-safety.sh" || echo "cleanup: delete-content-safety.sh failed" >&2
+  # Exit code 3 from create-content-safety.sh is the pre-existence guard's
+  # refusal signal: an account already existed under this name (live or
+  # soft-deleted) and this run created nothing. Purging on that path would
+  # destroy an account this run never owned, so skip teardown — see the
+  # matching comment in create-content-safety.sh for the full contract.
+  # Every other non-zero status still needs the normal delete+purge cleanup.
+  if [ "$status" -eq 3 ]; then
+    echo "cleanup: create-content-safety.sh refused (account already existed) — skipping teardown, nothing was created." >&2
+  else
+    "$SCRIPT_DIR/delete-content-safety.sh" || echo "cleanup: delete-content-safety.sh failed" >&2
+  fi
   exit "$status"   # preserve the original failure status
 }
 trap cleanup EXIT   # armed BEFORE create can leave a resource behind

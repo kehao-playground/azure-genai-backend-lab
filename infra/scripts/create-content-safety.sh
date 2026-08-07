@@ -40,7 +40,7 @@ CONTENT_SAFETY_SKU_FALLBACK_CODES="${CONTENT_SAFETY_SKU_FALLBACK_CODES:-}"
 # empty string and gets compared as though the query had succeeded (this
 # repo has been bitten by exactly that shape three times, Day 20 review).
 fail_query() {
-  echo "Failed to query $1 (see error above); aborting before any mutation." >&2
+  echo "Failed to query $1 (see error above); aborting without creating a Content Safety account." >&2
   exit 1
 }
 
@@ -61,6 +61,17 @@ fi
 # every exit path, so a name collision with an existing account (mistyped or
 # copy-pasted AZ_CONTENT_SAFETY_NAME) would mean this script adopts someone
 # else's account and the trap purges it.
+#
+# Exit code 3 is a deliberate, narrow signal shared with the orchestrator
+# (run-content-safety-probe.sh): "refused before touching anything — an
+# account already exists under this name, and nothing belonging to this run
+# was created." The orchestrator's cleanup trap special-cases exactly this
+# status to skip teardown, so it never purges an account it did not create.
+# Every OTHER failure in this script (query failures, create failures) keeps
+# exit 1, because those still need the orchestrator's normal teardown (e.g. a
+# create that fails after partially creating the account). Do not reuse exit
+# 3 for any new failure path unless it is equally true that this run created
+# nothing.
 if ! LIVE_COUNT=$(az cognitiveservices account list --subscription "$AZ_SUBSCRIPTION_ID" \
     --query "length([?name=='$AZ_CONTENT_SAFETY_NAME'])" -o tsv); then
   fail_query "live Content Safety accounts in the subscription"
@@ -68,7 +79,7 @@ fi
 if [ "$LIVE_COUNT" != "0" ]; then
   echo "Content Safety account '$AZ_CONTENT_SAFETY_NAME' already exists live in this subscription. This script only creates from scratch:" >&2
   echo "reuse the existing account as-is, or run delete-content-safety.sh first." >&2
-  exit 1
+  exit 3
 fi
 if ! DELETED_COUNT=$(az cognitiveservices account list-deleted --subscription "$AZ_SUBSCRIPTION_ID" \
     --query "length([?name=='$AZ_CONTENT_SAFETY_NAME'])" -o tsv); then
@@ -77,7 +88,7 @@ fi
 if [ "$DELETED_COUNT" != "0" ]; then
   echo "The name '$AZ_CONTENT_SAFETY_NAME' is held by a soft-deleted Content Safety account (soft delete reserves the name until purge)." >&2
   echo "Run delete-content-safety.sh (it purges from this state too), or pick another name." >&2
-  exit 1
+  exit 3
 fi
 
 # From here on a failure can leave a real account behind: print the exact
