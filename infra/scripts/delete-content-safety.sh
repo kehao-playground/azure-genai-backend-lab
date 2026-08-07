@@ -64,6 +64,49 @@ AZ_CS_POLL_INTERVAL="${AZ_CS_POLL_INTERVAL:-5}"
 AZ_CS_RETRY_INTERVAL="${AZ_CS_RETRY_INTERVAL:-10}"
 AZ_CS_CREATE_ATTEMPTED="${AZ_CS_CREATE_ATTEMPTED:-0}"
 
+# Every `for _ in $(seq 1 "$AZ_CS_POLL_ATTEMPTS")` loop below relies on
+# AZ_CS_POLL_ATTEMPTS being a positive integer. `seq` fails closed on a
+# non-numeric argument (exit 2), but that failure is invisible where it is
+# used: `$(seq ...)` inside `for _ in $(...)` is command substitution, not a
+# command whose own exit status `set -e` checks -- a failed `seq` just
+# substitutes empty output, so the loop body silently runs zero times and the
+# script carries on as if the wait (or retry) had simply already finished.
+# That would silently disable the P1b stabilization wait and the final
+# absence assertion. Validate once, up front, so a bad knob aborts loudly
+# instead of quietly skipping the protection it bounds. Zero attempts is
+# rejected too: it is indistinguishable in effect from the non-numeric bug
+# (the loop body never runs), so it is never a meaningful configuration here.
+require_positive_int() {
+  local value="$1" name="$2"
+  case "$value" in
+    ''|*[!0-9]*|0)
+      echo "$name must be a positive integer; got '$value'. Aborting rather than silently skipping the loop it bounds (a non-numeric or zero value makes \`seq\` fail, or produce an empty range, and the loop run zero times, not error out)." >&2
+      exit 1
+      ;;
+  esac
+}
+require_positive_int "$AZ_CS_POLL_ATTEMPTS" AZ_CS_POLL_ATTEMPTS
+
+# AZ_CS_POLL_INTERVAL and AZ_CS_RETRY_INTERVAL are sibling numeric knobs, but
+# they are only ever passed to `sleep`, never used as a `seq` loop bound, so
+# they don't carry the exact same silent-skip failure mode above -- a
+# non-numeric value here makes `sleep` itself fail loudly under `set -e`.
+# They are validated anyway for a clear, consistent error message instead of
+# a raw `sleep: invalid time interval` one, and because 0 is a legitimate
+# value here (used by this suite's fake-CLI harness to skip delays, unlike
+# AZ_CS_POLL_ATTEMPTS where 0 would defeat the loop's purpose).
+require_nonneg_int() {
+  local value="$1" name="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "$name must be a non-negative integer; got '$value'." >&2
+      exit 1
+      ;;
+  esac
+}
+require_nonneg_int "$AZ_CS_POLL_INTERVAL" AZ_CS_POLL_INTERVAL
+require_nonneg_int "$AZ_CS_RETRY_INTERVAL" AZ_CS_RETRY_INTERVAL
+
 # Each query propagates its exit status; call sites abort on query failure
 # instead of reading a failed (empty) substitution as a count.
 deleted_count() {
@@ -132,7 +175,13 @@ elif [ "$DELETED" = "0" ]; then
     # which is evidence of absence over that window, not proof for all time.
     echo "'$AZ_CONTENT_SAFETY_NAME' never appeared in either listing within the stabilization deadline; nothing to delete."
     echo "If it does materialise later, tear it down with:" >&2
-    echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP AZ_LOCATION=$AZ_LOCATION AZ_CONTENT_SAFETY_NAME=$AZ_CONTENT_SAFETY_NAME ./delete-content-safety.sh" >&2
+    # AZ_CS_CREATE_ATTEMPTED=1 is deliberately included here, matching
+    # create-content-safety.sh's own recovery hint: if the account is STILL
+    # not visible in either listing at the moment this command is run, the
+    # flag is what makes the script wait (bounded) instead of taking the
+    # fast "neither listing -> nothing to do" path and exiting 0 without
+    # ever tearing down an account that materialises moments later.
+    echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP AZ_LOCATION=$AZ_LOCATION AZ_CONTENT_SAFETY_NAME=$AZ_CONTENT_SAFETY_NAME AZ_CS_CREATE_ATTEMPTED=1 ./delete-content-safety.sh" >&2
   else
     echo "Nothing to do: '$AZ_CONTENT_SAFETY_NAME' is neither live nor soft-deleted in this subscription."
   fi

@@ -37,10 +37,10 @@
 #
 # ACCOUNT NAME OWNERSHIP: AZ_CONTENT_SAFETY_NAME is a name PREFIX here, not
 # the account name. This script appends an unpredictable per-run suffix
-# (6 hex characters from /dev/urandom) and exports the resolved name back
-# under the same variable, so both child scripts — whose own interface is
-# unchanged, they still take AZ_CONTENT_SAFETY_NAME as the final name — act
-# on the same resolved name.
+# (8 hex characters, 4 bytes, from /dev/urandom) and exports the resolved
+# name back under the same variable, so both child scripts — whose own
+# interface is unchanged, they still take AZ_CONTENT_SAFETY_NAME as the final
+# name — act on the same resolved name.
 #
 # This is a correctness property, not cosmetics. The pre-existence guard in
 # create-content-safety.sh and the create itself are separate operations: a
@@ -49,18 +49,21 @@
 # guard's exit 3 — so CREATE_REFUSED stays 0 and the cleanup trap below
 # delete+PURGEs whatever now holds that name. Purge is irreversible. Because
 # only this run could have invented the resolved name, cleanup can only ever
-# target a resource this run created: the collision class disappears rather
-# than being narrowed. It is also what makes the stabilization wait in
-# delete-content-safety.sh safe — a bounded wait for a not-yet-visible
-# account cannot possibly wait onto somebody else's resource.
+# target a resource this run created — PROVIDED the suffix is not itself
+# reused across runs. At 4 bytes (32 bits) a collision between two runs that
+# share a prefix has probability on the order of 2^-32 per pair, which is not
+# realistically reachable at this project's run volume; it is not zero, and
+# the TOCTOU window this mechanism exists to close would reopen for that
+# astronomically unlikely pair. (An earlier 3-byte/24-bit suffix made the
+# same claim at a much weaker margin; widened here.)
 #
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on default context)
 #   AZ_RESOURCE_GROUP      - existing resource group
-#   AZ_CONTENT_SAFETY_NAME - account name PREFIX (see above); must be 1-57
+#   AZ_CONTENT_SAFETY_NAME - account name PREFIX (see above); must be 1-55
 #                             characters of alphanumerics and hyphens,
 #                             starting and ending with an alphanumeric, so
-#                             prefix + "-" + 6 hex fits the 64-character
+#                             prefix + "-" + 8 hex fits the 64-character
 #                             Microsoft.CognitiveServices/accounts limit
 #                             (checked 2026-08)
 #   EVIDENCE_OUT            - path the probe writes its evidence JSON to; if
@@ -126,14 +129,17 @@ fi
 # --- resolve the per-run account name (before anything is queried) ---------
 # Microsoft.CognitiveServices/accounts: 2-64 characters, alphanumerics and
 # hyphens, start and end with an alphanumeric (Azure resource naming rules,
-# checked 2026-08). The suffix costs 7 characters ("-" + 6 hex), so the
-# prefix must be at most 57. Too long is a hard failure, never a silent
+# checked 2026-08). The suffix costs 9 characters ("-" + 8 hex), so the
+# prefix must be at most 55 -- CS_MAX_PREFIX_LENGTH is derived from
+# CS_SUFFIX_LENGTH below, never hard-coded, so the two stay in lockstep if
+# the suffix width changes again. Too long is a hard failure, never a silent
 # truncation: a truncated prefix could collide with a name that is not ours,
 # which is exactly the ownership property this whole mechanism exists to
 # guarantee.
 CS_NAME_PREFIX="$AZ_CONTENT_SAFETY_NAME"
 CS_MAX_NAME_LENGTH=64
-CS_SUFFIX_LENGTH=6
+CS_SUFFIX_BYTES=4
+CS_SUFFIX_LENGTH=$((CS_SUFFIX_BYTES * 2))
 CS_MAX_PREFIX_LENGTH=$((CS_MAX_NAME_LENGTH - CS_SUFFIX_LENGTH - 1))
 if [ "${#CS_NAME_PREFIX}" -gt "$CS_MAX_PREFIX_LENGTH" ]; then
   echo "AZ_CONTENT_SAFETY_NAME is a name PREFIX here: this script appends a ${CS_SUFFIX_LENGTH}-character per-run suffix." >&2
@@ -148,10 +154,14 @@ if ! [[ "$CS_NAME_PREFIX" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
 fi
 # Cryptographically unpredictable, not $RANDOM (seeded, guessable) and not a
 # timestamp (two runs started in the same second would collide, and the value
-# is trivially predictable by anything else creating accounts).
-CS_RUN_SUFFIX=$(od -An -vN3 -tx1 /dev/urandom | tr -d ' \n') \
+# is trivially predictable by anything else creating accounts). 4 bytes (32
+# bits) rather than 3 (24 bits): at 3 bytes two runs sharing a prefix collide
+# with probability on the order of 2^-24, which is small but not the kind of
+# margin this mechanism's own commentary should describe as making the
+# TOCTOU class disappear. 4 bytes pushes that down to roughly 2^-32.
+CS_RUN_SUFFIX=$(od -An -vN"$CS_SUFFIX_BYTES" -tx1 /dev/urandom | tr -d ' \n') \
   || { echo "Failed to read random bytes for the per-run account-name suffix; aborting rather than falling back to a predictable value." >&2; exit 1; }
-if ! [[ "$CS_RUN_SUFFIX" =~ ^[0-9a-f]{6}$ ]]; then
+if ! [[ "$CS_RUN_SUFFIX" =~ ^[0-9a-f]{$CS_SUFFIX_LENGTH}$ ]]; then
   echo "Unexpected random suffix '$CS_RUN_SUFFIX'; aborting rather than creating an account under an unverified name." >&2
   exit 1
 fi
@@ -204,10 +214,26 @@ export AZ_CS_CREATE_ATTEMPTED=1
 "$SCRIPT_DIR/create-content-safety.sh" \
   || { create_status=$?; [ "$create_status" -eq 3 ] && CREATE_REFUSED=1; exit "$create_status"; }
 
+# `az ... --query <field> -o tsv` returns an empty string with exit 0 when
+# the queried field is absent from the response -- it does not fail the
+# command. The `|| { ...; exit 1; }` guards above only catch a failing `az`
+# invocation itself; they do nothing about a successful call that read back
+# nothing. This is the same `-o tsv` trap the Day 19 review caught: check
+# every read-back below explicitly, not just the assignment's own exit
+# status.
+require_nonempty() {
+  local value="$1" what="$2"
+  if [ -z "$value" ]; then
+    echo "Read back an empty $what via 'az ... -o tsv' (command succeeded but the queried field was absent). Aborting rather than forwarding an empty value downstream." >&2
+    exit 1
+  fi
+}
+
 ENDPOINT=$(az cognitiveservices account show --name "$AZ_CONTENT_SAFETY_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
   --query properties.endpoint -o tsv) \
   || { echo "Failed to read back the account endpoint (see error above)." >&2; exit 1; }
+require_nonempty "$ENDPOINT" "account endpoint"
 # Read back the ACTUAL sku, not the requested AZ_CONTENT_SAFETY_SKU: if
 # create-content-safety.sh fell back from F0 to S0 internally, that
 # assignment happened in its own child process and never reached this
@@ -217,10 +243,12 @@ ACTUAL_SKU=$(az cognitiveservices account show --name "$AZ_CONTENT_SAFETY_NAME" 
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
   --query sku.name -o tsv) \
   || { echo "Failed to read back the account SKU (see error above)." >&2; exit 1; }
+require_nonempty "$ACTUAL_SKU" "account SKU"
 KEY=$(az cognitiveservices account keys list --name "$AZ_CONTENT_SAFETY_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
   --query key1 -o tsv) \
   || { echo "Failed to read back the account key (see error above)." >&2; exit 1; }
+require_nonempty "$KEY" "account key"
 
 # cd to the repo root so `uv run python -m tools.prompt_shields_probe`
 # resolves regardless of the caller's cwd (see cwd note above). Every path

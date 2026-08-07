@@ -219,6 +219,27 @@ def test_validate_matrix_rejects_wrong_kind_composition() -> None:
         prompt_shields_probe.validate_matrix(cases)
 
 
+def test_validate_matrix_rejects_composition_right_as_a_set_but_wrong_as_a_multiset() -> None:
+    # `validate_matrix` compares the MULTISET of regular kinds (a
+    # kind->count dict), not merely the set of kinds present. A regression to
+    # `set(kinds) == set(expected)` would pass every OTHER test in this file,
+    # because none of them changes which kinds appear -- only how many of
+    # each. This composition has the exact same set of kinds as the
+    # canonical fixture ({baseline, direct, indirect, false_positive,
+    # zh_tw}) but 2 direct / 1 indirect instead of 1 direct / 2 indirect.
+    # It is, deliberately, the old `_matrix()` helper this suite replaced --
+    # kept here as the negative case it was dropped from.
+    Case = prompt_shields_probe.Case
+    kinds = ["baseline", "direct", "indirect", "false_positive", "zh_tw", "direct"]
+    cases = tuple(
+        [Case(f"{i}", "u", ("d",), k) for i, k in enumerate(kinds)]
+        + [Case("6", "u", (), "c4_only_user"),
+           Case("7", None, ("d",), "c4_only_docs")]
+    )
+    with pytest.raises(ValueError, match="composition"):
+        prompt_shields_probe.validate_matrix(cases)
+
+
 def test_load_cases_rejects_falsy_documents(tmp_path: Path) -> None:
     for bad in ("", 0, False, {}):
         p = _write(tmp_path, {"cases": [

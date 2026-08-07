@@ -33,10 +33,10 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "infra" / "scripts"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_CASES_FILE = REPO_ROOT / "tools" / "prompt_shields_cases.json"
 # The prefix the harness supplies as AZ_CONTENT_SAFETY_NAME. The orchestrator
-# resolves it into a per-run unique account name (prefix + "-" + 6 hex chars);
+# resolves it into a per-run unique account name (prefix + "-" + 8 hex chars);
 # the two child scripts still take AZ_CONTENT_SAFETY_NAME as the FINAL name.
 NAME_PREFIX = "cs-fake-d21"
-RESOLVED_NAME_RE = re.compile(rf"^{re.escape(NAME_PREFIX)}-[0-9a-f]{{6}}$")
+RESOLVED_NAME_RE = re.compile(rf"^{re.escape(NAME_PREFIX)}-[0-9a-f]{{8}}$")
 
 FAKE_AZ = '''#!/usr/bin/env python3
 import json, os, sys
@@ -139,13 +139,19 @@ if args[:3] == ["cognitiveservices", "account", "show"]:
     answers = {
         # Derived from the --name argument, not a fixed string, so tests can
         # assert the endpoint handed to the probe carries the RESOLVED
-        # per-run account name.
-        "properties.endpoint": f"https://{name_value()}.cognitiveservices.azure.com/",
+        # per-run account name. `empty_endpoint_field` simulates the `-o tsv`
+        # trap: the command succeeds (exit 0) but the queried field is absent
+        # from the response, same as a real `az ... --query <absent-field> -o
+        # tsv` call.
+        "properties.endpoint": (
+            "" if state.get("empty_endpoint_field") else f"https://{name_value()}.cognitiveservices.azure.com/"
+        ),
         # Reflects whatever SKU the create call actually landed on (may
         # differ from the requested AZ_CONTENT_SAFETY_SKU if a fallback
         # retry fired), so tests can assert the orchestrator reads back and
-        # forwards the ACTUAL sku, not the requested one.
-        "sku.name": state.get("created_sku", ""),
+        # forwards the ACTUAL sku, not the requested one. `empty_sku_field`
+        # is the same "-o tsv" trap as above, applied to the SKU read-back.
+        "sku.name": "" if state.get("empty_sku_field") else state.get("created_sku", ""),
     }
     done(answers.get(query_value(), ""))
 if args[:4] == ["cognitiveservices", "account", "keys", "list"]:
@@ -417,6 +423,41 @@ def test_delete_requires_resource_group_even_when_soft_deleted_only(tmp_path: Pa
     result = h.run("delete-content-safety.sh")  # no AZ_RESOURCE_GROUP
     assert result.returncode != 0
     assert "AZ_RESOURCE_GROUP" in result.stderr
+    assert not h.calls
+
+
+@pytest.mark.parametrize("bad_value", ["abc", "1.5", "-1", "0"])
+def test_delete_aborts_on_non_numeric_poll_attempts_rather_than_silently_skipping(
+    tmp_path: Path, bad_value: str
+) -> None:
+    # `for _ in $(seq 1 "$AZ_CS_POLL_ATTEMPTS")` fails closed at the `seq`
+    # level (exit 2), but that failure is invisible to the script: `seq`'s
+    # own exit status is inside a command substitution used only for its
+    # stdout, which `set -e` does not check, so a malformed knob makes the
+    # loop body silently run zero times instead of aborting -- at the final
+    # absence assertion that would report success without ever having
+    # re-checked anything. Validate the knob up front instead. (An empty
+    # string is not covered here: `${AZ_CS_POLL_ATTEMPTS:-24}` treats an
+    # empty value the same as unset and falls back to the default, matching
+    # every other `:-`-defaulted knob in this script -- that is correct,
+    # existing behavior, not the bug.)
+    h = Harness(tmp_path, provider="Registered", account="live")
+    result = h.run(
+        "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_POLL_ATTEMPTS=bad_value
+    )
+    assert result.returncode != 0
+    assert "AZ_CS_POLL_ATTEMPTS" in result.stderr
+    assert not h.calls  # aborted before any az call, not merely before mutation
+
+
+def test_delete_aborts_on_non_numeric_poll_interval(tmp_path: Path) -> None:
+    # Sibling numeric knob to AZ_CS_POLL_ATTEMPTS -- same validation applies.
+    h = Harness(tmp_path, provider="Registered", account="live")
+    result = h.run(
+        "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_POLL_INTERVAL="not-a-number"
+    )
+    assert result.returncode != 0
+    assert "AZ_CS_POLL_INTERVAL" in result.stderr
     assert not h.calls
 
 
@@ -746,6 +787,45 @@ def test_orchestrator_teardown_runs_when_endpoint_retrieval_fails(tmp_path: Path
     assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
 
 
+def test_orchestrator_aborts_when_endpoint_readback_is_empty(tmp_path: Path) -> None:
+    # `az ... --query properties.endpoint -o tsv` can succeed (exit 0) while
+    # the queried field is absent from the response, returning an empty
+    # string. The bare `|| { ...; exit 1; }` on the assignment does not catch
+    # this -- the command did not fail. The orchestrator must check the
+    # VALUE, not just the exit status, and still tear down the account it
+    # created.
+    h = Harness(tmp_path, provider="Registered", account="absent", empty_endpoint_field=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert "empty" in result.stderr.lower()
+    assert "endpoint" in result.stderr.lower()
+    assert h.state["account"] == "absent"  # trap still tore down the created account
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_aborts_when_sku_readback_is_empty(tmp_path: Path) -> None:
+    # Same "-o tsv" trap as the endpoint case, applied to the SKU read-back:
+    # an absent field must not silently forward AZ_CONTENT_SAFETY_SKU="" to
+    # the probe's evidence header.
+    h = Harness(tmp_path, provider="Registered", account="absent", empty_sku_field=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert "empty" in result.stderr.lower()
+    assert "sku" in result.stderr.lower()
+    assert h.state["account"] == "absent"  # trap still tore down the created account
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
 def test_orchestrator_teardown_runs_when_key_retrieval_fails(tmp_path: Path) -> None:
     h = Harness(tmp_path, provider="Registered", account="absent", fail_keys=True)
     evidence = tmp_path / "evidence.json"
@@ -806,11 +886,11 @@ def test_orchestrator_explicit_teardown_failure_is_not_masked_by_trap_disarm(
 
 def test_orchestrator_resolves_a_different_account_name_on_every_run(tmp_path: Path) -> None:
     # AZ_CONTENT_SAFETY_NAME is a PREFIX at the orchestrator: each run appends
-    # an unpredictable suffix, so only this run could have invented the name it
-    # creates. That is what makes the teardown path safe — cleanup can only
-    # ever target a resource this run created, so the TOCTOU window between
-    # the pre-existence guard and `create` stops being a collision class at
-    # all rather than merely being narrowed.
+    # an unpredictable 4-byte suffix, so in practice only this run has invented
+    # the name it creates. That is what makes the teardown path safe — cleanup
+    # can only realistically target a resource this run created, narrowing the
+    # TOCTOU window between the pre-existence guard and `create` to a
+    # collision probability on the order of 2^-32 rather than eliminating it.
     names = []
     for i in range(2):
         run_dir = tmp_path / f"run{i}"
@@ -868,18 +948,18 @@ def test_orchestrator_fails_fast_when_the_name_prefix_is_too_long(tmp_path: Path
         "run-content-safety-probe.sh",
         AZ_RESOURCE_GROUP="rg",
         EVIDENCE_OUT=str(evidence),
-        AZ_CONTENT_SAFETY_NAME="c" * 58,
+        AZ_CONTENT_SAFETY_NAME="c" * 56,
     )
     assert result.returncode != 0
     assert "AZ_CONTENT_SAFETY_NAME" in result.stderr
-    assert "57" in result.stderr  # the actual limit, not a vague complaint
+    assert "55" in result.stderr  # the actual limit, not a vague complaint
     assert not h.calls  # failed before any mutation, and before any query
     assert not evidence.exists()
 
 
 def test_orchestrator_accepts_the_longest_prefix_that_still_fits(tmp_path: Path) -> None:
-    # The boundary is inclusive: 57 characters + "-" + 6 hex = exactly 64.
-    prefix = "c" * 57
+    # The boundary is inclusive: 55 characters + "-" + 8 hex = exactly 64.
+    prefix = "c" * 55
     h = Harness(tmp_path, provider="Registered", account="absent")
     result = h.run(
         "run-content-safety-probe.sh",
