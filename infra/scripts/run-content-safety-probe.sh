@@ -44,6 +44,11 @@
 #                              cwd (see cwd note below), not the repo root
 # Optional env vars:
 #   AZ_LOCATION               - defaults to japaneast
+#   AZ_CONTENT_SAFETY_SKU     - defaults to F0; forwarded to the probe so its
+#                                evidence header can record what SKU was
+#                                asked for (see the caveat at its own default
+#                                below if create-content-safety.sh falls back
+#                                to S0 internally)
 #   PROMPT_SHIELDS_CASES_FILE - defaults to tools/prompt_shields_cases.json
 #                                (the canonical fixture) at the repo root;
 #                                a relative override is also resolved
@@ -63,6 +68,12 @@ set -euo pipefail
 : "${AZ_RESOURCE_GROUP:?Set AZ_RESOURCE_GROUP}"
 : "${AZ_LOCATION:=japaneast}"
 : "${AZ_CONTENT_SAFETY_NAME:?Set AZ_CONTENT_SAFETY_NAME}"
+# Mirrors create-content-safety.sh's own default so the probe's evidence
+# header can record the SKU it asked for. Known gap: if that script falls
+# back from F0 to S0 internally (its own retry, inside a child process),
+# this value is not updated to match -- the evidence header can be stale
+# in that one case, but it is never fabricated when the var is unset.
+: "${AZ_CONTENT_SAFETY_SKU:=F0}"
 CALLER_DIR="$PWD"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -130,6 +141,7 @@ KEY=$(az cognitiveservices account keys list --name "$AZ_CONTENT_SAFETY_NAME" \
 # used from here on (CASES_FILE, EVIDENCE_OUT) is already absolute.
 cd "$REPO_ROOT"
 CONTENT_SAFETY_ENDPOINT="$ENDPOINT" CONTENT_SAFETY_KEY="$KEY" \
+  AZ_LOCATION="$AZ_LOCATION" AZ_CONTENT_SAFETY_SKU="$AZ_CONTENT_SAFETY_SKU" \
   uv run python -m tools.prompt_shields_probe --cases-file "$CASES_FILE" --evidence-out "$EVIDENCE_OUT"
 
 # Explicit teardown; only disarm the trap after it succeeds.
