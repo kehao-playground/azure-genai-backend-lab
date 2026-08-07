@@ -17,6 +17,9 @@
 | `create-entra-app.sh` | Create the Day 19 API + client Entra ID app registrations, one client secret, and delegated admin consent | working |
 | `assign-entra-app-role.sh` | Assign the API's application role to the client service principal (idempotent) | working |
 | `delete-entra-app.sh` | Delete those two registrations — and only those two | working |
+| `create-content-safety.sh` | Ephemeral Content Safety account (F0; conditional S0 fallback on allowlisted error code) with provider pre-check | working |
+| `delete-content-safety.sh` | Delete and purge that account from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
+| `run-content-safety-probe.sh` | Orchestrate create → Prompt Shields probe → delete/purge, EXIT-trap cleanup armed before create | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
@@ -103,3 +106,31 @@ Notes:
 - The client secret expires after **7 days**, matching the ephemeral posture. It is printed to the terminal exactly once and never written to a file. `ENTRA_CLIENT_SECRET` is read from the environment by the smoke tool, never passed as a command-line argument (`ps` shows another user the whole argv of a running process).
 - `--evidence-out` is safe to commit: it carries PASS/FAIL, check names, redacted details and sorted claim *key names* — no tenant id, no app ids, no `oid`, no token, no secret.
 - The server runs with the fake adapters, so the smoke exercises Entra verification only and costs nothing in model tokens.
+
+## Content Safety (Day 21)
+
+The Prompt Shields probe (see [prompt-injection.md §5](../../docs/prompt-injection.md#5-the-probabilistic-layer-azure-ai-content-safety-prompt-shields)) needs an ephemeral, key-authenticated Content Safety account — no role assignment, the orchestrator reads the account key back directly:
+
+```bash
+export AZ_SUBSCRIPTION_ID=... AZ_RESOURCE_GROUP=rg-azgenai-lab AZ_CONTENT_SAFETY_NAME=cs-example-d21
+export EVIDENCE_OUT=evidence.txt
+
+./run-content-safety-probe.sh   # create -> probe -> delete + purge, always
+```
+
+Each script's required/optional env vars (defaults in the script headers):
+
+| Var | Required by | Notes |
+|---|---|---|
+| `AZ_SUBSCRIPTION_ID` | all three | never rely on the default az context |
+| `AZ_RESOURCE_GROUP` | all three | must already exist |
+| `AZ_CONTENT_SAFETY_NAME` | all three | globally unique — also used as the custom subdomain |
+| `EVIDENCE_OUT` | `run-content-safety-probe.sh` only | path the probe writes its evidence JSON to |
+| `AZ_LOCATION` | optional, all three | defaults to `japaneast` in every script — override all or none, since purge needs the same location the account was created in |
+| `AZ_CONTENT_SAFETY_SKU` | optional, `create-content-safety.sh` | defaults to `F0` (free tier, one per subscription) |
+| `CONTENT_SAFETY_SKU_FALLBACK_CODES` | optional, `create-content-safety.sh` | comma-separated machine-readable error `code` values safe to auto-retry with `--sku S0`. **Ships empty on purpose**: until a live run observes a stable code that unambiguously means "SKU/quota, not something else," any create failure aborts instead of silently falling back and masking a real problem — rerun explicitly with `AZ_CONTENT_SAFETY_SKU=S0` instead |
+| `PROMPT_SHIELDS_CASES_FILE` | optional, `run-content-safety-probe.sh` | defaults to `tools/prompt_shields_cases.json` (the canonical 8-case fixture) at the repo root |
+
+`create-content-safety.sh` registers the `Microsoft.CognitiveServices` provider before its first call if needed, then creates the account. On any failure past that point it prints the exact `delete-content-safety.sh` recovery command — it is a recovery hint only, it does not delete anything itself; the real delete/purge cleanup is owned solely by `run-content-safety-probe.sh`'s EXIT trap, armed *before* create runs, so a half-created account is still torn down and a failing probe still ends the run non-zero.
+
+`delete-content-safety.sh` deletes and purges from any state (live / soft-deleted / absent), with bounded waits, and exits by asserting the name is gone from both the active and soft-deleted listings. Purging matters here for the same reason it does for Key Vault: Cognitive Services accounts (Content Safety included) soft-delete and **block re-creation of the same name for 48 hours** — skip the purge and the next `create-content-safety.sh` run under the same name fails.
