@@ -387,14 +387,14 @@ document sample lit `documentsAnalysis` with the prompt verdict staying `false` 
 cross-contamination between the two analyses. Case 4 — the shape that actually matches this
 lab, an injection buried in a retrieved ops-doc chunk — was flagged too. Neither control case
 produced a false positive: the plain baseline and the benign document that *discusses* prompt
-injection at length both came back `false`/`false`. Case 6's zh-TW line was flagged, which is
+injection both came back `false`/`false`. Case 6's zh-TW line was flagged, which is
 one observation about one input and settles nothing about Traditional Chinese coverage — the
 documented language list says "Chinese", undifferentiated, and one sentence is not a test of a
 language.
 
-**C4, settled against behavior rather than against a page.** The service returned `200` for a
+**C4, read against behavior rather than against a page.** The service returned `200` for a
 request with `documents` omitted (case 7) *and* for a request with `userPrompt` omitted (case
-8). In practice, on this date, neither field was required — contrary to the quickstart's
+8). In practice, on this date, neither field was required on its own — contrary to the quickstart's
 parameter table marking both `Required: Yes`, and consistent with the REST reference marking
 neither. Following §7's discipline, that is recorded as **behavior observed on a date, not an
 adjudication of which page is correct**: one observation does not settle a documentation
@@ -407,25 +407,33 @@ service never analyzed, and that fabricated `false` would then flow into whateve
 it. Any caller that treats a missing verdict as a passing verdict has built a fail-open filter
 by accident. (What the evidence proves is that no boolean verdict came back for that field; the
 probe records absent and null identically, so it does not distinguish a missing key from an
-explicit `null`.)
+explicit `null`.) **Case 7's `[]` in the table above carries the same ambiguity:**
+`_parse_documents_field` maps an absent `documentsAnalysis`, an explicit `null`, and a literal
+empty array to the same recorded value, so "no document verdict" is all the table row can
+honestly claim — not that the service returned a specifically empty array.
 
 **What the run cost operationally.** Two failures preceded the clean run, and both are findings
 rather than embarrassments:
 
 - **F0 throttled.** The first run fired all eight calls back to back with no pacing and no 429
-  handling; cases 6 and 7 came back `429` against F0's documented 5 RPS. The probe now paces
-  its calls and retries `429` within a bounded attempt count, honoring `Retry-After`. The clean
-  run recorded `attempts=1` on every case and saw **no throttling** — which is not the same
-  claim as the pacing change being *proven* to have fixed it. One run does not establish that.
+  handling; cases 6 and 7 came back `429`. The probe does not capture a response body for
+  non-2xx statuses, so no throttling-specific error body was recorded — the inference that this
+  was F0's documented 5 RPS limit rests on the documented number, not on anything in the
+  response. The probe now paces its calls and retries `429` within a bounded attempt count,
+  honoring `Retry-After`. The clean run recorded `attempts=1` on every case and saw **no
+  throttling** — which is not the same claim as the pacing change being *proven* to have fixed
+  it. One run does not establish that.
 - **Reusing a purged account name produced a uniform `401`.** The second run recreated the
   account under the name that had been purged minutes earlier, and **all eight cases returned
-  `401`** on a code path that had authenticated immediately in the first run. The only changed
-  variable was name reuse after purge. A fresh account name, everything else identical, gave
-  8/8 observations on the next run. This is the same control-plane-versus-data-plane
-  propagation shape [managed-identity.md](managed-identity.md) records for role assignments —
-  the control plane reports the resource is ready before the data plane agrees — and it carries
-  the same caveat: a single observation, with no measurement of how long the name would have
-  taken to converge, because the run switched names instead of waiting.
+  `401`** on a code path that had authenticated normally in the first run. The only changed
+  variable in the request path was name reuse after purge; the same probe build authenticated
+  normally under a fresh name — run 3 used the identical, already-fixed probe build as run 2,
+  changed only the account name, and got 8/8 observations. This resembles the same
+  control-plane-versus-data-plane propagation shape [managed-identity.md](managed-identity.md)
+  records for role assignments — the control plane reports the resource is ready before the
+  data plane agrees — and it carries the same caveat: a single observation, with no measurement
+  of how long the name would have taken to converge, because the run switched names instead of
+  waiting.
 
 The same probe fix that added pacing also let case 8's partial verdict be recorded at all: the
 first run received a `200` for it and *discarded the body*, because the strict parser demanded
@@ -434,13 +442,13 @@ observation in the matrix was, for one run, invisible to the tool designed to ca
 
 **And what none of it changes.** Eight cases are an illustration, not a measurement. **No
 detection rate is claimed from them**, and none can be — six flagged cases and two clean
-controls, all hand-picked, describe those inputs and not the classifier. Nor do the results
-move Prompt Shields anywhere in the stack. It
-caught every attack in this matrix and still sits exactly where §5 puts it: a probabilistic
-filter layered **on top of** the structural defenses of §2, never a replacement for one and
-never a guarantee. The fences, the closure-bound `Principal`, the read-only toolset and the
-prompt budget are what hold when a classifier misses — and the vendor's own documentation says
-plainly that it may.
+controls, all hand-picked, describe those inputs and not the classifier. Every attack-bearing
+case here was flagged — six hand-picked inputs, not a rate. Nor do the results move Prompt
+Shields anywhere in the stack: it stays a probabilistic filter layered **on top of** the
+structural defenses of §2, exactly as this section's opening framed it, never a replacement
+for one and never a guarantee. The fences, the closure-bound `Principal`, the read-only
+toolset and the prompt budget are what hold when a classifier misses — and the vendor's own
+documentation says plainly that it may.
 
 ## 6. One level up: Defender for Cloud
 

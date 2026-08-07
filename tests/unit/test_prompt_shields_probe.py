@@ -386,3 +386,73 @@ def test_post_with_backoff_exhausts_bound_and_stays_429() -> None:
         _case("c4_only_docs", user=None), 429, {"error": {"code": "x", "message": "y"}}
     )
     assert v.outcome == "failure"
+
+
+def test_retry_delay_seconds_caps_an_absurd_retry_after() -> None:
+    # A server value of 100000 seconds (~27.8 hours) must never be honored
+    # verbatim -- this path is a bounded, money-spending probe, not a
+    # general-purpose retry loop.
+    assert prompt_shields_probe._retry_delay_seconds("100000") == (
+        prompt_shields_probe.RETRY_CAP_SECONDS
+    )
+
+
+def test_retry_delay_seconds_leaves_ordinary_values_untouched() -> None:
+    assert prompt_shields_probe._retry_delay_seconds("7") == 7.0
+
+
+def test_post_with_backoff_never_sleeps_past_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient([
+        _http_response(429, headers={"Retry-After": "100000"}),
+        _http_response(200, json_body={
+            "userPromptAnalysis": {"attackDetected": False},
+            "documentsAnalysis": [{"attackDetected": False}],
+        }),
+    ])
+    sleeps: list[float] = []
+    prompt_shields_probe._post_with_backoff(
+        client, "https://cs.example/x", headers={}, json_body={}, sleep=sleeps.append
+    )
+    assert sleeps == [prompt_shields_probe.RETRY_CAP_SECONDS]
+
+
+# --- evidence header: started_at / region / sku ---------------------------
+
+
+def test_build_evidence_header_defaults_region_and_sku_to_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AZ_LOCATION", raising=False)
+    monkeypatch.delenv("AZ_CONTENT_SAFETY_SKU", raising=False)
+    cases_file = _write(tmp_path, {"cases": []})
+    header = prompt_shields_probe.build_evidence_header(
+        cases_file, now=lambda: "2026-08-07T00:00:00+00:00"
+    )
+    assert header["region"] is None
+    assert header["sku"] is None
+
+
+def test_build_evidence_header_reads_region_and_sku_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AZ_LOCATION", "japaneast")
+    monkeypatch.setenv("AZ_CONTENT_SAFETY_SKU", "F0")
+    cases_file = _write(tmp_path, {"cases": []})
+    header = prompt_shields_probe.build_evidence_header(
+        cases_file, now=lambda: "2026-08-07T00:00:00+00:00"
+    )
+    assert header["region"] == "japaneast"
+    assert header["sku"] == "F0"
+
+
+def test_build_evidence_header_carries_the_injected_clock_and_fixture_identity(
+    tmp_path: Path,
+) -> None:
+    cases_file = _write(tmp_path, {"cases": []})
+    header = prompt_shields_probe.build_evidence_header(
+        cases_file, now=lambda: "2026-08-07T01:02:03+00:00"
+    )
+    assert header["started_at"] == "2026-08-07T01:02:03+00:00"
+    assert header["api_version"] == prompt_shields_probe.API_VERSION
+    assert header["fixture_sha256"] == fixture_sha256(cases_file)
+    assert header["surface"] == "standalone-content-safety"

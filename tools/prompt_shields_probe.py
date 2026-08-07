@@ -14,6 +14,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -26,6 +27,11 @@ MAX_FIELD_CODE_POINTS = 1000
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 3.0
 INTER_CALL_DELAY_SECONDS = 1.0
+# A server-supplied Retry-After is honored, but not unconditionally: a
+# malicious or misconfigured value (e.g. 100000) must not turn a bounded
+# probe into a multi-hour sleep. This is a ceiling, not a target -- ordinary
+# values stay well under it.
+RETRY_CAP_SECONDS = 60.0
 CaseKind = Literal[
     "baseline", "direct", "indirect", "false_positive",
     "zh_tw", "c4_only_user", "c4_only_docs",
@@ -239,16 +245,18 @@ def classify_response(case: Case, status: int, body: Any) -> Verdict:
 
 def _retry_delay_seconds(retry_after: str | None) -> float:
     """Parse a Retry-After header defensively: only a well-formed,
-    non-negative number of seconds is honored. A missing, malformed, or
-    negative value falls back to the fixed backoff rather than sleeping for
-    an unparseable or nonsensical duration."""
+    non-negative number of seconds is honored, and it is capped at
+    RETRY_CAP_SECONDS so an absurd server value cannot turn a bounded probe
+    into an hours-long sleep. A missing, malformed, or negative value falls
+    back to the fixed backoff rather than sleeping for an unparseable or
+    nonsensical duration."""
     if retry_after is not None:
         try:
             parsed = float(retry_after)
         except ValueError:
             parsed = -1.0
         if parsed >= 0:
-            return parsed
+            return min(parsed, RETRY_CAP_SECONDS)
     return RETRY_BACKOFF_SECONDS
 
 
@@ -279,6 +287,39 @@ def fixture_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def build_evidence_header(
+    cases_file: Path, *, now: Callable[[], str] = _utc_now_iso
+) -> dict[str, Any]:
+    """Evidence-file fields that describe the run itself, not any one case.
+
+    `region` and `sku` are read from AZ_LOCATION and AZ_CONTENT_SAFETY_SKU --
+    the same env var names infra/scripts/create-content-safety.sh and
+    run-content-safety-probe.sh already use -- and default to null when
+    unset, so a manual or partial invocation is honest about not knowing
+    them rather than guessing a value. (Known gap: if create-content-
+    safety.sh falls back from F0 to S0 internally, that fallback happens in
+    a child process and is not currently reported back to this one, so `sku`
+    can be stale in that specific case; it is still never fabricated for an
+    unset var.) `started_at` is captured once, here, in UTC.
+
+    The three JSONs committed for the 2026-08-07 live probe predate these
+    fields -- their attribution is documented in prose in the evidence file,
+    not machine-recorded.
+    """
+    return {
+        "api_version": API_VERSION,
+        "fixture_sha256": fixture_sha256(cases_file),
+        "surface": "standalone-content-safety",
+        "started_at": now(),
+        "region": os.environ.get("AZ_LOCATION"),
+        "sku": os.environ.get("AZ_CONTENT_SAFETY_SKU"),
+    }
+
+
 def _build_payload(case: Case) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if case.user_prompt is not None:
@@ -289,6 +330,9 @@ def _build_payload(case: Case) -> dict[str, Any]:
 
 
 def run(cases_file: Path, evidence_out: Path) -> int:
+    # Captured before any network call, so it reflects when the run actually
+    # started, not when the evidence file happens to get written.
+    header = build_evidence_header(cases_file)
     endpoint = os.environ["CONTENT_SAFETY_ENDPOINT"].rstrip("/")
     key = os.environ["CONTENT_SAFETY_KEY"]
     cases = load_cases(cases_file)
@@ -324,9 +368,7 @@ def run(cases_file: Path, evidence_out: Path) -> int:
                 "document_lens": [len(d) for d in case.documents],
             })
     Path(evidence_out).write_text(json.dumps({
-        "api_version": API_VERSION,
-        "fixture_sha256": fixture_sha256(cases_file),
-        "surface": "standalone-content-safety",
+        **header,
         "results": results,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return 1 if failures else 0
