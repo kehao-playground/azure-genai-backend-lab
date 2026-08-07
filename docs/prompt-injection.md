@@ -323,7 +323,10 @@ in one session: `infra/scripts/create-content-safety.sh`,
 `infra/scripts/delete-content-safety.sh` (delete **and** purge — Cognitive Services accounts
 soft-delete and block re-creation of the same name for 48 hours), orchestrated by
 `infra/scripts/run-content-safety-probe.sh`, which arms its cleanup trap *before* the first
-mutation so a half-created account is still torn down. The eight cases live in
+mutation so a half-created account is still torn down. Cleanup finds the account by name and
+*purges* it, which is irreversible, so the orchestrator treats `AZ_CONTENT_SAFETY_NAME` as a
+prefix and appends an unpredictable per-run suffix: only that run could have invented the name
+it creates, so teardown can only ever target a resource that run created. The eight cases live in
 `tools/prompt_shields_cases.json` and are sent by `tools/prompt_shields_probe.py`.
 
 | # | `userPrompt` | `documents` | Purpose | Text provenance (of the field that varies) |

@@ -33,6 +33,24 @@
 # Optional env vars:
 #   AZ_LOCATION             - defaults to japaneast, same default as
 #                             create-content-safety.sh — override both or neither
+#   AZ_CS_CREATE_ATTEMPTED  - set to 1 by run-content-safety-probe.sh before
+#                             it issues the create. It means "a create was
+#                             issued under this name and its outcome may be
+#                             unknown", which makes a single reading of
+#                             "in neither listing" NOT proof of absence: if
+#                             Azure accepted the create but the CLI reported
+#                             failure and the listings have not caught up,
+#                             exiting 0 here abandons an account that
+#                             materialises moments later with no teardown
+#                             ever running. With the flag set, the "absent"
+#                             branch takes a bounded stabilization wait
+#                             first. Left unset (the default) when an
+#                             operator runs this script standalone, so a name
+#                             that really is gone still exits immediately.
+#                             This is only safe because the orchestrator's
+#                             account names are unique per run — waiting for
+#                             a not-yet-visible account can never end up
+#                             waiting onto somebody else's resource.
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID (default az context may point at the wrong subscription)}"
@@ -44,6 +62,7 @@ AZ_LOCATION="${AZ_LOCATION:-japaneast}"
 AZ_CS_POLL_ATTEMPTS="${AZ_CS_POLL_ATTEMPTS:-24}"
 AZ_CS_POLL_INTERVAL="${AZ_CS_POLL_INTERVAL:-5}"
 AZ_CS_RETRY_INTERVAL="${AZ_CS_RETRY_INTERVAL:-10}"
+AZ_CS_CREATE_ATTEMPTED="${AZ_CS_CREATE_ATTEMPTED:-0}"
 
 # Each query propagates its exit status; call sites abort on query failure
 # instead of reading a failed (empty) substitution as a count.
@@ -65,6 +84,28 @@ fail_query() {
 
 # --- state: live? ----------------------------------------------------------
 LIVE=$(live_count) || fail_query live_count
+DELETED=0
+if [ "$LIVE" = "0" ]; then
+  DELETED=$(deleted_count) || fail_query deleted_count
+fi
+
+# --- "not visible yet" is not "absent" -------------------------------------
+# Only when this run issued a create whose outcome may be unknown (see
+# AZ_CS_CREATE_ATTEMPTED in the header). Same bounded-poll idiom and the same
+# fail_query discipline as every other wait here: each query assigns on its
+# own line and aborts on failure, never reading a failed query as "still
+# absent". On deadline the script falls through to the normal absent branch.
+if [ "$LIVE" = "0" ] && [ "$DELETED" = "0" ] && [ "$AZ_CS_CREATE_ATTEMPTED" = "1" ]; then
+  echo "'$AZ_CONTENT_SAFETY_NAME' is in neither listing, but this run issued a create under this name — waiting (bounded) in case the account is still materialising." >&2
+  for _ in $(seq 1 "$AZ_CS_POLL_ATTEMPTS"); do
+    sleep "$AZ_CS_POLL_INTERVAL"
+    LIVE=$(live_count) || fail_query live_count
+    if [ "$LIVE" != "0" ]; then break; fi
+    DELETED=$(deleted_count) || fail_query deleted_count
+    if [ "$DELETED" != "0" ]; then break; fi
+  done
+fi
+
 if [ "$LIVE" != "0" ]; then
   echo "Deleting live Content Safety account '$AZ_CONTENT_SAFETY_NAME'"
   az cognitiveservices account delete \
@@ -85,12 +126,17 @@ if [ "$LIVE" != "0" ]; then
     echo "Re-run this script to retry from the current state." >&2
     exit 1
   fi
-else
-  DELETED=$(deleted_count) || fail_query deleted_count
-  if [ "$DELETED" = "0" ]; then
+elif [ "$DELETED" = "0" ]; then
+  if [ "$AZ_CS_CREATE_ATTEMPTED" = "1" ]; then
+    # Honest about what was and was not established: the wait ran and ended,
+    # which is evidence of absence over that window, not proof for all time.
+    echo "'$AZ_CONTENT_SAFETY_NAME' never appeared in either listing within the stabilization deadline; nothing to delete."
+    echo "If it does materialise later, tear it down with:" >&2
+    echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP AZ_LOCATION=$AZ_LOCATION AZ_CONTENT_SAFETY_NAME=$AZ_CONTENT_SAFETY_NAME ./delete-content-safety.sh" >&2
+  else
     echo "Nothing to do: '$AZ_CONTENT_SAFETY_NAME' is neither live nor soft-deleted in this subscription."
-    exit 0
   fi
+  exit 0
 fi
 
 # --- state: soft-deleted -> purge, with bounded retries --------------------
