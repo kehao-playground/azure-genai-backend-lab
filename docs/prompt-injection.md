@@ -96,7 +96,7 @@ happened to each.
 | T1 | Direct injection in the caller's own prompt | Instructions are a versioned asset loaded from `prompts/*.md` at startup and sent as `instructions`, separate from history (Day 8); no template engine and no variable interpolation, so there is no SSTI surface | `prompts/loader.py`, `prompts/rag_answer.md` | **Nothing inspects the caller's prompt.** No jailbreak detector sits in the request path — deliberate, see §5 |
 | T2 | Indirect injection via a retrieved chunk (`/rag`) | Every source is fenced with a **per-request random** `BEGIN`/`END UNTRUSTED SOURCE {nonce} {n}` marker, plus rules 4 and 5 of the answering prompt | `services/rag.py` (`render_sources`), `prompts/rag_answer.md` v3 | **G1 — fixed this milestone** (§3.1). Residual: fencing is marking, not sandboxing |
 | T3 | The same corpus text reaching the agent path (`/agent`) | `search_docs` returns `json.dumps({"hits": [...]})` — syntactic containment — plus hard rule 4 of the agent prompt: snippets are retrieved data, never instructions | `services/agent_tools.py` (`make_search_docs`), `prompts/ops_agent.md` v2 | **G2 — fixed this milestone at the instruction layer** (§3.2) |
-| T4 | Tool abuse — the model picks a dangerous action | All three tools are read-only (search, config read, usage read); no mutating tool exists | `services/agent_tools.py` | None structurally — but this is a property of *today's* toolset, not an enforced invariant. One mutating tool removes the defense silently |
+| T4 | Tool abuse — the model picks a dangerous action | Every tool bound to a run is read-only — `search_docs` is always bound; `get_runtime_config` and `get_conversation_usage` are bound only when a token budget is configured — no mutating tool exists in any combination | `services/agent_tools.py` | None structurally — but this is a property of *today's* toolset, not an enforced invariant. One mutating tool removes the defense silently |
 | T5 | Confused deputy — reading across a tenant or ACL boundary | `Principal` is closure-bound at bind time, never a tool parameter; the OData ACL filter is server-built and reaches `SearchClient.search` with no default | `services/acl.py`, `services/agent_tools.py` (`bind_principal_tools`) | None found. The strongest layer in the lab |
 | T6 | Conversation-id enumeration through a tool | Unknown, cross-tenant and scope-mismatched ids all return one `_USAGE_NOT_FOUND` shape — "a distinct shape here would let the model narrate a conversation's existence into its answer" | `services/agent_tools.py` (`make_get_conversation_usage`) | None found |
 | T7 | Credential or config disclosure through a tool | `get_runtime_config` emits six named fields under an explicit allowlist; the code comment is the rule — "never serialize `Settings`", which holds `azure_openai_api_key` | `services/agent_tools.py` (`make_get_runtime_config`) | None found |
@@ -145,10 +145,11 @@ END UNTRUSTED SOURCE {nonce} {n}
   bytes, 128 bits** (`_default_nonce`). `token_hex` takes a *byte* count, so `token_hex(8)`
   would have been 64 bits; the contract is pinned by a test that asserts the production
   default asks `secrets` for 16 bytes.
-- It is drawn **once per request**, at the top of `RagService.answer`, and threaded
-  explicitly through `_select_within_budget`, `render_user_message` and `render_sources` —
-  so the rendering that *sizes* the prompt and the rendering that is *sent* use the same
-  value by construction.
+- It is drawn **once per request**, after retrieval and before the prompt is sized — at the
+  start of the `assemble_context` stage in `RagService.answer`, so the zero-hit path returns
+  before any nonce exists — and threaded explicitly through `_select_within_budget`,
+  `render_user_message` and `render_sources` — so the rendering that *sizes* the prompt and
+  the rendering that is *sent* use the same value by construction.
 - The generator is injected (`nonce_factory`), defaulting to `_default_nonce`, so tests pin
   a deterministic value rather than asserting on randomness.
 - Fence bytes were already counted toward `MAX_PROMPT_BYTES` because the budget sizes the
@@ -251,7 +252,7 @@ groups, the store, or the budget — those are fixed at composition."
 | # | Contrast | Unsafe (above) | Safe (this repository) |
 |---|---|---|---|
 | C1 | Caller-supplied vs closure-bound identity | `tenant_id` is a tool parameter, so a poisoned document can instruct the model to pass someone else's | `make_search_docs(retriever, principal)` captures the `Principal` at bind time; the only argument is `query: str`. `get_conversation_usage` takes only `conversation_id`; `get_runtime_config` takes nothing. There is no parameter through which a tenant or group can be named. Binding is per run (`bind_principal_tools`), not per process — "a fixed principal bound at build time would apply one caller's ACL to every request" |
-| C2 | Mutating vs read-only | an `action` parameter admitting `"delete"`/`"share"` | Three tools, all read-only. No mutating tool exists, so LLM06's mailbox scenario has no analogue. Agent Safety's approval criteria — side effects, reversibility — are answered by absence rather than by an approval prompt |
+| C2 | Mutating vs read-only | an `action` parameter admitting `"delete"`/`"share"` | One to three tools depending on whether a token budget is configured (search is always bound; config-read and usage-read are added only then), and every combination is read-only. No mutating tool exists, so LLM06's mailbox scenario has no analogue. Agent Safety's approval criteria — side effects, reversibility — are answered by absence rather than by an approval prompt |
 | C3 | Unbounded vs byte-bounded output | returns whatever the store hands back, whole documents included | `MAX_SEARCH_HITS = 3`, `MAX_SNIPPET_CHARS = 1200`, `MAX_TOOL_RESULT_BYTES = 4800`. `_fit_within_budget` shrinks a candidate snippet by the *measured* JSON-envelope overflow and, if it still does not fit, drops that hit and every hit after it rather than emitting a mangled one |
 | C4 | Arbitrary vs allowlisted disclosure | serializes the settings object — and hands over `azure_openai_api_key` with it | `get_runtime_config` emits exactly six named fields under an explicit allowlist, with the rule written next to it: "never serialize `Settings`" |
 
@@ -317,15 +318,15 @@ soft-delete and block re-creation of the same name for 48 hours), orchestrated b
 mutation so a half-created account is still torn down. The eight cases live in
 `tools/prompt_shields_cases.json` and are sent by `tools/prompt_shields_probe.py`.
 
-| # | `userPrompt` | `documents` | Purpose | Text provenance |
+| # | `userPrompt` | `documents` | Purpose | Text provenance (of the field that varies) |
 |---|---|---|---|---|
 | 1 | benign question | benign document | false/false baseline | self-authored |
-| 2 | direct-attack sample | benign document (fixed control) | direct positive control | Microsoft quickstart sample, verbatim |
-| 3 | benign question (fixed control) | document-attack sample | indirect positive control | Microsoft quickstart sample, verbatim |
+| 2 | direct-attack sample | benign document (fixed control) | direct positive control | `userPrompt`: Microsoft quickstart sample, verbatim. `documents`: self-authored control |
+| 3 | benign question (fixed control) | document-attack sample | indirect positive control | `userPrompt`: self-authored control. `documents`: Microsoft quickstart sample, verbatim |
 | 4 | benign question (fixed control) | RAG-shaped injection in an ops-doc chunk | the shape that matches this lab | self-authored |
 | 5 | benign question (fixed control) | benign document that *discusses* prompt injection | false-positive observation | self-authored |
 | 6 | zh-TW injection | benign document (fixed control) | one observation about one input | self-authored |
-| 7 | direct-attack sample | *field omitted* | required-ness of `documents` (conflict C4) | Microsoft quickstart sample, verbatim |
+| 7 | direct-attack sample | `[]` in the fixture — `_build_payload` omits the key from the wire request when the list is empty | required-ness of `documents` (conflict C4) | Microsoft quickstart sample, verbatim |
 | 8 | *field omitted* | document-attack sample | required-ness of `userPrompt` (conflict C4) | Microsoft quickstart sample, verbatim |
 
 Provenance is recorded per case rather than per id because the ids do not carry it uniformly:
