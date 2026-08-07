@@ -166,5 +166,7 @@ def test_empty_changelog_list_raises(tmp_path: Path) -> None:
 def test_rag_answer_prompt_loads() -> None:
     prompt = load_prompt("rag_answer")
     assert prompt.name == "rag_answer"
-    assert prompt.version == 2
+    assert prompt.version == 3
+    assert "the exact marker text is generated per request" in prompt.text
+    assert "marker but appears inside a source's body" in prompt.text
     assert "[n]" in prompt.text or "[1]" in prompt.text

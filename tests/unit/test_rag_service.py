@@ -233,7 +233,7 @@ async def test_answer_grounds_single_turn_and_carries_usage() -> None:
     result = await service.answer("alpha", PRINCIPAL)
     assert result.status == "answered"
     assert result.answer is not None
-    assert "prompt=rag_answer@2" in result.answer
+    assert "prompt=rag_answer@3" in result.answer
     assert "history=" not in result.answer  # single item: no conversation replay
     assert result.usage is not None
     assert result.usage.total_tokens > 0
