@@ -46,7 +46,7 @@ sequenceDiagram
         Note right of RagService: short-circuit — no LLM call.<br/>Cross-tenant/wrong-group questions land here too:<br/>filtered-out hits look identical to "nothing indexed".
     else one or more hits
         RagService->>Chat: complete([{role: user, content: fenced sources + question}])
-        Note right of Chat: instructions = rag_answer.md (citation + refusal rules,<br/>sources marked non-instructions),<br/>each source wrapped BEGIN/END UNTRUSTED SOURCE n,<br/>sources travel as untrusted user-message data
+        Note right of Chat: instructions = rag_answer.md (citation + refusal rules,<br/>sources marked non-instructions),<br/>each source fenced with a per-request random nonce (Day 21 G1),<br/>sources travel as untrusted user-message data
         Chat-->>RagService: message, usage, incomplete_reason
         RagService->>RagService: strip citation numbers outside 1..included_hit_count
         RagService-->>API: RagAnswer(status="answered", answer, hits, usage)
@@ -86,11 +86,12 @@ sequenceDiagram
   by `status` alone; it has to read `answer` and the cited sources.
 - **Sources are untrusted data, fenced, not instructions.** Retrieved chunks
   travel in the *user* message (`render_user_message`), each wrapped in
-  `BEGIN`/`END UNTRUSTED SOURCE n` markers; the *instructions* live only in
-  the prompt template, which explicitly tells the model to treat source text
-  as non-instructions. Fencing raises the bar; it is mitigation, not
-  immunity — a poisoned corpus entry crafted to look like an instruction is
-  still on the threat model, not closed by this design.
+  start/end markers carrying a per-request random nonce (Day 21 G1), so
+  poisoned corpus text cannot forge the closing marker; the *instructions*
+  live only in the prompt template, which explicitly tells the model to
+  treat source text as non-instructions. Fencing raises the bar; it is
+  mitigation, not immunity — a poisoned corpus entry crafted to look like an
+  instruction is still on the threat model, not closed by this design.
 - **Citations are validated syntactically, not evidentially.** A `[n]` marker
   outside `1..included_hit_count` is stripped and logged by number only; a
   citation that survives points at a source that was really sent to the

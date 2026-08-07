@@ -19,7 +19,7 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] Instructions are versioned assets loaded at startup, never assembled from request data — `prompts/loader.py`, `prompts/*.md`
 - [ ] No template engine and no variable interpolation in any prompt path (no SSTI surface) — `prompts/loader.py`
 - [ ] Conversation history carries only `user`/`assistant` items; end-user text never enters a `system`-role message — [api-conventions.md](api-conventions.md#conversation-state)
-- [ ] `/agent` task input and `/rag` question are byte-capped before they reach the model — `services/agent_framework.py` (`AGENT_MAX_TASK_BYTES = 4000`), `api/rag.py` (`RagRequest.question`, `max_length=2000`). `/chat` and `/chat/stream` declare only `min_length=1` — no upper bound on message length
+- [ ] `/agent` task input is byte-capped, and `/rag` question is length-capped in characters (not bytes — a 2,000-character Traditional Chinese question is roughly 6,000 UTF-8 bytes) before they reach the model — `services/agent_framework.py` (`AGENT_MAX_TASK_BYTES = 4000`), `api/rag.py` (`RagRequest.question`, `max_length=2000`). `/chat` and `/chat/stream` declare only `min_length=1` — no upper bound on message length
 
 ## Tool least privilege
 

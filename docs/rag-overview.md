@@ -60,14 +60,15 @@ pipeline does not manufacture that distinction after the fact.
 
 ### Two Day 15 debts, stated as honest boundaries, not silent gaps
 
-- **Source fencing is a marker, not a sandbox.** Every retrieved chunk is wrapped in
-  `BEGIN UNTRUSTED SOURCE n` / `END UNTRUSTED SOURCE n` before it reaches the prompt
-  (`render_sources()`), on top of the template-level instruction that source text is data, not
-  commands. That raises the bar against a corpus entry phrased as an instruction; it does not remove
-  the entry from the model's context window, and a sufficiently well-crafted poisoned chunk is still
-  on the threat model exactly as [Failure modes](#failure-modes-design-inputs-not-afterthoughts) FP4
-  describes it — "not extracted" has a mirror failure, "extracted as if it were an instruction",
-  that fencing mitigates rather than closes.
+- **Source fencing is a marker, not a sandbox.** Every retrieved chunk is wrapped in start/end
+  markers carrying a per-request random nonce (`render_sources()`), so poisoned corpus text cannot
+  forge the closing marker (Day 21 G1), on top of the template-level instruction that source text is
+  data, not commands. That raises the bar against a corpus entry phrased as an instruction; it does
+  not remove the entry from the model's context window, and a sufficiently well-crafted poisoned
+  chunk is still on the threat model exactly as [Failure
+  modes](#failure-modes-design-inputs-not-afterthoughts) FP4 describes it — "not extracted" has a
+  mirror failure, "extracted as if it were an instruction", that fencing mitigates rather than
+  closes.
 - **Citation validation is syntactic, not evidentiary.** `_validate_citations()` strips a `[n]`
   marker whose number falls outside `1..included_hit_count` — the range of sources actually sent to
   the model, after budget-driven dropping — and logs only the invalid numbers, never the answer

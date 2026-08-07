@@ -233,13 +233,15 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   document that was never retrieved, so a cross-tenant question resolves the
   same way an answer-absent one does: `status: "no_answer"`, not a denial
   signal. See [rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check).
-- Retrieved chunk content is fenced with `BEGIN UNTRUSTED SOURCE n` /
-  `END UNTRUSTED SOURCE n` markers on top of the template-level warning that
-  source text is data, not instructions (Day 15). This is mitigation, not a
-  sandbox: a poisoned corpus entry crafted to look like an instruction stays
-  on the threat model regardless of the fence. Citation markers (`[n]`) in
-  the model's answer are validated syntactically against the actually-included
-  source numbers — an out-of-range or invented `[n]` is stripped, logged by
+- Retrieved chunk content is fenced with start/end markers carrying a
+  per-request random nonce, on top of the template-level warning that
+  source text is data, not instructions (Day 15; nonce Day 21 G1) — a
+  poisoned chunk cannot forge the closing marker without guessing it. This
+  is mitigation, not a sandbox: a poisoned corpus entry crafted to look
+  like an instruction stays on the threat model regardless of the fence.
+  Citation markers (`[n]`) in the model's answer are validated
+  syntactically against the actually-included source numbers — an
+  out-of-range or invented `[n]` is stripped, logged by
   number only, and never fails the request or changes `status`; this proves
   the citation *points somewhere real*, not that the cited text actually
   supports the sentence it is attached to.
