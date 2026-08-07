@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import httpx
 
@@ -44,10 +44,9 @@ class Verdict:
     detail: str
 
 
-_VALID_KINDS = frozenset({
-    "baseline", "direct", "indirect", "false_positive",
-    "zh_tw", "c4_only_user", "c4_only_docs",
-})
+# Derived from CaseKind, not duplicated: a kind added only here (or only
+# there) used to yield a mypy-clean runtime rejection instead of a type error.
+_VALID_KINDS = frozenset(get_args(CaseKind))
 
 
 def load_cases(path: Path) -> tuple[Case, ...]:

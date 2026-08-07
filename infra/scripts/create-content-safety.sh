@@ -34,12 +34,50 @@ AZ_LOCATION="${AZ_LOCATION:-japaneast}"
 AZ_CONTENT_SAFETY_SKU="${AZ_CONTENT_SAFETY_SKU:-F0}"
 CONTENT_SAFETY_SKU_FALLBACK_CODES="${CONTENT_SAFETY_SKU_FALLBACK_CODES:-}"
 
+# A failed query aborts explicitly instead of being misread as a benign
+# value: the pattern is always VAR=$(query) || fail_query "..." on its own
+# line — never $(query) inside a condition, where a failure collapses to an
+# empty string and gets compared as though the query had succeeded (this
+# repo has been bitten by exactly that shape three times, Day 20 review).
+fail_query() {
+  echo "Failed to query $1 (see error above); aborting before any mutation." >&2
+  exit 1
+}
+
 # --- provider registration BEFORE any Content Safety call ------------------
 REG_STATE=$(az provider show --namespace Microsoft.CognitiveServices \
-  --subscription "$AZ_SUBSCRIPTION_ID" --query registrationState -o tsv)
+  --subscription "$AZ_SUBSCRIPTION_ID" --query registrationState -o tsv) \
+  || fail_query "the Microsoft.CognitiveServices provider registration state"
 if [ "$REG_STATE" != "Registered" ]; then
   echo "Registering the Microsoft.CognitiveServices resource provider (one-time, may take a minute)"
   az provider register --namespace Microsoft.CognitiveServices --subscription "$AZ_SUBSCRIPTION_ID" --wait
+fi
+
+# --- account state check: create must know what already exists ------------
+# Mirrors create-keyvault.sh's own precedent (this repo's guard for exactly
+# this shape of risk) and delete-content-safety.sh's query shape, so the two
+# Content Safety scripts stay consistent. The exposure here is worse than Key
+# Vault's: the orchestrator's EXIT trap deletes AND purges unconditionally on
+# every exit path, so a name collision with an existing account (mistyped or
+# copy-pasted AZ_CONTENT_SAFETY_NAME) would mean this script adopts someone
+# else's account and the trap purges it.
+if ! LIVE_COUNT=$(az cognitiveservices account list --subscription "$AZ_SUBSCRIPTION_ID" \
+    --query "length([?name=='$AZ_CONTENT_SAFETY_NAME'])" -o tsv); then
+  fail_query "live Content Safety accounts in the subscription"
+fi
+if [ "$LIVE_COUNT" != "0" ]; then
+  echo "Content Safety account '$AZ_CONTENT_SAFETY_NAME' already exists live in this subscription. This script only creates from scratch:" >&2
+  echo "reuse the existing account as-is, or run delete-content-safety.sh first." >&2
+  exit 1
+fi
+if ! DELETED_COUNT=$(az cognitiveservices account list-deleted --subscription "$AZ_SUBSCRIPTION_ID" \
+    --query "length([?name=='$AZ_CONTENT_SAFETY_NAME'])" -o tsv); then
+  fail_query "soft-deleted Content Safety accounts"
+fi
+if [ "$DELETED_COUNT" != "0" ]; then
+  echo "The name '$AZ_CONTENT_SAFETY_NAME' is held by a soft-deleted Content Safety account (soft delete reserves the name until purge)." >&2
+  echo "Run delete-content-safety.sh (it purges from this state too), or pick another name." >&2
+  exit 1
 fi
 
 # From here on a failure can leave a real account behind: print the exact

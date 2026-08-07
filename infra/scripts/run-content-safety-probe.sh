@@ -21,21 +21,39 @@
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on default context)
 #   AZ_RESOURCE_GROUP      - existing resource group
 #   AZ_CONTENT_SAFETY_NAME - globally unique account name
-#   EVIDENCE_OUT            - path the probe writes its evidence JSON to
+#   EVIDENCE_OUT            - path the probe writes its evidence JSON to; if
+#                              relative, it is resolved against the CALLER's
+#                              cwd (see cwd note below), not the repo root
 # Optional env vars:
 #   AZ_LOCATION               - defaults to japaneast
 #   PROMPT_SHIELDS_CASES_FILE - defaults to tools/prompt_shields_cases.json
 #                                (the canonical fixture) at the repo root
+#
+# cwd note: `tools/` is not an installed package, so `uv run python -m
+# tools.prompt_shields_probe` only resolves when uv's own cwd is the repo
+# root. The documented invocation is `cd infra/scripts && ./run-content-
+# safety-probe.sh`, which is NOT the repo root, so this script cd's to
+# REPO_ROOT itself right before invoking the probe — after every
+# cwd-relative input (EVIDENCE_OUT) has already been made absolute against
+# the ORIGINAL caller cwd, so a relative path still lands where the caller
+# expects, not wherever the script happened to cd into.
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID}"
 : "${AZ_RESOURCE_GROUP:?Set AZ_RESOURCE_GROUP}"
 : "${AZ_LOCATION:=japaneast}"
 : "${AZ_CONTENT_SAFETY_NAME:?Set AZ_CONTENT_SAFETY_NAME}"
+CALLER_DIR="$PWD"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CASES_FILE="${PROMPT_SHIELDS_CASES_FILE:-$REPO_ROOT/tools/prompt_shields_cases.json}"
 EVIDENCE_OUT="${EVIDENCE_OUT:?Set EVIDENCE_OUT}"
+# Absolutize against the caller's cwd BEFORE the later `cd "$REPO_ROOT"` —
+# otherwise a relative EVIDENCE_OUT would silently be reinterpreted against
+# the repo root instead of where the caller actually meant it.
+if [[ "$EVIDENCE_OUT" != /* ]]; then
+  EVIDENCE_OUT="$CALLER_DIR/$EVIDENCE_OUT"
+fi
 
 # Validate inputs BEFORE any mutation.
 [ -r "$CASES_FILE" ] || { echo "cases file not readable: $CASES_FILE" >&2; exit 1; }
@@ -51,11 +69,17 @@ trap cleanup EXIT   # armed BEFORE create can leave a resource behind
 
 ENDPOINT=$(az cognitiveservices account show --name "$AZ_CONTENT_SAFETY_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
-  --query properties.endpoint -o tsv)
+  --query properties.endpoint -o tsv) \
+  || { echo "Failed to read back the account endpoint (see error above)." >&2; exit 1; }
 KEY=$(az cognitiveservices account keys list --name "$AZ_CONTENT_SAFETY_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
-  --query key1 -o tsv)
+  --query key1 -o tsv) \
+  || { echo "Failed to read back the account key (see error above)." >&2; exit 1; }
 
+# cd to the repo root so `uv run python -m tools.prompt_shields_probe`
+# resolves regardless of the caller's cwd (see cwd note above). Every path
+# used from here on (CASES_FILE, EVIDENCE_OUT) is already absolute.
+cd "$REPO_ROOT"
 CONTENT_SAFETY_ENDPOINT="$ENDPOINT" CONTENT_SAFETY_KEY="$KEY" \
   uv run python -m tools.prompt_shields_probe --cases-file "$CASES_FILE" --evidence-out "$EVIDENCE_OUT"
 
