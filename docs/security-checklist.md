@@ -17,7 +17,7 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] The agent prompt states that `search_docs` snippets are untrusted corpus text — `prompts/ops_agent.md` (v2, rule 4), [§3.2](prompt-injection.md#32-g2--the-agent-path-had-no-untrusted-data-rule-fixed-at-the-instruction-layer)
 - [ ] Tool results are serialized as JSON so corpus text cannot escape the app's own envelope — `services/agent_tools.py` (`make_search_docs`)
 - [ ] Instructions are versioned assets loaded at startup, never assembled from request data — `prompts/loader.py`, `prompts/*.md`
-- [ ] No template engine and no variable interpolation in any prompt path (no SSTI surface) — `prompts/loader.py`
+- [ ] Versioned instruction assets load verbatim with no request-data interpolation; no template engine executes anywhere in the prompt path (no SSTI surface) — dynamic data (question, sources, nonce) is assembled only into the user-role message — `prompts/loader.py`, `services/rag.py` (`render_user_message`)
 - [ ] Conversation history carries only `user`/`assistant` items; end-user text never enters a `system`-role message — [api-conventions.md](api-conventions.md#conversation-state)
 - [ ] `/agent` task input is byte-capped, and `/rag` question is length-capped in characters (not bytes — a 2,000-character Traditional Chinese question is roughly 6,000 UTF-8 bytes) before they reach the model — `services/agent_framework.py` (`AGENT_MAX_TASK_BYTES = 4000`), `api/rag.py` (`RagRequest.question`, `max_length=2000`). `/chat` and `/chat/stream` declare only `min_length=1` — no upper bound on message length
 

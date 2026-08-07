@@ -157,9 +157,12 @@ def test_fixture_sha256_is_raw_bytes(tmp_path: Path) -> None:
 
 
 def _matrix() -> tuple:
+    # Canonical regular-kind composition (matches the shipped fixture and
+    # validate_matrix's own _EXPECTED_REGULAR_KIND_COUNTS): one each of
+    # baseline/direct/false_positive/zh_tw, two indirect.
     Case = prompt_shields_probe.Case
     base = [Case(f"{i}", "u", ("d",), k) for i, k in enumerate(
-        ["baseline", "direct", "indirect", "false_positive", "zh_tw", "direct"])]
+        ["baseline", "direct", "indirect", "indirect", "false_positive", "zh_tw"])]
     base.append(Case("6", "u", (), "c4_only_user"))
     base.append(Case("7", None, ("d",), "c4_only_docs"))
     return tuple(base)
@@ -198,6 +201,21 @@ def test_validate_matrix_rejects_duplicate_c4_kind() -> None:
            Case("7", None, ("d",), "c4_only_docs")]
     )
     with pytest.raises(ValueError, match="one c4_only_user|six regular"):
+        prompt_shields_probe.validate_matrix(cases)
+
+
+def test_validate_matrix_rejects_wrong_kind_composition() -> None:
+    # Right counts (1 c4_only_user, 1 c4_only_docs, 6 regular) but the six
+    # regular cases are all `baseline` -- validate_matrix must not just count
+    # the six, it must check WHICH kinds they are, or a fixture with zero
+    # direct/indirect/false_positive/zh_tw coverage would silently pass.
+    Case = prompt_shields_probe.Case
+    cases = tuple(
+        [Case(f"{i}", "u", ("d",), "baseline") for i in range(6)]
+        + [Case("6", "u", (), "c4_only_user"),
+           Case("7", None, ("d",), "c4_only_docs")]
+    )
+    with pytest.raises(ValueError, match="composition"):
         prompt_shields_probe.validate_matrix(cases)
 
 

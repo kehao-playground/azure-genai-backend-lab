@@ -113,7 +113,14 @@ if args[:3] == ["cognitiveservices", "account", "show"]:
     if state.get("fail_show"):
         print("ERROR: injected show failure", file=sys.stderr)
         done(code=1)
-    answers = {"properties.endpoint": "https://fake.cognitiveservices.azure.com/"}
+    answers = {
+        "properties.endpoint": "https://fake.cognitiveservices.azure.com/",
+        # Reflects whatever SKU the create call actually landed on (may
+        # differ from the requested AZ_CONTENT_SAFETY_SKU if a fallback
+        # retry fired), so tests can assert the orchestrator reads back and
+        # forwards the ACTUAL sku, not the requested one.
+        "sku.name": state.get("created_sku", ""),
+    }
     done(answers.get(query_value(), ""))
 if args[:4] == ["cognitiveservices", "account", "keys", "list"]:
     if state.get("fail_keys"):
@@ -151,6 +158,9 @@ if args[:4] == ["run", "python", "-m", "tools.prompt_shields_probe"]:
     # `uv run python -m tools.prompt_shields_probe` only resolves against
     # its own cwd, not against wherever the caller started the script.
     state["uv_cwd"] = os.getcwd()
+    # Recorded so tests can assert which SKU value the orchestrator actually
+    # forwarded to the probe -- the requested one or the account's real one.
+    state["probe_env_sku"] = os.environ.get("AZ_CONTENT_SAFETY_SKU")
     exit_code = state.get("probe_exit_code", 0)
     if exit_code == 0 and "--evidence-out" in args:
         evidence_path = args[args.index("--evidence-out") + 1]
@@ -477,6 +487,28 @@ def test_orchestrator_probe_invoked_from_repo_root_and_relative_evidence_out_lan
         assert not stray.exists()
     finally:
         stray.unlink(missing_ok=True)
+
+
+def test_orchestrator_forwards_actual_created_sku_not_requested_to_probe(tmp_path: Path) -> None:
+    # create-content-safety.sh's own SKU-fallback retry (F0 -> S0) happens
+    # inside its own child process, so this orchestrator's copy of
+    # AZ_CONTENT_SAFETY_SKU (the REQUESTED value) never sees it. The
+    # orchestrator must read back the account's ACTUAL sku via
+    # `account show` and forward that to the probe instead.
+    h = Harness(
+        tmp_path, provider="Registered", account="absent", create_fail_code="TESTFALLBACK"
+    )
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        AZ_CONTENT_SAFETY_SKU="F0",
+        CONTENT_SAFETY_SKU_FALLBACK_CODES="TESTFALLBACK",
+    )
+    assert result.returncode == 0, result.stderr
+    assert h.state["created_sku"] == "S0"
+    assert h.state["probe_env_sku"] == "S0"  # not "F0", the requested value
 
 
 def test_orchestrator_does_not_purge_preexisting_live_account_on_refusal(tmp_path: Path) -> None:

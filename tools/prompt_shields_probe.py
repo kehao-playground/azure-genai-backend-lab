@@ -106,13 +106,20 @@ def load_cases(path: Path) -> tuple[Case, ...]:
     return tuple(cases)
 
 
+_EXPECTED_REGULAR_KIND_COUNTS: dict[str, int] = {
+    "baseline": 1, "direct": 1, "indirect": 2, "false_positive": 1, "zh_tw": 1,
+}
+
+
 def validate_matrix(cases: tuple[Case, ...]) -> None:
     """Fail-fast on the fixed 8-case matrix shape (spec §5): exactly 8 cases,
     unique ids, exactly one c4_only_user, exactly one c4_only_docs, exactly
-    six regular cases, and the C4 field omissions. A mis-shaped fixture (e.g.
-    5 regular + 2 c4_only_user + 1 c4_only_docs) must not produce a
-    'successful' probe (Day 21 review P2 — counts, not a kind->case dict that
-    silently collapses duplicates)."""
+    six regular cases with the exact kind composition
+    _EXPECTED_REGULAR_KIND_COUNTS, and the C4 field omissions. A mis-shaped
+    fixture (e.g. 5 regular + 2 c4_only_user + 1 c4_only_docs, or six
+    `baseline` regular cases) must not produce a 'successful' probe (Day 21
+    review P2 — counts, not a kind->case dict that silently collapses
+    duplicates)."""
     if len(cases) != 8:
         raise ValueError(f"expected exactly 8 cases, got {len(cases)}")
     ids = [c.id for c in cases]
@@ -127,6 +134,14 @@ def validate_matrix(cases: tuple[Case, ...]) -> None:
         raise ValueError("expected exactly one c4_only_docs case")
     if len(regular) != 6:
         raise ValueError("expected exactly six regular cases")
+    actual_kind_counts: dict[str, int] = {}
+    for c in regular:
+        actual_kind_counts[c.kind] = actual_kind_counts.get(c.kind, 0) + 1
+    if actual_kind_counts != _EXPECTED_REGULAR_KIND_COUNTS:
+        raise ValueError(
+            "regular case kind composition mismatch: expected "
+            f"{_EXPECTED_REGULAR_KIND_COUNTS}, got {actual_kind_counts}"
+        )
     if user_only[0].user_prompt is None or user_only[0].documents:
         raise ValueError("c4_only_user must send user_prompt and no documents")
     if docs_only[0].user_prompt is not None or len(docs_only[0].documents) != 1:
@@ -300,11 +315,11 @@ def build_evidence_header(
     the same env var names infra/scripts/create-content-safety.sh and
     run-content-safety-probe.sh already use -- and default to null when
     unset, so a manual or partial invocation is honest about not knowing
-    them rather than guessing a value. (Known gap: if create-content-
-    safety.sh falls back from F0 to S0 internally, that fallback happens in
-    a child process and is not currently reported back to this one, so `sku`
-    can be stale in that specific case; it is still never fabricated for an
-    unset var.) `started_at` is captured once, here, in UTC.
+    them rather than guessing a value. run-content-safety-probe.sh forwards
+    the account's ACTUAL sku (read back via `account show` after create
+    returns), not the requested one, so this field is accurate even when
+    create-content-safety.sh's own SKU-fallback retry (F0 -> S0) fired
+    inside its child process. `started_at` is captured once, here, in UTC.
 
     The three JSONs committed for the 2026-08-07 live probe predate these
     fields -- their attribution is documented in prose in the evidence file,
