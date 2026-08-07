@@ -23,6 +23,7 @@ suite guards against here too:
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -31,6 +32,11 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "infra" / "scripts"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_CASES_FILE = REPO_ROOT / "tools" / "prompt_shields_cases.json"
+# The prefix the harness supplies as AZ_CONTENT_SAFETY_NAME. The orchestrator
+# resolves it into a per-run unique account name (prefix + "-" + 6 hex chars);
+# the two child scripts still take AZ_CONTENT_SAFETY_NAME as the FINAL name.
+NAME_PREFIX = "cs-fake-d21"
+RESOLVED_NAME_RE = re.compile(rf"^{re.escape(NAME_PREFIX)}-[0-9a-f]{{6}}$")
 
 FAKE_AZ = '''#!/usr/bin/env python3
 import json, os, sys
@@ -48,6 +54,9 @@ def save() -> None:
 
 def query_value() -> str:
     return args[args.index("--query") + 1] if "--query" in args else ""
+
+def name_value() -> str:
+    return args[args.index("--name") + 1] if "--name" in args else ""
 
 def done(out: str = "", code: int = 0) -> None:
     save()
@@ -76,6 +85,11 @@ if args[:3] == ["cognitiveservices", "account", "create"]:
     if fail_code and sku != "S0":
         if state.get("create_partial_leak"):
             state["account"] = "live"
+        elif state.get("create_pending_leak"):
+            # Azure accepted the create but the CLI reported failure: the
+            # account exists and will show up in the listings shortly.
+            state["account"] = "pending"
+            state["pending_list_calls"] = state.get("create_pending_leak")
         fail({"error": {"code": fail_code, "message": "synthetic failure for tests"}})
     state["account"] = "live"
     state["created_sku"] = sku
@@ -95,6 +109,15 @@ if args[:3] == ["cognitiveservices", "account", "list"]:
     if state.get("fail_list"):
         print("ERROR: injected list failure", file=sys.stderr)
         done(code=1)
+    if state["account"] == "pending":
+        # Accepted by Azure but not yet visible: reports absent for the first
+        # `pending_list_calls` queries, then turns live. list-deleted reports
+        # absent throughout (it only ever knows the "deleted" state).
+        remaining = int(state.get("pending_list_calls", 0)) - 1
+        state["pending_list_calls"] = remaining
+        if remaining <= 0:
+            state["account"] = "live"
+        done("0")
     done("1" if state["account"] == "live" else "0")
 if args[:3] == ["cognitiveservices", "account", "delete"]:
     if state.get("fail_account_delete_once"):
@@ -114,7 +137,10 @@ if args[:3] == ["cognitiveservices", "account", "show"]:
         print("ERROR: injected show failure", file=sys.stderr)
         done(code=1)
     answers = {
-        "properties.endpoint": "https://fake.cognitiveservices.azure.com/",
+        # Derived from the --name argument, not a fixed string, so tests can
+        # assert the endpoint handed to the probe carries the RESOLVED
+        # per-run account name.
+        "properties.endpoint": f"https://{name_value()}.cognitiveservices.azure.com/",
         # Reflects whatever SKU the create call actually landed on (may
         # differ from the requested AZ_CONTENT_SAFETY_SKU if a fallback
         # retry fired), so tests can assert the orchestrator reads back and
@@ -161,6 +187,9 @@ if args[:4] == ["run", "python", "-m", "tools.prompt_shields_probe"]:
     # Recorded so tests can assert which SKU value the orchestrator actually
     # forwarded to the probe -- the requested one or the account's real one.
     state["probe_env_sku"] = os.environ.get("AZ_CONTENT_SAFETY_SKU")
+    # Recorded so tests can assert the probe (and therefore the evidence it
+    # writes) targets the RESOLVED per-run account, not the name prefix.
+    state["probe_env_endpoint"] = os.environ.get("CONTENT_SAFETY_ENDPOINT")
     exit_code = state.get("probe_exit_code", 0)
     if exit_code == 0 and "--evidence-out" in args:
         evidence_path = args[args.index("--evidence-out") + 1]
@@ -195,7 +224,7 @@ class Harness:
             "PATH": f"{fake_dir}:{os.environ['PATH']}",
             "AZ_FAKE_STATE": str(self.state_path),
             "AZ_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
-            "AZ_CONTENT_SAFETY_NAME": "cs-fake-d21",
+            "AZ_CONTENT_SAFETY_NAME": NAME_PREFIX,
             "AZ_CS_POLL_ATTEMPTS": "2",
             "AZ_CS_POLL_INTERVAL": "0",
             "AZ_CS_RETRY_INTERVAL": "0",
@@ -237,6 +266,21 @@ class Harness:
 
     def first_index(self, prefix: str) -> int:
         return next(i for i, call in enumerate(self.calls) if call.startswith(prefix))
+
+    @property
+    def created_name(self) -> str:
+        """The account name the `az cognitiveservices account create` call
+        actually used — i.e. the name this run resolved."""
+        call = self.first_call("cognitiveservices account create")
+        return arg_value(call, "--name")
+
+    def first_call(self, prefix: str) -> str:
+        return next(call for call in self.calls if call.startswith(prefix))
+
+
+def arg_value(call: str, flag: str) -> str:
+    parts = call.split()
+    return parts[parts.index(flag) + 1]
 
 
 # --- create-content-safety.sh -----------------------------------------------
@@ -391,6 +435,79 @@ def test_delete_of_absent_account_is_a_noop_success(tmp_path: Path) -> None:
     result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
     assert result.returncode == 0, result.stderr
     assert "Nothing to do" in result.stdout
+    assert not any(
+        call.startswith(("cognitiveservices account delete", "resource delete")) for call in h.calls
+    )
+
+
+def test_delete_absent_fast_path_does_not_wait_when_no_create_was_attempted(
+    tmp_path: Path,
+) -> None:
+    # An operator running this script standalone against a name that really is
+    # gone must not pay a stabilization wait: exactly one query of each
+    # listing, then exit 0. The wait only exists for the case where THIS run
+    # issued a create whose outcome is unknown.
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert "Nothing to do" in result.stdout
+    assert sum(call.startswith("cognitiveservices account list ") for call in h.calls) == 1
+    assert sum(call.startswith("cognitiveservices account list-deleted") for call in h.calls) == 1
+
+
+def test_delete_waits_for_an_account_that_is_not_visible_yet_when_create_was_attempted(
+    tmp_path: Path,
+) -> None:
+    # P1b. Azure accepted the create but the CLI reported failure, and neither
+    # listing has caught up: a single reading of "neither live nor
+    # soft-deleted" is NOT proof of absence. Short-circuiting on it abandons
+    # an account this run created, with no teardown ever running. With the
+    # create-attempted signal set, the script must wait (bounded) for the
+    # account to become visible and then delete AND purge it.
+    h = Harness(
+        tmp_path, provider="Registered", account="pending", pending_list_calls=2
+    )
+    result = h.run(
+        "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_CREATE_ATTEMPTED="1"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Nothing to do" not in result.stdout
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert h.state["account"] == "absent"
+
+
+def test_delete_stabilization_wait_is_bounded_when_account_never_appears(
+    tmp_path: Path,
+) -> None:
+    # The wait is bounded like every other wait in this script: an account
+    # that never materialises ends the run reporting there was nothing to
+    # delete, not looping forever and not failing the caller's teardown.
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run(
+        "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_CREATE_ATTEMPTED="1"
+    )
+    assert result.returncode == 0, result.stderr
+    assert not any(
+        call.startswith(("cognitiveservices account delete", "resource delete")) for call in h.calls
+    )
+    # One initial reading + AZ_CS_POLL_ATTEMPTS (2) re-readings, no more.
+    assert sum(call.startswith("cognitiveservices account list ") for call in h.calls) == 3
+
+
+def test_delete_stabilization_wait_aborts_on_query_failure_rather_than_reading_absent(
+    tmp_path: Path,
+) -> None:
+    # fail_query discipline holds inside the new wait too: a failed listing
+    # query is not a benign "still absent".
+    h = Harness(
+        tmp_path, provider="Registered", account="absent", fail_list_deleted=True
+    )
+    result = h.run(
+        "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_CREATE_ATTEMPTED="1"
+    )
+    assert result.returncode != 0
+    assert "Failed to query account state" in result.stderr
     assert not any(
         call.startswith(("cognitiveservices account delete", "resource delete")) for call in h.calls
     )
@@ -682,6 +799,148 @@ def test_orchestrator_explicit_teardown_failure_is_not_masked_by_trap_disarm(
     # The account was actually created and deleted (soft-deleted), just never
     # successfully purged — never silently reported as success.
     assert h.state["account"] == "deleted"
+
+
+# --- per-run account name ----------------------------------------------------
+
+
+def test_orchestrator_resolves_a_different_account_name_on_every_run(tmp_path: Path) -> None:
+    # AZ_CONTENT_SAFETY_NAME is a PREFIX at the orchestrator: each run appends
+    # an unpredictable suffix, so only this run could have invented the name it
+    # creates. That is what makes the teardown path safe — cleanup can only
+    # ever target a resource this run created, so the TOCTOU window between
+    # the pre-existence guard and `create` stops being a collision class at
+    # all rather than merely being narrowed.
+    names = []
+    for i in range(2):
+        run_dir = tmp_path / f"run{i}"
+        run_dir.mkdir()
+        h = Harness(run_dir, provider="Registered", account="absent")
+        result = h.run_direct(
+            "run-content-safety-probe.sh",
+            AZ_RESOURCE_GROUP="rg",
+            EVIDENCE_OUT=str(run_dir / "evidence.json"),
+        )
+        assert result.returncode == 0, result.stderr
+        name = h.created_name
+        assert name != NAME_PREFIX
+        assert RESOLVED_NAME_RE.match(name), name
+        names.append(name)
+    assert names[0] != names[1], "the per-run suffix must not be fixed"
+
+
+def test_orchestrator_uses_the_resolved_name_for_every_call_and_for_the_probe(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run_direct(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode == 0, result.stderr
+    resolved = h.created_name
+    for call in h.calls:
+        # Token membership, not substring: `--namespace` contains `--name`.
+        if "--name" in call.split():
+            assert arg_value(call, "--name") == resolved, call
+        # Both lifecycle scripts filter their listings by name via JMESPath.
+        if "name==" in call:
+            assert f"name=='{resolved}'" in call, call
+    # The purge resource id embeds the name too — purging by prefix would
+    # target something this run never created.
+    purge_id = arg_value(h.first_call("resource delete"), "--ids")
+    assert purge_id.endswith(f"/deletedAccounts/{resolved}"), purge_id
+    # The probe (and therefore the evidence it writes) talks to the resolved
+    # account, not to the prefix.
+    assert h.state["probe_env_endpoint"] == f"https://{resolved}.cognitiveservices.azure.com/"
+
+
+def test_orchestrator_fails_fast_when_the_name_prefix_is_too_long(tmp_path: Path) -> None:
+    # Cognitive Services account names are capped at 64 characters, so a
+    # prefix that cannot fit the per-run suffix must abort with a clear
+    # message rather than be silently truncated into a name that might
+    # collide with somebody else's account.
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        AZ_CONTENT_SAFETY_NAME="c" * 58,
+    )
+    assert result.returncode != 0
+    assert "AZ_CONTENT_SAFETY_NAME" in result.stderr
+    assert "57" in result.stderr  # the actual limit, not a vague complaint
+    assert not h.calls  # failed before any mutation, and before any query
+    assert not evidence.exists()
+
+
+def test_orchestrator_accepts_the_longest_prefix_that_still_fits(tmp_path: Path) -> None:
+    # The boundary is inclusive: 57 characters + "-" + 6 hex = exactly 64.
+    prefix = "c" * 57
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(tmp_path / "evidence.json"),
+        AZ_CONTENT_SAFETY_NAME=prefix,
+    )
+    assert result.returncode == 0, result.stderr
+    assert len(h.created_name) == 64
+
+
+@pytest.mark.parametrize(
+    "bad_prefix",
+    ["cs_fake_d21", "-cs-fake", "cs-fake-", "cs fake", ""],
+)
+def test_orchestrator_fails_fast_on_a_prefix_azure_would_reject(
+    tmp_path: Path, bad_prefix: str
+) -> None:
+    # Alphanumerics and hyphens only, starting and ending with an
+    # alphanumeric. Rejecting here keeps the failure at input-validation time
+    # instead of halfway through a create.
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        AZ_CONTENT_SAFETY_NAME=bad_prefix,
+    )
+    assert result.returncode != 0
+    assert "AZ_CONTENT_SAFETY_NAME" in result.stderr
+    assert not h.calls
+    assert not evidence.exists()
+
+
+def test_orchestrator_tears_down_an_account_that_only_becomes_visible_after_create_failed(
+    tmp_path: Path,
+) -> None:
+    # P1b end-to-end: Azure accepted the create, the CLI reported failure, and
+    # neither listing shows the account when cleanup starts. The orchestrator
+    # signals that a create was attempted, so cleanup waits instead of
+    # concluding "absent" — and the account this run created is deleted and
+    # purged rather than abandoned.
+    h = Harness(
+        tmp_path,
+        provider="Registered",
+        account="absent",
+        create_fail_code="SIMULATED_ACCEPTED_BUT_REPORTED_FAILED",
+        create_pending_leak=2,
+    )
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0  # the create failure is still a failure
+    assert h.state["account"] == "absent"
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
 
 
 # --- fixture resolution ------------------------------------------------------

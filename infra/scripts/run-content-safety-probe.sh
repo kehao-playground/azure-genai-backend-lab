@@ -35,10 +35,34 @@
 # refused, nothing to tear down" and skip the retry — even though create
 # succeeded and an account this run made is still live.
 #
+# ACCOUNT NAME OWNERSHIP: AZ_CONTENT_SAFETY_NAME is a name PREFIX here, not
+# the account name. This script appends an unpredictable per-run suffix
+# (6 hex characters from /dev/urandom) and exports the resolved name back
+# under the same variable, so both child scripts — whose own interface is
+# unchanged, they still take AZ_CONTENT_SAFETY_NAME as the final name — act
+# on the same resolved name.
+#
+# This is a correctness property, not cosmetics. The pre-existence guard in
+# create-content-safety.sh and the create itself are separate operations: a
+# name that was free at guard time can be taken by something else before
+# create runs, and that create then fails with a generic exit 1 — not the
+# guard's exit 3 — so CREATE_REFUSED stays 0 and the cleanup trap below
+# delete+PURGEs whatever now holds that name. Purge is irreversible. Because
+# only this run could have invented the resolved name, cleanup can only ever
+# target a resource this run created: the collision class disappears rather
+# than being narrowed. It is also what makes the stabilization wait in
+# delete-content-safety.sh safe — a bounded wait for a not-yet-visible
+# account cannot possibly wait onto somebody else's resource.
+#
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on default context)
 #   AZ_RESOURCE_GROUP      - existing resource group
-#   AZ_CONTENT_SAFETY_NAME - globally unique account name
+#   AZ_CONTENT_SAFETY_NAME - account name PREFIX (see above); must be 1-57
+#                             characters of alphanumerics and hyphens,
+#                             starting and ending with an alphanumeric, so
+#                             prefix + "-" + 6 hex fits the 64-character
+#                             Microsoft.CognitiveServices/accounts limit
+#                             (checked 2026-08)
 #   EVIDENCE_OUT            - path the probe writes its evidence JSON to; if
 #                              relative, it is resolved against the CALLER's
 #                              cwd (see cwd note below), not the repo root
@@ -99,6 +123,43 @@ fi
 # Validate inputs BEFORE any mutation.
 [ -r "$CASES_FILE" ] || { echo "cases file not readable: $CASES_FILE" >&2; exit 1; }
 
+# --- resolve the per-run account name (before anything is queried) ---------
+# Microsoft.CognitiveServices/accounts: 2-64 characters, alphanumerics and
+# hyphens, start and end with an alphanumeric (Azure resource naming rules,
+# checked 2026-08). The suffix costs 7 characters ("-" + 6 hex), so the
+# prefix must be at most 57. Too long is a hard failure, never a silent
+# truncation: a truncated prefix could collide with a name that is not ours,
+# which is exactly the ownership property this whole mechanism exists to
+# guarantee.
+CS_NAME_PREFIX="$AZ_CONTENT_SAFETY_NAME"
+CS_MAX_NAME_LENGTH=64
+CS_SUFFIX_LENGTH=6
+CS_MAX_PREFIX_LENGTH=$((CS_MAX_NAME_LENGTH - CS_SUFFIX_LENGTH - 1))
+if [ "${#CS_NAME_PREFIX}" -gt "$CS_MAX_PREFIX_LENGTH" ]; then
+  echo "AZ_CONTENT_SAFETY_NAME is a name PREFIX here: this script appends a ${CS_SUFFIX_LENGTH}-character per-run suffix." >&2
+  echo "'$CS_NAME_PREFIX' is ${#CS_NAME_PREFIX} characters; the limit is $CS_MAX_PREFIX_LENGTH (Cognitive Services account names cap at $CS_MAX_NAME_LENGTH)." >&2
+  echo "Shorten it — this script will not truncate, because a truncated prefix could collide with an account this run does not own." >&2
+  exit 1
+fi
+if ! [[ "$CS_NAME_PREFIX" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+  echo "AZ_CONTENT_SAFETY_NAME ('$CS_NAME_PREFIX') must be alphanumerics and hyphens only, starting and ending with an alphanumeric." >&2
+  echo "That is the Microsoft.CognitiveServices/accounts naming rule; the name is also used as the account's custom subdomain." >&2
+  exit 1
+fi
+# Cryptographically unpredictable, not $RANDOM (seeded, guessable) and not a
+# timestamp (two runs started in the same second would collide, and the value
+# is trivially predictable by anything else creating accounts).
+CS_RUN_SUFFIX=$(od -An -vN3 -tx1 /dev/urandom | tr -d ' \n') \
+  || { echo "Failed to read random bytes for the per-run account-name suffix; aborting rather than falling back to a predictable value." >&2; exit 1; }
+if ! [[ "$CS_RUN_SUFFIX" =~ ^[0-9a-f]{6}$ ]]; then
+  echo "Unexpected random suffix '$CS_RUN_SUFFIX'; aborting rather than creating an account under an unverified name." >&2
+  exit 1
+fi
+# Exported so BOTH child scripts see the resolved name under the variable
+# they already read — their interface does not change.
+export AZ_CONTENT_SAFETY_NAME="${CS_NAME_PREFIX}-${CS_RUN_SUFFIX}"
+echo "This run's Content Safety account name: $AZ_CONTENT_SAFETY_NAME (prefix '$CS_NAME_PREFIX' + per-run suffix)"
+
 # Set BEFORE the trap is armed (so the trap never reads an unset variable
 # under `set -u` on any early-exit path) and flipped ONLY at the
 # create-content-safety.sh call site below — see the block comment above for
@@ -123,6 +184,18 @@ cleanup() {
   exit "$status"   # preserve the original failure status
 }
 trap cleanup EXIT   # armed BEFORE create can leave a resource behind
+
+# Tells delete-content-safety.sh that a create was ISSUED under this name and
+# its outcome may be unknown, so a single reading of "in neither listing" is
+# not proof of absence — it must wait (bounded) before concluding there is
+# nothing to tear down. Exported BEFORE the create call, precisely because
+# the case it covers is a create whose result never came back: setting it
+# afterwards would leave it unset on exactly the path that needs it. Safe by
+# construction because the name is unique to this run — the wait can only
+# ever be waiting on our own account. It is unset when someone runs
+# delete-content-safety.sh standalone, which keeps the genuinely-absent fast
+# path free of a pointless wait.
+export AZ_CS_CREATE_ATTEMPTED=1
 
 # `$?` inside this `||` group is create-content-safety.sh's own exit status
 # (the `if ! cmd; then` shape would give 0 instead, losing that status).

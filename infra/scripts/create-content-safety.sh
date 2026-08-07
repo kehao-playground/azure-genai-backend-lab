@@ -6,8 +6,13 @@
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on the default context)
 #   AZ_RESOURCE_GROUP      - existing resource group
-#   AZ_CONTENT_SAFETY_NAME - globally unique account name (used as the custom
-#                             subdomain too)
+#   AZ_CONTENT_SAFETY_NAME - the FINAL, globally unique account name (used as
+#                             the custom subdomain too). Note the asymmetry
+#                             with run-content-safety-probe.sh, where the same
+#                             variable is a name PREFIX: that script resolves
+#                             a per-run unique name and exports it back under
+#                             this name, so this script's interface is
+#                             unchanged and it always receives a final name
 # Optional env vars:
 #   AZ_LOCATION            - defaults to japaneast; delete-content-safety.sh
 #                             defaults to the same value — override both or
@@ -62,6 +67,16 @@ fi
 # copy-pasted AZ_CONTENT_SAFETY_NAME) would mean this script adopts someone
 # else's account and the trap purges it.
 #
+# Kept as defence in depth even though run-content-safety-probe.sh now
+# resolves a per-run unique name, which makes a collision here near
+# unreachable for THAT caller: this script is also runnable standalone with
+# an operator-chosen name, and the guard is what protects that path. What the
+# guard cannot do on its own is close the window between this check and the
+# create below — they are separate operations, and a name taken in between
+# fails create with a generic exit 1, not the exit 3 the orchestrator treats
+# as "nothing of mine exists". That gap is closed by name uniqueness at the
+# orchestrator, not here.
+#
 # Exit code 3 is a deliberate, narrow signal shared with the orchestrator
 # (run-content-safety-probe.sh): "refused before touching anything — an
 # account already exists under this name, and nothing belonging to this run
@@ -104,7 +119,7 @@ fi
 trap 'status=$?; if [ "$status" -ne 0 ]; then
   echo "" >&2
   echo "create-content-safety.sh failed (exit $status). If the account was already created, clean up with:" >&2
-  echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP AZ_LOCATION=$AZ_LOCATION AZ_CONTENT_SAFETY_NAME=$AZ_CONTENT_SAFETY_NAME ./delete-content-safety.sh" >&2
+  echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP AZ_LOCATION=$AZ_LOCATION AZ_CONTENT_SAFETY_NAME=$AZ_CONTENT_SAFETY_NAME AZ_CS_CREATE_ATTEMPTED=1 ./delete-content-safety.sh" >&2
 fi' EXIT
 
 create_account() {
