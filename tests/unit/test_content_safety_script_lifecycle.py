@@ -1,0 +1,543 @@
+"""Fake-CLI state regressions for the Day 21 Content Safety lifecycle scripts
+(create-content-safety.sh, delete-content-safety.sh,
+run-content-safety-probe.sh).
+
+Mirrors tests/unit/test_keyvault_script_lifecycle.py: a fake `az` (and, for
+the orchestrator, a fake `uv`) is shimmed onto PATH and records every
+invocation to a call log, so ordering and argument assertions are exact and
+the whole suite runs in milliseconds — no real Azure call is ever made.
+
+Three things this repo has been bitten by before (Day 20 review) and this
+suite guards against here too:
+  - a `$(query)` used directly inside a conditional swallows the query's own
+    failure and misreads it as a benign value — every state query here is
+    `VAR=$(query) || fail_query ...` on its own line;
+  - a destructive/irreversible flag should be proven by read-back, not by
+    passing an explicit boolean (n/a for a key-based resource, but the
+    SKU-fallback allowlist follows the same "safe until proven" posture:
+    it starts empty and stays empty unless a code is explicitly allowlisted);
+  - a fresh script file is mode 0644 until `chmod +x`, so a regression that
+    drops the executable bit must fail a test that runs the script directly,
+    not through `bash script.sh`.
+"""
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "infra" / "scripts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CANONICAL_CASES_FILE = REPO_ROOT / "tools" / "prompt_shields_cases.json"
+
+FAKE_AZ = '''#!/usr/bin/env python3
+import json, os, sys
+
+state_path = os.environ["AZ_FAKE_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+
+args = sys.argv[1:]
+state.setdefault("calls", []).append(" ".join(args))
+
+def save() -> None:
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+
+def query_value() -> str:
+    return args[args.index("--query") + 1] if "--query" in args else ""
+
+def done(out: str = "", code: int = 0) -> None:
+    save()
+    if out:
+        print(out)
+    sys.exit(code)
+
+def fail(body: dict, code: int = 1) -> None:
+    save()
+    print(json.dumps(body), file=sys.stderr)
+    sys.exit(code)
+
+def registered() -> bool:
+    return state["provider"] == "Registered"
+
+joined = " ".join(args)
+
+if args[:2] == ["provider", "show"]:
+    done(state["provider"])
+if args[:2] == ["provider", "register"]:
+    state["provider"] = "Registered"
+    done()
+if args[:3] == ["cognitiveservices", "account", "create"]:
+    sku = args[args.index("--sku") + 1] if "--sku" in args else None
+    fail_code = state.get("create_fail_code")
+    if fail_code and sku != "S0":
+        if state.get("create_partial_leak"):
+            state["account"] = "live"
+        fail({"error": {"code": fail_code, "message": "synthetic failure for tests"}})
+    state["account"] = "live"
+    state["created_sku"] = sku
+    done("{}")
+if args[:3] == ["cognitiveservices", "account", "list-deleted"]:
+    if not registered():
+        print("ERROR: (MissingSubscriptionRegistration)", file=sys.stderr)
+        done(code=1)
+    if state.get("fail_list_deleted"):
+        print("ERROR: injected list-deleted failure", file=sys.stderr)
+        done(code=1)
+    done("1" if state["account"] == "deleted" else "0")
+if args[:3] == ["cognitiveservices", "account", "list"]:
+    if not registered():
+        print("ERROR: (MissingSubscriptionRegistration)", file=sys.stderr)
+        done(code=1)
+    if state.get("fail_list"):
+        print("ERROR: injected list failure", file=sys.stderr)
+        done(code=1)
+    done("1" if state["account"] == "live" else "0")
+if args[:3] == ["cognitiveservices", "account", "delete"]:
+    state["account"] = "limbo" if state.get("delete_limbo") else "deleted"
+    done()
+if args[:3] == ["cognitiveservices", "account", "show"]:
+    if state.get("fail_show"):
+        print("ERROR: injected show failure", file=sys.stderr)
+        done(code=1)
+    answers = {"properties.endpoint": "https://fake.cognitiveservices.azure.com/"}
+    done(answers.get(query_value(), ""))
+if args[:4] == ["cognitiveservices", "account", "keys", "list"]:
+    if state.get("fail_keys"):
+        print("ERROR: injected keys failure", file=sys.stderr)
+        done(code=1)
+    done("FAKE-KEY-VALUE" if query_value() == "key1" else "")
+if args[:2] == ["resource", "delete"]:
+    if state.get("fail_purge"):
+        print("ERROR: injected purge conflict", file=sys.stderr)
+        done(code=1)
+    state["account"] = "absent"
+    done()
+
+print(f"fake az: unhandled command: {joined}", file=sys.stderr)
+done(code=2)
+'''
+
+FAKE_UV = '''#!/usr/bin/env python3
+import json, os, sys
+
+state_path = os.environ["AZ_FAKE_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+
+args = sys.argv[1:]
+state.setdefault("calls", []).append(" ".join(args))
+
+def save() -> None:
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+
+if args[:4] == ["run", "python", "-m", "tools.prompt_shields_probe"]:
+    exit_code = state.get("probe_exit_code", 0)
+    if exit_code == 0 and "--evidence-out" in args:
+        evidence_path = args[args.index("--evidence-out") + 1]
+        with open(evidence_path, "w") as f:
+            json.dump({"results": []}, f)
+    save()
+    sys.exit(exit_code)
+
+save()
+print(f"fake uv: unhandled command: {' '.join(args)}", file=sys.stderr)
+sys.exit(2)
+'''
+
+
+class Harness:
+    def __init__(
+        self, tmp_path: Path, *, provider: str, account: str, **flags: object
+    ) -> None:
+        self.tmp_path = tmp_path
+        self.state_path = tmp_path / "state.json"
+        self.state_path.write_text(json.dumps({"provider": provider, "account": account, **flags}))
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir()
+        fake_az = fake_dir / "az"
+        fake_az.write_text(FAKE_AZ)
+        fake_az.chmod(0o755)
+        fake_uv = fake_dir / "uv"
+        fake_uv.write_text(FAKE_UV)
+        fake_uv.chmod(0o755)
+        self.env = {
+            **os.environ,
+            "PATH": f"{fake_dir}:{os.environ['PATH']}",
+            "AZ_FAKE_STATE": str(self.state_path),
+            "AZ_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
+            "AZ_CONTENT_SAFETY_NAME": "cs-fake-d21",
+            "AZ_CS_POLL_ATTEMPTS": "2",
+            "AZ_CS_POLL_INTERVAL": "0",
+            "AZ_CS_RETRY_INTERVAL": "0",
+        }
+
+    def run(self, script: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(SCRIPTS_DIR / script)],
+            env={**self.env, **extra_env},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def run_direct(self, script: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        # No "bash" prefix: this is the one path that fails closed (exit 126 /
+        # PermissionError) if a regression drops the executable bit.
+        return subprocess.run(
+            [str(SCRIPTS_DIR / script)],
+            env={**self.env, **extra_env},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    @property
+    def state(self) -> dict[str, object]:
+        return json.loads(self.state_path.read_text())  # type: ignore[no-any-return]
+
+    @property
+    def calls(self) -> list[str]:
+        return self.state.get("calls", [])  # type: ignore[return-value]
+
+    def first_index(self, prefix: str) -> int:
+        return next(i for i, call in enumerate(self.calls) if call.startswith(prefix))
+
+
+# --- create-content-safety.sh -----------------------------------------------
+
+
+def test_create_registers_provider_before_create_and_every_call_carries_subscription(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path, provider="NotRegistered", account="absent")
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert h.first_index("provider register") < h.first_index("cognitiveservices account create")
+    assert h.state["account"] == "live"
+    assert h.calls, "expected at least one az call"
+    for call in h.calls:
+        assert "--subscription" in call, call
+
+
+def test_create_f0_success_path(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert h.state["account"] == "live"
+    assert h.state["created_sku"] == "F0"
+    assert sum(call.startswith("cognitiveservices account create") for call in h.calls) == 1
+
+
+def test_create_sku_fallback_retries_on_allowlisted_code(tmp_path: Path) -> None:
+    h = Harness(
+        tmp_path, provider="Registered", account="absent", create_fail_code="TESTFALLBACK"
+    )
+    result = h.run(
+        "create-content-safety.sh",
+        AZ_RESOURCE_GROUP="rg",
+        CONTENT_SAFETY_SKU_FALLBACK_CODES="TESTFALLBACK",
+    )
+    assert result.returncode == 0, result.stderr
+    create_calls = [c for c in h.calls if c.startswith("cognitiveservices account create")]
+    assert len(create_calls) == 2
+    assert "--sku S0" in create_calls[1]
+    assert h.state["account"] == "live"
+    assert h.state["created_sku"] == "S0"
+
+
+def test_create_sku_fallback_ignores_override_for_non_matching_code(tmp_path: Path) -> None:
+    # The allowlist override is present but the observed code does not match
+    # it: still aborts, no retry. The mechanism checks the code, not merely
+    # whether an override was supplied.
+    h = Harness(
+        tmp_path, provider="Registered", account="absent", create_fail_code="OTHER_CODE"
+    )
+    result = h.run(
+        "create-content-safety.sh",
+        AZ_RESOURCE_GROUP="rg",
+        CONTENT_SAFETY_SKU_FALLBACK_CODES="TESTFALLBACK",
+    )
+    assert result.returncode != 0
+    create_calls = [c for c in h.calls if c.startswith("cognitiveservices account create")]
+    assert len(create_calls) == 1
+    assert h.state["account"] == "absent"
+
+
+@pytest.mark.parametrize(
+    "synthetic_code",
+    ["SIMULATED_UNKNOWN_CODE", "SIMULATED_AUTH_DENIED", "SIMULATED_WRONG_KIND"],
+)
+def test_create_aborts_on_any_failure_with_default_empty_allowlist(
+    tmp_path: Path, synthetic_code: str
+) -> None:
+    # These are synthetic stand-ins, not real Azure error codes: the point is
+    # that the DEFAULT (unset/empty) allowlist rejects every code, whatever
+    # its category. No CONTENT_SAFETY_SKU_FALLBACK_CODES override is set.
+    h = Harness(tmp_path, provider="Registered", account="absent", create_fail_code=synthetic_code)
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert not any(
+        call.startswith("cognitiveservices account create") and "--sku S0" in call
+        for call in h.calls
+    )
+    assert sum(call.startswith("cognitiveservices account create") for call in h.calls) == 1
+    assert h.state["account"] == "absent"
+
+
+# --- delete-content-safety.sh -----------------------------------------------
+
+
+def test_delete_requires_resource_group_even_when_soft_deleted_only(tmp_path: Path) -> None:
+    # Deviation from delete-keyvault.sh: the Cognitive Services purge resource
+    # ID embeds the ORIGINAL resource group, so it cannot be constructed from
+    # name + location alone even when the account is only soft-deleted.
+    h = Harness(tmp_path, provider="Registered", account="deleted")
+    result = h.run("delete-content-safety.sh")  # no AZ_RESOURCE_GROUP
+    assert result.returncode != 0
+    assert "AZ_RESOURCE_GROUP" in result.stderr
+    assert not h.calls
+
+
+def test_delete_purges_soft_deleted_directly(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="deleted")
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert h.state["account"] == "absent"
+    assert not any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert "no active or soft-deleted account" in result.stdout
+
+
+def test_delete_of_absent_account_is_a_noop_success(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert "Nothing to do" in result.stdout
+    assert not any(
+        call.startswith(("cognitiveservices account delete", "resource delete")) for call in h.calls
+    )
+
+
+def test_delete_full_cycle_from_live(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="live")
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert h.first_index("cognitiveservices account delete") < h.first_index("resource delete")
+    assert h.state["account"] == "absent"
+    assert "no active or soft-deleted account" in result.stdout
+
+
+def test_delete_times_out_bounded_when_proxy_never_appears(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="live", delete_limbo=True)
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "did not appear within the deadline" in result.stderr
+    assert not any(call.startswith("resource delete") for call in h.calls)
+    assert sum(call.startswith("cognitiveservices account list-deleted") for call in h.calls) == 2
+
+
+def test_delete_purge_failure_is_bounded_to_three_attempts(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="deleted", fail_purge=True)
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "Purge failed after 3 attempts" in result.stderr
+    assert sum(call.startswith("resource delete") for call in h.calls) == 3
+
+
+def test_delete_aborts_on_query_failure_before_mutating(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="live", fail_list=True)
+    result = h.run("delete-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "Failed to query account state" in result.stderr
+    assert not any(
+        call.startswith(("cognitiveservices account delete", "resource delete")) for call in h.calls
+    )
+
+
+# --- run-content-safety-probe.sh --------------------------------------------
+
+
+def test_orchestrator_happy_path_full_lifecycle_direct_execution(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run_direct(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode == 0, result.stderr
+    assert h.state["account"] == "absent"  # explicit teardown ran, trap did not re-fire
+    probe_calls = [c for c in h.calls if c.startswith("run python -m tools.prompt_shields_probe")]
+    assert len(probe_calls) == 1
+    assert f"--cases-file {CANONICAL_CASES_FILE}" in probe_calls[0]
+    assert f"--evidence-out {evidence}" in probe_calls[0]
+    # trap-before-create ordering: create is the first mutating call.
+    assert h.first_index("cognitiveservices account create") < h.first_index(
+        "run python -m tools.prompt_shields_probe"
+    )
+    # Exactly one full delete->purge cycle: the explicit teardown, not a
+    # second cleanup-triggered one (which would mean the trap misfired).
+    assert sum(call.startswith("cognitiveservices account delete") for call in h.calls) == 1
+    assert sum(call.startswith("resource delete") for call in h.calls) == 1
+
+
+def test_orchestrator_teardown_runs_when_create_leaves_partial_resource(tmp_path: Path) -> None:
+    # The trap is armed BEFORE create runs: a create that fails after the
+    # resource actually got created must not leave it behind.
+    h = Harness(
+        tmp_path,
+        provider="Registered",
+        account="absent",
+        create_fail_code="SIMULATED_PARTIAL_FAILURE",
+        create_partial_leak=True,
+    )
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert h.state["account"] == "absent"  # cleanup trap purged the leaked resource
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_teardown_runs_when_endpoint_retrieval_fails(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent", fail_show=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    # The account must actually have been created, then torn down by the
+    # trap — not merely "still absent" because nothing ran at all.
+    assert any(call.startswith("cognitiveservices account create") for call in h.calls)
+    assert any(call.startswith("cognitiveservices account show") for call in h.calls)
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert h.state["account"] == "absent"  # trap still tore down the created account
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_teardown_runs_when_key_retrieval_fails(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent", fail_keys=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert any(call.startswith("cognitiveservices account create") for call in h.calls)
+    assert any(call.startswith("cognitiveservices account keys list") for call in h.calls)
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+    assert h.state["account"] == "absent"
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_teardown_runs_and_status_preserved_when_probe_fails(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent", probe_exit_code=5)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    # The original probe exit status survives the cleanup trap verbatim.
+    assert result.returncode == 5, result.stderr
+    assert h.state["account"] == "absent"
+    assert any(call.startswith("cognitiveservices account delete") for call in h.calls)
+    assert any(call.startswith("resource delete") for call in h.calls)
+
+
+def test_orchestrator_explicit_teardown_failure_is_not_masked_by_trap_disarm(
+    tmp_path: Path,
+) -> None:
+    # Purge fails every time (both the explicit end-of-run teardown and the
+    # cleanup trap's own teardown attempt): the run must still end non-zero.
+    # A prior success followed by a masked failure would be exactly the
+    # double-failure-becomes-success bug this test exists to catch.
+    h = Harness(tmp_path, provider="Registered", account="absent", fail_purge=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert "cleanup: delete-content-safety.sh failed" in result.stderr
+    # Explicit teardown (3 attempts) + cleanup-triggered retry (3 attempts).
+    assert sum(call.startswith("resource delete") for call in h.calls) == 6
+    # The account was actually created and deleted (soft-deleted), just never
+    # successfully purged — never silently reported as success.
+    assert h.state["account"] == "deleted"
+
+
+# --- fixture resolution ------------------------------------------------------
+
+
+def test_orchestrator_resolves_canonical_cases_file_when_unset(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode == 0, result.stderr
+    probe_calls = [c for c in h.calls if c.startswith("run python -m tools.prompt_shields_probe")]
+    assert f"--cases-file {CANONICAL_CASES_FILE}" in probe_calls[0]
+
+
+def test_orchestrator_honors_cases_file_override(tmp_path: Path) -> None:
+    custom_cases = tmp_path / "custom-cases.json"
+    custom_cases.write_text("{}")
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        PROMPT_SHIELDS_CASES_FILE=str(custom_cases),
+    )
+    assert result.returncode == 0, result.stderr
+    probe_calls = [c for c in h.calls if c.startswith("run python -m tools.prompt_shields_probe")]
+    assert f"--cases-file {custom_cases}" in probe_calls[0]
+
+
+def test_orchestrator_fails_fast_on_missing_resolved_cases_file_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+        PROMPT_SHIELDS_CASES_FILE=str(missing),
+    )
+    assert result.returncode != 0
+    assert "cases file not readable" in result.stderr
+    assert not h.calls  # validated before create-content-safety.sh (or anything else) ran
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["create-content-safety.sh", "delete-content-safety.sh", "run-content-safety-probe.sh"],
+)
+def test_scripts_exist_and_are_executable(script: str) -> None:
+    path = SCRIPTS_DIR / script
+    assert path.is_file()
+    assert os.access(path, os.X_OK)
