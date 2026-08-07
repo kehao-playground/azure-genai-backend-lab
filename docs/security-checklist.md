@@ -19,7 +19,7 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] Instructions are versioned assets loaded at startup, never assembled from request data — `prompts/loader.py`, `prompts/*.md`
 - [ ] No template engine and no variable interpolation in any prompt path (no SSTI surface) — `prompts/loader.py`
 - [ ] Conversation history carries only `user`/`assistant` items; end-user text never enters a `system`-role message — [api-conventions.md](api-conventions.md#conversation-state)
-- [ ] Request input is byte-capped before it reaches the model — `services/agent_framework.py` (`AGENT_MAX_TASK_BYTES = 4000`)
+- [ ] `/agent` task input and `/rag` question are byte-capped before they reach the model — `services/agent_framework.py` (`AGENT_MAX_TASK_BYTES = 4000`), `api/rag.py` (`RagRequest.question`, `max_length=2000`). `/chat` and `/chat/stream` declare only `min_length=1` — no upper bound on message length
 
 ## Tool least privilege
 
@@ -55,7 +55,7 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] Assembled prompt is bounded server-side, rank-ordered, stop-at-first-overflow — `services/rag.py` (`MAX_PROMPT_BYTES`, `_select_within_budget`)
 - [ ] Agent tool calls are bounded by sequential tool mode, a per-run admission counter, and the framework's own cap — `services/agent_framework.py` (`AdmissionState`)
 - [ ] A subscription budget alert exists, and is understood as delayed notification, not a spending cap — `infra/scripts/create-budget-alert.sh`, [cost-and-monitoring.md](cost-and-monitoring.md)
-- [ ] Every create script has a teardown script — `infra/scripts/`
+- [ ] Every script that creates a probe or demo Azure resource pairs with a delete script — OpenAI, Search, Key Vault, Content Safety and the Entra app registration (`infra/scripts/create-*.sh` / `delete-*.sh`), plus `teardown.sh` for the whole resource group. Two named exceptions: `create-budget-alert.sh` has no delete counterpart because the subscription budget alert is deliberately persistent, not ephemeral; `deploy-container-app.sh` has no dedicated delete script and is removed only via `teardown.sh`
 
 ## Logging and redaction
 
