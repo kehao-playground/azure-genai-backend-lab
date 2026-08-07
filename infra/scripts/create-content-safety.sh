@@ -65,13 +65,17 @@ fi
 # Exit code 3 is a deliberate, narrow signal shared with the orchestrator
 # (run-content-safety-probe.sh): "refused before touching anything — an
 # account already exists under this name, and nothing belonging to this run
-# was created." The orchestrator's cleanup trap special-cases exactly this
-# status to skip teardown, so it never purges an account it did not create.
-# Every OTHER failure in this script (query failures, create failures) keeps
-# exit 1, because those still need the orchestrator's normal teardown (e.g. a
-# create that fails after partially creating the account). Do not reuse exit
-# 3 for any new failure path unless it is equally true that this run created
-# nothing.
+# was created." The orchestrator captures THIS script's own exit status at
+# ITS call site (immediately after invoking create-content-safety.sh) and
+# latches a dedicated CREATE_REFUSED flag only when that status is 3 — it
+# does not infer refusal from a bare `$? -eq 3` read inside its cleanup
+# trap, because other commands (e.g. delete-content-safety.sh's own internal
+# az calls) can also exit 3 for unrelated reasons and must not be misread as
+# this guard's refusal. Every OTHER failure in this script (query failures,
+# create failures) keeps exit 1, because those still need the orchestrator's
+# normal teardown (e.g. a create that fails after partially creating the
+# account). Do not reuse exit 3 for any new failure path unless it is
+# equally true that this run created nothing.
 if ! LIVE_COUNT=$(az cognitiveservices account list --subscription "$AZ_SUBSCRIPTION_ID" \
     --query "length([?name=='$AZ_CONTENT_SAFETY_NAME'])" -o tsv); then
   fail_query "live Content Safety accounts in the subscription"

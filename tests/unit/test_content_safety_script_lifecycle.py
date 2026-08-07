@@ -97,6 +97,16 @@ if args[:3] == ["cognitiveservices", "account", "list"]:
         done(code=1)
     done("1" if state["account"] == "live" else "0")
 if args[:3] == ["cognitiveservices", "account", "delete"]:
+    if state.get("fail_account_delete_once"):
+        # Consumed after one shot: simulates `az cognitiveservices account
+        # delete` itself exiting 3 (Azure CLI's own resource-not-found
+        # status) on exactly the FIRST call this run makes, unrelated to
+        # create-content-safety.sh's pre-existence guard. The account is
+        # NOT mutated to "deleted" here -- the delete did not succeed -- so
+        # a subsequent retry call still sees it as "live".
+        state["fail_account_delete_once"] = False
+        print("ERROR: injected account delete exit 3 (resource-not-found)", file=sys.stderr)
+        done(code=3)
     state["account"] = "limbo" if state.get("delete_limbo") else "deleted"
     done()
 if args[:3] == ["cognitiveservices", "account", "show"]:
@@ -509,6 +519,40 @@ def test_orchestrator_does_not_purge_preexisting_soft_deleted_account_on_refusal
     assert not any(call.startswith("resource delete") for call in h.calls)
     assert h.state["account"] == "deleted"  # untouched: this run never owned it
     assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_retries_teardown_when_explicit_teardown_itself_exits_3(
+    tmp_path: Path,
+) -> None:
+    # A bug this test catches: create-content-safety.sh's pre-existence guard
+    # is not the only thing that can exit 3. `az cognitiveservices account
+    # delete` can itself exit 3 (Azure CLI's own resource-not-found status)
+    # for reasons that have nothing to do with that guard. Here: create
+    # succeeds, the probe succeeds, and the EXPLICIT end-of-run teardown call
+    # near the bottom of the orchestrator fails because its internal
+    # `account delete` call exits 3. `set -e` propagates that 3 into the EXIT
+    # trap. A cleanup() that infers "create refused, nothing to tear down"
+    # from a bare `status -eq 3` comparison would misread this and skip the
+    # retry teardown -- leaving the account this run DID create still live,
+    # while printing a message that says the opposite of what happened. The
+    # fix must instead retry teardown and never print the refusal message.
+    h = Harness(
+        tmp_path, provider="Registered", account="absent", fail_account_delete_once=True
+    )
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    # The original (explicit-teardown) failure status survives -- this run's
+    # own step failed even though the trap's retry eventually cleaned up.
+    assert result.returncode != 0
+    assert "refused" not in result.stderr
+    assert "cleanup: delete-content-safety.sh failed" not in result.stderr
+    assert h.state["account"] == "absent"  # the trap's retry actually tore it down
+    assert sum(call.startswith("cognitiveservices account delete") for call in h.calls) == 2
+    assert sum(call.startswith("resource delete") for call in h.calls) == 1
 
 
 def test_orchestrator_teardown_runs_when_create_leaves_partial_resource(tmp_path: Path) -> None:
