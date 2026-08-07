@@ -20,9 +20,20 @@
 # ONE exception to "the trap always tears down": create-content-safety.sh
 # exits 3 when its pre-existence guard refuses because an account already
 # exists under this name (live or soft-deleted). That guard runs before any
-# mutation, so this run created nothing — the trap detects status 3 and
-# skips teardown, or it would purge an account it never created. Every other
-# non-zero status still gets the normal delete+purge cleanup.
+# mutation, so this run created nothing — skipping teardown then avoids
+# purging an account it never created. Every other non-zero status still
+# gets the normal delete+purge cleanup.
+#
+# That refusal is detected via a dedicated CREATE_REFUSED flag set ONLY at
+# the create-content-safety.sh call site below, never by comparing the
+# trap's bare `$status` to 3. `$status` in the trap is whatever the LAST
+# failing command returned, and other commands in this script — notably
+# delete-content-safety.sh's own internal `az ... delete` calls — can also
+# exit 3 for unrelated reasons (Azure CLI's own resource-not-found status).
+# If the explicit end-of-run teardown near the bottom of this script fails
+# with exit 3, a bare `status -eq 3` check would misread that as "create
+# refused, nothing to tear down" and skip the retry — even though create
+# succeeded and an account this run made is still live.
 #
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID     - target subscription (never rely on default context)
@@ -73,15 +84,23 @@ fi
 # Validate inputs BEFORE any mutation.
 [ -r "$CASES_FILE" ] || { echo "cases file not readable: $CASES_FILE" >&2; exit 1; }
 
+# Set BEFORE the trap is armed (so the trap never reads an unset variable
+# under `set -u` on any early-exit path) and flipped ONLY at the
+# create-content-safety.sh call site below — see the block comment above for
+# why this must not be inferred from a bare exit-status comparison.
+CREATE_REFUSED=0
+
 cleanup() {
   status=$?
-  # Exit code 3 from create-content-safety.sh is the pre-existence guard's
-  # refusal signal: an account already existed under this name (live or
-  # soft-deleted) and this run created nothing. Purging on that path would
-  # destroy an account this run never owned, so skip teardown — see the
-  # matching comment in create-content-safety.sh for the full contract.
-  # Every other non-zero status still needs the normal delete+purge cleanup.
-  if [ "$status" -eq 3 ]; then
+  # CREATE_REFUSED is set only when create-content-safety.sh itself returned
+  # exit 3 (its pre-existence guard refusing because an account already
+  # existed under this name, live or soft-deleted). That guard runs before
+  # any mutation, so this run created nothing — purging here would destroy
+  # an account this run never owned, so skip teardown. See the matching
+  # comment in create-content-safety.sh for the full contract. Every other
+  # failure — including a `delete-content-safety.sh` exit 3 from its own
+  # internal az call — still needs the normal delete+purge cleanup.
+  if [ "$CREATE_REFUSED" = 1 ]; then
     echo "cleanup: create-content-safety.sh refused (account already existed) — skipping teardown, nothing was created." >&2
   else
     "$SCRIPT_DIR/delete-content-safety.sh" || echo "cleanup: delete-content-safety.sh failed" >&2
@@ -90,7 +109,12 @@ cleanup() {
 }
 trap cleanup EXIT   # armed BEFORE create can leave a resource behind
 
-"$SCRIPT_DIR/create-content-safety.sh"
+# `$?` inside this `||` group is create-content-safety.sh's own exit status
+# (the `if ! cmd; then` shape would give 0 instead, losing that status).
+# CREATE_REFUSED is set here and ONLY here, so no later command's unrelated
+# exit-3 can be mistaken for this refusal.
+"$SCRIPT_DIR/create-content-safety.sh" \
+  || { create_status=$?; [ "$create_status" -eq 3 ] && CREATE_REFUSED=1; exit "$create_status"; }
 
 ENDPOINT=$(az cognitiveservices account show --name "$AZ_CONTENT_SAFETY_NAME" \
   --resource-group "$AZ_RESOURCE_GROUP" --subscription "$AZ_SUBSCRIPTION_ID" \
