@@ -4,6 +4,8 @@
 - [Microsoft Entra ID Authentication](entra-id-auth.md) — the two auth modes, app registrations, validation chain, 401/403 contract
 - [Key Vault Configuration](key-vault-config.md) — secret inventory, vault decisions, rotation reality, what actually belongs in the vault
 - [Managed Identity](managed-identity.md) — keyless auth verified live, DefaultAzureCredential risks, the Day 24 identity plan
+- [Prompt Injection & Tool Abuse](prompt-injection.md) — threat model, the lab's structural defenses, G1/G2 fixes, unsafe-vs-safe tools
+- [Security Checklist](security-checklist.md) — the operable checklist; Day 29 production checklist references it
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
