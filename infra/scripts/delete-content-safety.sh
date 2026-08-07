@@ -79,11 +79,21 @@ AZ_CS_CREATE_ATTEMPTED="${AZ_CS_CREATE_ATTEMPTED:-0}"
 require_positive_int() {
   local value="$1" name="$2"
   case "$value" in
-    ''|*[!0-9]*|0)
-      echo "$name must be a positive integer; got '$value'. Aborting rather than silently skipping the loop it bounds (a non-numeric or zero value makes \`seq\` fail, or produce an empty range, and the loop run zero times, not error out)." >&2
+    ''|*[!0-9]*)
+      echo "$name must be a positive integer; got '$value'. Aborting rather than silently skipping the loop it bounds (a non-numeric value makes \`seq\` fail, and the loop run zero times, not error out)." >&2
       exit 1
       ;;
   esac
+  # The glob above only rejects non-digit characters, so '0', '00', '0000',
+  # etc. all pass it -- they are digits-only but numerically zero. Compare
+  # numerically (base 10 explicitly, so a leading zero like '010' is not
+  # misread as octal by `$(( ))`) instead of matching the literal string '0':
+  # a glob arm for '0' alone lets '00' and wider slip through as "not the
+  # exact string", even though they select the same zero-length \`seq\` range.
+  if [ "$((10#$value))" -eq 0 ]; then
+    echo "$name must be a positive integer; got '$value'. Aborting rather than silently skipping the loop it bounds (a zero value makes a positive-integer \`seq\` bound produce an empty range on GNU coreutils -- \`seq\`'s handling of a zero upper bound is not the same across implementations -- and the loop run zero times either way, not error out)." >&2
+    exit 1
+  fi
 }
 require_positive_int "$AZ_CS_POLL_ATTEMPTS" AZ_CS_POLL_ATTEMPTS
 

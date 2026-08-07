@@ -158,7 +158,13 @@ if args[:4] == ["cognitiveservices", "account", "keys", "list"]:
     if state.get("fail_keys"):
         print("ERROR: injected keys failure", file=sys.stderr)
         done(code=1)
-    done("FAKE-KEY-VALUE" if query_value() == "key1" else "")
+    if query_value() == "key1":
+        # `empty_key_field` is the same "-o tsv" trap as
+        # `empty_endpoint_field`/`empty_sku_field` above, applied to the key
+        # read-back: the command succeeds (exit 0) but the queried field is
+        # absent from the response.
+        done("" if state.get("empty_key_field") else "FAKE-KEY-VALUE")
+    done("")
 if args[:2] == ["resource", "delete"]:
     if state.get("fail_purge"):
         print("ERROR: injected purge conflict", file=sys.stderr)
@@ -426,7 +432,7 @@ def test_delete_requires_resource_group_even_when_soft_deleted_only(tmp_path: Pa
     assert not h.calls
 
 
-@pytest.mark.parametrize("bad_value", ["abc", "1.5", "-1", "0"])
+@pytest.mark.parametrize("bad_value", ["abc", "1.5", "-1", "0", "00"])
 def test_delete_aborts_on_non_numeric_poll_attempts_rather_than_silently_skipping(
     tmp_path: Path, bad_value: str
 ) -> None:
@@ -440,7 +446,11 @@ def test_delete_aborts_on_non_numeric_poll_attempts_rather_than_silently_skippin
     # string is not covered here: `${AZ_CS_POLL_ATTEMPTS:-24}` treats an
     # empty value the same as unset and falls back to the default, matching
     # every other `:-`-defaulted knob in this script -- that is correct,
-    # existing behavior, not the bug.)
+    # existing behavior, not the bug.) "00" is its own case, not just a
+    # restatement of "0": a validator that matches only the literal string
+    # "0" lets "00" (and wider) slip through as digits-only but numerically
+    # zero -- on GNU coreutils `seq 1 00` yields an empty range exactly like
+    # `seq 1 0`, so this must abort the same way.
     h = Harness(tmp_path, provider="Registered", account="live")
     result = h.run(
         "delete-content-safety.sh", AZ_RESOURCE_GROUP="rg", AZ_CS_POLL_ATTEMPTS=bad_value
@@ -822,6 +832,28 @@ def test_orchestrator_aborts_when_sku_readback_is_empty(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "empty" in result.stderr.lower()
     assert "sku" in result.stderr.lower()
+    assert h.state["account"] == "absent"  # trap still tore down the created account
+    assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
+
+
+def test_orchestrator_aborts_when_key_readback_is_empty(tmp_path: Path) -> None:
+    # Same "-o tsv" trap as the endpoint and SKU cases, applied to the key
+    # read-back: `az ... --query key1 -o tsv` can succeed while the queried
+    # field is absent, returning an empty string. `require_nonempty` is
+    # applied to KEY too (infra/scripts/run-content-safety-probe.sh:262), but
+    # until this test existed, nothing in this suite exercised that guard --
+    # only the endpoint and SKU siblings had fake-CLI coverage, so a
+    # regression that dropped the key guard specifically would pass silently.
+    h = Harness(tmp_path, provider="Registered", account="absent", empty_key_field=True)
+    evidence = tmp_path / "evidence.json"
+    result = h.run(
+        "run-content-safety-probe.sh",
+        AZ_RESOURCE_GROUP="rg",
+        EVIDENCE_OUT=str(evidence),
+    )
+    assert result.returncode != 0
+    assert "empty" in result.stderr.lower()
+    assert "key" in result.stderr.lower()
     assert h.state["account"] == "absent"  # trap still tore down the created account
     assert not any(call.startswith("run python -m tools.prompt_shields_probe") for call in h.calls)
 
