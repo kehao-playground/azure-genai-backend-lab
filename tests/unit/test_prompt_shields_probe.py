@@ -15,6 +15,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "prompt_shields_probe.py"
@@ -227,3 +228,161 @@ def test_canonical_fixture_loads_and_matches_matrix() -> None:
     # Smoke: the shipped fixture is a valid fixed 8-case matrix.
     root = Path(__file__).resolve().parents[2]  # repo root from tests/unit/
     prompt_shields_probe.validate_matrix(load_cases(root / "tools" / "prompt_shields_cases.json"))
+
+
+# --- F2: C4 partial-verdict 2xx must be a recordable observation ---------
+
+
+def test_classify_c4_only_docs_2xx_missing_user_analysis_is_observation() -> None:
+    # No userPrompt was sent; userPromptAnalysis simply isn't in the body.
+    # This is exactly the finding case 8 exists to make, not a parse error.
+    body = {"documentsAnalysis": [{"attackDetected": True}]}
+    v = classify_response(_case("c4_only_docs", user=None, docs=("d",)), 200, body)
+    assert v.outcome == "observation"
+    assert v.user_attack_detected is None  # absent, never coerced to False
+    assert v.documents_attack_detected == (True,)
+
+
+def test_classify_c4_only_docs_2xx_null_user_analysis_is_observation() -> None:
+    # Same finding, but the service sends an explicit null instead of
+    # omitting the key. Both must be treated as the expected omission.
+    body = {"userPromptAnalysis": None, "documentsAnalysis": [{"attackDetected": False}]}
+    v = classify_response(_case("c4_only_docs", user=None, docs=("d",)), 200, body)
+    assert v.outcome == "observation"
+    assert v.user_attack_detected is None
+    assert v.documents_attack_detected == (False,)
+
+
+def test_classify_c4_only_user_2xx_missing_documents_analysis_is_observation() -> None:
+    # Mirror of the above: no documents were sent, so documentsAnalysis is
+    # absent. userPromptAnalysis must still carry a real bool.
+    body = {"userPromptAnalysis": {"attackDetected": True}}
+    v = classify_response(_case("c4_only_user", user="u", docs=()), 200, body)
+    assert v.outcome == "observation"
+    assert v.user_attack_detected is True
+    assert v.documents_attack_detected == ()
+
+
+def test_classify_c4_only_docs_2xx_wrong_document_cardinality_is_failure() -> None:
+    # c4_only_docs sends exactly one document; two verdicts back is a real
+    # cardinality mismatch, not the expected-omission leniency.
+    body = {"documentsAnalysis": [{"attackDetected": True}, {"attackDetected": False}]}
+    v = classify_response(_case("c4_only_docs", user=None, docs=("d",)), 200, body)
+    assert v.outcome == "failure"
+
+
+def test_classify_non_c4_2xx_missing_analysis_is_still_failure() -> None:
+    # Cases 1-6 keep the strict contract: the partial-verdict leniency is
+    # scoped to the two C4 cases only.
+    body = {"documentsAnalysis": [{"attackDetected": True}]}
+    v = classify_response(_case("direct"), 200, body)
+    assert v.outcome == "failure"
+
+
+# --- F3: malformed 2xx must capture the body's shape, not just reject it --
+
+
+def test_classify_malformed_2xx_records_body_shape() -> None:
+    body = {"unexpected": "shape", "userPromptAnalysis": "not-a-dict"}
+    v = classify_response(_case("baseline"), 200, body)
+    assert v.outcome == "failure"
+    assert v.body_shape is not None
+    assert v.body_shape["top_level_keys"] == ["unexpected", "userPromptAnalysis"]
+    assert v.body_shape["userPromptAnalysis"] == "present:str"
+    assert v.body_shape["documentsAnalysis"] == "absent"
+
+
+def test_classify_2xx_success_leaves_body_shape_none() -> None:
+    body = {"userPromptAnalysis": {"attackDetected": True},
+            "documentsAnalysis": [{"attackDetected": False}]}
+    v = classify_response(_case("direct"), 200, body)
+    assert v.body_shape is None
+
+
+# --- F1: bounded pacing/retry on 429 --------------------------------------
+
+
+def _http_response(
+    status: int, *, json_body: dict | None = None, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    request = httpx.Request("POST", "https://cs.example/contentsafety/text:shieldPrompt")
+    if json_body is not None:
+        return httpx.Response(status, request=request, json=json_body, headers=headers)
+    return httpx.Response(status, request=request, headers=headers)
+
+
+class _FakeClient:
+    """Stands in for httpx.Client: returns queued responses in call order."""
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    def post(self, url: str, *, headers: dict[str, str], json: dict) -> httpx.Response:
+        self.calls += 1
+        return self._responses.pop(0)
+
+
+def test_post_with_backoff_retries_on_429_then_succeeds() -> None:
+    client = _FakeClient([
+        _http_response(429),
+        _http_response(200, json_body={
+            "userPromptAnalysis": {"attackDetected": False},
+            "documentsAnalysis": [{"attackDetected": False}],
+        }),
+    ])
+    sleeps: list[float] = []
+    response, attempts = prompt_shields_probe._post_with_backoff(
+        client, "https://cs.example/x", headers={}, json_body={}, sleep=sleeps.append
+    )
+    assert attempts == 2
+    assert response.status_code == 200
+    assert len(sleeps) == 1
+    v = classify_response(_case("direct"), response.status_code, response.json())
+    assert v.outcome == "observation"
+
+
+def test_post_with_backoff_honors_retry_after_header() -> None:
+    client = _FakeClient([
+        _http_response(429, headers={"Retry-After": "7"}),
+        _http_response(200, json_body={
+            "userPromptAnalysis": {"attackDetected": False},
+            "documentsAnalysis": [{"attackDetected": False}],
+        }),
+    ])
+    sleeps: list[float] = []
+    prompt_shields_probe._post_with_backoff(
+        client, "https://cs.example/x", headers={}, json_body={}, sleep=sleeps.append
+    )
+    assert sleeps == [7.0]
+
+
+def test_post_with_backoff_falls_back_on_malformed_retry_after() -> None:
+    client = _FakeClient([
+        _http_response(429, headers={"Retry-After": "not-a-number"}),
+        _http_response(200, json_body={
+            "userPromptAnalysis": {"attackDetected": False},
+            "documentsAnalysis": [{"attackDetected": False}],
+        }),
+    ])
+    sleeps: list[float] = []
+    prompt_shields_probe._post_with_backoff(
+        client, "https://cs.example/x", headers={}, json_body={}, sleep=sleeps.append
+    )
+    assert sleeps == [prompt_shields_probe.RETRY_BACKOFF_SECONDS]
+
+
+def test_post_with_backoff_exhausts_bound_and_stays_429() -> None:
+    client = _FakeClient([_http_response(429) for _ in range(10)])
+    sleeps: list[float] = []
+    response, attempts = prompt_shields_probe._post_with_backoff(
+        client, "https://cs.example/x", headers={}, json_body={}, sleep=sleeps.append
+    )
+    assert response.status_code == 429
+    assert attempts == prompt_shields_probe.MAX_ATTEMPTS
+    assert client.calls == prompt_shields_probe.MAX_ATTEMPTS
+    assert len(sleeps) == prompt_shields_probe.MAX_ATTEMPTS - 1  # no sleep after the last attempt
+    v = classify_response(
+        _case("c4_only_docs", user=None), 429, {"error": {"code": "x", "message": "y"}}
+    )
+    assert v.outcome == "failure"
