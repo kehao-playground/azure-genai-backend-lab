@@ -15,8 +15,9 @@ prompt injection via poisoned corpus stays on the threat-model page.
 
 import logging
 import re
+import secrets
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -131,28 +132,34 @@ class RagAnswer:
                 )
 
 
-def render_sources(hits: Sequence[SearchHit]) -> str:
+def _default_nonce() -> str:
+    # 16 bytes -> 32 hex chars -> 128-bit entropy. secrets.token_hex(nbytes)
+    # takes a BYTE count; token_hex(8) would be only 64-bit (Day 21 review P1).
+    return secrets.token_hex(16)
+
+
+def render_sources(hits: Sequence[SearchHit], *, nonce: str) -> str:
     # heading_path already starts with the document title (Day 12 invariant),
     # so one line locates the chunk; content stays verbatim — it is the text
     # a citation points at (embedding input != citation text).
     #
-    # Each source is fenced with BEGIN/END UNTRUSTED SOURCE {n} markers
-    # (Task 11): retrieved content is data, not instructions, and the fence
-    # makes that boundary explicit to the model on top of the template's
-    # instruction-level warning. The fence text is part of what
-    # render_user_message returns, so `_select_within_budget` -- which sizes
-    # candidates via that same function -- counts fence bytes toward the
-    # prompt budget automatically, with no code motion.
+    # Each source is fenced with BEGIN/END UNTRUSTED SOURCE {nonce} {n}
+    # markers. The nonce is a per-request 128-bit random token (Day 21 G1):
+    # a poisoned chunk cannot forge the closing marker without guessing it.
+    # The fence text is part of what render_user_message returns, so
+    # `_select_within_budget` -- which sizes candidates via that same
+    # function -- counts fence bytes toward the prompt budget automatically,
+    # with no code motion.
     return "\n\n".join(
-        f"BEGIN UNTRUSTED SOURCE {number}\n"
+        f"BEGIN UNTRUSTED SOURCE {nonce} {number}\n"
         f"[{number}] {hit.heading_path}\n{hit.content}\n"
-        f"END UNTRUSTED SOURCE {number}"
+        f"END UNTRUSTED SOURCE {nonce} {number}"
         for number, hit in enumerate(hits, start=1)
     )
 
 
-def render_user_message(question: str, hits: Sequence[SearchHit]) -> str:
-    return f"Sources:\n\n{render_sources(hits)}\n\nQuestion: {question}"
+def render_user_message(question: str, hits: Sequence[SearchHit], *, nonce: str) -> str:
+    return f"Sources:\n\n{render_sources(hits, nonce=nonce)}\n\nQuestion: {question}"
 
 
 def _log_rag_stage(
@@ -189,7 +196,7 @@ def _log_rag_stage(
 
 
 def _select_within_budget(
-    question: str, hits: Sequence[SearchHit], *, instructions_bytes: int
+    question: str, hits: Sequence[SearchHit], *, instructions_bytes: int, nonce: str
 ) -> tuple[list[SearchHit], int]:
     """Include hits in rank order until the rendered user message would push
     the total provider input (instructions + message) past MAX_PROMPT_BYTES.
@@ -211,13 +218,15 @@ def _select_within_budget(
     included: list[SearchHit] = []
     for hit in hits:
         candidate = [*included, hit]
-        rendered_bytes = len(render_user_message(question, candidate).encode("utf-8"))
+        rendered_bytes = len(
+            render_user_message(question, candidate, nonce=nonce).encode("utf-8")
+        )
         if rendered_bytes > budget:
             break
         included.append(hit)
     if hits and not included:
         first = hits[0]
-        first_bytes = len(render_user_message(question, [first]).encode("utf-8"))
+        first_bytes = len(render_user_message(question, [first], nonce=nonce).encode("utf-8"))
         raise RagContextOverflowError(
             upstream_detail=f"chunk_id={first.chunk_id} bytes={first_bytes}"
         )
@@ -257,7 +266,12 @@ def _validate_citations(answer: str, included_hit_count: int) -> str:
 
 class RagService:
     def __init__(
-        self, retriever: Retriever, chat_service: RagChatService, *, instructions_bytes: int = 0
+        self,
+        retriever: Retriever,
+        chat_service: RagChatService,
+        *,
+        instructions_bytes: int = 0,
+        nonce_factory: Callable[[], str] = _default_nonce,
     ) -> None:
         self._retriever = retriever
         self._chat_service = chat_service
@@ -266,6 +280,9 @@ class RagService:
         # assembled prompt; the ChatService adapter is what actually owns and
         # sends the instructions text on the wire.
         self._instructions_bytes = instructions_bytes
+        # Draws one nonce per request (Day 21 G1). Injectable so tests can
+        # pin a deterministic value; production uses _default_nonce.
+        self._nonce_factory = nonce_factory
 
     async def answer(self, question: str, principal: Principal) -> RagAnswer:
         total_started = time.perf_counter()
@@ -285,10 +302,14 @@ class RagService:
                     status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
                 )
             current_stage = "assemble_context"
+            nonce = self._nonce_factory()
             included, dropped_source_count = _select_within_budget(
-                question, retrieved.hits, instructions_bytes=self._instructions_bytes
+                question,
+                retrieved.hits,
+                instructions_bytes=self._instructions_bytes,
+                nonce=nonce,
             )
-            user_message = render_user_message(question, included)
+            user_message = render_user_message(question, included, nonce=nonce)
             _log_rag_stage(
                 question,
                 included,
