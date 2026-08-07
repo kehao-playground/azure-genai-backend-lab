@@ -136,6 +136,11 @@ def save() -> None:
         json.dump(state, f)
 
 if args[:4] == ["run", "python", "-m", "tools.prompt_shields_probe"]:
+    # Recorded so tests can assert the orchestrator cd'd to the repo root
+    # before invoking uv: `tools/` is not an installed package, so the real
+    # `uv run python -m tools.prompt_shields_probe` only resolves against
+    # its own cwd, not against wherever the caller started the script.
+    state["uv_cwd"] = os.getcwd()
     exit_code = state.get("probe_exit_code", 0)
     if exit_code == 0 and "--evidence-out" in args:
         evidence_path = args[args.index("--evidence-out") + 1]
@@ -176,21 +181,27 @@ class Harness:
             "AZ_CS_RETRY_INTERVAL": "0",
         }
 
-    def run(self, script: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, script: str, *, cwd: str | None = None, **extra_env: str
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(SCRIPTS_DIR / script)],
             env={**self.env, **extra_env},
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=30,
         )
 
-    def run_direct(self, script: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+    def run_direct(
+        self, script: str, *, cwd: str | None = None, **extra_env: str
+    ) -> subprocess.CompletedProcess[str]:
         # No "bash" prefix: this is the one path that fails closed (exit 126 /
         # PermissionError) if a regression drops the executable bit.
         return subprocess.run(
             [str(SCRIPTS_DIR / script)],
             env={**self.env, **extra_env},
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=30,
@@ -289,6 +300,48 @@ def test_create_aborts_on_any_failure_with_default_empty_allowlist(
     assert h.state["account"] == "absent"
 
 
+def test_create_aborts_when_name_already_live_no_create_call(tmp_path: Path) -> None:
+    # Mirrors create-keyvault.sh's own precedent: the exposure here is worse
+    # (the orchestrator's EXIT trap deletes AND purges unconditionally), so a
+    # name collision with an existing account must never reach `create`.
+    h = Harness(tmp_path, provider="Registered", account="live")
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "already exists live" in result.stderr
+    assert not any(call.startswith("cognitiveservices account create") for call in h.calls)
+
+
+def test_create_aborts_when_name_soft_deleted_no_create_call(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="deleted")
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "soft-deleted" in result.stderr
+    assert not any(call.startswith("cognitiveservices account create") for call in h.calls)
+
+
+def test_create_proceeds_to_create_when_name_is_absent_from_both_listings(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode == 0, result.stderr
+    assert any(call.startswith("cognitiveservices account create") for call in h.calls)
+
+
+def test_create_aborts_on_live_listing_query_failure_not_assume_absent(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent", fail_list=True)
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "Failed to query" in result.stderr
+    assert not any(call.startswith("cognitiveservices account create") for call in h.calls)
+
+
+def test_create_aborts_on_deleted_listing_query_failure_not_assume_absent(tmp_path: Path) -> None:
+    h = Harness(tmp_path, provider="Registered", account="absent", fail_list_deleted=True)
+    result = h.run("create-content-safety.sh", AZ_RESOURCE_GROUP="rg")
+    assert result.returncode != 0
+    assert "Failed to query" in result.stderr
+    assert not any(call.startswith("cognitiveservices account create") for call in h.calls)
+
+
 # --- delete-content-safety.sh -----------------------------------------------
 
 
@@ -384,6 +437,36 @@ def test_orchestrator_happy_path_full_lifecycle_direct_execution(tmp_path: Path)
     # second cleanup-triggered one (which would mean the trap misfired).
     assert sum(call.startswith("cognitiveservices account delete") for call in h.calls) == 1
     assert sum(call.startswith("resource delete") for call in h.calls) == 1
+
+
+def test_orchestrator_probe_invoked_from_repo_root_and_relative_evidence_out_lands_at_caller_cwd(
+    tmp_path: Path,
+) -> None:
+    # The documented invocation is `cd infra/scripts && ./run-content-safety-
+    # probe.sh`. `tools/` is not an installed package, so `uv run python -m
+    # tools.prompt_shields_probe` only resolves when uv's own cwd is the repo
+    # root — the script must cd there before invoking the probe, no matter
+    # what directory the caller started in. A relative EVIDENCE_OUT must
+    # still be interpreted against the CALLER's cwd, not the repo root the
+    # script cd's into.
+    stray = REPO_ROOT / "evidence.json"
+    assert not stray.exists(), "stray file from a previous failed run; remove it and rerun"
+    h = Harness(tmp_path, provider="Registered", account="absent")
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    try:
+        result = h.run_direct(
+            "run-content-safety-probe.sh",
+            cwd=str(caller_dir),
+            AZ_RESOURCE_GROUP="rg",
+            EVIDENCE_OUT="evidence.json",
+        )
+        assert result.returncode == 0, result.stderr
+        assert h.state.get("uv_cwd") == str(REPO_ROOT)
+        assert (caller_dir / "evidence.json").exists()
+        assert not stray.exists()
+    finally:
+        stray.unlink(missing_ok=True)
 
 
 def test_orchestrator_teardown_runs_when_create_leaves_partial_resource(tmp_path: Path) -> None:

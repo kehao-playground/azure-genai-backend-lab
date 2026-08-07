@@ -177,6 +177,14 @@ corpus text that discusses this very topic. And no escaping of `hit.content`: th
 text a source points at must stay verbatim (Day 12's embedding-input-versus-citation-text
 rule).
 
+One thing worth naming so it is not mistaken for a leak: in fake-LLM mode, `_fake_reply`
+(`services/azure_openai.py`) answers by prefixing the last user message verbatim, so a fake
+`/rag` reply echoes the nonce and the full fence back to the caller. This is harmless against
+the threat this section addresses — forging a fence requires *predicting* a future request's
+nonce, and corpus text is fixed at index time, not something the fake echo lets an attacker
+influence — but it means demo output and any evidence captured while running in fake mode
+will show the raw fenced prompt, not a model-generated answer.
+
 ### 3.2 G2 — the agent path had no untrusted-data rule (fixed, at the instruction layer)
 
 The same corpus text reaches `/agent` through `search_docs`, which embeds each hit's
