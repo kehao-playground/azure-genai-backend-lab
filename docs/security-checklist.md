@@ -71,7 +71,7 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] Prompt Shields is treated as a probabilistic layer on top of structural defenses, never as a replacement — [§5](prompt-injection.md#5-the-probabilistic-layer-azure-ai-content-safety-prompt-shields)
 - [ ] The probe resource is ephemeral: created, used, deleted **and purged** in one session — `infra/scripts/run-content-safety-probe.sh`, `infra/scripts/delete-content-safety.sh`
 - [ ] The probe's cleanup trap is armed before the first mutation — `infra/scripts/run-content-safety-probe.sh`
-- [ ] The account name is unique per run, so an irreversible purge can only ever target a resource that run created — `infra/scripts/run-content-safety-probe.sh` (`AZ_CONTENT_SAFETY_NAME` is a prefix there)
+- [ ] The account name is unique per run, so an irreversible purge targets a resource that run created — `infra/scripts/run-content-safety-probe.sh` (`AZ_CONTENT_SAFETY_NAME` is a prefix there). The per-pair suffix-collision chance is about 2⁻³² (rising with accumulated runs per the birthday bound): negligible at this project's run volume but not zero, and on a collision the ownership property fails and the TOCTOU risk reopens
 - [ ] A non-2xx probe response is never recorded as "no attack detected" — `tools/prompt_shields_probe.py` (`classify_response`)
 - [ ] Defender for Cloud AI threat protection is a subscription-level billing decision; not enabled here — [§6](prompt-injection.md#6-one-level-up-defender-for-cloud)
 
