@@ -298,7 +298,9 @@ versus Simplified; F0 allows 5 RPS and 5,000 text records per month, S0 allows 1
 Prompt Shields is available in **japaneast**, this series' standing region, so no cross-region
 exception is needed.
 
-And the sentence that fixes its place in the stack, quoted from the same page:
+And the sentence that fixes its place in the stack, from the Troubleshooting section of the
+[Prompt Shields concepts page](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/jailbreak-detection#troubleshooting)
+(checked 2026-08):
 
 > **False positives/negatives**: Prompt Shields may not catch all attack vectors or may flag
 > legitimate prompts. Always implement additional validation layers.
@@ -326,9 +328,10 @@ soft-delete and block re-creation of the same name for 48 hours), orchestrated b
 mutation so a half-created account is still torn down. Cleanup finds the account by name and
 *purges* it, which is irreversible, so the orchestrator treats `AZ_CONTENT_SAFETY_NAME` as a
 prefix and appends an unpredictable 4-byte (32-bit) per-run suffix: only that run should ever
-have invented the name it creates, so teardown targets a resource that run created — barring the
-roughly 2⁻³² chance that two runs sharing a prefix draw the same suffix, which is not realistically
-reachable at this project's run volume. The eight cases live in
+have invented the name it creates, so teardown targets a resource that run created. The chance
+that two runs sharing a prefix draw the same suffix is about 2⁻³² per pair (rising with
+accumulated runs per the birthday bound) — negligible at this project's run volume but not zero,
+and on a collision the ownership property fails and the TOCTOU risk reopens. The eight cases live in
 `tools/prompt_shields_cases.json` and are sent by `tools/prompt_shields_probe.py`.
 
 | # | `userPrompt` | `documents` | Purpose | Text provenance (of the field that varies) |
