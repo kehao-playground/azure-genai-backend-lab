@@ -16,81 +16,45 @@ from collections.abc import Sequence
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.unit.audit_helpers import IDENTITY, audit_events
+from tests.unit.audit_helpers import (
+    IDENTITY,
+    audit_events,
+    with_broken_chat_append_store,
+    with_broken_chat_get_store,
+    with_raising_chat_service,
+    with_tiny_chat_budget,
+)
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ContentFilteredError, UpstreamServiceError
 from azgenai_lab.core.keyed_lock import KeyedLock
-from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts import loader
 from azgenai_lab.services.conversation import build_conversation_service
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 
-class _RaisingChatService:
-    """Substitutes only the LLM boundary; the orchestrator stays real. Takes
-    any Exception, not just UpstreamError, so the same stub also drives the
-    non-UpstreamError no-event proof below."""
-
-    def __init__(self, error: Exception) -> None:
-        self._error = error
-
-    async def complete(self, items: Sequence[ReplayItem]) -> object:
-        raise self._error
-
-    async def open_stream(self, items: Sequence[ReplayItem]) -> object:
-        raise self._error
-
-    async def aclose(self) -> None:
-        return None
-
-
-class _BrokenGetStore(InMemoryConversationStore):
-    async def get(self, tenant_id: str, conversation_id: str) -> object:
-        raise RuntimeError("store unavailable")
-
-
-class _BrokenAppendStore(InMemoryConversationStore):
-    async def append(
-        self,
-        tenant_id: str,
-        conversation_id: str,
-        turns: Sequence[Message],
-        replay_items: Sequence[ReplayItem],
-        expected_revision: int,
-        usage_tokens: int,
-        *,
-        first_turn_authorization_group_ids: tuple[str, ...] | None,
-    ) -> None:
-        raise RuntimeError("disk on fire")
-
-
 @pytest.fixture
 def raising_client_factory(client: TestClient):
     def _factory(error: Exception) -> TestClient:
-        client.app.state.conversation_service._chat_service = _RaisingChatService(error)
-        return client
+        return with_raising_chat_service(client, error)
 
     return _factory
 
 
 @pytest.fixture
 def tiny_budget_client(client: TestClient) -> TestClient:
-    client.app.state.conversation_service._token_budget = 1
-    return client
+    return with_tiny_chat_budget(client)
 
 
 @pytest.fixture
 def broken_store_get_client(client: TestClient) -> TestClient:
-    client.app.state.conversation_service._store = _BrokenGetStore()
-    return client
+    return with_broken_chat_get_store(client)
 
 
 @pytest.fixture
 def broken_store_append_client(client: TestClient) -> TestClient:
-    client.app.state.conversation_service._store = _BrokenAppendStore()
-    return client
+    return with_broken_chat_append_store(client)
 
 
 def test_chat_success_exactly_one_event(

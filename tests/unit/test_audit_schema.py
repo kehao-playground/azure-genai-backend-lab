@@ -12,6 +12,7 @@ from azgenai_lab.core import audit
 from azgenai_lab.core.audit import (
     AUDIT_EVENT_ADAPTER,
     AgentRunErrorEvent,
+    AgentRunSuccess,
     AuditTool,
     AuditUsage,
     AuthRejected,
@@ -257,6 +258,22 @@ def test_union_round_trip_by_discriminators():
     event = ChatTurnSuccess(**_base())
     parsed = AUDIT_EVENT_ADAPTER.validate_python(event.model_dump(mode="json"))
     assert isinstance(parsed, ChatTurnSuccess)
+
+
+def test_union_round_trip_covers_all_four_families():
+    """test_union_round_trip_by_discriminators above only exercises the
+    chat.turn branch; test_outer_union_covers_all_four_event_families below
+    only asserts the discriminator mapping's *keys*, which would still pass
+    if a key pointed at the wrong family's schema (right key, wrong shape).
+    Round-trip one real instance of each of the other three families through
+    the outer union to its own type -- closes that gap completely (Task 13)."""
+    for event in (
+        RagQuerySuccess(**_rag_base()),
+        AgentRunSuccess(**_agent_fields()),
+        AuthRejected(**_auth()),
+    ):
+        parsed = AUDIT_EVENT_ADAPTER.validate_python(event.model_dump(mode="json"))
+        assert isinstance(parsed, type(event))
 
 
 # --- Exported schema (Task 11): structural + per-$def constraint assertions ---
