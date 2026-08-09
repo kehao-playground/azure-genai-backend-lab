@@ -43,6 +43,11 @@ packages = ["src/azgenai_lab"]
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/integration"]
 asyncio_mode = "auto"
+# Day 22: audit tests import shared fixtures as `tests.unit.audit_helpers` —
+# neither tests/ nor tests/unit/ carries __init__.py, so the project root
+# must be on sys.path for that dotted import to resolve (implicit namespace
+# packages do the rest).
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
