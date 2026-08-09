@@ -12,138 +12,55 @@ documents for /chat).
 """
 
 import logging
-from collections.abc import Sequence
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.unit.audit_helpers import IDENTITY, audit_events
+from tests.unit.audit_helpers import (
+    IDENTITY,
+    audit_events,
+    with_broken_generation,
+    with_oversized_hit,
+    with_raising_retriever,
+    with_seeded_retriever,
+)
 
 from azgenai_lab.core.audit import has_audit_context, request_duration_ms
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.correlation import correlation_id_var, request_start_var
 from azgenai_lab.core.errors import ContentFilteredError, UpstreamServiceError
 from azgenai_lab.models.principal import Principal
-from azgenai_lab.models.search import SearchHit, SearchMode, SearchResult
-from azgenai_lab.services.azure_search import FakeSearchClient
-from azgenai_lab.services.embeddings import EmbeddingRejectedError, FakeEmbeddingClient
-from azgenai_lab.services.rag import MAX_PROMPT_BYTES, build_rag_service
-from azgenai_lab.services.retrieval import Retriever
+from azgenai_lab.services.embeddings import EmbeddingRejectedError
+from azgenai_lab.services.rag import build_rag_service
 
 PRINCIPAL = Principal(tenant_id="t1", user_id="u1", group_ids=())
-
-DOC = {
-    "chunk_id": "doc-a-0000",
-    "parent_id": "doc-a",
-    "title": "Doc A",
-    "heading_path": "Doc A > Intro",
-    "content": "alpha refund window",
-    "tenant_id": "t1",
-    "allowed_groups": [],
-}
-
-
-class _RaisingRetriever:
-    """Substitutes the whole retrieve() step -- embed vs. search are both
-    "retrieve" stage as far as RagQueryEvent.failed_stage is concerned, so a
-    single stub raising directly is enough to drive that stage's failure
-    path without separately faking the embedding/search split."""
-
-    def __init__(self, error: Exception) -> None:
-        self._error = error
-
-    async def retrieve(self, question: str, principal: Principal) -> object:
-        raise self._error
-
-    async def aclose(self) -> None:
-        pass
-
-
-class _RaisingChatService:
-    def __init__(self, error: Exception) -> None:
-        self._error = error
-
-    async def complete(self, items: Sequence[object]) -> object:
-        raise self._error
-
-    async def aclose(self) -> None:
-        pass
-
-
-class _OversizedSearchClient:
-    """Duck-typed SearchClient returning a fixed hostile hit set (same shape
-    as test_rag_api.py's helper of the same name) -- drives the
-    assemble_context-stage failure, which never reaches the chat service at
-    all (RagContextOverflowError is raised locally by _select_within_budget
-    before any provider call)."""
-
-    def __init__(self, hits: Sequence[SearchHit]) -> None:
-        self._hits = tuple(hits)
-
-    async def search(
-        self,
-        query_text: str,
-        query_vector: Sequence[float] | None = None,
-        *,
-        mode: SearchMode = SearchMode.HYBRID,
-        top: int,
-        principal: Principal,
-        vector_k: int = 50,
-    ) -> SearchResult:
-        return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
-
-    async def aclose(self) -> None:
-        pass
 
 
 @pytest.fixture
 def seeded_client(client: TestClient) -> TestClient:
-    client.app.state.rag_service._retriever = Retriever(
-        FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5
-    )
-    return client
+    return with_seeded_retriever(client)
 
 
 @pytest.fixture
 def broken_retriever_client_factory(client: TestClient):
     def _factory(error: Exception) -> TestClient:
-        client.app.state.rag_service._retriever = _RaisingRetriever(error)
-        return client
+        return with_raising_retriever(client, error)
 
     return _factory
 
 
 @pytest.fixture
 def oversized_hit_client(client: TestClient) -> TestClient:
-    hit = SearchHit(
-        chunk_id="doc-oversized", parent_id="doc-oversized", title="Doc", heading_path="Doc",
-        content="x" * (MAX_PROMPT_BYTES + 1), score=1.0,
-    )
-    client.app.state.rag_service._retriever = Retriever(
-        FakeEmbeddingClient(), _OversizedSearchClient([hit]), top=5
-    )
-    return client
+    return with_oversized_hit(client)
 
 
 @pytest.fixture
 def seeded_broken_generation_client(client: TestClient) -> TestClient:
-    client.app.state.rag_service._retriever = Retriever(
-        FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5
-    )
-    client.app.state.rag_service._chat_service = _RaisingChatService(
-        UpstreamServiceError("boom")
-    )
-    return client
+    return with_broken_generation(client, UpstreamServiceError("boom"))
 
 
 @pytest.fixture
 def seeded_broken_generation_client_cf(client: TestClient) -> TestClient:
-    client.app.state.rag_service._retriever = Retriever(
-        FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5
-    )
-    client.app.state.rag_service._chat_service = _RaisingChatService(
-        ContentFilteredError("blocked")
-    )
-    return client
+    return with_broken_generation(client, ContentFilteredError("blocked"))
 
 
 # --- context-guard coverage (Task 3 gap: has_audit_context/request_duration_ms

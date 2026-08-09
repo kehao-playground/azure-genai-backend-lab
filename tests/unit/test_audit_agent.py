@@ -9,17 +9,22 @@ new service would drop the composed ``audit_attribution``/prompt instance.
 """
 
 import logging
-from collections.abc import Sequence
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.unit.audit_helpers import IDENTITY, audit_events
+from tests.unit.audit_helpers import (
+    IDENTITY,
+    RaisingAgentService,
+    audit_events,
+    with_broken_agent_append_store,
+    with_broken_agent_get_store,
+    with_tiny_agent_budget,
+)
 
 from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, AuditToolExecution
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.keyed_lock import KeyedLock
-from azgenai_lab.models.chat import Message, TokenUsage
-from azgenai_lab.models.conversation import ReplayItem
+from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts import loader
 from azgenai_lab.services.agent_framework import (
@@ -33,49 +38,9 @@ from azgenai_lab.services.agent_turn import build_agent_turn_service
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 
-class _RaisingAgentService:
-    """Substitutes only the loop boundary — mirrors
-    test_audit_chat_api.py's ``_RaisingChatService``. Always raises the
-    supplied error; used here to drive a degraded (framework-fields-None)
-    terminal snapshot through ``AgentRunError``.
-    """
-
-    def __init__(self, error: Exception) -> None:
-        self._error = error
-
-    async def run(
-        self, task: str, history: object, *, principal: Principal
-    ) -> AgentRunResult:
-        raise self._error
-
-    async def aclose(self) -> None:
-        return None
-
-
-class _BrokenGetStore(InMemoryConversationStore):
-    async def get(self, tenant_id: str, conversation_id: str) -> object:
-        raise RuntimeError("store unavailable")
-
-
-class _BrokenAppendStore(InMemoryConversationStore):
-    async def append(
-        self,
-        tenant_id: str,
-        conversation_id: str,
-        turns: Sequence[Message],
-        replay_items: Sequence[ReplayItem],
-        expected_revision: int,
-        usage_tokens: int,
-        *,
-        first_turn_authorization_group_ids: tuple[str, ...] | None,
-    ) -> None:
-        raise RuntimeError("disk on fire")
-
-
 @pytest.fixture
 def tiny_budget_agent_client(client: TestClient) -> TestClient:
-    client.app.state.agent_turn_service._token_budget = 1
-    return client
+    return with_tiny_agent_budget(client)
 
 
 @pytest.fixture
@@ -90,7 +55,7 @@ def degraded_agent_client(client: TestClient) -> TestClient:
         stop_reason=None, usage=None,
     )
     error = AgentRunError("framework blew up", usage=None, audit_snapshot=snapshot)
-    client.app.state.agent_turn_service._agent_service = _RaisingAgentService(error)
+    client.app.state.agent_turn_service._agent_service = RaisingAgentService(error)
     return client
 
 
@@ -98,7 +63,7 @@ class _EmptyAnswerAgentService:
     """A run that succeeded -- real tool executions, real counts, natural
     stop -- but produced no final text. This is the /agent finalizer's
     empty-answer guard (services/agent_turn.py), not the adapter's own
-    degraded-failure path exercised by ``_RaisingAgentService``. Used to
+    degraded-failure path exercised by ``RaisingAgentService``. Used to
     prove the guard's audit_snapshot is the run's real one, not the generic
     upstream fallback's None's (review fix round 1: the data is in scope
     and was being discarded)."""
@@ -144,14 +109,12 @@ def empty_answer_agent_client(client: TestClient) -> TestClient:
 
 @pytest.fixture
 def broken_store_get_agent_client(client: TestClient) -> TestClient:
-    client.app.state.agent_turn_service._store = _BrokenGetStore()
-    return client
+    return with_broken_agent_get_store(client)
 
 
 @pytest.fixture
 def broken_store_append_agent_client(client: TestClient) -> TestClient:
-    client.app.state.agent_turn_service._store = _BrokenAppendStore()
-    return client
+    return with_broken_agent_append_store(client)
 
 
 def test_agent_success_event(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
@@ -313,7 +276,7 @@ def test_non_upstream_exception_propagates_uncaught_with_no_event(
     # A bug (not a contract case): the handler's except clause is UpstreamError
     # specifically, so this must not be swallowed into an agent.run event.
     error = RuntimeError("not an UpstreamError")
-    client.app.state.agent_turn_service._agent_service = _RaisingAgentService(error)
+    client.app.state.agent_turn_service._agent_service = RaisingAgentService(error)
     with (
         caplog.at_level(logging.INFO, logger="audit"),
         pytest.raises(RuntimeError, match="not an UpstreamError"),
