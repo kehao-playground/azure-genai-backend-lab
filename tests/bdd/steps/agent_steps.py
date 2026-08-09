@@ -1,6 +1,7 @@
 from behave import given, then, when
 
 from azgenai_lab.api.agent import get_agent_turn_service
+from azgenai_lab.core.audit import AgentAuditTerminalSnapshot
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.services.agent_framework import AgentRunResult
@@ -45,7 +46,8 @@ def step_budget_exhausted_conversation(context) -> None:  # type: ignore[no-unty
     # budget is below the tokens the first turn already committed.
     current: AgentTurnService = app.state.agent_turn_service
     limited = AgentTurnService(
-        current._agent_service, current._store, token_budget=1, locks=current._locks
+        current._agent_service, current._store, token_budget=1, locks=current._locks,
+        audit_attribution=current.audit_attribution,
     )
     app.dependency_overrides[get_agent_turn_service] = lambda: limited
 
@@ -55,6 +57,9 @@ class _LimitStoppingAgent:
     the fallback was already stripped, so the answer is legitimately empty."""
 
     async def run(self, task, history, *, principal):  # type: ignore[no-untyped-def]
+        usage = TokenUsage(
+            input_tokens=30, output_tokens=15, total_tokens=45, reasoning_tokens=6
+        )
         return AgentRunResult(
             answer="",
             model_call_count=3,
@@ -64,10 +69,13 @@ class _LimitStoppingAgent:
             stop_reason="function_call_limit",
             limit_reasons=frozenset({"function_call_limit"}),
             tool_calls=(),
-            usage=TokenUsage(
-                input_tokens=30, output_tokens=15, total_tokens=45, reasoning_tokens=6
-            ),
+            usage=usage,
             per_round=None,
+            audit_snapshot=AgentAuditTerminalSnapshot(
+                provider_call_attempted=True, executions=(), model_calls=3,
+                tool_call_count=2, refused_call_count=0,
+                stop_reason="function_call_limit", usage=usage,
+            ),
         )
 
     async def aclose(self) -> None:
@@ -78,7 +86,8 @@ class _LimitStoppingAgent:
 def step_agent_stops_at_limit(context) -> None:  # type: ignore[no-untyped-def]
     current: AgentTurnService = app.state.agent_turn_service
     service = AgentTurnService(
-        _LimitStoppingAgent(), current._store, locks=current._locks
+        _LimitStoppingAgent(), current._store, locks=current._locks,
+        audit_attribution=current.audit_attribution,
     )
     app.dependency_overrides[get_agent_turn_service] = lambda: service
 

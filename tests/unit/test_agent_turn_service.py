@@ -4,8 +4,9 @@ import asyncio
 
 import pytest
 
+from azgenai_lab.core.audit import AgentAuditTerminalSnapshot
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import StorageError, UpstreamServiceError
+from azgenai_lab.core.errors import AgentRunUpstreamError, StorageError, UpstreamServiceError
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message, TokenUsage
 from azgenai_lab.models.principal import Principal
@@ -47,6 +48,22 @@ def _result(
         tool_calls=(),
         usage=usage,
         per_round=None,
+        audit_snapshot=AgentAuditTerminalSnapshot(
+            provider_call_attempted=True, executions=(), model_calls=2,
+            tool_call_count=1, refused_call_count=0,
+            stop_reason=stop,  # type: ignore[arg-type]
+            usage=usage,
+        ),
+    )
+
+
+def _degraded_run_error(message: str, usage: TokenUsage | None = None) -> AgentRunError:
+    return AgentRunError(
+        message, usage=usage,
+        audit_snapshot=AgentAuditTerminalSnapshot(
+            provider_call_attempted=True, executions=(), model_calls=None,
+            tool_call_count=None, refused_call_count=None, stop_reason=None, usage=None,
+        ),
     )
 
 
@@ -117,9 +134,9 @@ async def test_budget_gate_rejects_before_run() -> None:
 
 
 async def test_run_failure_commits_nothing_and_maps_upstream() -> None:
-    agent = _StubAgent(AgentRunError("boom", usage=None))
+    agent = _StubAgent(_degraded_run_error("boom", usage=None))
     service, _, store = _service(agent=agent)
-    with pytest.raises(UpstreamServiceError):
+    with pytest.raises(AgentRunUpstreamError):
         await service.run_turn("task", None, principal=P)
     # First turn never came into existence: nothing was published to the store.
     assert len(agent.calls) == 1
@@ -171,8 +188,8 @@ async def test_lock_released_on_every_exit(failure: str) -> None:
             await service.run_turn("task two", cid, principal=P)
         key = ("t1", cid)
     elif failure == "run_error":
-        service, _, _ = _service(agent=_StubAgent(AgentRunError("boom")))
-        with pytest.raises(UpstreamServiceError):
+        service, _, _ = _service(agent=_StubAgent(_degraded_run_error("boom")))
+        with pytest.raises(AgentRunUpstreamError):
             await service.run_turn("task", None, principal=P)
         key = None  # id was freshly issued; registry emptiness is the check
     else:
@@ -269,8 +286,8 @@ async def test_stage_logs_on_success(caplog) -> None:  # type: ignore[no-untyped
 async def test_stage_log_on_run_failure_no_commit_stage(caplog) -> None:  # type: ignore[no-untyped-def]
     import logging
 
-    service, _, _ = _service(agent=_StubAgent(AgentRunError("boom")))
-    with caplog.at_level(logging.INFO), pytest.raises(UpstreamServiceError):
+    service, _, _ = _service(agent=_StubAgent(_degraded_run_error("boom")))
+    with caplog.at_level(logging.INFO), pytest.raises(AgentRunUpstreamError):
         await service.run_turn("task", None, principal=P)
     stages = [
         r.getMessage()
@@ -278,7 +295,7 @@ async def test_stage_log_on_run_failure_no_commit_stage(caplog) -> None:  # type
         if r.getMessage().startswith("agent_turn_stage")
     ]
     assert any(
-        "stage=run outcome=error" in s and "exception=UpstreamServiceError" in s
+        "stage=run outcome=error" in s and "exception=AgentRunUpstreamError" in s
         for s in stages
     )
     assert not any("stage=commit" in s for s in stages)

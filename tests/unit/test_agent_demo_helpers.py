@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from azgenai_lab.core.audit import AgentAuditTerminalSnapshot
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
@@ -81,6 +82,7 @@ def _call(name: str, args: dict[str, object]) -> dict[str, object]:
 
 
 def _result(per_round: tuple[AgentRoundMetrics, ...] | None) -> AgentRunResult:
+    usage = TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2, reasoning_tokens=None)
     return AgentRunResult(
         answer="",
         model_call_count=2,
@@ -90,8 +92,12 @@ def _result(per_round: tuple[AgentRoundMetrics, ...] | None) -> AgentRunResult:
         stop_reason="natural",
         limit_reasons=frozenset(),
         tool_calls=(),
-        usage=TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2, reasoning_tokens=None),
+        usage=usage,
         per_round=per_round,
+        audit_snapshot=AgentAuditTerminalSnapshot(
+            provider_call_attempted=True, executions=(), model_calls=2,
+            tool_call_count=1, refused_call_count=0, stop_reason="natural", usage=usage,
+        ),
     )
 
 

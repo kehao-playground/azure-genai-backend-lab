@@ -10,9 +10,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 if TYPE_CHECKING:
     # core.audit never imports this module (see its module docstring); the
     # reverse is fine, and TYPE_CHECKING keeps it from being a runtime edge.
-    # AgentAuditTerminalSnapshot doesn't exist until Task 9 defines it
-    # alongside the agent-scoped counterparts of the helpers below.
-    from azgenai_lab.core.audit import ChatCommitSnapshot
+    from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, ChatCommitSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +124,23 @@ class ChatStorageCommitError(StorageCommitError):
         self.audit_snapshot = audit_snapshot
 
 
+class AgentStorageCommitError(StorageCommitError):
+    """An ``/agent`` run's commit failed after the provider already ran.
+
+    ``audit_snapshot`` is required for the same reason ``ChatStorageCommitError``'s
+    is: the commit call site (``AgentTurnService._commit``) has the run's
+    terminal snapshot in hand — the run that just completed — so there is no
+    case where this can legitimately be raised without one.
+    """
+
+    def __init__(
+        self, upstream_detail: str | None = None, *,
+        audit_snapshot: "AgentAuditTerminalSnapshot",
+    ) -> None:
+        super().__init__(upstream_detail)
+        self.audit_snapshot = audit_snapshot
+
+
 class UpstreamThrottledError(UpstreamError):
     """Upstream capacity is exhausted — our quota problem, not the client's request rate."""
 
@@ -144,6 +159,25 @@ class UpstreamServiceError(UpstreamError):
     status_code = 502
     code = "upstream_error"
     message = "The upstream LLM service failed."
+
+
+class AgentRunUpstreamError(UpstreamServiceError):
+    """An agent run failed at the framework/provider boundary
+    (``AgentRunError`` from ``services/agent_framework.py``). Same wire
+    contract as ``UpstreamServiceError`` (502 ``upstream_error``) — the
+    subtype exists only to carry the terminal snapshot the adapter had in
+    hand at the point of failure (spec §4b: success and error snapshots
+    share one shape), required for the same reason the storage-commit
+    errors' is: every raise site has one, a caller that cannot supply one
+    has a different bug.
+    """
+
+    def __init__(
+        self, upstream_detail: str | None = None, *,
+        audit_snapshot: "AgentAuditTerminalSnapshot",
+    ) -> None:
+        super().__init__(upstream_detail)
+        self.audit_snapshot = audit_snapshot
 
 
 def upstream_outcome(exc: UpstreamError) -> Literal["rejected", "error"]:
@@ -174,6 +208,31 @@ def chat_upstream_audit_args(
         return upstream_outcome(exc), exc.code, True, exc.audit_snapshot
     if isinstance(exc, StorageError):
         return upstream_outcome(exc), exc.code, False, None
+    return upstream_outcome(exc), exc.code, True, None
+
+
+def agent_upstream_audit_args(
+    exc: UpstreamError,
+) -> tuple[Literal["rejected", "error"], str, bool, "AgentAuditTerminalSnapshot | None"]:
+    """(outcome, error_code, provider_call_attempted, snapshot) — the agent
+    equivalent of ``chat_upstream_audit_args``, same classification order for
+    the same reason: ``AgentStorageCommitError`` (a ``StorageCommitError``
+    subclass) must be checked before the bare ``StorageError`` case or every
+    commit failure would fall into the load-path branch instead. A
+    ``AgentStorageCommitError`` means the run completed and only the commit
+    failed (attempted=true, its snapshot carried through); a bare
+    ``StorageError`` means the load path never reached the provider
+    (attempted=false, no run ever started); an ``AgentRunUpstreamError`` means
+    the run itself failed at the framework/provider boundary (attempted=true,
+    its degraded snapshot carried through); anything else reached the
+    provider with no snapshot to carry (attempted=true, snapshot=None).
+    """
+    if isinstance(exc, AgentStorageCommitError):
+        return upstream_outcome(exc), exc.code, True, exc.audit_snapshot
+    if isinstance(exc, StorageError):
+        return upstream_outcome(exc), exc.code, False, None
+    if isinstance(exc, AgentRunUpstreamError):
+        return upstream_outcome(exc), exc.code, True, exc.audit_snapshot
     return upstream_outcome(exc), exc.code, True, None
 
 
