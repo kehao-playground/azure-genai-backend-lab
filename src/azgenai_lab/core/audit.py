@@ -3,6 +3,8 @@ who/when/which ids/outcome — never content. Presence rules are enforced by
 outcome variants (structural) plus runtime validators (the
 provider_call_attempted layer); see docs/audit-logging.md."""
 
+import json
+import logging
 import time
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -17,6 +19,7 @@ from pydantic import (
     model_validator,
 )
 
+from azgenai_lab.core.correlation import correlation_id_var, request_start_var
 from azgenai_lab.models.chat import TokenUsage
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
@@ -307,3 +310,26 @@ AuditEventModel = (
     | AgentRunSuccess | AgentRunRejected | AgentRunErrorEvent
     | AuthRejected
 )
+
+_audit_logger = logging.getLogger("audit")
+
+
+def emit_audit_event(event: AuditEventModel) -> None:
+    """The emission boundary: whatever reaches the log line has passed the
+    audit schema. A foreign model raises before anything is written — the
+    never-log guarantee is enforced here, not by a type hint."""
+    validated = AUDIT_EVENT_ADAPTER.validate_python(event)
+    payload = AUDIT_EVENT_ADAPTER.dump_python(validated, mode="json")
+    _audit_logger.info(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+
+
+def has_audit_context() -> bool:
+    """True inside a request (the correlation middleware ran). Service-level
+    producers emit only under this guard; direct service invocation neither
+    fabricates request fields nor raises (spec §3c)."""
+    return request_start_var.get() is not None and correlation_id_var.get() is not None
+
+
+def request_duration_ms() -> float:
+    start = request_start_var.get()
+    return 0.0 if start is None else duration_since(start)
