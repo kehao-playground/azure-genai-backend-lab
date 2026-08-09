@@ -21,12 +21,23 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from azgenai_lab.core.audit import (
+    AuditAttribution,
+    build_audit_attribution,
+    emit_audit_event,
+    has_audit_context,
+    rag_base_fields,
+    rag_failure_event,
+    rag_success_event,
+    request_duration_ms,
+)
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError
+from azgenai_lab.core.correlation import correlation_id_var
+from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError, upstream_outcome
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal
-from azgenai_lab.models.search import SearchHit
+from azgenai_lab.models.search import SearchHit, SearchResult
 from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import ChatResult, IncompleteReason, build_chat_service
 from azgenai_lab.services.retrieval import Retriever, build_retriever
@@ -272,6 +283,7 @@ class RagService:
         *,
         instructions_bytes: int = 0,
         nonce_factory: Callable[[], str] = _default_nonce,
+        audit_attribution: AuditAttribution | None = None,
     ) -> None:
         self._retriever = retriever
         self._chat_service = chat_service
@@ -283,10 +295,25 @@ class RagService:
         # Draws one nonce per request (Day 21 G1). Injectable so tests can
         # pin a deterministic value; production uses _default_nonce.
         self._nonce_factory = nonce_factory
+        # The prompt/deployment identity actually used by the generation
+        # call, built once at composition time from the same PromptTemplate
+        # instance handed to build_chat_service (Day 22). Optional (most
+        # existing tests construct RagService directly without it) so its
+        # absence just means an "answered" audit event's attempted=true
+        # branch has nothing to attribute -- that would fail
+        # emit_audit_event's schema validation loudly rather than silently,
+        # which is the intended fail-fast: a real /rag deployment always
+        # goes through build_rag_service, which always supplies one.
+        self._audit_attribution = audit_attribution
 
     async def answer(self, question: str, principal: Principal) -> RagAnswer:
         total_started = time.perf_counter()
         current_stage = "retrieve"
+        # Pre-declared so the except branch below can read them safely: an
+        # exception raised before either is assigned (e.g. retrieval itself
+        # fails) must not turn into a NameError inside the error handler.
+        retrieved: SearchResult | None = None
+        included: list[SearchHit] = []
         try:
             retrieved = await self._retriever.retrieve(question, principal)
             if not retrieved.hits:
@@ -298,6 +325,16 @@ class RagService:
                     "rag stage=complete total_ms=%.1f status=no_answer outcome=success",
                     (time.perf_counter() - total_started) * 1000,
                 )
+                if has_audit_context():
+                    emit_audit_event(rag_success_event(
+                        base=rag_base_fields(
+                            tenant_id=principal.tenant_id, user_id=principal.user_id,
+                            correlation_id=correlation_id_var.get() or "-",
+                        ),
+                        duration_ms=request_duration_ms(), attribution=None,
+                        status="no_answer", hit_count=0, selected_chunk_ids=None,
+                        model_version=None, usage=None,
+                    ))
                 return RagAnswer(
                     status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
                 )
@@ -354,12 +391,47 @@ class RagService:
                 current_stage,
                 type(exc).__name__,
             )
+            if has_audit_context() and isinstance(exc, UpstreamError):
+                # attempted iff the failure happened at the generation stage:
+                # retrieve and assemble_context both fail before the provider
+                # is ever called (assemble_context's only failure mode is the
+                # local byte-budget guard in _select_within_budget, which
+                # raises before calling the chat service).
+                attempted = current_stage == "generation"
+                emit_audit_event(rag_failure_event(
+                    base=rag_base_fields(
+                        tenant_id=principal.tenant_id, user_id=principal.user_id,
+                        correlation_id=correlation_id_var.get() or "-",
+                    ),
+                    duration_ms=request_duration_ms(),
+                    outcome=upstream_outcome(exc), error_code=exc.code,
+                    provider_call_attempted=attempted,
+                    attribution=self._audit_attribution if attempted else None,
+                    failed_stage=current_stage,
+                    hit_count=len(retrieved.hits) if retrieved is not None else None,
+                    selected_chunk_ids=(
+                        tuple(hit.chunk_id for hit in included)
+                        if current_stage == "generation" else None
+                    ),
+                ))
             raise
         validated_answer = _validate_citations(result.message, len(included))
         logger.info(
             "rag stage=complete total_ms=%.1f status=answered outcome=success",
             (time.perf_counter() - total_started) * 1000,
         )
+        assert retrieved is not None  # reaching here means retrieval succeeded with hits
+        if has_audit_context():
+            emit_audit_event(rag_success_event(
+                base=rag_base_fields(
+                    tenant_id=principal.tenant_id, user_id=principal.user_id,
+                    correlation_id=correlation_id_var.get() or "-",
+                ),
+                duration_ms=request_duration_ms(), attribution=self._audit_attribution,
+                status="answered", hit_count=len(retrieved.hits),
+                selected_chunk_ids=tuple(hit.chunk_id for hit in included),
+                model_version=result.model_version, usage=result.usage,
+            ))
         return RagAnswer(
             status="answered",
             answer=validated_answer,
@@ -376,14 +448,17 @@ class RagService:
 
 def build_rag_service(settings: Settings) -> RagService:
     # Loaded once: the same PromptTemplate instance goes to the adapter
-    # (build_chat_service, which sends prompt.text as the wire instructions)
-    # and to this module, which only needs the byte cost for budgeting
-    # (Day 22 — a second load of the same file is not the same instance).
+    # (build_chat_service, which sends prompt.text as the wire instructions),
+    # to build_audit_attribution (so the audit trail describes what was
+    # actually sent, not a same-looking reload), and to this module, which
+    # only needs the byte cost for budgeting (Day 22 — a second load of the
+    # same file is not the same instance).
     prompt = load_prompt("rag_answer")
     return RagService(
         build_retriever(settings),
         build_chat_service(settings, prompt=prompt),
         instructions_bytes=len(prompt.text.encode("utf-8")),
+        audit_attribution=build_audit_attribution(settings, prompt),
     )
 
 

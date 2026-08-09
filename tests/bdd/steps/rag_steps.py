@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from behave import given, then, when
 
 from azgenai_lab.api.rag import get_rag_service
+from azgenai_lab.core.audit import AuditAttribution
 from azgenai_lab.main import app
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.services.azure_openai import ChatResult
@@ -13,6 +14,16 @@ from azgenai_lab.services.rag import RagService
 from azgenai_lab.services.retrieval import Retriever
 
 _QUESTION = "What does hybrid search combine?"
+
+# StubChatService below never actually sends the rag_answer prompt (it
+# returns a fixed answer, independent of any prompt text), so this stands in
+# for what build_rag_service would derive from the real PromptTemplate --
+# these scenarios exercise the answered path (Day 22), which requires an
+# attribution to be present on the audit event, not what that attribution
+# says.
+_STUB_ATTRIBUTION = AuditAttribution(
+    prompt_name="rag_answer", prompt_version=1, prompt_sha256="stub", deployment="fake"
+)
 
 # A fixed, independently authored answer: NOT derived from the input items,
 # so citing it as evidence of model-generated citations is honest (the
@@ -41,7 +52,7 @@ def _override_rag_service(documents: Sequence[dict[str, str]], context) -> None:
     retriever = Retriever(FakeEmbeddingClient(), search_client, top=5)
     chat = StubChatService()
     context.rag_chat_spy = chat
-    service = RagService(retriever, chat)
+    service = RagService(retriever, chat, audit_attribution=_STUB_ATTRIBUTION)
     app.dependency_overrides[get_rag_service] = lambda: service
 
 
