@@ -129,17 +129,18 @@ def delta(text: str) -> Any:
     return SimpleNamespace(type="response.output_text.delta", delta=text)
 
 
-def completed(output: list[Any] | None = None, usage: Any = None) -> Any:
+def completed(output: list[Any] | None = None, usage: Any = None, model: str | None = None) -> Any:
     return SimpleNamespace(
-        type="response.completed", response=SimpleNamespace(output=output or [], usage=usage)
+        type="response.completed",
+        response=SimpleNamespace(output=output or [], usage=usage, model=model),
     )
 
 
-def incomplete(reason: str) -> Any:
+def incomplete(reason: str, model: str | None = None) -> Any:
     return SimpleNamespace(
         type="response.incomplete",
         response=SimpleNamespace(
-            incomplete_details=SimpleNamespace(reason=reason), output=[], usage=None
+            incomplete_details=SimpleNamespace(reason=reason), output=[], usage=None, model=model
         ),
     )
 
@@ -169,6 +170,33 @@ async def test_terminal_event_carries_the_reported_usage() -> None:
     assert isinstance(events[-1], StreamDone)
     assert events[-1].usage is not None
     assert events[-1].usage.total_tokens == 27
+
+
+async def test_completed_terminal_event_carries_the_reported_model_version() -> None:
+    service, _ = make_service(
+        StubUpstreamStream([delta("pong"), completed(model="gpt-5-mini-2025-08-07")])
+    )
+
+    events = await collect(await service.open_stream(user_items("ping")))
+
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].model_version == "gpt-5-mini-2025-08-07"
+
+
+async def test_incomplete_terminal_event_carries_the_reported_model_version() -> None:
+    # The incomplete path is the easy one to miss: it's a real terminal that
+    # carries usage, and it must carry the model too.
+    service, _ = make_service(
+        StubUpstreamStream(
+            [delta("po"), incomplete("max_output_tokens", model="gpt-5-mini-2025-08-07")]
+        )
+    )
+
+    events = await collect(await service.open_stream(user_items("ping")))
+
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].status == "incomplete"
+    assert events[-1].model_version == "gpt-5-mini-2025-08-07"
 
 
 async def test_terminal_event_carries_the_response_output_as_replay_items() -> None:

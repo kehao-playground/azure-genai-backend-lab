@@ -124,7 +124,7 @@ def _extract_usage(usage: Any) -> TokenUsage | None:
 @dataclass(frozen=True)
 class ChatResult:
     message: str
-    model: str | None = None
+    model_version: str | None = None
     # The response's output items (assistant messages, encrypted reasoning,
     # future tool calls) as opaque dicts — the replay context for the next turn.
     replay_items: tuple[ReplayItem, ...] = ()
@@ -166,6 +166,9 @@ class StreamDone:
     # response's usage block — deltas carry no usage; only the terminal
     # reports the turn's count.
     usage: TokenUsage | None = None
+    # The model that actually served this request, per the provider's own
+    # terminal response — null, never fabricated, if the provider omitted it.
+    model_version: str | None = None
 
 
 ChatStreamEvent = TextDelta | StreamDone
@@ -237,7 +240,7 @@ class FakeChatService:
         _log_llm_usage(usage)
         return ChatResult(
             message=reply,
-            model="fake",
+            model_version="fake",
             replay_items=(_fake_output_item(reply),),
             usage=usage,
         )
@@ -252,7 +255,10 @@ class FakeChatService:
             yield TextDelta(reply.removeprefix("[fake-llm] "))
             _log_llm_usage(usage)
             yield StreamDone(
-                status="completed", replay_items=(_fake_output_item(reply),), usage=usage
+                status="completed",
+                replay_items=(_fake_output_item(reply),),
+                usage=usage,
+                model_version="fake",
             )
 
         return stream()
@@ -334,6 +340,7 @@ async def _translate_stream(
                     status="completed",
                     replay_items=_dump_output_items(event.response.output),
                     usage=usage,
+                    model_version=event.response.model,
                 )
                 return
             elif event.type == "response.incomplete":
@@ -347,6 +354,7 @@ async def _translate_stream(
                     incomplete_reason=mapped,
                     replay_items=_dump_output_items(event.response.output),
                     usage=usage,
+                    model_version=event.response.model,
                 )
                 return
             elif event.type == "response.failed":
@@ -413,7 +421,7 @@ class AzureOpenAIChatService:
             details = response.incomplete_details
             return ChatResult(
                 message=response.output_text,
-                model=response.model,
+                model_version=response.model,
                 replay_items=_dump_output_items(response.output),
                 usage=usage,
                 status="incomplete",
@@ -421,7 +429,7 @@ class AzureOpenAIChatService:
             )
         return ChatResult(
             message=response.output_text,
-            model=response.model,
+            model_version=response.model,
             replay_items=_dump_output_items(response.output),
             usage=usage,
         )
