@@ -1,16 +1,26 @@
+import dataclasses
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from azgenai_lab.api.principal import require_principal
-from azgenai_lab.core.errors import ErrorEnvelope
+from azgenai_lab.core.audit import (
+    chat_base_fields,
+    chat_failure_event,
+    chat_rejected_event,
+    chat_success_event,
+    duration_since,
+    emit_audit_event,
+)
+from azgenai_lab.core.errors import ErrorEnvelope, UpstreamError, chat_upstream_audit_args
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.conversation import (
     ConversationChatService,
     ConversationNotFoundError,
     TokenBudgetExceededError,
+    turn_commits,
 )
 
 router = APIRouter(tags=["chat"])
@@ -117,14 +127,59 @@ async def chat(
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
     principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> ChatResponse:
+    # Exactly one chat.turn event per call: every branch below either emits
+    # and raises/returns, or falls through to the single success emission at
+    # the end — there is no path that returns without emitting. A non-
+    # UpstreamError exception (a bug, not a contract case) is deliberately
+    # not caught here: it propagates with no event, per spec.
+    audit_start: float = request.state.audit_start
+    base = chat_base_fields(
+        tenant_id=principal.tenant_id, user_id=principal.user_id,
+        correlation_id=request.state.correlation_id,
+        conversation_id=payload.conversation_id, streaming=False,
+    )
+    attribution = service.audit_attribution
+    if attribution is None:
+        # A success event requires attribution (the schema enforces it); a
+        # service reaching /chat without one is a composition bug, not a
+        # request case — fail loudly rather than emit an event the schema
+        # would reject anyway. build_conversation_service() always supplies
+        # one; only direct, non-composed constructions (tests/tools that
+        # never emit) may legitimately omit it.
+        raise RuntimeError(
+            "ConversationChatService.audit_attribution is required to serve /chat"
+        )
     try:
         conversation_id, result = await service.complete(
             payload.message, payload.conversation_id, principal=principal
         )
     except ConversationNotFoundError:
+        emit_audit_event(chat_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="conversation_not_found",
+        ))
         raise conversation_not_found() from None
-    except TokenBudgetExceededError:
+    except TokenBudgetExceededError as exc:
+        emit_audit_event(chat_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="token_budget_exceeded", spent=exc.spent, budget=exc.budget,
+        ))
         raise token_budget_exceeded() from None
+    except UpstreamError as exc:
+        outcome, code, attempted, snapshot = chat_upstream_audit_args(exc)
+        emit_audit_event(chat_failure_event(
+            base=base, duration_ms=duration_since(audit_start), outcome=outcome,
+            error_code=code, provider_call_attempted=attempted,
+            attribution=attribution, snapshot=snapshot,
+        ))
+        raise
+    base = dataclasses.replace(base, conversation_id=conversation_id)
+    emit_audit_event(chat_success_event(
+        base=base, duration_ms=duration_since(audit_start), attribution=attribution,
+        model_version=result.model_version, usage=result.usage,
+        status=result.status, incomplete_reason=result.incomplete_reason,
+        committed=turn_commits(result.status, result.incomplete_reason),
+    ))
     return ChatResponse(
         message=result.message,
         conversation_id=conversation_id,

@@ -41,7 +41,7 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
-from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
+from azgenai_lab.prompts.loader import PromptTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -462,10 +462,13 @@ class AzureOpenAIChatService:
         await self._client.close()
 
 
-def build_chat_service(settings: Settings, *, prompt_name: str = "default_chat") -> ChatService:
-    """Composition point: the only place that decides fake vs. real."""
-    # Fail fast: a malformed template must kill startup, not the first request.
-    prompt = load_prompt(prompt_name)
+def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatService:
+    """Composition point: fake vs. real. The prompt instance is loaded once by
+    the caller (fail-fast on a malformed template, same as before) and shared
+    with the audit attribution built from the same instance (Day 22) — "same
+    file, same sha256" is not "same object", and the attribution must
+    describe the prompt this adapter actually holds.
+    """
     if settings.use_fake_llm:
         return FakeChatService(prompt=prompt)
     if not (

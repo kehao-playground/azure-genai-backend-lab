@@ -6,8 +6,9 @@ provider_call_attempted layer); see docs/audit-logging.md."""
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 from pydantic import (
     AwareDatetime,
@@ -19,8 +20,10 @@ from pydantic import (
     model_validator,
 )
 
+from azgenai_lab.core.config import Settings
 from azgenai_lab.core.correlation import correlation_id_var, request_start_var
 from azgenai_lab.models.chat import TokenUsage
+from azgenai_lab.prompts.loader import PromptTemplate
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
 
@@ -333,3 +336,166 @@ def has_audit_context() -> bool:
 def request_duration_ms() -> float:
     start = request_start_var.get()
     return 0.0 if start is None else duration_since(start)
+
+
+# --- Route event builders (Day 22 Task 6): chat.turn ---
+#
+# core.audit never imports core.errors (see module docstring in
+# api/chat.py): builders below take only primitives, dataclasses defined in
+# this module, and models already defined above — never an UpstreamError
+# subtype. The exception -> primitive classification that decides *which*
+# builder to call and what to pass it lives in core.errors instead
+# (upstream_outcome / chat_upstream_audit_args), so api/chat.py and
+# api/streaming.py share one classification without either module reaching
+# into the other's private symbols.
+#
+# Every field is passed by name rather than by dict-splat: BaseModel's
+# synthesized __init__ (pydantic's dataclass_transform) has one concrete
+# parameter type per field, and an untyped dict (however convenient to
+# assemble) cannot satisfy that under mypy strict — the explicit form below
+# is what actually type-checks, and it matches the rest of this codebase's
+# style for constructing these models (e.g. AuthRejected in api/principal.py).
+
+
+@dataclass(frozen=True)
+class AuditAttribution:
+    """The prompt/deployment identity actually used by a request — built once
+    per composition point from the same PromptTemplate instance handed to the
+    adapter, so this describes what was sent, not a same-looking reload."""
+
+    prompt_name: str
+    prompt_version: int
+    prompt_sha256: str
+    deployment: str
+
+
+def build_audit_attribution(settings: Settings, prompt: PromptTemplate) -> AuditAttribution:
+    deployment = "fake" if settings.use_fake_llm else settings.azure_openai_deployment_name
+    if deployment is None:
+        raise ValueError("real mode requires AZURE_OPENAI_DEPLOYMENT_NAME")
+    return AuditAttribution(prompt.name, prompt.version, prompt.sha256, deployment)
+
+
+@dataclass(frozen=True)
+class ChatCommitSnapshot:
+    """Terminal data captured at the point a turn tries to commit — carried on
+    ChatStorageCommitError so a commit failure's audit event can still report
+    what the provider returned, not just that storage failed."""
+
+    model_version: str | None
+    usage: TokenUsage | None
+    status: Literal["completed", "incomplete"]
+    incomplete_reason: IncompleteReason | None
+
+
+@dataclass(frozen=True)
+class ChatEventBase:
+    """The fields every chat.turn variant carries, collected once at handler
+    entry — grouped so a finalizer's several emit call sites cannot each
+    independently misspell or omit one. ``conversation_id`` starts as
+    whatever the request carried (``None`` for a first turn) and the handler
+    replaces it with the resolved id once ``complete()`` returns one."""
+
+    tenant_id: str
+    user_id: str
+    correlation_id: str
+    conversation_id: str | None
+    streaming: bool
+
+
+def chat_base_fields(
+    *, tenant_id: str, user_id: str, correlation_id: str,
+    conversation_id: str | None, streaming: bool,
+) -> ChatEventBase:
+    return ChatEventBase(
+        tenant_id=tenant_id, user_id=user_id, correlation_id=correlation_id,
+        conversation_id=conversation_id, streaming=streaming,
+    )
+
+
+def chat_success_event(
+    *, base: ChatEventBase, duration_ms: float, attribution: AuditAttribution,
+    model_version: str | None, usage: TokenUsage | None,
+    status: Literal["completed", "incomplete"], incomplete_reason: IncompleteReason | None,
+    committed: bool,
+) -> ChatTurnSuccess:
+    return ChatTurnSuccess(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        conversation_id=base.conversation_id, streaming=base.streaming,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=True,
+        prompt_name=attribution.prompt_name, prompt_version=attribution.prompt_version,
+        prompt_sha256=attribution.prompt_sha256, deployment=attribution.deployment,
+        model_version=model_version,
+        usage=AuditUsage.from_token_usage(usage) if usage else None,
+        status=status, incomplete_reason=incomplete_reason, committed=committed,
+    )
+
+
+def chat_rejected_event(
+    *, base: ChatEventBase, duration_ms: float, error_code: ChatRejectedCode,
+    spent: int | None = None, budget: int | None = None,
+) -> ChatTurnRejected:
+    return ChatTurnRejected(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        conversation_id=base.conversation_id, streaming=base.streaming,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=False,
+        prompt_name=None, prompt_version=None, prompt_sha256=None, deployment=None,
+        committed=False, error_code=error_code, spent=spent, budget=budget,
+    )
+
+
+def chat_failure_event(
+    *, base: ChatEventBase, duration_ms: float,
+    outcome: Literal["rejected", "error"], error_code: str,
+    provider_call_attempted: bool, attribution: AuditAttribution | None,
+    snapshot: ChatCommitSnapshot | None = None,
+) -> "ChatTurnRejected | ChatTurnError":
+    """Primitives only — core.audit never imports core.errors. No synthetic
+    HTTP status for non-HTTP failures: the caller names the outcome.
+
+    ``error_code`` arrives as a plain ``str`` (UpstreamError.code is a class
+    attribute typed ``str``, not a Literal, since one exception hierarchy
+    backs several distinct wire vocabularies) rather than the narrower
+    ChatRejectedCode/ChatErrorCode each branch's model expects. The cast
+    below documents that widening, not an assumption it papers over: an
+    error_code outside the model's Literal set still fails loudly at
+    emit_audit_event's validated boundary, the same as any other schema
+    violation this module enforces.
+    """
+    effective_attribution = attribution if provider_call_attempted else None
+    prompt_name = effective_attribution.prompt_name if effective_attribution else None
+    prompt_version = effective_attribution.prompt_version if effective_attribution else None
+    prompt_sha256 = effective_attribution.prompt_sha256 if effective_attribution else None
+    deployment = effective_attribution.deployment if effective_attribution else None
+    if snapshot is not None:
+        model_version = snapshot.model_version
+        auditable_usage = AuditUsage.from_token_usage(snapshot.usage) if snapshot.usage else None
+        status = snapshot.status
+        incomplete_reason = snapshot.incomplete_reason
+    else:
+        model_version, auditable_usage, status, incomplete_reason = None, None, None, None
+    if outcome == "rejected":
+        return ChatTurnRejected(
+            tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+            conversation_id=base.conversation_id, streaming=base.streaming,
+            occurred_at=audit_now(), duration_ms=duration_ms,
+            provider_call_attempted=provider_call_attempted,
+            prompt_name=prompt_name, prompt_version=prompt_version,
+            prompt_sha256=prompt_sha256, deployment=deployment,
+            model_version=model_version, usage=auditable_usage,
+            status=status, incomplete_reason=incomplete_reason,
+            committed=False, error_code=cast(ChatRejectedCode, error_code),
+        )
+    return ChatTurnError(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        conversation_id=base.conversation_id, streaming=base.streaming,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=provider_call_attempted,
+        prompt_name=prompt_name, prompt_version=prompt_version,
+        prompt_sha256=prompt_sha256, deployment=deployment,
+        model_version=model_version, usage=auditable_usage,
+        status=status, incomplete_reason=incomplete_reason,
+        committed=False, error_code=cast(ChatErrorCode, error_code),
+    )

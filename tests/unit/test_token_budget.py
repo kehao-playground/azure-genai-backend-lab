@@ -38,7 +38,15 @@ def make_service(
     budget: int | None, chat: FakeChatService | None = None
 ) -> tuple[ConversationChatService, InMemoryConversationStore]:
     store = InMemoryConversationStore()
-    return ConversationChatService(chat or FakeChatService(), store, token_budget=budget), store
+    # Attribution is the app's own: some callers of this helper drive the
+    # service through /chat (the 429-envelope tests below), where a success
+    # or failure event needs it — most callers exercise the service layer
+    # directly and never touch it either way.
+    service = ConversationChatService(
+        chat or FakeChatService(), store, token_budget=budget,
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
+    return service, store
 
 
 # --- fake usage: the deterministic numbers the wiring proofs below rely on ---
