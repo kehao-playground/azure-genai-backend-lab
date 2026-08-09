@@ -75,7 +75,14 @@ class ScriptedChatService:
 
 def override(service: ScriptedChatService) -> None:
     # The orchestrator stays real: only the LLM boundary is scripted.
-    wrapped = ConversationChatService(service, InMemoryConversationStore())
+    # audit_attribution carries over from the app's real composition (Day 22
+    # Task 7): the finalizer requires one, and this is the same "same file,
+    # same sha256 is not the same instance" attribution the composition point
+    # built for the prompt this test never actually swaps out.
+    wrapped = ConversationChatService(
+        service, InMemoryConversationStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: wrapped
 
 
@@ -84,6 +91,9 @@ class SpyConversationService:
 
     def __init__(self) -> None:
         self.tenant_ids: list[str] = []
+        # The finalizer (Day 22 Task 7) reads this off whatever service it is
+        # given, real or scripted — carry over the app's real attribution.
+        self.audit_attribution = app.state.conversation_service.audit_attribution
 
     async def open_stream(
         self, message: str, conversation_id: str | None, *, principal: Principal
@@ -291,7 +301,10 @@ class FailingStore(InMemoryConversationStore):
 
 
 def test_store_failure_mid_stream_ends_with_storage_error_terminal(client: TestClient) -> None:
-    service = ConversationChatService(FakeChatService(), FailingStore())
+    service = ConversationChatService(
+        FakeChatService(), FailingStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
     response = post_stream(client)

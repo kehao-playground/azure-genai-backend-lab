@@ -46,7 +46,13 @@ class ScriptedChatService:
 
 def _override(service: ScriptedChatService) -> None:
     # The orchestrator stays real: only the LLM boundary is scripted.
-    wrapped = ConversationChatService(service, InMemoryConversationStore())
+    # audit_attribution carries over from the app's real composition (Day 22
+    # Task 7 finalizer requires one — see tests/unit/test_streaming_api.py's
+    # override() for the same fix and rationale).
+    wrapped = ConversationChatService(
+        service, InMemoryConversationStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: wrapped
 
 
