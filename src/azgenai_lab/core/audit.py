@@ -5,9 +5,17 @@ provider_call_attempted layer); see docs/audit-logging.md."""
 
 import time
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from azgenai_lab.models.chat import TokenUsage
 
@@ -163,3 +171,139 @@ class ChatTurnRejected(_ChatTurnBase):
 class ChatTurnError(_ChatTurnBase):
     outcome: Literal["error"] = "error"
     error_code: ChatErrorCode
+
+
+class _RagQueryBase(_RouteEventBase):
+    event: Literal["rag.query"] = "rag.query"
+    model_version: str | None = None
+    hit_count: int | None = Field(default=None, ge=0)
+    selected_chunk_ids: tuple[str, ...] | None = None
+    status: Literal["answered", "no_answer", "error"] | None = None
+    failed_stage: Literal["retrieve", "assemble_context", "generation"] | None = None
+
+    @model_validator(mode="after")
+    def _terminal_shape(self) -> "_RagQueryBase":
+        if not self.provider_call_attempted and self.model_version is not None:
+            raise ValueError(ATTEMPTED_CONSTRAINT)
+        return self
+
+
+class RagQuerySuccess(_RagQueryBase):
+    outcome: Literal["success"] = Field(default="success", description=RAG_SUCCESS_CONSTRAINT)
+    status: Literal["answered", "no_answer"]
+
+    @model_validator(mode="after")
+    def _success_invariants(self) -> "RagQuerySuccess":
+        if (self.status == "answered") != self.provider_call_attempted:
+            raise ValueError(RAG_SUCCESS_CONSTRAINT)
+        if self.failed_stage is not None:
+            raise ValueError("failed_stage is error-path data")
+        return self
+
+
+class RagQueryRejected(_RagQueryBase):
+    outcome: Literal["rejected"] = "rejected"
+    error_code: RagRejectedCode
+    status: Literal["error"] | None = None  # null only when the pipeline never ran (422)
+
+
+class RagQueryError(_RagQueryBase):
+    outcome: Literal["error"] = "error"
+    error_code: RagErrorCode
+    status: Literal["error"] = "error"
+
+    @model_validator(mode="after")
+    def _error_invariants(self) -> "RagQueryError":
+        if self.failed_stage is None:
+            raise ValueError("a rag error names its failed stage")
+        return self
+
+
+class _AgentRunBase(_RouteEventBase):
+    event: Literal["agent.run"] = "agent.run"
+    conversation_id: str | None
+    committed: bool
+    model_calls: int | None = Field(default=None, ge=0)
+    tool_call_count: int | None = Field(default=None, ge=0)
+    refused_call_count: int | None = Field(default=None, ge=0)
+    tools: tuple[AuditTool, ...] | None = None
+    stop_reason: Literal["natural", "iteration_limit", "function_call_limit"] | None = None
+
+
+class AgentRunSuccess(_AgentRunBase):
+    outcome: Literal["success"] = Field(default="success", description=AGENT_SUCCESS_CONSTRAINT)
+
+    @model_validator(mode="after")
+    def _success_invariants(self) -> "AgentRunSuccess":
+        if not self.provider_call_attempted:
+            raise ValueError(AGENT_SUCCESS_CONSTRAINT)
+        return self
+
+
+class AgentRunRejected(_AgentRunBase):
+    outcome: Literal["rejected"] = "rejected"
+    error_code: AgentRejectedCode
+    spent: int | None = Field(default=None, ge=0, description=BUDGET_CONSTRAINT)
+    budget: int | None = Field(default=None, ge=0, description=BUDGET_CONSTRAINT)
+
+    @model_validator(mode="after")
+    def _rejected_invariants(self) -> "AgentRunRejected":
+        check_budget_pair(self.error_code, self.spent, self.budget)
+        return self
+
+
+class AgentRunErrorEvent(_AgentRunBase):
+    outcome: Literal["error"] = "error"
+    error_code: AgentErrorCode
+
+
+class AuthRejected(_AuditBase):
+    """401 carries no identity; 403 requires verified identity."""
+
+    event: Literal["auth.rejected"] = "auth.rejected"
+    outcome: Literal["rejected"] = "rejected"
+    tenant_id: str | None = Field(description=IDENTITY_CONSTRAINT)
+    user_id: str | None = Field(description=IDENTITY_CONSTRAINT)
+    path: str  # request.url.path — never the query string
+    auth_mode: Literal["headers", "entra"]
+    reason: AuthRejectionReason
+    http_status: Literal[401, 403]
+
+    @model_validator(mode="after")
+    def _identity_rules(self) -> "AuthRejected":
+        if self.http_status == 401 and (self.tenant_id is not None or self.user_id is not None):
+            raise ValueError(IDENTITY_CONSTRAINT)
+        if self.http_status == 403 and (self.tenant_id is None or self.user_id is None):
+            raise ValueError(IDENTITY_CONSTRAINT)
+        if (self.reason == "permission_missing") != (self.http_status == 403):
+            raise ValueError("permission_missing is exactly the 403 reason")
+        if self.auth_mode == "headers":
+            if self.reason not in ("headers_missing", "headers_invalid") or self.http_status != 401:
+                raise ValueError("headers mode rejects only as 401 headers_missing/headers_invalid")
+        elif self.http_status == 401 and self.reason not in ("bearer_missing", "token_invalid"):
+            raise ValueError("entra 401 reasons are bearer_missing/token_invalid")
+        return self
+
+
+ChatTurnEvent = Annotated[
+    ChatTurnSuccess | ChatTurnRejected | ChatTurnError, Field(discriminator="outcome")
+]
+RagQueryEvent = Annotated[
+    RagQuerySuccess | RagQueryRejected | RagQueryError, Field(discriminator="outcome")
+]
+AgentRunEvent = Annotated[
+    AgentRunSuccess | AgentRunRejected | AgentRunErrorEvent, Field(discriminator="outcome")
+]
+AuditEvent = Annotated[
+    ChatTurnEvent | RagQueryEvent | AgentRunEvent | AuthRejected,
+    Field(discriminator="event"),
+]
+
+AUDIT_EVENT_ADAPTER: TypeAdapter[AuditEvent] = TypeAdapter(AuditEvent)
+
+AuditEventModel = (
+    ChatTurnSuccess | ChatTurnRejected | ChatTurnError
+    | RagQuerySuccess | RagQueryRejected | RagQueryError
+    | AgentRunSuccess | AgentRunRejected | AgentRunErrorEvent
+    | AuthRejected
+)
