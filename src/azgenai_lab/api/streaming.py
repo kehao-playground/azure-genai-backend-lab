@@ -263,6 +263,17 @@ async def _audit_observed(
             ))
         raise
     else:
+        # Unreachable through this endpoint on the healthy-200 path:
+        # `_render_sse` `return`s right after yielding `message.done`
+        # without pulling a next value, so this generator is left suspended
+        # at its own `yield` and never reaches loop completion — the
+        # `GeneratorExit` branch above emits success instead, once asyncio's
+        # async-generator finalizer eventually closes it (see
+        # docs/audit-logging.md's "known gap" section). Kept for
+        # direct-iteration callers (e.g. the generator-level tests that
+        # drive this async generator to natural exhaustion) and as a
+        # correct fallback should the endpoint's consumption pattern ever
+        # change.
         if seen_done is not None:
             emit_audit_event(_terminal_success())
         else:  # upstream EOF without a terminal: still an upstream failure
