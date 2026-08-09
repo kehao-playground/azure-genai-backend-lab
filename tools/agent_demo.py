@@ -1363,8 +1363,13 @@ async def main() -> None:
     # construction would otherwise strand one of them (Task 13's lesson).
     store = build_conversation_store(settings)
     sink: list[ToolOutputRecord] = []
+    # Loaded once: both the seed and baseline services get the same
+    # default_chat PromptTemplate instance (Day 22) — this tool never drives
+    # them through the /chat audit finalizer, but build_chat_service's
+    # signature no longer loads its own copy either way.
+    default_chat_prompt = load_prompt("default_chat")
     try:
-        seed_chat_service = build_chat_service(settings)
+        seed_chat_service = build_chat_service(settings, prompt=default_chat_prompt)
     except (ValueError, ConfigurationError) as exc:
         _config_error(str(exc))
     # No budget on the seed service: the budget is DERIVED from what these
@@ -1373,7 +1378,7 @@ async def main() -> None:
     # derived number, threaded from the single place it is computed below.
     seed_service = ConversationChatService(seed_chat_service, store, token_budget=None)
     try:
-        baseline_service = build_chat_service(settings)
+        baseline_service = build_chat_service(settings, prompt=default_chat_prompt)
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         _config_error(str(exc))

@@ -8,9 +8,13 @@ from azgenai_lab.services.conversation import ConversationChatService
 @given("a conversation token budget of {budget:d} tokens")
 def step_small_token_budget(context, budget: int) -> None:  # type: ignore[no-untyped-def]
     # Same fake chat service and same store as the app — only the budget
-    # shrinks, so turns committed in this scenario count against it.
+    # shrinks, so turns committed in this scenario count against it. Same
+    # attribution too: it describes what the (unchanged) chat service holds.
     current = app.state.conversation_service
-    service = ConversationChatService(current._chat_service, current._store, token_budget=budget)
+    service = ConversationChatService(
+        current._chat_service, current._store, token_budget=budget,
+        audit_attribution=current.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
 

@@ -29,9 +29,15 @@ class RejectingChatService:
 @given("the upstream model rejects the input")
 def step_upstream_rejects_input(context) -> None:  # type: ignore[no-untyped-def]
     # Wrap the app's own store so conversations started earlier in the
-    # scenario stay visible: only the LLM boundary fails.
+    # scenario stay visible: only the LLM boundary fails. Attribution is the
+    # app's own too — the failure event still needs it, since the provider
+    # boundary was reached.
     store = app.state.conversation_service._store
-    service = ConversationChatService(RejectingChatService(), store)  # type: ignore[arg-type]
+    service = ConversationChatService(
+        RejectingChatService(),  # type: ignore[arg-type]
+        store,
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
 
@@ -57,7 +63,11 @@ class TruncatingChatService:
 @given("the upstream truncates the reply at the output token cap")
 def step_upstream_truncates(context) -> None:  # type: ignore[no-untyped-def]
     store = app.state.conversation_service._store
-    service = ConversationChatService(TruncatingChatService(), store)  # type: ignore[arg-type]
+    service = ConversationChatService(
+        TruncatingChatService(),  # type: ignore[arg-type]
+        store,
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
 

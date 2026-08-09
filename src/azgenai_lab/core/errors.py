@@ -1,10 +1,18 @@
 import logging
+from typing import TYPE_CHECKING, Literal
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+if TYPE_CHECKING:
+    # core.audit never imports this module (see its module docstring); the
+    # reverse is fine, and TYPE_CHECKING keeps it from being a runtime edge.
+    # AgentAuditTerminalSnapshot doesn't exist until Task 9 defines it
+    # alongside the agent-scoped counterparts of the helpers below.
+    from azgenai_lab.core.audit import ChatCommitSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +101,31 @@ class StorageError(UpstreamError):
     message = "Conversation storage failed; the turn was not saved."
 
 
+class StorageCommitError(StorageError):
+    """Commit-path storage failure (base), distinct from the load path's bare
+    ``StorageError`` (Day 22). A finalizer keys ``provider_call_attempted`` off
+    this subtype — the load path never reached the provider, the commit path
+    always did — never off ``__cause__`` or an exception message, which are
+    both log-only and not part of the typed contract.
+    """
+
+
+class ChatStorageCommitError(StorageCommitError):
+    """A ``/chat`` turn's commit failed after the provider already replied.
+
+    ``audit_snapshot`` is required, not optional: every commit call site has
+    terminal data in hand (the reply that just arrived), so there is no case
+    where this can legitimately be raised without it — a caller that cannot
+    supply one has a different bug.
+    """
+
+    def __init__(
+        self, upstream_detail: str | None = None, *, audit_snapshot: "ChatCommitSnapshot"
+    ) -> None:
+        super().__init__(upstream_detail)
+        self.audit_snapshot = audit_snapshot
+
+
 class UpstreamThrottledError(UpstreamError):
     """Upstream capacity is exhausted — our quota problem, not the client's request rate."""
 
@@ -111,6 +144,37 @@ class UpstreamServiceError(UpstreamError):
     status_code = 502
     code = "upstream_error"
     message = "The upstream LLM service failed."
+
+
+def upstream_outcome(exc: UpstreamError) -> Literal["rejected", "error"]:
+    """4xx is a rejection of this request; anything else (5xx) is a failure
+    that was not this caller's fault, even if a client retry might still
+    trigger it again — the split an audit outcome field needs."""
+    return "rejected" if 400 <= exc.status_code < 500 else "error"
+
+
+def chat_upstream_audit_args(
+    exc: UpstreamError,
+) -> tuple[Literal["rejected", "error"], str, bool, "ChatCommitSnapshot | None"]:
+    """(outcome, error_code, provider_call_attempted, snapshot) — the pure
+    exception -> primitive classification for any chat-turn caller that needs
+    to call ``core.audit.chat_failure_event`` without core.audit importing
+    this module. Public for two callers, not one: ``/chat`` (non-streaming)
+    and ``/chat/stream`` both raise this same exception hierarchy out of the
+    same ``ConversationChatService``, so both finalizers classify a failure
+    the same way — the streaming finalizer is not a special case here, it is
+    the second normal user. A ``ChatStorageCommitError`` means the provider
+    ran and only the commit failed (attempted=true, its snapshot carried
+    through); a bare ``StorageError`` means the load path never reached the
+    provider (attempted=false); anything else is an upstream failure that did
+    reach the provider (attempted=true, no snapshot — there was no commit to
+    carry one from).
+    """
+    if isinstance(exc, ChatStorageCommitError):
+        return upstream_outcome(exc), exc.code, True, exc.audit_snapshot
+    if isinstance(exc, StorageError):
+        return upstream_outcome(exc), exc.code, False, None
+    return upstream_outcome(exc), exc.code, True, None
 
 
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:

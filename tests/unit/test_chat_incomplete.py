@@ -209,7 +209,10 @@ def test_chat_response_reports_completed_status(client: TestClient) -> None:
 
 def test_chat_response_reports_truncation(client: TestClient) -> None:
     scripted = ChatResult(message="par", status="incomplete", incomplete_reason="max_output_tokens")
-    service = ConversationChatService(ScriptedChat(scripted), InMemoryConversationStore())
+    service = ConversationChatService(
+        ScriptedChat(scripted), InMemoryConversationStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
     client.post("/api/v1/chat", json={"message": "one"})

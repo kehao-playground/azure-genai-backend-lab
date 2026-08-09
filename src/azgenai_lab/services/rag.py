@@ -375,14 +375,14 @@ class RagService:
 
 
 def build_rag_service(settings: Settings) -> RagService:
+    # Loaded once: the same PromptTemplate instance goes to the adapter
+    # (build_chat_service, which sends prompt.text as the wire instructions)
+    # and to this module, which only needs the byte cost for budgeting
+    # (Day 22 — a second load of the same file is not the same instance).
     prompt = load_prompt("rag_answer")
     return RagService(
         build_retriever(settings),
-        build_chat_service(settings, prompt_name="rag_answer"),
-        # build_chat_service (above) loads its own copy of the same template
-        # to hand to the adapter that owns the instructions wire-side; this
-        # is a second, deterministic load of the same file solely so
-        # RagService can know the instructions' byte cost for budgeting.
+        build_chat_service(settings, prompt=prompt),
         instructions_bytes=len(prompt.text.encode("utf-8")),
     )
 

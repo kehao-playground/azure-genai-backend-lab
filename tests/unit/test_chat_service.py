@@ -19,7 +19,7 @@ from azgenai_lab.core.errors import (
     UpstreamTimeoutError,
 )
 from azgenai_lab.models.conversation import ReplayItem
-from azgenai_lab.prompts.loader import PromptTemplate
+from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
@@ -47,7 +47,7 @@ def make_settings(**overrides: Any) -> Settings:
 
 
 def test_default_settings_build_fake_service() -> None:
-    service = build_chat_service(Settings(_env_file=None))
+    service = build_chat_service(Settings(_env_file=None), prompt=PROMPT)
 
     assert isinstance(service, FakeChatService)
 
@@ -78,7 +78,7 @@ def test_real_service_requires_endpoint_key_and_deployment() -> None:
     settings = Settings(_env_file=None, use_fake_llm=False)
 
     with pytest.raises(ValueError, match="USE_FAKE_LLM=false requires"):
-        build_chat_service(settings)
+        build_chat_service(settings, prompt=PROMPT)
 
 
 def make_real_settings() -> Settings:
@@ -92,13 +92,13 @@ def make_real_settings() -> Settings:
 
 
 def test_real_service_built_from_complete_settings() -> None:
-    service = build_chat_service(make_real_settings())
+    service = build_chat_service(make_real_settings(), prompt=PROMPT)
 
     assert isinstance(service, AzureOpenAIChatService)
 
 
 def test_real_client_uses_configured_timeout_not_sdk_default() -> None:
-    service = build_chat_service(make_real_settings())
+    service = build_chat_service(make_real_settings(), prompt=PROMPT)
 
     assert isinstance(service, AzureOpenAIChatService)
     assert service._client.timeout == 30.0
@@ -263,9 +263,9 @@ async def test_fake_without_prompt_keeps_legacy_output() -> None:
 
 
 async def test_build_chat_service_wires_prompt() -> None:
-    service = build_chat_service(make_settings(use_fake_llm=True))
+    service = build_chat_service(make_settings(use_fake_llm=True), prompt=PROMPT)
     result = await service.complete([{"role": "user", "content": "ping"}])
-    assert "(prompt=default_chat@1)" in result.message
+    assert f"(prompt={PROMPT.name}@{PROMPT.version})" in result.message
 
 
 async def test_real_service_sends_prompt_as_instructions() -> None:
@@ -279,9 +279,12 @@ async def test_real_service_sends_prompt_as_instructions() -> None:
     assert responses.calls[0]["instructions"] == PROMPT.text
 
 
-async def test_build_chat_service_binds_named_prompt() -> None:
-    service = build_chat_service(make_settings(use_fake_llm=True))
-    assert isinstance(service, FakeChatService)
-    rag_service = build_chat_service(make_settings(use_fake_llm=True), prompt_name="rag_answer")
+async def test_build_chat_service_wires_whichever_prompt_instance_the_caller_loaded() -> None:
+    # build_chat_service no longer decides which template to load (Day 22):
+    # the caller (build_conversation_service / build_rag_service) loads once
+    # and hands the instance in — this proves the adapter carries whatever
+    # instance it was given, not a name it resolved itself.
+    rag_prompt = load_prompt("rag_answer")
+    rag_service = build_chat_service(make_settings(use_fake_llm=True), prompt=rag_prompt)
     result = await rag_service.complete([{"role": "user", "content": "q"}])
-    assert "prompt=rag_answer@3" in result.message
+    assert f"prompt=rag_answer@{rag_prompt.version}" in result.message

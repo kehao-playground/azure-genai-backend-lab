@@ -36,12 +36,14 @@ may already have incurred billable processing; retrying repeats it.
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
+from azgenai_lab.core.audit import AuditAttribution, ChatCommitSnapshot, build_audit_attribution
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import StorageError, UpstreamServiceError
+from azgenai_lab.core.errors import ChatStorageCommitError, StorageError, UpstreamServiceError
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message
 from azgenai_lab.models.conversation import Conversation, ReplayItem
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.azure_openai import (
     ChatResult,
     ChatService,
@@ -51,6 +53,17 @@ from azgenai_lab.services.azure_openai import (
     build_chat_service,
 )
 from azgenai_lab.services.conversation_store import ConversationStore
+
+
+def turn_commits(status: str, incomplete_reason: str | None) -> bool:
+    """Single source of the Day 6/7 keep rule: ``completed`` always commits,
+    and ``incomplete`` commits only for ``max_output_tokens`` (a client-kept
+    partial reply) — ``content_filter``/``other`` are replies the client must
+    discard, so the log must not keep them either. ``complete()``,
+    ``_commit_on_done()`` and the audit success-event builders' ``committed``
+    argument all call this rather than each re-deriving it.
+    """
+    return status == "completed" or incomplete_reason == "max_output_tokens"
 
 
 class ConversationNotFoundError(Exception):
@@ -88,10 +101,15 @@ class ConversationChatService:
         store: ConversationStore,
         token_budget: int | None = None,
         locks: KeyedLock[tuple[str, str]] | None = None,
+        audit_attribution: AuditAttribution | None = None,
     ) -> None:
         self._chat_service = chat_service
         self._store = store
         self._token_budget = token_budget
+        # Public: the finalizer in api/chat.py reads this to attribute a
+        # success event to the prompt/deployment this service was actually
+        # built with (the same PromptTemplate instance the adapter holds).
+        self.audit_attribution = audit_attribution
         # One turn at a time per (tenant_id, conversation_id). Acquire and
         # release sit in different frames on the streaming path — the release
         # happens when the event iterator finishes, not when open_stream()
@@ -147,6 +165,7 @@ class ConversationChatService:
         expected_revision: int,
         usage_tokens: int,
         first_turn_scope: tuple[str, ...] | None,
+        audit_snapshot: ChatCommitSnapshot,
     ) -> None:
         try:
             await self._store.append(
@@ -162,7 +181,11 @@ class ConversationChatService:
             # Includes ConversationConflictError: under the per-process lock a
             # stale revision can only mean a cross-replica race this demo
             # does not support — a broken deployment, not a client case.
-            raise StorageError(str(exc)) from exc
+            # Typed (not bare StorageError) so a finalizer can tell this path
+            # apart from _load's: the provider already ran by the time this
+            # is raised (Day 22) — audit_snapshot is required, not optional,
+            # because every call site here has terminal data in hand.
+            raise ChatStorageCommitError(str(exc), audit_snapshot=audit_snapshot) from exc
 
     async def complete(
         self, message: str, conversation_id: str | None, *, principal: Principal
@@ -185,7 +208,7 @@ class ConversationChatService:
             # other are replies the client must discard, so the log must not
             # keep them either — the turn leaves no trace and a first-turn id
             # never comes into existence.
-            keeps = result.status == "completed" or result.incomplete_reason == "max_output_tokens"
+            keeps = turn_commits(result.status, result.incomplete_reason)
             if keeps:
                 turns = [Message(role="user", content=message)]
                 if result.message:
@@ -199,6 +222,9 @@ class ConversationChatService:
                     usage_tokens=result.usage.total_tokens if result.usage else 0,
                     first_turn_scope=(
                         conversation.authorization_group_ids if conversation.revision == 0 else None
+                    ),
+                    audit_snapshot=ChatCommitSnapshot(
+                        result.model_version, result.usage, result.status, result.incomplete_reason
                     ),
                 )
         finally:
@@ -251,9 +277,7 @@ class ConversationChatService:
         try:
             async for event in events:
                 if isinstance(event, StreamDone):
-                    keeps_text = event.status == "completed" or (
-                        event.incomplete_reason == "max_output_tokens"
-                    )
+                    keeps_text = turn_commits(event.status, event.incomplete_reason)
                     if keeps_text:
                         text = "".join(parts)
                         turns = [Message(role="user", content=message)]
@@ -270,6 +294,10 @@ class ConversationChatService:
                             expected_revision=expected_revision,
                             usage_tokens=event.usage.total_tokens if event.usage else 0,
                             first_turn_scope=first_turn_scope,
+                            audit_snapshot=ChatCommitSnapshot(
+                                event.model_version, event.usage,
+                                event.status, event.incomplete_reason,
+                            ),
                         )
                     yield event
                     return
@@ -302,10 +330,17 @@ def build_conversation_service(
     one store (or cross-endpoint history is silently invisible) and one lock
     registry (or concurrent turns on one conversation burn a full inference
     before dying as 500 storage_error). Correctness, not convenience.
+
+    The prompt is loaded exactly once here and handed to both the adapter
+    (build_chat_service) and the audit attribution (build_audit_attribution) —
+    the same PromptTemplate instance, not two loads of the same file, so the
+    attribution reports what the adapter actually holds (Day 22).
     """
+    prompt = load_prompt("default_chat")
     return ConversationChatService(
-        build_chat_service(settings),
+        build_chat_service(settings, prompt=prompt),
         store,
         token_budget=settings.conversation_token_budget,
         locks=locks,
+        audit_attribution=build_audit_attribution(settings, prompt),
     )

@@ -107,8 +107,14 @@ class RaisingChatService:
 
 
 def override_with_raising(error: UpstreamError) -> None:
-    # The orchestrator stays real: only the LLM boundary fails.
-    service = ConversationChatService(RaisingChatService(error), InMemoryConversationStore())  # type: ignore[arg-type]
+    # The orchestrator stays real: only the LLM boundary fails. Attribution
+    # is the app's own (built once by build_conversation_service): a failure
+    # event still needs it, since the provider boundary was reached.
+    service = ConversationChatService(
+        RaisingChatService(error),  # type: ignore[arg-type]
+        InMemoryConversationStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
 
@@ -128,7 +134,10 @@ class FailingStore(InMemoryConversationStore):
 
 
 def test_store_failure_maps_to_500_storage_error_envelope(client: TestClient) -> None:
-    service = ConversationChatService(FakeChatService(), FailingStore())
+    service = ConversationChatService(
+        FakeChatService(), FailingStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
     response = client.post("/api/v1/chat", json={"message": "ping"})
@@ -147,7 +156,11 @@ class EmptyReplyChatService:
 
 
 def test_empty_upstream_reply_maps_to_502_not_a_ghost_conversation(client: TestClient) -> None:
-    service = ConversationChatService(EmptyReplyChatService(), InMemoryConversationStore())  # type: ignore[arg-type]
+    service = ConversationChatService(
+        EmptyReplyChatService(),  # type: ignore[arg-type]
+        InMemoryConversationStore(),
+        audit_attribution=app.state.conversation_service.audit_attribution,
+    )
     app.dependency_overrides[get_conversation_service] = lambda: service
 
     response = client.post("/api/v1/chat", json={"message": "ping"})
