@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from azgenai_lab.api.rag import get_rag_service
+from azgenai_lab.core.audit import AuditAttribution
 from azgenai_lab.core.errors import ContextLengthExceededError
 from azgenai_lab.main import app
 from azgenai_lab.models.chat import TokenUsage
@@ -22,6 +23,15 @@ from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.rag import RagAnswer, RagService
 from azgenai_lab.services.retrieval import Retriever
+
+# These tests construct RagService directly (not via build_rag_service), so
+# they must supply the same audit_attribution build_rag_service derives from
+# the real rag_answer PromptTemplate -- otherwise an "answered" event (or a
+# generation-stage failure, both attempted=true) raises inside
+# emit_audit_event's schema validation (Day 22 Task 8).
+_TEST_ATTRIBUTION = AuditAttribution(
+    prompt_name="rag_answer", prompt_version=1, prompt_sha256="test", deployment="fake"
+)
 
 
 class StubRagService:
@@ -195,6 +205,7 @@ def test_rag_incomplete_reason_flows_through_real_service_to_http(
     service = RagService(
         Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5),
         StubIncompleteChatService(reason),
+        audit_attribution=_TEST_ATTRIBUTION,
     )
     app.dependency_overrides[get_rag_service] = lambda: service
 
@@ -282,6 +293,7 @@ def test_rag_response_sources_reflect_truncation_over_http(client: TestClient) -
         Retriever(FakeEmbeddingClient(), _OversizedSearchClient(hits), top=50),
         FakeChatService(prompt=prompt),
         instructions_bytes=len(prompt.text.encode("utf-8")),
+        audit_attribution=_TEST_ATTRIBUTION,
     )
     app.dependency_overrides[get_rag_service] = lambda: service
     try:
@@ -408,6 +420,7 @@ def test_provider_context_overflow_is_server_owned_on_rag(
     service = RagService(
         Retriever(FakeEmbeddingClient(), _OversizedSearchClient([hit]), top=5),
         chat,
+        audit_attribution=_TEST_ATTRIBUTION,
     )
     app.dependency_overrides[get_rag_service] = lambda: service
     try:

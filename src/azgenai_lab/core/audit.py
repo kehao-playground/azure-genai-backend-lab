@@ -369,6 +369,36 @@ class AuditAttribution:
     deployment: str
 
 
+@dataclass(frozen=True)
+class _AttributionFields:
+    """The four _RouteEventBase attribution fields, typed per-field (not a
+    dict[str, object]) so a builder can pass them on to a model constructor
+    by name and still satisfy mypy strict — pydantic's synthesized __init__
+    exposes one concrete parameter type per field (see the module comment
+    above chat_failure_event), and unpacking a dict[str, object] into that
+    does not type-check even though every value is individually correct."""
+
+    prompt_name: str | None
+    prompt_version: int | None
+    prompt_sha256: str | None
+    deployment: str | None
+
+
+def _attribution_fields(attribution: AuditAttribution | None) -> _AttributionFields:
+    """Widen an AuditAttribution (or its absence) to the four primitive
+    fields _RouteEventBase expects. A caller passes None here exactly when
+    provider_call_attempted is False (the _attempted_layer validator forbids
+    any of the four being non-None in that case), so this single helper is
+    the one place that "attempted implies attribution" gets encoded as data
+    rather than repeated at every builder call site."""
+    if attribution is None:
+        return _AttributionFields(None, None, None, None)
+    return _AttributionFields(
+        attribution.prompt_name, attribution.prompt_version,
+        attribution.prompt_sha256, attribution.deployment,
+    )
+
+
 def build_audit_attribution(settings: Settings, prompt: PromptTemplate) -> AuditAttribution:
     deployment = "fake" if settings.use_fake_llm else settings.azure_openai_deployment_name
     if deployment is None:
@@ -498,4 +528,132 @@ def chat_failure_event(
         model_version=model_version, usage=auditable_usage,
         status=status, incomplete_reason=incomplete_reason,
         committed=False, error_code=cast(ChatErrorCode, error_code),
+    )
+
+
+# --- Route event builders (Day 22 Task 8): rag.query ---
+#
+# rag.query differs from chat.turn in *where* it is emitted: RagService.answer()
+# is a plain async method with no Request, called both from the /rag endpoint
+# and (in tests, and potentially future callers) directly. There is no
+# per-endpoint finalizer to own emission the way api/chat.py does, so the
+# service itself emits at its three terminals, each guarded by
+# has_audit_context() -- see that function's docstring. duration_ms therefore
+# comes from request_duration_ms() (the ContextVar path), never
+# duration_since(request.state.audit_start): the service has no
+# request.state to read.
+#
+# Base fields are collected into RagEventBase (mirrors ChatEventBase) rather
+# than a dict: dict[str, object] cannot be splatted into a model constructor
+# under mypy strict (each field has its own concrete type; see
+# _attribution_fields above), so every builder below passes fields by name,
+# same discipline as chat_success_event/chat_failure_event.
+
+
+@dataclass(frozen=True)
+class RagEventBase:
+    """tenant_id/user_id/correlation_id collected once per call so answer()'s
+    three emit call sites build the same triple the same way."""
+
+    tenant_id: str
+    user_id: str
+    correlation_id: str
+
+
+def rag_base_fields(*, tenant_id: str, user_id: str, correlation_id: str) -> RagEventBase:
+    return RagEventBase(tenant_id=tenant_id, user_id=user_id, correlation_id=correlation_id)
+
+
+def rag_success_event(
+    *, base: RagEventBase, duration_ms: float, attribution: AuditAttribution | None,
+    status: Literal["answered", "no_answer"], hit_count: int,
+    selected_chunk_ids: tuple[str, ...] | None,
+    model_version: str | None, usage: TokenUsage | None,
+) -> RagQuerySuccess:
+    """Covers both terminal RagStatus values from RagService.answer(): a
+    structural no_answer (zero retrieved hits, generation never attempted)
+    and answered (generation attempted and returned). RAG_SUCCESS_CONSTRAINT
+    ties provider_call_attempted to status, so it is derived from status
+    here rather than accepted as a separate caller-supplied bool -- there is
+    only one correct value once status is known, and computing it removes a
+    way for a call site to pass a mismatched pair.
+    """
+    attempted = status == "answered"
+    fields = _attribution_fields(attribution if attempted else None)
+    return RagQuerySuccess(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=attempted,
+        prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+        prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+        status=status, hit_count=hit_count, selected_chunk_ids=selected_chunk_ids,
+        model_version=model_version if attempted else None,
+        usage=AuditUsage.from_token_usage(usage) if (attempted and usage) else None,
+    )
+
+
+def rag_rejected_event(
+    *, base: RagEventBase, duration_ms: float, error_code: RagRejectedCode
+) -> RagQueryRejected:
+    """422-path builder: the request never reached RagService.answer() (a
+    validation_error from the FastAPI/pydantic request-model layer), so
+    provider_call_attempted is always False and status stays null -- the
+    pipeline never ran, which is a different case from rag_failure_event's
+    outcome="rejected" (content_filtered), where the pipeline ran and status
+    is "error". Not called from services/rag.py; Task 10's 422 handler is
+    the caller.
+    """
+    fields = _attribution_fields(None)
+    return RagQueryRejected(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=False,
+        prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+        prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+        status=None, error_code=error_code,
+    )
+
+
+def rag_failure_event(
+    *, base: RagEventBase, duration_ms: float,
+    outcome: Literal["rejected", "error"], error_code: str,
+    provider_call_attempted: bool, attribution: AuditAttribution | None,
+    failed_stage: str, hit_count: int | None,
+    selected_chunk_ids: tuple[str, ...] | None,
+) -> "RagQueryRejected | RagQueryError":
+    """The pipeline ran and raised: outcome/error_code classify *why*
+    (upstream_outcome + exc.code at the call site), failed_stage says
+    *where*, and hit_count/selected_chunk_ids report however much of
+    retrieval/selection completed before the raise -- None for a retrieve
+    failure (no SearchResult yet), populated for assemble_context/generation
+    failures. error_code arrives as a plain str for the same reason
+    chat_failure_event's does (UpstreamError.code is a class attribute typed
+    str, not a Literal); the cast below documents that widening, and an
+    error_code outside the model's Literal set still fails loudly at
+    emit_audit_event's validated boundary.
+    """
+    fields = _attribution_fields(attribution if provider_call_attempted else None)
+    failed_stage_literal = cast(
+        Literal["retrieve", "assemble_context", "generation"], failed_stage
+    )
+    if outcome == "rejected":
+        return RagQueryRejected(
+            tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+            occurred_at=audit_now(), duration_ms=duration_ms,
+            provider_call_attempted=provider_call_attempted,
+            prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+            prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+            status="error", failed_stage=failed_stage_literal,
+            hit_count=hit_count, selected_chunk_ids=selected_chunk_ids,
+            error_code=cast(RagRejectedCode, error_code),
+        )
+    return RagQueryError(
+        tenant_id=base.tenant_id, user_id=base.user_id, correlation_id=base.correlation_id,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=provider_call_attempted,
+        prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+        prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+        failed_stage=failed_stage_literal,
+        hit_count=hit_count, selected_chunk_ids=selected_chunk_ids,
+        error_code=cast(RagErrorCode, error_code),
     )
