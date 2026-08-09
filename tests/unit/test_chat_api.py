@@ -143,7 +143,7 @@ def test_store_failure_maps_to_500_storage_error_envelope(client: TestClient) ->
 
 class EmptyReplyChatService:
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
-        return ChatResult(message="", model="empty")
+        return ChatResult(message="", model_version="empty")
 
 
 def test_empty_upstream_reply_maps_to_502_not_a_ghost_conversation(client: TestClient) -> None:

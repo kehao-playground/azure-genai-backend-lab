@@ -23,6 +23,7 @@ from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
+    StreamDone,
     _fake_output_item,
     build_chat_service,
 )
@@ -55,8 +56,16 @@ async def test_fake_service_never_calls_azure() -> None:
     result = await FakeChatService().complete(user_items("hello"))
 
     assert result.message == "[fake-llm] hello"
-    assert result.model == "fake"
+    assert result.model_version == "fake"
     assert result.replay_items == (_fake_output_item("[fake-llm] hello"),)
+
+
+async def test_fake_stream_done_carries_model_version() -> None:
+    service = FakeChatService()
+    events = [e async for e in await service.open_stream([{"role": "user", "content": "hi"}])]
+    done = events[-1]
+    assert isinstance(done, StreamDone)
+    assert done.model_version == "fake"
 
 
 async def test_fake_service_makes_received_history_visible() -> None:
@@ -148,7 +157,7 @@ async def test_real_service_sends_deployment_name_and_replay_items_verbatim() ->
     assert responses.calls[0]["model"] == "chat-mini"
     assert responses.calls[0]["input"] == replay_context
     assert result.message == "pong"
-    assert result.model == "gpt-5-mini-2025-08-07"
+    assert result.model_version == "gpt-5-mini-2025-08-07"
     # The response's output items come back as the next turn's replay context.
     assert result.replay_items == (REASONING_ITEM,)
 

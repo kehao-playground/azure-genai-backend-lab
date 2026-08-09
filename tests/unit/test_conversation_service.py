@@ -56,7 +56,7 @@ class SpyChatService:
         if self._open_error is not None:
             raise self._open_error
         replay = (_fake_output_item(self._reply),) if self._reply else ()
-        return ChatResult(message=self._reply, model="spy", replay_items=replay)
+        return ChatResult(message=self._reply, model_version="spy", replay_items=replay)
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
         self.received.append(list(items))

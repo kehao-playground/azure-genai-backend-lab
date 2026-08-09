@@ -30,7 +30,7 @@ class StubChatService:
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         self.call_count += 1
-        return ChatResult(message=self._answer, model="stub")
+        return ChatResult(message=self._answer, model_version="stub")
 
     async def aclose(self) -> None:
         """No-op: this stub owns no resources to release."""
