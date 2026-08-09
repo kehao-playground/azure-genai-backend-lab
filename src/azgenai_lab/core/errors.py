@@ -7,10 +7,27 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from azgenai_lab.core.audit import (
+    agent_base_fields,
+    agent_rejected_event,
+    chat_base_fields,
+    chat_rejected_event,
+    duration_since,
+    emit_audit_event,
+    rag_base_fields,
+    rag_rejected_event,
+)
+
 if TYPE_CHECKING:
     # core.audit never imports this module (see its module docstring); the
     # reverse is fine, and TYPE_CHECKING keeps it from being a runtime edge.
-    from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, ChatCommitSnapshot
+    from azgenai_lab.core.audit import (
+        AgentAuditTerminalSnapshot,
+        AgentRunRejected,
+        ChatCommitSnapshot,
+        ChatTurnRejected,
+        RagQueryRejected,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -253,8 +270,68 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     )
 
 
+# event, streaming — one entry per route this handler covers. A route
+# missing from this map (or a path FastAPI never dispatched, e.g. a typo)
+# gets no 422 audit event, same as the unauthenticated case below: silence
+# over fabrication.
+_AUDIT_422_ROUTES: dict[str, tuple[str, bool]] = {
+    "/api/v1/chat": ("chat.turn", False),
+    "/api/v1/chat/stream": ("chat.turn", True),
+    "/api/v1/rag": ("rag.query", False),
+    "/api/v1/agent": ("agent.run", False),
+}
+
+
+def _emit_422_event(request: Request) -> None:
+    """A malformed-JSON body fails validation before FastAPI runs the route's
+    dependencies — including `require_principal` — so there is no resolved
+    identity and no `request.state.audit_start` (set by the correlation
+    middleware, which does run, but the two are checked together defensively
+    rather than assuming one implies the other). `request.state.principal`
+    is stashed by `require_principal` (api/principal.py) precisely so this
+    handler can tell "authenticated but bad body" (emit a rejected event)
+    apart from "never authenticated" (emit nothing) — an event claiming an
+    identity that was never verified would be a fabrication, not a record.
+    """
+    principal = getattr(request.state, "principal", None)
+    route = _AUDIT_422_ROUTES.get(request.url.path)
+    start = getattr(request.state, "audit_start", None)
+    if principal is None or route is None or start is None:
+        return
+    event_type, streaming = route
+    duration = duration_since(start)
+    event: "ChatTurnRejected | RagQueryRejected | AgentRunRejected"
+    if event_type == "chat.turn":
+        event = chat_rejected_event(
+            base=chat_base_fields(
+                tenant_id=principal.tenant_id, user_id=principal.user_id,
+                correlation_id=request.state.correlation_id,
+                conversation_id=None, streaming=streaming,
+            ),
+            duration_ms=duration, error_code="validation_error",
+        )
+    elif event_type == "rag.query":
+        event = rag_rejected_event(
+            base=rag_base_fields(
+                tenant_id=principal.tenant_id, user_id=principal.user_id,
+                correlation_id=request.state.correlation_id,
+            ),
+            duration_ms=duration, error_code="validation_error",
+        )
+    else:
+        event = agent_rejected_event(
+            base=agent_base_fields(
+                tenant_id=principal.tenant_id, user_id=principal.user_id,
+                correlation_id=request.state.correlation_id, conversation_id=None,
+            ),
+            duration_ms=duration, error_code="validation_error",
+        )
+    emit_audit_event(event)
+
+
 async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    _emit_422_event(request)
     message = "; ".join(
         f"{'.'.join(str(loc) for loc in error['loc'] if loc != 'body')}: {error['msg']}"
         for error in exc.errors()
