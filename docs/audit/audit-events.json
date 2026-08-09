@@ -1,0 +1,2191 @@
+{
+  "$defs": {
+    "AgentRunErrorEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "storage_error",
+            "upstream_error"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "agent.run",
+          "default": "agent.run",
+          "title": "Event",
+          "type": "string"
+        },
+        "model_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Calls"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "error",
+          "default": "error",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "refused_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Refused Call Count"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stop_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "natural",
+                "iteration_limit",
+                "function_call_limit"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Reason"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "tool_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Call Count"
+        },
+        "tools": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/AuditTool"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tools"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "committed",
+        "error_code"
+      ],
+      "title": "AgentRunErrorEvent",
+      "type": "object"
+    },
+    "AgentRunRejected": {
+      "additionalProperties": false,
+      "properties": {
+        "budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "spent/budget appear as a pair and exactly with error_code=token_budget_exceeded",
+          "title": "Budget"
+        },
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "validation_error",
+            "invalid_input",
+            "conversation_not_found",
+            "token_budget_exceeded"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "agent.run",
+          "default": "agent.run",
+          "title": "Event",
+          "type": "string"
+        },
+        "model_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Calls"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "rejected",
+          "default": "rejected",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "refused_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Refused Call Count"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "spent": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "spent/budget appear as a pair and exactly with error_code=token_budget_exceeded",
+          "title": "Spent"
+        },
+        "stop_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "natural",
+                "iteration_limit",
+                "function_call_limit"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Reason"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "tool_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Call Count"
+        },
+        "tools": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/AuditTool"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tools"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "committed",
+        "error_code"
+      ],
+      "title": "AgentRunRejected",
+      "type": "object"
+    },
+    "AgentRunSuccess": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "event": {
+          "const": "agent.run",
+          "default": "agent.run",
+          "title": "Event",
+          "type": "string"
+        },
+        "model_calls": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Calls"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "success",
+          "default": "success",
+          "description": "agent.run success requires provider_call_attempted=true",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "refused_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Refused Call Count"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "stop_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "natural",
+                "iteration_limit",
+                "function_call_limit"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Reason"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "tool_call_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Call Count"
+        },
+        "tools": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/AuditTool"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tools"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "committed"
+      ],
+      "title": "AgentRunSuccess",
+      "type": "object"
+    },
+    "AuditTool": {
+      "additionalProperties": false,
+      "properties": {
+        "executed": {
+          "title": "Executed",
+          "type": "boolean"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "round_index": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Round Index"
+        }
+      },
+      "required": [
+        "name",
+        "executed"
+      ],
+      "title": "AuditTool",
+      "type": "object"
+    },
+    "AuditUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "minimum": 0,
+          "title": "Input Tokens",
+          "type": "integer"
+        },
+        "output_tokens": {
+          "minimum": 0,
+          "title": "Output Tokens",
+          "type": "integer"
+        },
+        "reasoning_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reasoning Tokens"
+        },
+        "total_tokens": {
+          "minimum": 0,
+          "title": "Total Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ],
+      "title": "AuditUsage",
+      "type": "object"
+    },
+    "AuthRejected": {
+      "additionalProperties": false,
+      "description": "401 carries no identity; 403 requires verified identity.",
+      "properties": {
+        "auth_mode": {
+          "enum": [
+            "headers",
+            "entra"
+          ],
+          "title": "Auth Mode",
+          "type": "string"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "event": {
+          "const": "auth.rejected",
+          "default": "auth.rejected",
+          "title": "Event",
+          "type": "string"
+        },
+        "http_status": {
+          "enum": [
+            401,
+            403
+          ],
+          "title": "Http Status",
+          "type": "integer"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "rejected",
+          "default": "rejected",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "bearer_missing",
+            "token_invalid",
+            "permission_missing",
+            "headers_missing",
+            "headers_invalid"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tenant_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "401 carries no identity; 403 requires verified identity",
+          "title": "Tenant Id"
+        },
+        "user_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "401 carries no identity; 403 requires verified identity",
+          "title": "User Id"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "path",
+        "auth_mode",
+        "reason",
+        "http_status"
+      ],
+      "title": "AuthRejected",
+      "type": "object"
+    },
+    "ChatTurnError": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "configuration_error",
+            "storage_error",
+            "upstream_throttled",
+            "upstream_timeout",
+            "upstream_error",
+            "client_disconnect"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "chat.turn",
+          "default": "chat.turn",
+          "title": "Event",
+          "type": "string"
+        },
+        "incomplete_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_output_tokens",
+                "content_filter",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incomplete Reason"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "error",
+          "default": "error",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "completed",
+                "incomplete"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "streaming": {
+          "title": "Streaming",
+          "type": "boolean"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "streaming",
+        "committed",
+        "error_code"
+      ],
+      "title": "ChatTurnError",
+      "type": "object"
+    },
+    "ChatTurnRejected": {
+      "additionalProperties": false,
+      "properties": {
+        "budget": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "spent/budget appear as a pair and exactly with error_code=token_budget_exceeded",
+          "title": "Budget"
+        },
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "validation_error",
+            "conversation_not_found",
+            "token_budget_exceeded",
+            "invalid_input",
+            "content_filtered"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "chat.turn",
+          "default": "chat.turn",
+          "title": "Event",
+          "type": "string"
+        },
+        "incomplete_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_output_tokens",
+                "content_filter",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incomplete Reason"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "rejected",
+          "default": "rejected",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "spent": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "spent/budget appear as a pair and exactly with error_code=token_budget_exceeded",
+          "title": "Spent"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "completed",
+                "incomplete"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "streaming": {
+          "title": "Streaming",
+          "type": "boolean"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "streaming",
+        "committed",
+        "error_code"
+      ],
+      "title": "ChatTurnRejected",
+      "type": "object"
+    },
+    "ChatTurnSuccess": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "title": "Committed",
+          "type": "boolean"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Conversation Id"
+        },
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "event": {
+          "const": "chat.turn",
+          "default": "chat.turn",
+          "title": "Event",
+          "type": "string"
+        },
+        "incomplete_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "max_output_tokens",
+                "content_filter",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Incomplete Reason"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "success",
+          "default": "success",
+          "description": "chat.turn success requires provider_call_attempted=true",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "enum": [
+                "completed",
+                "incomplete"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "streaming": {
+          "title": "Streaming",
+          "type": "boolean"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "conversation_id",
+        "streaming",
+        "committed"
+      ],
+      "title": "ChatTurnSuccess",
+      "type": "object"
+    },
+    "RagQueryError": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "configuration_error",
+            "embedding_rejected",
+            "rag_context_overflow",
+            "search_unavailable",
+            "search_request_rejected",
+            "upstream_throttled",
+            "upstream_timeout",
+            "upstream_error"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "rag.query",
+          "default": "rag.query",
+          "title": "Event",
+          "type": "string"
+        },
+        "failed_stage": {
+          "anyOf": [
+            {
+              "enum": [
+                "retrieve",
+                "assemble_context",
+                "generation"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failed Stage"
+        },
+        "hit_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hit Count"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "error",
+          "default": "error",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "selected_chunk_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selected Chunk Ids"
+        },
+        "status": {
+          "const": "error",
+          "default": "error",
+          "title": "Status",
+          "type": "string"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "error_code"
+      ],
+      "title": "RagQueryError",
+      "type": "object"
+    },
+    "RagQueryRejected": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "error_code": {
+          "enum": [
+            "validation_error",
+            "content_filtered"
+          ],
+          "title": "Error Code",
+          "type": "string"
+        },
+        "event": {
+          "const": "rag.query",
+          "default": "rag.query",
+          "title": "Event",
+          "type": "string"
+        },
+        "failed_stage": {
+          "anyOf": [
+            {
+              "enum": [
+                "retrieve",
+                "assemble_context",
+                "generation"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failed Stage"
+        },
+        "hit_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hit Count"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "rejected",
+          "default": "rejected",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "selected_chunk_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selected Chunk Ids"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "const": "error",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "error_code"
+      ],
+      "title": "RagQueryRejected",
+      "type": "object"
+    },
+    "RagQuerySuccess": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_id": {
+          "title": "Correlation Id",
+          "type": "string"
+        },
+        "deployment": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployment"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "number"
+        },
+        "event": {
+          "const": "rag.query",
+          "default": "rag.query",
+          "title": "Event",
+          "type": "string"
+        },
+        "failed_stage": {
+          "anyOf": [
+            {
+              "enum": [
+                "retrieve",
+                "assemble_context",
+                "generation"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failed Stage"
+        },
+        "hit_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hit Count"
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model Version"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "outcome": {
+          "const": "success",
+          "default": "success",
+          "description": "rag.query answered requires attempted=true; no_answer requires attempted=false",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "prompt_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Name"
+        },
+        "prompt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Sha256"
+        },
+        "prompt_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Version"
+        },
+        "provider_call_attempted": {
+          "description": "attempted=true requires full prompt/deployment attribution; attempted=false forbids attribution and provider terminal data",
+          "title": "Provider Call Attempted",
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "selected_chunk_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selected Chunk Ids"
+        },
+        "status": {
+          "enum": [
+            "answered",
+            "no_answer"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuditUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "user_id": {
+          "title": "User Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "occurred_at",
+        "correlation_id",
+        "duration_ms",
+        "tenant_id",
+        "user_id",
+        "provider_call_attempted",
+        "status"
+      ],
+      "title": "RagQuerySuccess",
+      "type": "object"
+    }
+  },
+  "discriminator": {
+    "mapping": {
+      "agent.run": {
+        "discriminator": {
+          "mapping": {
+            "error": "#/$defs/AgentRunErrorEvent",
+            "rejected": "#/$defs/AgentRunRejected",
+            "success": "#/$defs/AgentRunSuccess"
+          },
+          "propertyName": "outcome"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/AgentRunSuccess"
+          },
+          {
+            "$ref": "#/$defs/AgentRunRejected"
+          },
+          {
+            "$ref": "#/$defs/AgentRunErrorEvent"
+          }
+        ]
+      },
+      "auth.rejected": "#/$defs/AuthRejected",
+      "chat.turn": {
+        "discriminator": {
+          "mapping": {
+            "error": "#/$defs/ChatTurnError",
+            "rejected": "#/$defs/ChatTurnRejected",
+            "success": "#/$defs/ChatTurnSuccess"
+          },
+          "propertyName": "outcome"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ChatTurnSuccess"
+          },
+          {
+            "$ref": "#/$defs/ChatTurnRejected"
+          },
+          {
+            "$ref": "#/$defs/ChatTurnError"
+          }
+        ]
+      },
+      "rag.query": {
+        "discriminator": {
+          "mapping": {
+            "error": "#/$defs/RagQueryError",
+            "rejected": "#/$defs/RagQueryRejected",
+            "success": "#/$defs/RagQuerySuccess"
+          },
+          "propertyName": "outcome"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/RagQuerySuccess"
+          },
+          {
+            "$ref": "#/$defs/RagQueryRejected"
+          },
+          {
+            "$ref": "#/$defs/RagQueryError"
+          }
+        ]
+      }
+    },
+    "propertyName": "event"
+  },
+  "oneOf": [
+    {
+      "discriminator": {
+        "mapping": {
+          "error": "#/$defs/ChatTurnError",
+          "rejected": "#/$defs/ChatTurnRejected",
+          "success": "#/$defs/ChatTurnSuccess"
+        },
+        "propertyName": "outcome"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ChatTurnSuccess"
+        },
+        {
+          "$ref": "#/$defs/ChatTurnRejected"
+        },
+        {
+          "$ref": "#/$defs/ChatTurnError"
+        }
+      ]
+    },
+    {
+      "discriminator": {
+        "mapping": {
+          "error": "#/$defs/RagQueryError",
+          "rejected": "#/$defs/RagQueryRejected",
+          "success": "#/$defs/RagQuerySuccess"
+        },
+        "propertyName": "outcome"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RagQuerySuccess"
+        },
+        {
+          "$ref": "#/$defs/RagQueryRejected"
+        },
+        {
+          "$ref": "#/$defs/RagQueryError"
+        }
+      ]
+    },
+    {
+      "discriminator": {
+        "mapping": {
+          "error": "#/$defs/AgentRunErrorEvent",
+          "rejected": "#/$defs/AgentRunRejected",
+          "success": "#/$defs/AgentRunSuccess"
+        },
+        "propertyName": "outcome"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AgentRunSuccess"
+        },
+        {
+          "$ref": "#/$defs/AgentRunRejected"
+        },
+        {
+          "$ref": "#/$defs/AgentRunErrorEvent"
+        }
+      ]
+    },
+    {
+      "$ref": "#/$defs/AuthRejected"
+    }
+  ]
+}
