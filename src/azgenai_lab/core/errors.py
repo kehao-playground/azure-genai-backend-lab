@@ -300,7 +300,7 @@ def _emit_422_event(request: Request) -> None:
         return
     event_type, streaming = route
     duration = duration_since(start)
-    event: "ChatTurnRejected | RagQueryRejected | AgentRunRejected"
+    event: ChatTurnRejected | RagQueryRejected | AgentRunRejected
     if event_type == "chat.turn":
         event = chat_rejected_event(
             base=chat_base_fields(
