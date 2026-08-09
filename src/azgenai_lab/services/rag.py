@@ -297,14 +297,20 @@ class RagService:
         self._nonce_factory = nonce_factory
         # The prompt/deployment identity actually used by the generation
         # call, built once at composition time from the same PromptTemplate
-        # instance handed to build_chat_service (Day 22). Optional (most
-        # existing tests construct RagService directly without it) so its
-        # absence just means an "answered" audit event's attempted=true
-        # branch has nothing to attribute -- that would fail
+        # instance handed to build_chat_service (Day 22). Public, matching
+        # ConversationChatService.audit_attribution (Task 6): a test that
+        # swaps ._retriever/._chat_service on the app-composed instance, or
+        # builds a fresh RagService for dependency-override, can read the
+        # real composed value here rather than fabricating one (review
+        # finding on the first version of this task -- test_chat_api.py /
+        # chat_steps.py already established this precedent for /chat).
+        # Optional (many existing tests construct RagService directly
+        # without it) so its absence just means an "answered" audit event's
+        # attempted=true branch has nothing to attribute -- that would fail
         # emit_audit_event's schema validation loudly rather than silently,
         # which is the intended fail-fast: a real /rag deployment always
         # goes through build_rag_service, which always supplies one.
-        self._audit_attribution = audit_attribution
+        self.audit_attribution = audit_attribution
 
     async def answer(self, question: str, principal: Principal) -> RagAnswer:
         total_started = time.perf_counter()
@@ -406,7 +412,7 @@ class RagService:
                     duration_ms=request_duration_ms(),
                     outcome=upstream_outcome(exc), error_code=exc.code,
                     provider_call_attempted=attempted,
-                    attribution=self._audit_attribution if attempted else None,
+                    attribution=self.audit_attribution if attempted else None,
                     failed_stage=current_stage,
                     hit_count=len(retrieved.hits) if retrieved is not None else None,
                     selected_chunk_ids=(
@@ -427,7 +433,7 @@ class RagService:
                     tenant_id=principal.tenant_id, user_id=principal.user_id,
                     correlation_id=correlation_id_var.get() or "-",
                 ),
-                duration_ms=request_duration_ms(), attribution=self._audit_attribution,
+                duration_ms=request_duration_ms(), attribution=self.audit_attribution,
                 status="answered", hit_count=len(retrieved.hits),
                 selected_chunk_ids=tuple(hit.chunk_id for hit in included),
                 model_version=result.model_version, usage=result.usage,
