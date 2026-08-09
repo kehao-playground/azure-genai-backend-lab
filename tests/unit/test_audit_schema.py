@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from typing import get_args
 
@@ -256,3 +257,44 @@ def test_union_round_trip_by_discriminators():
     event = ChatTurnSuccess(**_base())
     parsed = AUDIT_EVENT_ADAPTER.validate_python(event.model_dump(mode="json"))
     assert isinstance(parsed, ChatTurnSuccess)
+
+
+# --- Exported schema (Task 11): structural + per-$def constraint assertions ---
+#
+# text.count(...) below counts each inner discriminated union twice: pydantic
+# inlines a nested discriminated union's full schema both under the outer
+# discriminator's mapping value and again inside the outer oneOf array (no
+# $ref sharing between the two), so three inner "outcome" unions -> six
+# occurrences of that propertyName, not three. Verified directly against the
+# exported schema, not assumed from the brief's illustrative count.
+
+
+def test_exported_schema_structure_and_constraints():
+    schema = AUDIT_EVENT_ADAPTER.json_schema()
+    text = json.dumps(schema)
+    assert '"propertyName": "event"' in text            # outer discriminator
+    assert text.count('"propertyName": "outcome"') == 6  # three inner unions, inlined twice each
+    defs = schema["$defs"]
+
+    def def_text(name: str) -> str:
+        return json.dumps(defs[name])
+
+    assert audit.CHAT_SUCCESS_CONSTRAINT in def_text("ChatTurnSuccess")
+    assert audit.AGENT_SUCCESS_CONSTRAINT in def_text("AgentRunSuccess")
+    assert audit.RAG_SUCCESS_CONSTRAINT in def_text("RagQuerySuccess")
+    assert audit.BUDGET_CONSTRAINT in def_text("ChatTurnRejected")
+    assert audit.BUDGET_CONSTRAINT in def_text("AgentRunRejected")
+    assert audit.IDENTITY_CONSTRAINT in def_text("AuthRejected")
+    for name in ("ChatTurnSuccess", "RagQueryError", "AgentRunRejected"):
+        assert audit.ATTEMPTED_CONSTRAINT in def_text(name)
+
+
+def test_outer_union_covers_all_four_event_families():
+    """A mis-wired branch (e.g. rag.query left out of AuditEvent) would not
+    surface from test_union_round_trip_by_discriminators alone, since that
+    test only round-trips chat.turn. Assert the outer discriminator's
+    mapping directly instead of only asserting it exists."""
+    schema = AUDIT_EVENT_ADAPTER.json_schema()
+    assert set(schema["discriminator"]["mapping"]) == {
+        "chat.turn", "rag.query", "agent.run", "auth.rejected",
+    }
