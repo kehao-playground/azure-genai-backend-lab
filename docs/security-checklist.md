@@ -66,6 +66,16 @@ Every reference below is to a file in this repository unless it names a document
 - [ ] Agent Framework `Trace`-level logging and sensitive-data telemetry are never enabled — both log full chat message text ([Agent Safety](https://learn.microsoft.com/en-us/agent-framework/agents/safety), checked 2026-08); nothing in this repository turns either on
 - [ ] Secrets are read from the environment as `SecretStr` and never committed or baked into an image — `core/config.py`, [key-vault-config.md](key-vault-config.md)
 
+## Audit trail
+
+Full schema, presence rules, and honest limits: [audit-logging.md](audit-logging.md).
+
+- [ ] The never-log list is the same discipline as diagnostic logging, extended: no question/message text, chunk content, tool argument text, group ids, raw/bearer tokens, claims, or exception/upstream/validation detail in any audit event — enforced by a recursive field-name test, not a redaction filter at write time — `tests/unit/test_audit_schema.py` (`test_no_content_bearing_field_anywhere`), [audit-logging.md](audit-logging.md#never-log)
+- [ ] A 401 carries no identity at all — an unverified claim never reaches the audit log; only a 403 (already-authenticated, permission-denied) records `tenant_id`/`user_id` — `core/audit.py` (`AuthRejected`), [audit-logging.md](audit-logging.md#authrejected)
+- [ ] The audit logger is level-isolated from diagnostic verbosity: `LOG_LEVEL=WARNING` silences INFO diagnostics but never the audit trail — `core/logging.py` (`configure_logging`)
+- [ ] Every audit event passes a validated schema boundary before it is written; a value that doesn't fit raises instead of being logged — `core/audit.py` (`emit_audit_event`)
+- [ ] Emission is owned at one point per route (an endpoint finalizer, a service-level terminal, or `require_principal`), never scattered across call sites, so exactly one event (or zero, for a non-`UpstreamError` bug) is possible per request — [audit-logging.md](audit-logging.md#exactly-once--delivery)
+
 ## External extensions (evaluated, not wired in)
 
 - [ ] Prompt Shields is treated as a probabilistic layer on top of structural defenses, never as a replacement — [§5](prompt-injection.md#5-the-probabilistic-layer-azure-ai-content-safety-prompt-shields)

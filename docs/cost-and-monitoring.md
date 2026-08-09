@@ -15,6 +15,8 @@ llm usage input_tokens=1234 output_tokens=210 reasoning_tokens=128 total_tokens=
 
 This usage signal is for attribution and guardrails, not accounting: it is not an invoice record, and no per-request 1:1 reconciliation against Cost Management meters is implied. With reasoning models, hidden reasoning tokens (`usage.output_tokens_details.reasoning_tokens`, kept as `reasoning_tokens`) are billed as output — short exchanges can be output-dominated for exactly that reason. Input becomes the dominant term only as conversations grow: with `store=False` the full replay context is resent every turn, so *cumulative* input spend grows quadratically with turn count. That asymptote is what the per-conversation budget exists for.
 
+Day 22 adds an audit `usage` field on the same terminals this `llm usage` line already covers — same `TokenUsage` values, same source (the provider's `usage` block), just carried on a schema-validated event instead of a `key=value` line. It is not a second measurement: a request either has both (a usage-bearing terminal) or neither. `correlation_id` is what ties the two together, along with the prompt-attribution line above — one request's cost story is spread across three joinable log lines rather than duplicated into one. See [audit-logging.md](audit-logging.md#consuming-the-log).
+
 ## The two guardrails
 
 | Mechanism | Bound | Failure mode when it fires |

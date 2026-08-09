@@ -287,7 +287,7 @@ async def test_stage_logs_on_success(caplog) -> None:  # type: ignore[no-untyped
         if r.getMessage().startswith("agent_turn_stage")
     ]
     assert [s.split()[1] for s in stages] == ["stage=load", "stage=run", "stage=commit"]
-    assert all("outcome=ok" in s and "duration_ms=" in s for s in stages)
+    assert all("outcome=success" in s and "duration_ms=" in s for s in stages)
 
 
 async def test_stage_log_on_run_failure_no_commit_stage(caplog) -> None:  # type: ignore[no-untyped-def]
