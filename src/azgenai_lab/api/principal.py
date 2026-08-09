@@ -15,6 +15,13 @@ request-body validation, and a 422 here would leak the distinction between
 the required API permission is the one case that is not 401 — that caller is
 authenticated, so it gets 403 ``insufficient_scope``.
 
+Every rejection is raised internally as ``AuthRejection`` (Day 22 spec §3b),
+not ``HTTPException`` directly: the parsing/verification helpers below only
+know *why* a caller was refused, not that the refusal must become an audit
+event. ``require_principal`` is the sole place that catches ``AuthRejection``,
+emits ``auth.rejected`` from it, and only then raises the HTTPException the
+caller sees — unchanged, byte for byte, from before this event existed.
+
 An async-generator dependency (not a plain function) so the tenant/user
 context is set for the *entire* request lifetime, including a streaming
 response body — ``scope="request"`` on the callers' ``Depends(...)`` keeps the
@@ -24,12 +31,19 @@ returns.
 
 import logging
 from collections.abc import AsyncIterator, Mapping
-from typing import Annotated, Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
+from azgenai_lab.core.audit import (
+    AuthRejected,
+    AuthRejectionReason,
+    audit_now,
+    duration_since,
+    emit_audit_event,
+)
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.tenant_context import tenant_id_var, user_id_var
 from azgenai_lab.models.principal import Principal
@@ -57,12 +71,57 @@ MAX_GROUP_ID_TOKENS = 100
 MAX_AUTHORIZATION_HEADER_BYTES = 16 * 1024
 
 
-def unauthorized() -> HTTPException:
-    """401 through the shared envelope, with the RFC 7235 challenge header
-    that makes this an authentication (not authorization) failure. The
-    generic message deliberately doesn't name a mechanism (headers vs. JWT)
-    or a reason: two resolvers share this dependency, and telling an
-    unauthenticated caller *which* check failed is free reconnaissance."""
+class AuthRejection(Exception):
+    """Internal rejection contract (spec §3b): everything ``require_principal``
+    needs to emit ``auth.rejected`` and then map to the HTTP response, and
+    nothing else — never the raw token, the claims, or exception text. Every
+    parsing/verification helper below raises this instead of an
+    ``HTTPException`` directly, so the dependency gets one place to observe a
+    rejection before it becomes a response.
+
+    ``principal`` is only ever set on a 403 (``insufficient_scope`` — the
+    caller *was* verified). A 401 always carries ``principal=None``: no
+    identity was ever established, so there is nothing here for the audit
+    event to carry.
+    """
+
+    def __init__(
+        self,
+        http_status: Literal[401, 403],
+        reason: AuthRejectionReason,
+        principal: Principal | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.http_status = http_status
+        self.reason = reason
+        self.principal = principal
+
+
+def unauthorized(reason: AuthRejectionReason = "token_invalid") -> AuthRejection:
+    """A 401 rejection, tagged with *why* — for the ``auth.rejected`` audit
+    event, never for the response body: the HTTP side stays the generic
+    ``_http_401()`` envelope regardless of ``reason``, because telling an
+    unauthenticated caller which check failed is free reconnaissance."""
+    return AuthRejection(401, reason)
+
+
+def insufficient_scope(principal: Principal) -> AuthRejection:
+    """A 403 rejection for a verified credential without the required API
+    permission. Distinct from 401 on purpose: the caller *is* authenticated,
+    so retrying with the same token is pointless — the fix is a different
+    token, which is what the RFC 6750 ``insufficient_scope`` challenge says.
+    ``principal`` is carried through to the audit event: this is the one
+    rejection reason with a verified identity behind it.
+    """
+    return AuthRejection(403, "permission_missing", principal)
+
+
+def _http_401() -> HTTPException:
+    """The response ``unauthorized()`` used to build directly (pre-Day-22):
+    RFC 7235 challenge header, generic body. The generic message deliberately
+    doesn't name a mechanism (headers vs. JWT) or a reason: two resolvers
+    share this dependency, and telling an unauthenticated caller *which*
+    check failed is free reconnaissance."""
     return HTTPException(
         status_code=401,
         detail={
@@ -73,13 +132,10 @@ def unauthorized() -> HTTPException:
     )
 
 
-def insufficient_scope() -> HTTPException:
-    """403 for a verified credential without the required API permission.
-
-    Distinct from 401 on purpose: the caller *is* authenticated, so retrying
-    with the same token is pointless — the fix is a different token, which is
-    what the RFC 6750 ``insufficient_scope`` challenge says.
-    """
+def _http_403() -> HTTPException:
+    """The response ``insufficient_scope()`` used to build directly
+    (pre-Day-22), moved here verbatim so the public name can return an
+    ``AuthRejection`` instead."""
     return HTTPException(
         status_code=403,
         detail={
@@ -92,22 +148,26 @@ def insufficient_scope() -> HTTPException:
 
 def _parse_tenant_id(request: Request) -> str:
     values = request.headers.getlist("x-tenant-id")
+    if len(values) == 0:
+        raise unauthorized("headers_missing")
     if len(values) != 1:
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
     return values[0]
 
 
 def _parse_user_id(request: Request) -> str:
     values = request.headers.getlist("x-user-id")
+    if len(values) == 0:
+        raise unauthorized("headers_missing")
     if len(values) != 1:
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
     return values[0]
 
 
 def _parse_group_ids(request: Request) -> tuple[str, ...]:
     values = request.headers.getlist("x-group-ids")
     if len(values) > 1:
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
     if len(values) == 0:
         return ()
 
@@ -115,13 +175,13 @@ def _parse_group_ids(request: Request) -> tuple[str, ...]:
     if not raw.strip(" \t"):
         return ()
     if len(raw.encode("ascii", errors="replace")) > MAX_GROUP_IDS_HEADER_BYTES:
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
 
     tokens = [token.strip(" \t") for token in raw.split(",")]
     if any(token == "" for token in tokens):
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
     if len(tokens) > MAX_GROUP_ID_TOKENS:
-        raise unauthorized()
+        raise unauthorized("headers_invalid")
     return tuple(tokens)
 
 
@@ -136,8 +196,10 @@ def _parse_bearer_token(request: Request) -> str:
     proxy downstream might read differently.
     """
     values = request.headers.getlist("authorization")
+    if len(values) == 0:
+        raise unauthorized("bearer_missing")
     if len(values) != 1:
-        raise unauthorized()
+        raise unauthorized("token_invalid")
 
     raw = values[0]
     # Characters, which are bytes here: Starlette decodes header values as
@@ -145,15 +207,15 @@ def _parse_bearer_token(request: Request) -> str:
     # Encoding first would read as if it were counting something else while
     # producing the same number.
     if len(raw) > MAX_AUTHORIZATION_HEADER_BYTES:
-        raise unauthorized()
+        raise unauthorized("token_invalid")
 
     parts = raw.split(" ")
     if len(parts) != 2:
-        raise unauthorized()
+        raise unauthorized("token_invalid")
     scheme, token = parts
     # Case-insensitive per RFC 7235: the scheme is a token, not a literal.
     if scheme.lower() != "bearer" or not token:
-        raise unauthorized()
+        raise unauthorized("token_invalid")
     return token
 
 
@@ -174,7 +236,7 @@ class HeaderPrincipalResolver:
         try:
             return Principal(tenant_id=tenant_id, user_id=user_id, group_ids=group_ids)
         except (ValidationError, ValueError):
-            raise unauthorized() from None
+            raise unauthorized("headers_invalid") from None
 
     async def aclose(self) -> None:
         return None
@@ -207,13 +269,13 @@ class EntraJwtPrincipalResolver:
             # would turn a misconfigured deployment into a 401 storm that
             # reads as a fleet of bad clients.
             logger.info("bearer token rejected exception=%s", type(exc).__name__)
-            raise unauthorized() from None
+            raise unauthorized("token_invalid") from None
 
         # Identity first, permissions second: claims we do not trust are not
         # claims we evaluate permissions on. An overage or a malformed `tid`
         # is 401 even when the scope would also have been refused.
         principal = self._principal_from(claims)
-        self._require_permission(claims)
+        self._require_permission(claims, principal)
         return principal
 
     async def aclose(self) -> None:
@@ -223,7 +285,7 @@ class EntraJwtPrincipalResolver:
         tenant_id = claims.get("tid")
         user_id = claims.get("oid")
         if not isinstance(tenant_id, str) or not isinstance(user_id, str):
-            raise unauthorized()
+            raise unauthorized("token_invalid")
         # The one and only `tid` comparison in the codebase (see the
         # `services/entra_jwt` docstring): the verifier's contract stops at
         # the signature and the registered claims, so if this line goes away
@@ -231,13 +293,13 @@ class EntraJwtPrincipalResolver:
         # makes this the second layer — not a duplicate of a check that lives
         # somewhere else.
         if tenant_id != self._settings.entra_tenant_id:
-            raise unauthorized()
+            raise unauthorized("token_invalid")
 
         group_ids = self._group_ids(claims)
         try:
             return Principal(tenant_id=tenant_id, user_id=user_id, group_ids=group_ids)
         except (ValidationError, ValueError):
-            raise unauthorized() from None
+            raise unauthorized("token_invalid") from None
 
     def _group_ids(self, claims: Mapping[str, Any]) -> tuple[str, ...]:
         """Group object ids, or 401 — never a silent empty tuple.
@@ -257,7 +319,7 @@ class EntraJwtPrincipalResolver:
         # is; it is not treated as absence, because a flag that is present has
         # already told us the issuer had something to say about groups.
         if "hasgroups" in claims and claims["hasgroups"] is not False:
-            raise unauthorized()
+            raise unauthorized("token_invalid")
 
         # `_claim_names` is a *pointer* rather than a flag, which is why its
         # null is read the other way: a null carries no pointer, so it names
@@ -267,9 +329,9 @@ class EntraJwtPrincipalResolver:
         claim_names = claims.get("_claim_names")
         if claim_names is not None:
             if not isinstance(claim_names, Mapping):
-                raise unauthorized()
+                raise unauthorized("token_invalid")
             if "groups" in claim_names:
-                raise unauthorized()
+                raise unauthorized("token_invalid")
 
         groups = claims.get("groups")
         if groups is None:
@@ -282,14 +344,14 @@ class EntraJwtPrincipalResolver:
         # like" is this adapter's question, not the model's, and because the
         # model's answer currently rests on Pydantic's coercion table.
         if not isinstance(groups, list):
-            raise unauthorized()
+            raise unauthorized("token_invalid")
         if len(groups) > MAX_GROUP_ID_TOKENS:
-            raise unauthorized()
+            raise unauthorized("token_invalid")
         if any(not isinstance(group, str) for group in groups):
-            raise unauthorized()
+            raise unauthorized("token_invalid")
         return tuple(groups)
 
-    def _require_permission(self, claims: Mapping[str, Any]) -> None:
+    def _require_permission(self, claims: Mapping[str, Any], principal: Principal) -> None:
         """Delegated and app-only, selected by the presence of `scp` and never
         allowed to satisfy each other.
 
@@ -316,24 +378,24 @@ class EntraJwtPrincipalResolver:
         if "scp" in claims:
             scp = claims["scp"]
             if not isinstance(scp, str):
-                raise unauthorized()
+                raise unauthorized("token_invalid")
             required_scope = self._settings.entra_required_scope
             # `split()` with no argument splits on runs of whitespace and
             # drops empties, so set membership is exact: `access_as_user`
             # must be one of the space-delimited entries, not a substring of
             # one (`access_as_user_extended` is a different scope).
             if required_scope is None or required_scope not in set(scp.split()):
-                raise insufficient_scope()
+                raise insufficient_scope(principal)
             return
 
         roles = claims.get("roles")
         if roles is not None and (
             not isinstance(roles, list) or any(not isinstance(role, str) for role in roles)
         ):
-            raise unauthorized()
+            raise unauthorized("token_invalid")
         required_role = self._settings.entra_required_app_role
         if required_role is None or roles is None or required_role not in roles:
-            raise insufficient_scope()
+            raise insufficient_scope(principal)
 
 
 class UninitializedResolver:
@@ -409,8 +471,36 @@ async def require_principal(
     # startup. The adapter returns data; the request-lifetime context below is
     # this dependency's to own.
     resolver: PrincipalResolver = request.app.state.principal_resolver
-    principal = await resolver.resolve(request)
+    try:
+        principal = await resolver.resolve(request)
+    except AuthRejection as rejection:
+        # Emitted here, not by the resolver: this dependency is the only
+        # place that sees both the rejection and the request-scoped
+        # correlation id / start time the audit event needs.
+        # `rejection.principal` is set only for a 403 (`insufficient_scope`
+        # — the one rejection with a verified identity behind it), so the
+        # ternaries below are what keeps an unverified claim from ever
+        # reaching the audit log: a 401 always logs `tenant_id=None,
+        # user_id=None`.
+        settings: Settings = request.app.state.settings
+        emit_audit_event(AuthRejected(
+            occurred_at=audit_now(),
+            correlation_id=request.state.correlation_id,
+            duration_ms=duration_since(request.state.audit_start),
+            tenant_id=rejection.principal.tenant_id if rejection.principal else None,
+            user_id=rejection.principal.user_id if rejection.principal else None,
+            path=request.url.path,
+            auth_mode=settings.auth_mode,
+            reason=rejection.reason,
+            http_status=rejection.http_status,
+        ))
+        raise (_http_401() if rejection.http_status == 401 else _http_403()) from None
 
+    # Stashed for Task 10's 422 handler: a malformed-JSON body can fail
+    # before this dependency ever runs, and `request.state.principal` being
+    # set is the reliable way that handler tells "authenticated but bad
+    # body" apart from "never authenticated".
+    request.state.principal = principal
     tenant_token = tenant_id_var.set(principal.tenant_id)
     user_token = user_id_var.set(principal.user_id)
     logger.info("identity resolved")

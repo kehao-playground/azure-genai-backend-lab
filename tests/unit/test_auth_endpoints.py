@@ -333,12 +333,27 @@ def test_health_does_not_resolve_a_principal() -> None:
 
 
 @pytest.mark.parametrize("path", ["/api/v1/chat", "/api/v1/chat/stream"])
-def test_insufficient_scope_is_403_through_the_shared_envelope(path: str) -> None:
-    app_under_test = create_app()
-    app_under_test.state.principal_resolver = _StubResolver(failure=insufficient_scope())
+def test_insufficient_scope_is_403_through_the_shared_envelope(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    # Entra-mode settings, not headers mode (Day 22): `insufficient_scope()`
+    # now builds an `AuthRejection` that `require_principal` turns into an
+    # `auth.rejected` audit event before this HTTPException, and that event's
+    # schema forbids a headers-mode 403 — a `HeaderPrincipalResolver` never
+    # raises one for real, so a headers-mode app here would be asserting a
+    # combination the schema (rightly) says cannot happen.
+    app_under_test = _entra_mode_app(monkeypatch)
+    principal = Principal(tenant_id="t1", user_id="u1", group_ids=())
+    app_under_test.state.principal_resolver = _StubResolver(
+        failure=insufficient_scope(principal)
+    )
 
-    with TestClient(app_under_test) as client:
-        response = client.post(path, json={"message": "hello"})
+    # Bare, not a context manager: entering one would run the entra-mode
+    # lifespan, which would try a real JWKS discovery request and overwrite
+    # the stub resolver installed above (see `_entra_mode_app`'s docstring
+    # and the "without_lifespan" tests below).
+    client = TestClient(app_under_test)
+    response = client.post(path, json={"message": "hello"})
 
     assert response.status_code == 403
     # Plain JSON on the streaming route too: a 403 is raised before the

@@ -28,13 +28,16 @@ from fastapi import HTTPException, Request
 from azgenai_lab.api import principal as principal_module
 from azgenai_lab.api.principal import (
     MAX_AUTHORIZATION_HEADER_BYTES,
+    AuthRejection,
     EntraJwtPrincipalResolver,
     HeaderPrincipalResolver,
     UninitializedResolver,
     build_entra_resolver,
     build_initial_resolver,
     insufficient_scope,
+    unauthorized,
 )
+from azgenai_lab.core.audit import AuthRejectionReason
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.entra_jwt import (
@@ -120,22 +123,26 @@ async def _resolve(
     return await resolver.resolve(request_with(headers if headers is not None else BEARER_HEADER))
 
 
-async def _expect_status(
+async def _expect_rejection(
     claims: Mapping[str, Any] | Exception,
-    status: int,
+    http_status: int,
+    reason: AuthRejectionReason,
     *,
     settings: Settings | None = None,
     headers: list[tuple[bytes, bytes]] | None = None,
-) -> HTTPException:
-    with pytest.raises(HTTPException) as caught:
+) -> AuthRejection:
+    """Resolve and pin the `AuthRejection` shape (Day 22): `http_status` and
+    `reason` are the contract `require_principal` maps to an HTTP response
+    and an `auth.rejected` audit event. The HTTPException envelope itself —
+    fixed, and identical for every case of a given status — is asserted once,
+    directly against `_http_401`/`_http_403`, and again end-to-end in
+    test_auth_endpoints.py; re-checking it per case here would just repeat
+    the same literal dict for every parametrization.
+    """
+    with pytest.raises(AuthRejection) as caught:
         await _resolve(claims, settings=settings, headers=headers)
-    assert caught.value.status_code == status
-    if status == 401:
-        assert caught.value.detail == {
-            "code": "unauthorized",
-            "message": "Missing or invalid credentials.",
-        }
-        assert caught.value.headers == {"WWW-Authenticate": "Bearer"}
+    assert caught.value.http_status == http_status
+    assert caught.value.reason == reason
     return caught.value
 
 
@@ -145,23 +152,29 @@ async def _expect_status(
 # would succeed — which is what makes these assertions discriminating.
 # ---------------------------------------------------------------------------
 
-_BAD_AUTHORIZATION_HEADERS: dict[str, list[tuple[bytes, bytes]]] = {
-    "absent": [],
-    "two_headers": [(b"authorization", b"Bearer a"), (b"authorization", b"Bearer b")],
-    "wrong_scheme": [(b"authorization", b"Basic dXNlcjpwdw==")],
-    "no_scheme": [(b"authorization", b"token")],
-    "empty_value": [(b"authorization", b"")],
-    "empty_token": [(b"authorization", b"Bearer ")],
-    "two_spaces": [(b"authorization", b"Bearer  token")],
-    "tab_separator": [(b"authorization", b"Bearer\ttoken")],
-    "trailing_space": [(b"authorization", b"Bearer token ")],
-    "leading_space": [(b"authorization", b" Bearer token")],
+# Reason per the Day 22 mapping table: an absent header is `bearer_missing`;
+# every other shape — including a *duplicate* header, which is also a count
+# other than exactly one — is `token_invalid`.
+_BAD_AUTHORIZATION_HEADERS: dict[str, tuple[list[tuple[bytes, bytes]], AuthRejectionReason]] = {
+    "absent": ([], "bearer_missing"),
+    "two_headers": (
+        [(b"authorization", b"Bearer a"), (b"authorization", b"Bearer b")], "token_invalid"
+    ),
+    "wrong_scheme": ([(b"authorization", b"Basic dXNlcjpwdw==")], "token_invalid"),
+    "no_scheme": ([(b"authorization", b"token")], "token_invalid"),
+    "empty_value": ([(b"authorization", b"")], "token_invalid"),
+    "empty_token": ([(b"authorization", b"Bearer ")], "token_invalid"),
+    "two_spaces": ([(b"authorization", b"Bearer  token")], "token_invalid"),
+    "tab_separator": ([(b"authorization", b"Bearer\ttoken")], "token_invalid"),
+    "trailing_space": ([(b"authorization", b"Bearer token ")], "token_invalid"),
+    "leading_space": ([(b"authorization", b" Bearer token")], "token_invalid"),
 }
 
 
 @pytest.mark.parametrize("case", list(_BAD_AUTHORIZATION_HEADERS))
 async def test_malformed_authorization_header_is_401(case: str) -> None:
-    await _expect_status(DELEGATED_CLAIMS, 401, headers=_BAD_AUTHORIZATION_HEADERS[case])
+    headers, reason = _BAD_AUTHORIZATION_HEADERS[case]
+    await _expect_rejection(DELEGATED_CLAIMS, 401, reason, headers=headers)
 
 
 @pytest.mark.parametrize("scheme", [b"Bearer", b"bearer", b"BEARER", b"BeArEr"])
@@ -193,7 +206,9 @@ async def test_header_value_one_byte_over_the_cap_is_401() -> None:
     header = b"Bearer " + token
     assert len(header) == MAX_AUTHORIZATION_HEADER_BYTES + 1 == 16385
 
-    await _expect_status(DELEGATED_CLAIMS, 401, headers=[(b"authorization", header)])
+    await _expect_rejection(
+        DELEGATED_CLAIMS, 401, "token_invalid", headers=[(b"authorization", header)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,19 +218,22 @@ async def test_header_value_one_byte_over_the_cap_is_401() -> None:
 
 
 async def test_token_invalid_error_is_a_generic_401() -> None:
-    exception = await _expect_status(TokenInvalidError("token failed verification"), 401)
-
-    # No mechanism, no reason, nothing from the token: an unauthenticated
-    # caller learning *which* check failed is free reconnaissance.
-    assert "verification" not in str(exception.detail)
+    # No mechanism, no reason, nothing from the token in the rejection itself
+    # (the `TokenInvalidError` message never reaches `AuthRejection.reason`,
+    # which is always the fixed string "token_invalid" — the response body it
+    # maps to is `_http_401()`'s static dict, pinned separately below): an
+    # unauthenticated caller learning *which* check failed is free
+    # reconnaissance.
+    await _expect_rejection(TokenInvalidError("token failed verification"), 401, "token_invalid")
 
 
 async def test_rejection_logs_only_the_exception_class(caplog: pytest.LogCaptureFixture) -> None:
     secret_token = b"Bearer supersecrettokenvalue"
     with caplog.at_level(logging.INFO, logger="azgenai_lab.api.principal"):
-        await _expect_status(
+        await _expect_rejection(
             TokenInvalidError("expired at 2026-08-03"),
             401,
+            "token_invalid",
             headers=[(b"authorization", secret_token)],
         )
 
@@ -286,7 +304,7 @@ _BAD_IDENTITY_CLAIMS: dict[str, dict[str, Any]] = {
 
 @pytest.mark.parametrize("case", list(_BAD_IDENTITY_CLAIMS))
 async def test_missing_or_malformed_identity_claims_are_401(case: str) -> None:
-    await _expect_status(_BAD_IDENTITY_CLAIMS[case], 401)
+    await _expect_rejection(_BAD_IDENTITY_CLAIMS[case], 401, "token_invalid")
 
 
 async def test_token_from_another_tenant_is_401() -> None:
@@ -295,14 +313,14 @@ async def test_token_from_another_tenant_is_401() -> None:
     # signature.
     claims = {**DELEGATED_CLAIMS, "tid": OTHER_TENANT_ID}
 
-    await _expect_status(claims, 401)
+    await _expect_rejection(claims, 401, "token_invalid")
 
 
 async def test_configured_tenant_is_compared_exactly() -> None:
     # A prefix of the configured GUID is not the configured GUID.
     claims = {**DELEGATED_CLAIMS, "tid": TENANT_ID[:-1]}
 
-    await _expect_status(claims, 401)
+    await _expect_rejection(claims, 401, "token_invalid")
 
 
 _GROUP_CLAIM_CASES: dict[str, tuple[dict[str, Any], tuple[str, ...] | None]] = {
@@ -365,7 +383,7 @@ _BAD_GROUP_CLAIMS: dict[str, dict[str, Any]] = {
 async def test_bad_or_overage_group_claims_are_401(case: str) -> None:
     claims = {"tid": TENANT_ID, "oid": USER_ID, "scp": REQUIRED_SCOPE, **_BAD_GROUP_CLAIMS[case]}
 
-    await _expect_status(claims, 401)
+    await _expect_rejection(claims, 401, "token_invalid")
 
 
 @pytest.mark.parametrize("case", ["claim_names_groups", "hasgroups_true"])
@@ -380,7 +398,7 @@ async def test_overage_is_401_before_the_permission_gate(case: str) -> None:
         **_BAD_GROUP_CLAIMS[case],
     }
 
-    await _expect_status(claims, 401)
+    await _expect_rejection(claims, 401, "token_invalid")
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +424,8 @@ async def test_scp_is_a_whitespace_delimited_set(scp: str, expected: int) -> Non
     if expected == 200:
         assert (await _resolve(claims)).user_id == USER_ID
         return
-    exception = await _expect_status(claims, 403)
-    assert exception.detail["code"] == "insufficient_scope"
+    rejection = await _expect_rejection(claims, 403, "permission_missing")
+    assert rejection.principal == Principal(tenant_id=TENANT_ID, user_id=USER_ID, group_ids=())
 
 
 async def test_delegated_token_cannot_fall_back_to_app_role() -> None:
@@ -419,13 +437,10 @@ async def test_delegated_token_cannot_fall_back_to_app_role() -> None:
         "roles": ["Api.Access"],
     }
     resolver = EntraJwtPrincipalResolver(_settings(), FakeVerifier(claims))  # type: ignore[arg-type]
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(AuthRejection) as caught:
         await resolver.resolve(request_with([(b"authorization", b"Bearer token")]))
-    assert caught.value.status_code == 403
-    assert caught.value.detail["code"] == "insufficient_scope"
-    assert caught.value.headers == {
-        "WWW-Authenticate": 'Bearer error="insufficient_scope"'
-    }
+    assert caught.value.http_status == 403
+    assert caught.value.reason == "permission_missing"
 
 
 async def test_role_only_configuration_rejects_a_delegated_token() -> None:
@@ -433,13 +448,13 @@ async def test_role_only_configuration_rejects_a_delegated_token() -> None:
     # that the delegated check is skipped.
     settings = _settings(entra_required_scope=None)
 
-    await _expect_status(DELEGATED_CLAIMS, 403, settings=settings)
+    await _expect_rejection(DELEGATED_CLAIMS, 403, "permission_missing", settings=settings)
 
 
 async def test_scope_only_configuration_rejects_an_app_only_token() -> None:
     settings = _settings(entra_required_app_role=None)
 
-    await _expect_status(APP_ONLY_CLAIMS, 403, settings=settings)
+    await _expect_rejection(APP_ONLY_CLAIMS, 403, "permission_missing", settings=settings)
 
 
 _INSUFFICIENT_PERMISSION_CLAIMS: dict[str, dict[str, Any]] = {
@@ -454,13 +469,9 @@ _INSUFFICIENT_PERMISSION_CLAIMS: dict[str, dict[str, Any]] = {
 async def test_missing_permissions_are_403(case: str) -> None:
     claims = {"tid": TENANT_ID, "oid": USER_ID, **_INSUFFICIENT_PERMISSION_CLAIMS[case]}
 
-    exception = await _expect_status(claims, 403)
+    rejection = await _expect_rejection(claims, 403, "permission_missing")
 
-    assert exception.detail == {
-        "code": "insufficient_scope",
-        "message": "The credential lacks the required API permission.",
-    }
-    assert exception.headers == {"WWW-Authenticate": 'Bearer error="insufficient_scope"'}
+    assert rejection.principal == Principal(tenant_id=TENANT_ID, user_id=USER_ID, group_ids=())
 
 
 _MALFORMED_PERMISSION_CLAIMS: dict[str, dict[str, Any]] = {
@@ -479,11 +490,15 @@ async def test_malformed_permission_claims_are_401(case: str) -> None:
     # decision — there is nothing to evaluate.
     claims = {"tid": TENANT_ID, "oid": USER_ID, **_MALFORMED_PERMISSION_CLAIMS[case]}
 
-    await _expect_status(claims, 401)
+    await _expect_rejection(claims, 401, "token_invalid")
 
 
-def test_insufficient_scope_challenge_is_exact() -> None:
-    exception = insufficient_scope()
+def test_http_403_body_is_exact() -> None:
+    # `_http_403()` is `insufficient_scope()`'s old HTTPException body,
+    # relocated verbatim (Day 22): `insufficient_scope()` itself now returns
+    # an `AuthRejection` (pinned separately below), not this — the RFC 6750
+    # challenge header and envelope shape live here instead.
+    exception = principal_module._http_403()
 
     assert exception.status_code == 403
     assert exception.detail == {
@@ -491,6 +506,41 @@ def test_insufficient_scope_challenge_is_exact() -> None:
         "message": "The credential lacks the required API permission.",
     }
     assert exception.headers == {"WWW-Authenticate": 'Bearer error="insufficient_scope"'}
+
+
+def test_http_401_body_is_exact() -> None:
+    # The `unauthorized()`-built body, relocated the same way as `_http_403`.
+    exception = principal_module._http_401()
+
+    assert exception.status_code == 401
+    assert exception.detail == {
+        "code": "unauthorized",
+        "message": "Missing or invalid credentials.",
+    }
+    assert exception.headers == {"WWW-Authenticate": "Bearer"}
+
+
+def test_insufficient_scope_builds_a_403_permission_missing_rejection() -> None:
+    principal = Principal(tenant_id=TENANT_ID, user_id=USER_ID, group_ids=())
+
+    rejection = insufficient_scope(principal)
+
+    assert rejection.http_status == 403
+    assert rejection.reason == "permission_missing"
+    assert rejection.principal == principal
+
+
+@pytest.mark.parametrize(
+    "reason", ["bearer_missing", "token_invalid", "headers_missing", "headers_invalid"]
+)
+def test_unauthorized_builds_a_401_rejection_carrying_no_principal(
+    reason: AuthRejectionReason,
+) -> None:
+    rejection = unauthorized(reason)
+
+    assert rejection.http_status == 401
+    assert rejection.reason == reason
+    assert rejection.principal is None
 
 
 # ---------------------------------------------------------------------------
@@ -515,10 +565,11 @@ async def test_header_resolver_maps_the_day_15_headers() -> None:
 async def test_header_resolver_still_rejects_bad_headers() -> None:
     resolver = HeaderPrincipalResolver()
 
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(AuthRejection) as caught:
         await resolver.resolve(request_with([(b"x-tenant-id", b"t1")]))
 
-    assert caught.value.status_code == 401
+    assert caught.value.http_status == 401
+    assert caught.value.reason == "headers_missing"  # X-User-Id absent, not malformed
 
 
 async def test_header_resolver_close_is_a_no_op() -> None:
