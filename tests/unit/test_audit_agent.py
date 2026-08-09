@@ -18,7 +18,7 @@ from tests.unit.audit_helpers import IDENTITY, audit_events
 from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, AuditToolExecution
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.keyed_lock import KeyedLock
-from azgenai_lab.models.chat import Message
+from azgenai_lab.models.chat import Message, TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts import loader
@@ -91,6 +91,54 @@ def degraded_agent_client(client: TestClient) -> TestClient:
     )
     error = AgentRunError("framework blew up", usage=None, audit_snapshot=snapshot)
     client.app.state.agent_turn_service._agent_service = _RaisingAgentService(error)
+    return client
+
+
+class _EmptyAnswerAgentService:
+    """A run that succeeded -- real tool executions, real counts, natural
+    stop -- but produced no final text. This is the /agent finalizer's
+    empty-answer guard (services/agent_turn.py), not the adapter's own
+    degraded-failure path exercised by ``_RaisingAgentService``. Used to
+    prove the guard's audit_snapshot is the run's real one, not the generic
+    upstream fallback's None's (review fix round 1: the data is in scope
+    and was being discarded)."""
+
+    def __init__(self) -> None:
+        self.usage = TokenUsage(
+            input_tokens=5, output_tokens=0, total_tokens=5, reasoning_tokens=0
+        )
+
+    async def run(
+        self, task: str, history: object, *, principal: Principal
+    ) -> AgentRunResult:
+        return AgentRunResult(
+            answer="",
+            model_call_count=2,
+            tool_round_count=1,
+            tool_call_count=1,
+            refused_call_count=0,
+            stop_reason="natural",
+            limit_reasons=frozenset(),
+            tool_calls=(),
+            usage=self.usage,
+            per_round=None,
+            audit_snapshot=AgentAuditTerminalSnapshot(
+                provider_call_attempted=True,
+                executions=(
+                    AuditToolExecution(name="search_docs", executed=True, round_index=1),
+                ),
+                model_calls=2, tool_call_count=1, refused_call_count=0,
+                stop_reason="natural", usage=self.usage,
+            ),
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture
+def empty_answer_agent_client(client: TestClient) -> TestClient:
+    client.app.state.agent_turn_service._agent_service = _EmptyAnswerAgentService()
     return client
 
 
@@ -174,6 +222,27 @@ def test_agent_run_error_degraded_snapshot(
     assert len(event["tools"]) == 1 and event["tools"][0]["round_index"] is None
     assert event["model_calls"] is None  # null, not 0
     assert event["provider_call_attempted"] is True
+
+
+def test_agent_empty_answer_preserves_real_snapshot(
+    empty_answer_agent_client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Would regress to model_calls/tool_call_count/stop_reason/usage/tools
+    # all None (and len(tools) == 0) if the empty-answer guard fell back to
+    # the generic no-snapshot upstream classification instead of carrying
+    # the run's own audit_snapshot (review fix round 1).
+    with caplog.at_level(logging.INFO, logger="audit"):
+        response = empty_answer_agent_client.post(
+            "/api/v1/agent", json={"task": "hi"}, headers=IDENTITY
+        )
+    assert response.status_code == 502
+    [event] = audit_events(caplog)
+    assert (event["outcome"], event["error_code"]) == ("error", "upstream_error")
+    assert event["provider_call_attempted"] is True
+    assert event["model_calls"] == 2 and event["tool_call_count"] == 1
+    assert event["stop_reason"] == "natural"
+    assert event["usage"] is not None and event["usage"]["total_tokens"] == 5
+    assert len(event["tools"]) == 1 and event["tools"][0]["round_index"] == 1
 
 
 def test_agent_storage_load_failure(
