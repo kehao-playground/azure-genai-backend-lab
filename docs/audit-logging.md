@@ -206,6 +206,15 @@ reach any `LogRecord` — see [api-conventions.md](api-conventions.md#logging) a
 [security-checklist.md](security-checklist.md#logging-and-redaction)); the audit log
 inherits it and adds the field-name test as a second, independent guarantee.
 
+This field-shape guarantee is about what *kinds* of fields exist, not about who chose their
+values. `conversation_id` and `correlation_id` are both caller-controlled strings — a client
+sets `conversation_id` in the request body (`ChatRequest`/`AgentRequest`, neither field length-
+nor format-constrained) and echoes `X-Correlation-Id` if it sends one — and both are logged
+verbatim, including on the `conversation_not_found` 404 path where the id never resolved to
+anything real. `json.dumps` escapes the value, so it cannot break the log line's JSON
+structure, and it is the caller's own data rather than another party's, but a reader should
+not assume every value under a reference-only field was server-generated.
+
 ## Exactly-once & delivery
 
 **In-process classification.** For every request that finishes inside this process, exactly
@@ -293,6 +302,20 @@ not an optional nice-to-have: a reader relying on the disconnect accounting abov
 know that the server-side generator logic is verified, but the trigger path from "the OS
 noticed the socket closed" to "this generator's `finally` ran" is not independently proven
 by anything in this repository.
+
+The gap is not limited to disconnects. `_render_sse` (`api/streaming.py`) `return`s
+immediately after yielding the `message.done` frame, without pulling a next value from
+`_audit_observed` — so on a perfectly healthy 200, `_audit_observed` is left suspended at its
+own `yield`, inside the `async for` loop, and the `else` branch that would emit success on
+ordinary loop completion is unreachable through this endpoint. The success event is instead
+emitted from the same `except (GeneratorExit, asyncio.CancelledError)` branch as a disconnect,
+once asyncio's async-generator finalizer eventually closes the still-suspended generator.
+`test_stream_success_exactly_one_event` proves the event arrives, and in practice it arrives
+promptly — but it arrives *after* the response body has already completed, not synchronously
+with it, and it rests on the same finalization machinery this section already flags as
+unproven end-to-end. A hard process kill can lose a streaming success event exactly as
+readily as it can lose a disconnect event; the finalizer reliance above covers both states,
+not disconnect alone.
 
 ## Consuming the log
 
