@@ -162,6 +162,21 @@ and any request that never reached a valid principal log `-` for both. Group ids
 are never logged. In Entra mode `user_id` is a directory object ID: treat it as
 pseudonymous personal data, not as an opaque request tag.
 
+Two conventions coexist on the same process log stream (Day 22 adds the second one; it does
+not replace the first): **diagnostic** lines are human-readable `key=value` text — the stage
+lines, the `llm usage` line, the prompt-attribution line, all of the above — and **audit**
+lines are one machine-readable JSON object per authenticated request, schema-validated
+before they are written. One custom `Formatter` (`_AuditAwareFormatter`) routes by logger
+name (`audit` vs. everything else) so both share one root handler and one output stream
+without a second file or a second process. The outcome vocabulary is a single set of words
+across both layers — `agent_turn.py`'s stage log and every audit `outcome` field both use
+`success`/`error` (`rejected` is audit-only, describing a 4xx the diagnostic stage log
+doesn't classify at that granularity) — so a reader never has to remember that one layer
+calls a clean result `ok` and the other calls it `success`. `extra=` fields on individual
+diagnostic calls are used ad hoc where a call site already passes one, not applied
+uniformly; that is the current state, not a target this codebase is working toward. See
+[audit-logging.md](audit-logging.md) for the full schema, presence rules, and honest limits.
+
 See [entra-id-auth.md](entra-id-auth.md) for the Entra ID integration in full,
 [rag-retrieval.md](rag-retrieval.md#access-control-is-a-query-time-filter-not-a-separate-check)
 for how a `Principal` becomes an OData filter, and
@@ -348,7 +363,7 @@ The middleware in `azgenai_lab.core.correlation`:
 - stores it on `request.state.correlation_id`,
 - always returns it as the `X-Correlation-Id` response header.
 
-It appears in every error body and, as the series progresses, in structured logs and traces (audit logging and Application Insights articles).
+It appears in every error body and in every diagnostic log line; it is also the join key across the audit log (Day 22 — see [audit-logging.md](audit-logging.md)) and, as the series progresses, traces (the Day 27 Application Insights article).
 
 ## Placeholder policy
 

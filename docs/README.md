@@ -6,6 +6,7 @@
 - [Managed Identity](managed-identity.md) — keyless auth verified live, DefaultAzureCredential risks, the Day 24 identity plan
 - [Prompt Injection & Tool Abuse](prompt-injection.md) — threat model, the lab's structural defenses, G1/G2 fixes, unsafe-vs-safe tools
 - [Security Checklist](security-checklist.md) — the operable checklist; Day 29 production checklist references it
+- [Audit Logging](audit-logging.md) — event taxonomy, presence rules, never-log list, exactly-once and delivery, consuming the log
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)

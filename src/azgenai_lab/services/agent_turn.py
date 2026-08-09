@@ -129,7 +129,7 @@ class AgentTurnService:
             )
             raise
         logger.info(
-            "agent_turn_stage stage=%s outcome=ok duration_ms=%.1f",
+            "agent_turn_stage stage=%s outcome=success duration_ms=%.1f",
             name,
             (time.perf_counter() - start) * 1000,
         )
