@@ -10,7 +10,15 @@ from pydantic import BaseModel, Field, field_validator
 
 from azgenai_lab.api.chat import conversation_not_found, token_budget_exceeded
 from azgenai_lab.api.principal import require_principal
-from azgenai_lab.core.errors import ErrorEnvelope
+from azgenai_lab.core.audit import (
+    agent_base_fields,
+    agent_failure_event,
+    agent_rejected_event,
+    agent_success_event,
+    duration_since,
+    emit_audit_event,
+)
+from azgenai_lab.core.errors import ErrorEnvelope, UpstreamError, agent_upstream_audit_args
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.agent_framework import AgentTaskTooLargeError
@@ -110,19 +118,62 @@ async def agent_turn(
     service: Annotated[AgentTurnService, Depends(get_agent_turn_service)],
     principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> AgentResponse:
+    # Exactly one agent.run event per call — same discipline as /chat
+    # (api/chat.py): every branch below emits and raises/returns, or falls
+    # through to the single success emission at the end. A non-UpstreamError
+    # exception (a bug, not a contract case) is deliberately not caught
+    # here: it propagates with no event, per spec.
+    audit_start: float = request.state.audit_start
+    base = agent_base_fields(
+        tenant_id=principal.tenant_id, user_id=principal.user_id,
+        correlation_id=request.state.correlation_id,
+        conversation_id=payload.conversation_id,
+    )
+    attribution = service.audit_attribution
+    if attribution is None:
+        # Mirrors api/chat.py's guard: a success/failure event requires
+        # attribution (the schema enforces it); a service reaching /agent
+        # without one is a composition bug, not a request case.
+        raise RuntimeError(
+            "AgentTurnService.audit_attribution is required to serve /agent"
+        )
     try:
         conversation_id, result = await service.run_turn(
             payload.task, payload.conversation_id, principal=principal
         )
     except AgentTaskTooLargeError as exc:
+        emit_audit_event(agent_rejected_event(
+            base=base, duration_ms=duration_since(audit_start), error_code="invalid_input",
+        ))
         raise HTTPException(
             status_code=400,
             detail={"code": "invalid_input", "message": str(exc)},
         ) from None
     except ConversationNotFoundError:
+        emit_audit_event(agent_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="conversation_not_found",
+        ))
         raise conversation_not_found() from None
-    except TokenBudgetExceededError:
+    except TokenBudgetExceededError as exc:
+        emit_audit_event(agent_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="token_budget_exceeded", spent=exc.spent, budget=exc.budget,
+        ))
         raise token_budget_exceeded() from None
+    except UpstreamError as exc:
+        outcome, code, attempted, snapshot = agent_upstream_audit_args(exc)
+        emit_audit_event(agent_failure_event(
+            base=base, duration_ms=duration_since(audit_start), outcome=outcome,
+            error_code=code, provider_call_attempted=attempted,
+            attribution=attribution, snapshot=snapshot,
+        ))
+        raise
+    base["conversation_id"] = conversation_id
+    emit_audit_event(agent_success_event(
+        base=base, duration_ms=duration_since(audit_start), attribution=attribution,
+        snapshot=result.audit_snapshot, committed=True,
+    ))
     return AgentResponse(
         answer=result.answer,
         conversation_id=conversation_id,

@@ -657,3 +657,152 @@ def rag_failure_event(
         hit_count=hit_count, selected_chunk_ids=selected_chunk_ids,
         error_code=cast(RagErrorCode, error_code),
     )
+
+
+# --- Route event builders (Day 22 Task 9): agent.run ---
+#
+# agent.run differs from chat.turn/rag.query in what a "terminal snapshot"
+# is: the data the event needs (tool executions, model/tool-call counts,
+# stop reason) is not on anything the /agent endpoint receives directly on
+# the error path -- AgentRunResult never returns at all when the run fails.
+# So the adapter (services/agent_framework.py) builds an
+# AgentAuditTerminalSnapshot at the point it still holds the app-side
+# ToolExecution list, for BOTH success and failure, and every builder below
+# just reads that one shape rather than re-deriving it from two different
+# sources. base arrives as a dict (not a dataclass like ChatEventBase/
+# RagEventBase) per spec §4b/r6-3c so the finalizer can mutate
+# conversation_id in place the same way chat's dataclasses.replace does --
+# the cast calls below are the same widening chat_failure_event/
+# rag_failure_event already do for error_code, applied here to the dict
+# values instead.
+
+
+@dataclass(frozen=True)
+class AuditToolExecution:
+    """App-side execution record, audit-safe: name and executed always;
+    round_index only from a verified framework join."""
+
+    name: str
+    executed: bool
+    round_index: int | None
+
+
+@dataclass(frozen=True)
+class AgentAuditTerminalSnapshot:
+    """The one shape both a successful run and a failed run report through
+    (spec §4b) -- an error path carries whatever of this was obtained before
+    the failure, honestly None past that point, never a fabricated zero."""
+
+    provider_call_attempted: bool
+    executions: tuple[AuditToolExecution, ...]
+    model_calls: int | None
+    tool_call_count: int | None
+    refused_call_count: int | None
+    stop_reason: Literal["natural", "iteration_limit", "function_call_limit"] | None
+    usage: TokenUsage | None
+
+
+def agent_base_fields(
+    *, tenant_id: str, user_id: str, correlation_id: str, conversation_id: str | None,
+) -> dict[str, object]:
+    return {
+        "tenant_id": tenant_id, "user_id": user_id, "correlation_id": correlation_id,
+        "conversation_id": conversation_id,
+    }
+
+
+def _snapshot_tools(snapshot: AgentAuditTerminalSnapshot) -> tuple[AuditTool, ...]:
+    return tuple(
+        AuditTool(name=e.name, executed=e.executed, round_index=e.round_index)
+        for e in snapshot.executions
+    )
+
+
+def agent_success_event(
+    *, base: dict[str, object], duration_ms: float, attribution: AuditAttribution,
+    snapshot: AgentAuditTerminalSnapshot, committed: bool,
+) -> AgentRunSuccess:
+    return AgentRunSuccess(
+        tenant_id=cast(str, base["tenant_id"]), user_id=cast(str, base["user_id"]),
+        correlation_id=cast(str, base["correlation_id"]),
+        conversation_id=cast("str | None", base["conversation_id"]),
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=True,
+        prompt_name=attribution.prompt_name, prompt_version=attribution.prompt_version,
+        prompt_sha256=attribution.prompt_sha256, deployment=attribution.deployment,
+        committed=committed,
+        model_calls=snapshot.model_calls, tool_call_count=snapshot.tool_call_count,
+        refused_call_count=snapshot.refused_call_count,
+        tools=_snapshot_tools(snapshot), stop_reason=snapshot.stop_reason,
+        usage=AuditUsage.from_token_usage(snapshot.usage) if snapshot.usage else None,
+    )
+
+
+def agent_rejected_event(
+    *, base: dict[str, object], duration_ms: float, error_code: str,
+    spent: int | None = None, budget: int | None = None,
+) -> AgentRunRejected:
+    return AgentRunRejected(
+        tenant_id=cast(str, base["tenant_id"]), user_id=cast(str, base["user_id"]),
+        correlation_id=cast(str, base["correlation_id"]),
+        conversation_id=cast("str | None", base["conversation_id"]),
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=False,
+        prompt_name=None, prompt_version=None, prompt_sha256=None, deployment=None,
+        committed=False, error_code=cast(AgentRejectedCode, error_code),
+        spent=spent, budget=budget,
+    )
+
+
+def agent_failure_event(
+    *, base: dict[str, object], duration_ms: float,
+    outcome: Literal["rejected", "error"], error_code: str,
+    provider_call_attempted: bool, attribution: AuditAttribution | None,
+    snapshot: AgentAuditTerminalSnapshot | None,
+) -> "AgentRunRejected | AgentRunErrorEvent":
+    """The run raised (or a prior stage did): outcome/error_code classify
+    *why* (agent_upstream_audit_args at the call site), snapshot carries
+    however much of the terminal trace the adapter had in hand -- None when
+    the failure happened before any run started (e.g. the load path), a
+    degraded (framework-fields-None) shape when the run itself failed.
+    """
+    tenant_id = cast(str, base["tenant_id"])
+    user_id = cast(str, base["user_id"])
+    correlation_id = cast(str, base["correlation_id"])
+    conversation_id = cast("str | None", base["conversation_id"])
+    fields = _attribution_fields(attribution if provider_call_attempted else None)
+    if snapshot is not None:
+        model_calls = snapshot.model_calls
+        tool_call_count = snapshot.tool_call_count
+        refused_call_count = snapshot.refused_call_count
+        tools = _snapshot_tools(snapshot)
+        stop_reason = snapshot.stop_reason
+        auditable_usage = AuditUsage.from_token_usage(snapshot.usage) if snapshot.usage else None
+    else:
+        model_calls, tool_call_count, refused_call_count = None, None, None
+        tools, stop_reason, auditable_usage = None, None, None
+    if outcome == "rejected":
+        return AgentRunRejected(
+            tenant_id=tenant_id, user_id=user_id, correlation_id=correlation_id,
+            conversation_id=conversation_id,
+            occurred_at=audit_now(), duration_ms=duration_ms,
+            provider_call_attempted=provider_call_attempted,
+            prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+            prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+            committed=False,
+            model_calls=model_calls, tool_call_count=tool_call_count,
+            refused_call_count=refused_call_count, tools=tools, stop_reason=stop_reason,
+            usage=auditable_usage, error_code=cast(AgentRejectedCode, error_code),
+        )
+    return AgentRunErrorEvent(
+        tenant_id=tenant_id, user_id=user_id, correlation_id=correlation_id,
+        conversation_id=conversation_id,
+        occurred_at=audit_now(), duration_ms=duration_ms,
+        provider_call_attempted=provider_call_attempted,
+        prompt_name=fields.prompt_name, prompt_version=fields.prompt_version,
+        prompt_sha256=fields.prompt_sha256, deployment=fields.deployment,
+        committed=False,
+        model_calls=model_calls, tool_call_count=tool_call_count,
+        refused_call_count=refused_call_count, tools=tools, stop_reason=stop_reason,
+        usage=auditable_usage, error_code=cast(AgentErrorCode, error_code),
+    )

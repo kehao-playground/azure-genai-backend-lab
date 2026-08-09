@@ -1432,8 +1432,9 @@ async def main() -> None:
         f"{budget} (1 turn)\n"
     )
 
+    prompt = load_prompt("ops_agent")
     try:
-        agent_service: AgentService = build_agent_service(settings, deps)
+        agent_service: AgentService = build_agent_service(settings, deps, prompt=prompt)
     except (ValueError, ConfigurationError) as exc:
         await seed_service.aclose()
         await baseline_service.aclose()
@@ -1447,7 +1448,6 @@ async def main() -> None:
             records[label] = record
             _print_run(record)
 
-        prompt = load_prompt("ops_agent")
         baseline = await run_baseline(baseline_service, prompt, records[BASELINE_LABEL])
         print(
             f"baseline ({baseline['baseline_kind']}, {BASELINE_LABEL}): "

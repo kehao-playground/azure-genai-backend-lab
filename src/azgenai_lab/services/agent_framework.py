@@ -19,10 +19,11 @@ from typing import Any, Literal, Protocol
 
 import openai
 
+from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, AuditToolExecution
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
-from azgenai_lab.prompts.loader import load_prompt
+from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.agent_tools import AgentToolDeps, AgentToolFn, bind_principal_tools
 
 logger = logging.getLogger(__name__)
@@ -107,15 +108,31 @@ class AgentRunResult:
     tool_calls: tuple[AgentToolCall, ...]
     usage: TokenUsage | None
     per_round: tuple[AgentRoundMetrics, ...] | None
+    # The Day 22 terminal snapshot (spec §4b): built by the adapter from the
+    # same executions/tool_calls used to fill the fields above, so a
+    # successful run's audit event and its AgentResponse always describe the
+    # same trace, not two independently-derived ones.
+    audit_snapshot: AgentAuditTerminalSnapshot
 
 
 class AgentRunError(Exception):
     """Terminal loop failure. Carries usage aggregated before the failure
-    when obtainable — a mid-loop failure has already been billed."""
+    when obtainable — a mid-loop failure has already been billed.
 
-    def __init__(self, message: str, *, usage: TokenUsage | None = None) -> None:
+    ``audit_snapshot`` is required (Day 22, r6-4): every raise site has a
+    degraded snapshot in hand (at minimum the executions observed so far),
+    so there is no legitimate raise without one — the caller's audit event
+    still needs *something* to report, honestly None past the point of
+    failure rather than silently absent.
+    """
+
+    def __init__(
+        self, message: str, *, usage: TokenUsage | None = None,
+        audit_snapshot: AgentAuditTerminalSnapshot,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.audit_snapshot = audit_snapshot
 
 
 def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
@@ -351,6 +368,42 @@ def _join_executions_to_rounds(
     )
 
 
+def _join_snapshot_executions(
+    executions: Sequence[ToolExecution],
+    joined_calls: Sequence[AgentToolCall] | None,
+) -> tuple[AuditToolExecution, ...]:
+    """Positional join of the audit-safe (name, executed) pair onto rounds.
+
+    Joinability mirrors `_join_executions_to_rounds` exactly (r6-3a): same
+    length AND every position's tool name matches. `joined_calls=None` covers
+    the failure path, where the run never reached tool-call extraction at
+    all. Anything not joinable -- length mismatch, a name mismatch at any
+    position, or no calls to join against -- degrades every round_index to
+    None rather than zipping two same-length sequences that don't actually
+    correspond, which would be a plausible-looking lie, not a degraded
+    trace."""
+    joinable = (
+        joined_calls is not None
+        and len(joined_calls) == len(executions)
+        and all(
+            call.tool_name == execution.tool_name
+            for call, execution in zip(joined_calls, executions, strict=True)
+        )
+    )
+    if joinable:
+        assert joined_calls is not None
+        return tuple(
+            AuditToolExecution(
+                name=e.tool_name, executed=e.executed, round_index=c.round_index
+            )
+            for e, c in zip(executions, joined_calls, strict=True)
+        )
+    return tuple(
+        AuditToolExecution(name=e.tool_name, executed=e.executed, round_index=None)
+        for e in executions
+    )
+
+
 def extract_run_shape(
     response_messages: Sequence[Any],
     executions: Sequence[ToolExecution],
@@ -489,8 +542,9 @@ class FakeAgentService:
     its query), results are embedded in the answer so contract tests prove
     the wiring -- the fake never talks to any provider."""
 
-    def __init__(self, deps: AgentToolDeps) -> None:
+    def __init__(self, deps: AgentToolDeps, *, prompt: PromptTemplate) -> None:
         self._deps = deps
+        self._prompt = prompt
         self.last_history: tuple[AgentHistoryTurn, ...] | None = None
         self.last_principal: Principal | None = None
         self._closed = False
@@ -508,6 +562,11 @@ class FakeAgentService:
         tools = bind_principal_tools(self._deps, principal)
         tool_calls: list[AgentToolCall] = []
         outputs: list[str] = []
+        # Accumulated alongside tool_calls, same loop, same order — so the
+        # join below is exercised for real (not a parallel, independently
+        # true-by-construction source) even though this adapter never talks
+        # to a provider.
+        executions: list[ToolExecution] = []
         for tool in tools:
             name = tool.__name__
             kwargs: dict[str, Any] = {}
@@ -526,6 +585,7 @@ class FakeAgentService:
                     executed=True,
                 )
             )
+            executions.append(ToolExecution(tool_name=name, executed=True, latency_ms=0.0))
         usage = TokenUsage(
             input_tokens=20, output_tokens=10, total_tokens=30, reasoning_tokens=0
         )
@@ -554,6 +614,15 @@ class FakeAgentService:
             tool_calls=tuple(tool_calls),
             usage=usage,
             per_round=None,
+            audit_snapshot=AgentAuditTerminalSnapshot(
+                provider_call_attempted=True,
+                executions=_join_snapshot_executions(executions, tool_calls),
+                model_calls=2,
+                tool_call_count=len(tool_calls),
+                refused_call_count=0,
+                stop_reason="natural",
+                usage=usage,
+            ),
         )
 
     async def aclose(self) -> None:
@@ -587,7 +656,9 @@ class AgentFrameworkService:
     max_function_calls is the third layer (between-batch, best-effort).
     """
 
-    def __init__(self, settings: Settings, deps: AgentToolDeps) -> None:
+    def __init__(
+        self, settings: Settings, deps: AgentToolDeps, *, prompt: PromptTemplate
+    ) -> None:
         if not (
             settings.azure_openai_endpoint
             and settings.azure_openai_api_key
@@ -599,7 +670,7 @@ class AgentFrameworkService:
             )
         self._settings = settings
         self._deps = deps
-        self._prompt = load_prompt("ops_agent")
+        self._prompt = prompt
         self._closed = False
         # Project-owned transport: same timeout/retry policy as the chat
         # adapter — the framework never reads its own env vars here.
@@ -679,7 +750,19 @@ class AgentFrameworkService:
                 # raises. A mid-loop failure has already been billed for the calls
                 # that completed, but that number is discarded above us and there is
                 # no supported way to reach it (Day 9: never fabricate counts).
-                raise AgentRunError(str(exc), usage=None) from exc
+                # The audit snapshot mirrors that honesty at the trace level: the
+                # run never reached tool-call extraction, so there is no
+                # joined_calls to join against -- every execution's round_index
+                # degrades to None rather than a guessed one.
+                raise AgentRunError(
+                    str(exc), usage=None,
+                    audit_snapshot=AgentAuditTerminalSnapshot(
+                        provider_call_attempted=True,
+                        executions=_join_snapshot_executions(executions, None),
+                        model_calls=None, tool_call_count=None, refused_call_count=None,
+                        stop_reason=None, usage=None,
+                    ),
+                ) from exc
             shape = extract_run_shape(
                 response.messages, executions, refusal_message=REFUSAL_MESSAGE
             )
@@ -692,6 +775,7 @@ class AgentFrameworkService:
                 max_iterations=self._settings.agent_max_iterations,
                 max_tool_calls=self._settings.agent_max_tool_calls,
             )
+            run_usage = map_usage_details(response.usage_details)
             result = AgentRunResult(
                 answer=strip_framework_fallback(shape.answer, stop_reason),
                 model_call_count=shape.model_call_count,
@@ -704,8 +788,17 @@ class AgentFrameworkService:
                 # Loop aggregate, not the last call's: FunctionInvocationLayer
                 # sums every iteration's usage into the returned response
                 # (`add_usage_details`), so this is the whole run's bill.
-                usage=map_usage_details(response.usage_details),
+                usage=run_usage,
                 per_round=shape.per_round,
+                audit_snapshot=AgentAuditTerminalSnapshot(
+                    provider_call_attempted=True,
+                    executions=_join_snapshot_executions(executions, shape.tool_calls),
+                    model_calls=shape.model_call_count,
+                    tool_call_count=executed,
+                    refused_call_count=refused,
+                    stop_reason=stop_reason,
+                    usage=run_usage,
+                ),
             )
             return result
         finally:
@@ -756,11 +849,17 @@ class AgentFrameworkService:
             await self._deps.retriever.aclose()
 
 
-def build_agent_service(settings: Settings, deps: AgentToolDeps) -> AgentService:
-    """Composition point: the only place that decides fake vs. real."""
+def build_agent_service(
+    settings: Settings, deps: AgentToolDeps, *, prompt: PromptTemplate
+) -> AgentService:
+    """Composition point: the only place that decides fake vs. real. `prompt`
+    is loaded once by the caller (build_agent_turn_service) and handed to
+    whichever adapter is built here -- the same instance also feeds
+    build_audit_attribution, so the attribution reports what the adapter
+    actually holds (Day 22), not a second load of the same file."""
     if settings.use_fake_llm:
-        return FakeAgentService(deps)
-    return AgentFrameworkService(settings, deps)
+        return FakeAgentService(deps, prompt=prompt)
+    return AgentFrameworkService(settings, deps, prompt=prompt)
 
 
 __all__ = [

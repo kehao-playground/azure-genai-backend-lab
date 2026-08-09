@@ -2,6 +2,7 @@ import pytest
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_framework import (
     AgentHistoryTurn,
     AgentTaskTooLargeError,
@@ -16,6 +17,7 @@ from azgenai_lab.services.agent_tools import (
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
+PROMPT = load_prompt("ops_agent")
 
 
 def _settings() -> Settings:
@@ -38,7 +40,7 @@ def _deps() -> AgentToolDeps:
 
 async def test_fake_agent_actually_invokes_injected_tools() -> None:
     deps = _deps()
-    service = FakeAgentService(deps)
+    service = FakeAgentService(deps, prompt=PROMPT)
     try:
         result = await service.run("what is the token budget?", (), principal=OPS)
     finally:
@@ -56,7 +58,7 @@ async def test_fake_agent_actually_invokes_injected_tools() -> None:
 
 async def test_fake_agent_validates_task_with_zero_tool_calls() -> None:
     deps = _deps()
-    service = FakeAgentService(deps)
+    service = FakeAgentService(deps, prompt=PROMPT)
     try:
         with pytest.raises(AgentTaskTooLargeError):
             await service.run("", (), principal=OPS)
@@ -70,7 +72,7 @@ async def test_fake_records_history_and_principal_and_marks_answer() -> None:
         conversation_store=InMemoryConversationStore(),
         token_budget=50_000,
     )
-    service = FakeAgentService(deps)
+    service = FakeAgentService(deps, prompt=PROMPT)
     principal = Principal(tenant_id="t1", user_id="u1", group_ids=("g1",))
     history = (
         AgentHistoryTurn(role="user", text="Hello"),
@@ -87,7 +89,7 @@ async def test_fake_records_history_and_principal_and_marks_answer() -> None:
 
 async def test_build_selects_fake_by_default_and_aclose_is_idempotent() -> None:
     deps = _deps()
-    service = build_agent_service(_settings(), deps)
+    service = build_agent_service(_settings(), deps, prompt=PROMPT)
     assert isinstance(service, FakeAgentService)
     await service.aclose()
     await service.aclose()  # idempotent

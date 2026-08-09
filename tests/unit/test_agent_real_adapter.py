@@ -48,6 +48,7 @@ from openai.types.responses.response_usage import ResponseUsage
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_framework import (
     AgentFrameworkService,
     AgentHistoryTurn,
@@ -58,6 +59,7 @@ from azgenai_lab.services.agent_tools import build_agent_tool_deps
 from azgenai_lab.services.conversation_store import InMemoryConversationStore
 
 OPS = Principal(tenant_id="opsdemo", user_id="u1", group_ids=())
+PROMPT = load_prompt("ops_agent")
 
 REAL = Settings(
     use_fake_llm=False,
@@ -249,7 +251,7 @@ def _service(
     deps = build_agent_tool_deps(
         settings, conversation_store=InMemoryConversationStore(), token_budget=400
     )
-    service = AgentFrameworkService(settings, deps)
+    service = AgentFrameworkService(settings, deps, prompt=PROMPT)
     if sequential:
         _install_sequential_tool_calling_mock(
             service,
@@ -272,7 +274,7 @@ def _service_capturing_requests(
     deps = build_agent_tool_deps(
         REAL, conversation_store=InMemoryConversationStore(), token_budget=400
     )
-    service = AgentFrameworkService(REAL, deps)
+    service = AgentFrameworkService(REAL, deps, prompt=PROMPT)
     captured: list[dict[str, Any]] = []
     counter = itertools.count()
 
@@ -504,6 +506,13 @@ async def test_provider_error_becomes_agent_run_error() -> None:
         # via the standard `raise ... from exc` chain.
         assert err.value.usage is None
         assert err.value.__cause__ is not None
+        # The failure happened before any tool ran and before extract_run_shape
+        # ever executed -- the degraded snapshot has zero executions and every
+        # framework-derived field honestly None, not a fabricated zero.
+        snapshot = err.value.audit_snapshot
+        assert snapshot.provider_call_attempted is True
+        assert snapshot.executions == ()
+        assert snapshot.model_calls is None and snapshot.stop_reason is None
     finally:
         await service.aclose()
 
@@ -512,7 +521,7 @@ async def test_build_selects_real_adapter_and_aclose_is_idempotent() -> None:
     deps = build_agent_tool_deps(
         REAL, conversation_store=InMemoryConversationStore(), token_budget=400
     )
-    service = build_agent_service(REAL, deps)
+    service = build_agent_service(REAL, deps, prompt=PROMPT)
     assert isinstance(service, AgentFrameworkService)
     await service.aclose()
     await service.aclose()  # idempotent
@@ -546,7 +555,7 @@ async def test_partial_construction_closes_the_transport(
         REAL, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     with pytest.raises(RuntimeError, match="agent construction failed"):
-        AgentFrameworkService(REAL, deps)
+        AgentFrameworkService(REAL, deps, prompt=PROMPT)
     await deps.retriever.aclose()
 
     assert len(created) == 1
@@ -564,7 +573,7 @@ async def test_missing_azure_configuration_fails_fast() -> None:
         settings, conversation_store=InMemoryConversationStore(), token_budget=400
     )
     with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
-        AgentFrameworkService(settings, deps)
+        AgentFrameworkService(settings, deps, prompt=PROMPT)
     await deps.retriever.aclose()
 
 

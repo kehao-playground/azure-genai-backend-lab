@@ -16,12 +16,23 @@ from dataclasses import dataclass
 from typing import Literal, cast
 from uuid import uuid4
 
+from azgenai_lab.core.audit import (
+    AgentAuditTerminalSnapshot,
+    AuditAttribution,
+    build_audit_attribution,
+)
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import StorageError, UpstreamServiceError
+from azgenai_lab.core.errors import (
+    AgentRunUpstreamError,
+    AgentStorageCommitError,
+    StorageError,
+    UpstreamServiceError,
+)
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message, TokenUsage
 from azgenai_lab.models.conversation import Conversation, ReplayItem
 from azgenai_lab.models.principal import Principal
+from azgenai_lab.prompts.loader import load_prompt
 from azgenai_lab.services.agent_framework import (
     AgentHistoryTurn,
     AgentRunError,
@@ -61,6 +72,10 @@ class AgentTurnResult:
     model_call_count: int
     tool_calls: tuple[AgentToolCall, ...]
     usage: TokenUsage | None
+    # Carried straight through from AgentRunResult (Day 22) so the /agent
+    # finalizer's success event describes the same trace as the response,
+    # not a re-derivation of it.
+    audit_snapshot: AgentAuditTerminalSnapshot
 
 
 def project_history(messages: Sequence[Message]) -> tuple[AgentHistoryTurn, ...]:
@@ -84,6 +99,7 @@ class AgentTurnService:
         store: ConversationStore,
         token_budget: int | None = None,
         locks: KeyedLock[tuple[str, str]] | None = None,
+        audit_attribution: AuditAttribution | None = None,
     ) -> None:
         self._agent_service = agent_service
         self._store = store
@@ -95,6 +111,9 @@ class AgentTurnService:
         self._locks: KeyedLock[tuple[str, str]] = (
             locks if locks is not None else KeyedLock()
         )
+        # Public, same as ConversationChatService's: the /agent finalizer
+        # reads this directly (Day 22).
+        self.audit_attribution = audit_attribution
         self._closed = False
 
     @asynccontextmanager
@@ -138,8 +157,13 @@ class AgentTurnService:
                     # upstream but carries no usage (the framework attaches its
                     # aggregate only to a returned response) — nothing enters the
                     # ledger, the gap is disclosed, Cost Management stays the
-                    # authority (Day 9 / Day 17).
-                    raise UpstreamServiceError(str(exc)) from exc
+                    # authority (Day 9 / Day 17). The exception's own degraded
+                    # snapshot (built by the adapter, at the point of failure)
+                    # rides along so the /agent finalizer's error event still
+                    # reports whatever trace exists.
+                    raise AgentRunUpstreamError(
+                        str(exc), audit_snapshot=exc.audit_snapshot
+                    ) from exc
                 if result.stop_reason == "natural" and not result.answer:
                     # Same contract as /chat's completed-empty reply: an upstream
                     # failure, not a turn — a 200 with a freshly issued id that
@@ -162,6 +186,7 @@ class AgentTurnService:
                 model_call_count=result.model_call_count,
                 tool_calls=result.tool_calls,
                 usage=result.usage,
+                audit_snapshot=result.audit_snapshot,
             )
         finally:
             # Every exit — 404, budget, run failure, commit failure,
@@ -229,7 +254,13 @@ class AgentTurnService:
                 first_turn_authorization_group_ids=first_turn_scope,
             )
         except Exception as exc:
-            raise StorageError(str(exc)) from exc
+            # The run already succeeded and returned a terminal snapshot
+            # (result.audit_snapshot) — carry it through so a commit failure's
+            # audit event still reports what the run actually did, the same
+            # discipline as ChatStorageCommitError (Day 22).
+            raise AgentStorageCommitError(
+                str(exc), audit_snapshot=result.audit_snapshot
+            ) from exc
 
     async def aclose(self) -> None:
         """Idempotent delegate: the adapter owns the model client and the
@@ -249,15 +280,23 @@ def build_agent_turn_service(
     locks: KeyedLock[tuple[str, str]],
 ) -> AgentTurnService:
     """Composition point (see build_conversation_service for why store and
-    locks are injected, never built here)."""
+    locks are injected, never built here).
+
+    The prompt is loaded exactly once here and handed to both the adapter
+    (build_agent_service) and the audit attribution (build_audit_attribution)
+    — same PromptTemplate instance, not two loads of the same file, mirroring
+    build_conversation_service's Day 22 discipline for /chat.
+    """
+    prompt = load_prompt("ops_agent")
     deps = build_agent_tool_deps(
         settings,
         conversation_store=store,
         token_budget=settings.conversation_token_budget,
     )
     return AgentTurnService(
-        build_agent_service(settings, deps),
+        build_agent_service(settings, deps, prompt=prompt),
         store,
         token_budget=settings.conversation_token_budget,
         locks=locks,
+        audit_attribution=build_audit_attribution(settings, prompt),
     )
