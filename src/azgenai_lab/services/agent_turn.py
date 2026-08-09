@@ -26,7 +26,6 @@ from azgenai_lab.core.errors import (
     AgentRunUpstreamError,
     AgentStorageCommitError,
     StorageError,
-    UpstreamServiceError,
 )
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message, TokenUsage
@@ -168,8 +167,16 @@ class AgentTurnService:
                     # Same contract as /chat's completed-empty reply: an upstream
                     # failure, not a turn — a 200 with a freshly issued id that
                     # 404s next turn would break the contract. Only the two limit
-                    # stops may return an empty (keepable) answer.
-                    raise UpstreamServiceError("agent returned an empty final answer")
+                    # stops may return an empty (keepable) answer. The run itself
+                    # succeeded, so result.audit_snapshot is not degraded — real
+                    # executions/tools, model_calls, stop_reason="natural", usage
+                    # are all in scope here and must not be discarded in favor of
+                    # the generic fallback's honest-but-needlessly-empty None's
+                    # (review finding, Day 22 fix round 1).
+                    raise AgentRunUpstreamError(
+                        "agent returned an empty final answer",
+                        audit_snapshot=result.audit_snapshot,
+                    )
             async with self._stage("commit"):
                 await self._commit(
                     principal.tenant_id, resolved_id, conversation, task, result

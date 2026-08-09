@@ -6,7 +6,7 @@ import pytest
 
 from azgenai_lab.core.audit import AgentAuditTerminalSnapshot
 from azgenai_lab.core.config import Settings
-from azgenai_lab.core.errors import AgentRunUpstreamError, StorageError, UpstreamServiceError
+from azgenai_lab.core.errors import AgentRunUpstreamError, StorageError
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.models.chat import Message, TokenUsage
 from azgenai_lab.models.principal import Principal
@@ -146,9 +146,16 @@ async def test_run_failure_commits_nothing_and_maps_upstream() -> None:
 async def test_natural_empty_answer_is_upstream_failure_no_commit() -> None:
     agent = _StubAgent(_result(answer="", stop="natural"))
     service, _, store = _service(agent=agent)
-    with pytest.raises(UpstreamServiceError):
+    with pytest.raises(AgentRunUpstreamError) as err:
         await service.run_turn("task", None, principal=P)
     assert store._messages == {}
+    # The run itself succeeded (only the answer was empty) -- the snapshot
+    # must carry the real trace, not the generic degraded shape (review
+    # fix round 1: this data was in scope and must not be discarded).
+    snapshot = err.value.audit_snapshot
+    assert snapshot.provider_call_attempted is True
+    assert snapshot.model_calls == 2 and snapshot.tool_call_count == 1
+    assert snapshot.stop_reason == "natural" and snapshot.usage is not None
 
 
 async def test_limit_empty_answer_commits_user_only_shape() -> None:
