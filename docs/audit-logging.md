@@ -18,9 +18,12 @@ lives in `core/audit.py`; the exported, CI-drift-checked JSON Schema is
 
 - **Reference-only.** Every field is an id, a count, a hash, a boolean, or an enum. There is
   no field that carries free text a user or the model wrote.
-- **Terminal, not per-stage.** Existing stage-latency, usage, and tool-execution log lines
-  (Day 6, Day 8, Day 9) are unchanged and stay diagnostic-only; the audit log adds one
-  additional line per request, emitted at the point the request's outcome is known.
+- **Terminal, not per-stage.** Existing diagnostic log lines are unchanged and stay
+  diagnostic-only: prompt attribution (`llm call …`, Day 8), usage (`llm usage …`, Day 9),
+  RAG stage latency (`rag stage=…`, Day 14), and agent-turn stage latency plus
+  tool-execution logging (`agent_turn_stage stage=…` / `agent_tool_execution …`, Day 18).
+  The audit log adds one additional line per request, on top of all of these, emitted at
+  the point the request's outcome is known.
 - **One event type per route, plus one for rejected auth:** `chat.turn`, `rag.query`,
   `agent.run`, and `auth.rejected`. A budget rejection is not a separate event type — it is
   `chat.turn`/`agent.run` with `outcome="rejected"` and `error_code="token_budget_exceeded"`.
@@ -45,7 +48,7 @@ Every event, regardless of type, carries:
 | `event` | `"chat.turn"` \| `"rag.query"` \| `"agent.run"` \| `"auth.rejected"` | outer discriminator |
 | `occurred_at` | timezone-aware datetime | naive datetimes are rejected outright; any offset is normalized to UTC on the way in |
 | `correlation_id` | string | joins back to every diagnostic line for the same request — see [Consuming the log](#consuming-the-log) |
-| `duration_ms` | float ≥ 0 | request-level: the correlation middleware stamps a monotonic start (`request.state.audit_start`) when the request begins, and emission computes the delta |
+| `duration_ms` | float ≥ 0 | request-level, from the same monotonic start the correlation middleware stamps when the request begins. `/chat`, `/chat/stream` and `/agent` read it as `request.state.audit_start` (`duration_since`); `/rag` emits from the service layer, which has no `Request` to read, so it goes through the `ContextVar` path instead (`request_duration_ms`) — same start value, different accessor, and `core/audit.py` calls out the distinction explicitly so a future caller doesn't reach for the wrong one |
 
 The three route events (`chat.turn`, `rag.query`, `agent.run`) additionally always carry:
 
@@ -216,7 +219,7 @@ the route handler body was never entered).
 
 | Path | Emission point | Covers |
 |---|---|---|
-| `/chat` | endpoint `try`/`except`/`finally`-shaped block, one exit | success, 400/404/429, 5xx — one outcome, one emit |
+| `/chat` | endpoint handler: a `try` with three `except` branches (each emits, then raises), falling through to a single success emission after the `try` block when none fires — no literal `finally`, but every exit emits exactly once | success, 400/404/429, 5xx — one outcome, one emit |
 | `/chat/stream` | two-phase: pre-stream failures owned by the endpoint finalizer (before `StreamingResponse` is built); once the iterator transfers, `_audit_observed` (the post-transfer generator) owns the terminal | mutually exclusive — a request lands in exactly one phase |
 | `/rag` | `RagService.answer()`, at its three terminals, guarded by `has_audit_context()` | matches the existing `rag stage=complete` diagnostic line's terminal points |
 | `/agent` | `api/agent.py::agent_turn`'s finalizer, wrapping the whole call to `service.run_turn()` | 400 (including the service's own `validate_task()`), 404, 429, run error, success |
@@ -296,8 +299,7 @@ by anything in this repository.
 `configure_logging()` calls `logging.basicConfig()` with no explicit stream, which means
 Python's default: **stderr**. Every reference to reading this log in this repository
 therefore says "the process log stream," never "stdout" — piping only stdout silently drops
-every line. The working incantation, matching how this repo's own live-smoke evidence reads
-it, redirects stderr first:
+every line. The working incantation redirects stderr first:
 
 ```sh
 your-command 2>&1 | grep '^{' | jq
