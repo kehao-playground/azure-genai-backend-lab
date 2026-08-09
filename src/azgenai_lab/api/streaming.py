@@ -21,6 +21,8 @@ keep their HTTP status codes (Day 5 mapping). Only failures after the 200 has
 been sent travel as ``error`` events.
 """
 
+import asyncio
+import dataclasses
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -36,13 +38,25 @@ from azgenai_lab.api.chat import (
     token_budget_exceeded,
 )
 from azgenai_lab.api.principal import require_principal
-from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError
+from azgenai_lab.core.audit import (
+    AuditAttribution,
+    ChatEventBase,
+    ChatTurnSuccess,
+    chat_base_fields,
+    chat_failure_event,
+    chat_rejected_event,
+    chat_success_event,
+    duration_since,
+    emit_audit_event,
+)
+from azgenai_lab.core.errors import UpstreamError, UpstreamServiceError, chat_upstream_audit_args
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_openai import StreamDone, TextDelta
 from azgenai_lab.services.conversation import (
     ConversationChatService,
     ConversationNotFoundError,
     TokenBudgetExceededError,
+    turn_commits,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,6 +204,75 @@ async def _render_sse(
     yield _error_event(fallback.code, fallback.message, correlation_id)
 
 
+async def _audit_observed(
+    events: AsyncIterator[TextDelta | StreamDone],
+    *,
+    base: ChatEventBase,
+    attribution: AuditAttribution,
+    audit_start: float,
+) -> AsyncIterator[TextDelta | StreamDone]:
+    """Post-transfer audit ownership (spec §3): once iteration has started, the
+    200 is already committed to the client, so this generator — not the
+    endpoint finalizer — owns the terminal ``chat.turn`` event. Exception
+    routing (r6-2): ``UpstreamError`` -> emit + raise (the Day 6 mid-stream
+    case, same classification as /chat via ``chat_upstream_audit_args``);
+    ``GeneratorExit``/``CancelledError`` -> client disconnect, two-state emit
+    + raise (see below); any other exception is an out-of-contract bug — NO
+    event, the original exception propagates untouched, so a genuine
+    programmer error is never misrecorded as a disconnect or a clean success.
+
+    Disconnect two-state: the store commits the turn *before* the terminal
+    event is yielded (services/conversation.py's ``_commit_on_done``), so
+    once ``seen_done`` is set the commit decision is already made and
+    unrelated to whether the client actually received the frame — the audit
+    log records commit truth, not delivery truth. Before that point, nothing
+    was committed.
+    """
+    seen_done: StreamDone | None = None
+
+    def _terminal_success() -> ChatTurnSuccess:
+        assert seen_done is not None
+        return chat_success_event(
+            base=base, duration_ms=duration_since(audit_start), attribution=attribution,
+            model_version=seen_done.model_version, usage=seen_done.usage,
+            status=seen_done.status, incomplete_reason=seen_done.incomplete_reason,
+            committed=turn_commits(seen_done.status, seen_done.incomplete_reason),
+        )
+
+    try:
+        async for event in events:
+            if isinstance(event, StreamDone):
+                seen_done = event
+            yield event
+    except UpstreamError as exc:
+        outcome, code, attempted, snapshot = chat_upstream_audit_args(exc)
+        emit_audit_event(chat_failure_event(
+            base=base, duration_ms=duration_since(audit_start), outcome=outcome,
+            error_code=code, provider_call_attempted=attempted,
+            attribution=attribution, snapshot=snapshot,
+        ))
+        raise
+    except (GeneratorExit, asyncio.CancelledError):
+        if seen_done is not None:
+            emit_audit_event(_terminal_success())
+        else:
+            emit_audit_event(chat_failure_event(
+                base=base, duration_ms=duration_since(audit_start), outcome="error",
+                error_code="client_disconnect", provider_call_attempted=True,
+                attribution=attribution,
+            ))
+        raise
+    else:
+        if seen_done is not None:
+            emit_audit_event(_terminal_success())
+        else:  # upstream EOF without a terminal: still an upstream failure
+            emit_audit_event(chat_failure_event(
+                base=base, duration_ms=duration_since(audit_start), outcome="error",
+                error_code="upstream_error", provider_call_attempted=True,
+                attribution=attribution,
+            ))
+
+
 @router.post("/chat/stream", response_class=EventStreamResponse, responses=_STREAM_RESPONSES)
 async def stream_chat(
     payload: StreamingChatRequest,
@@ -197,18 +280,57 @@ async def stream_chat(
     service: Annotated[ConversationChatService, Depends(get_conversation_service)],
     principal: Annotated[Principal, Depends(require_principal, scope="request")],
 ) -> EventStreamResponse:
-    # Two-phase boundary: pre-stream failures raise here → HTTP envelope.
+    # Two-phase audit ownership (spec §3): this finalizer owns pre-stream
+    # failures the same way /chat's finalizer does (api/chat.py) — before the
+    # 200 is sent, they are still ordinary HTTP failures through the Day 5
+    # envelope. Once open_stream() returns an iterator, ownership moves to
+    # _audit_observed, wrapped around it below.
+    audit_start: float = request.state.audit_start
+    base = chat_base_fields(
+        tenant_id=principal.tenant_id, user_id=principal.user_id,
+        correlation_id=request.state.correlation_id,
+        conversation_id=payload.conversation_id, streaming=True,
+    )
+    attribution = service.audit_attribution
+    if attribution is None:
+        # Same composition invariant as /chat: build_conversation_service()
+        # always supplies one; a service reaching this endpoint without one
+        # is a wiring bug, not a request case (see api/chat.py's identical
+        # guard for the rationale).
+        raise RuntimeError(
+            "ConversationChatService.audit_attribution is required to serve /chat/stream"
+        )
     try:
         conversation_id, events = await service.open_stream(
             payload.message, payload.conversation_id, principal=principal
         )
     except ConversationNotFoundError:
+        emit_audit_event(chat_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="conversation_not_found",
+        ))
         raise conversation_not_found() from None
-    except TokenBudgetExceededError:
+    except TokenBudgetExceededError as exc:
+        emit_audit_event(chat_rejected_event(
+            base=base, duration_ms=duration_since(audit_start),
+            error_code="token_budget_exceeded", spent=exc.spent, budget=exc.budget,
+        ))
         raise token_budget_exceeded() from None
+    except UpstreamError as exc:
+        outcome, code, attempted, snapshot = chat_upstream_audit_args(exc)
+        emit_audit_event(chat_failure_event(
+            base=base, duration_ms=duration_since(audit_start), outcome=outcome,
+            error_code=code, provider_call_attempted=attempted,
+            attribution=attribution, snapshot=snapshot,
+        ))
+        raise
+    base = dataclasses.replace(base, conversation_id=conversation_id)
+    observed = _audit_observed(
+        events, base=base, attribution=attribution, audit_start=audit_start
+    )
     # The id travels as a header because it must reach the client before the
     # body: SSE consumers read it at response time, not from an event.
     return EventStreamResponse(
-        _render_sse(events, request.state.correlation_id),
+        _render_sse(observed, request.state.correlation_id),
         headers={"Cache-Control": "no-cache", "X-Conversation-Id": conversation_id},
     )
