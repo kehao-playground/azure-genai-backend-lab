@@ -43,9 +43,11 @@ flowchart TB
 
 Reading notes:
 
-- The map classifies **outcomes**, not emission sites. The six actual emission points (the
-  `/chat` finalizer, `/chat/stream`'s two-phase ownership, `RagService.answer()`'s guarded
-  terminals, the `/agent` finalizer, `require_principal`, and the 422 handler) are listed in
+- The map classifies **outcomes**, not emission sites. The six logical producer categories
+  (the `/chat` finalizer, `/chat/stream`'s two-phase ownership — a pre-stream finalizer and
+  a post-transfer observer, two mutually exclusive owners, which is why the system counts
+  seven owning functions — `RagService.answer()`'s guarded terminals, the `/agent`
+  finalizer, `require_principal`, and the 422 handler) are listed in
   [audit-logging.md](../audit-logging.md#exactly-once--delivery); e.g. the "field validation"
   422 event is emitted by the validation handler, not by the route handler, whose body is
   never entered.
