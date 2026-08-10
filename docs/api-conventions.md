@@ -165,8 +165,12 @@ pseudonymous personal data, not as an opaque request tag.
 Two conventions coexist on the same process log stream (Day 22 adds the second one; it does
 not replace the first): **diagnostic** lines are human-readable `key=value` text — the stage
 lines, the `llm usage` line, the prompt-attribution line, all of the above — and **audit**
-lines are one machine-readable JSON object per authenticated request, schema-validated
-before they are written. One custom `Formatter` (`_AuditAwareFormatter`) routes by logger
+lines are one machine-readable JSON object per authenticated request that reaches a
+terminal the audit contract classifies (the zero-event exceptions — an out-of-contract bug,
+a malformed-JSON body that never established identity, a streaming observer closed before
+its first iteration — are in
+[audit-logging.md](audit-logging.md#exactly-once--delivery)), schema-validated before they
+are written. One custom `Formatter` (`_AuditAwareFormatter`) routes by logger
 name (`audit` vs. everything else) so both share one root handler and one output stream
 without a second file or a second process. The outcome vocabulary is a single set of words
 across both layers — `agent_turn.py`'s stage log and every audit `outcome` field both use
