@@ -11,4 +11,5 @@ Mermaid-first diagrams: the reference architecture, then sequence diagrams for t
 - [Retrieval Stages](retrieval-stages.md)
 - [RAG Query Sequence](rag-query-sequence.md) (placeholder)
 - [Agent Decision Flow](agent-decision-flow.md)
+- [Audit Event Exit Paths](audit-exit-paths.md)
 - [Agent Tool-Call Sequence](agent-tool-call-sequence.md) (placeholder)
