@@ -12,11 +12,13 @@ flowchart TB
     handler -- "2xx" --> s["success<br/>恰好一筆"]
     handler -- "4xx envelope<br/>（400／404／429）" --> rj
     handler -- "5xx envelope" --> er["error<br/>恰好一筆"]
-    handler -- "client 斷線<br/>（streaming）" --> dis{"StreamDone<br/>已觀察到？"}
+    handler -- "consumer 關閉／取消<br/>（streaming）" --> dis{"StreamDone<br/>已觀察到？"}
     dis -- "是：commit 已完成" --> s
     dis -- "否" --> er
-    handler -- "合約外例外<br/>＝真 bug" --> z2["零 event<br/>原例外原樣傳播"]
+    handler -- "合約外例外<br/>＝真 bug" --> z2["零 event<br/>原例外原樣傳播<br/>（/agent 框架層例外見文）"]
+    legend["圖例：本圖分類 outcome，不代表 emission 位置；<br/>合約外規則在 /agent 有框架層例外（audit-logging.md）"]
     style s fill:#d3f0d8,stroke:#2e7d32
+    style legend fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
     style rj fill:#fff3cd,stroke:#b26a00
     style ar fill:#fff3cd,stroke:#b26a00
     style er fill:#fde3e0,stroke:#c62828

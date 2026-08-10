@@ -178,8 +178,12 @@ enforced the same validator way:
   `refused_call_count`, `stop_reason`) are null, never zero, when the framework result is
   unavailable — a degraded run still reports the app-owned `tools` list (`name`/`executed`
   always present; `round_index` only when a framework trace join succeeded).
-- A 422 from a malformed body only ever produces `error_code="validation_error"` with every
-  per-request field null — see [Exactly-once & delivery](#exactly-once--delivery).
+- A 422 splits into two states, and only one of them produces an event: a **syntactically
+  malformed JSON body** fails to parse before `require_principal` ever runs, so no identity
+  was established and **zero events** are emitted; a body that parses but fails schema
+  validation *after* the principal was resolved produces exactly one
+  `error_code="validation_error"` rejected event — identity present, every per-request field
+  null — see [Exactly-once & delivery](#exactly-once--delivery).
 
 ## Never-log
 
@@ -217,12 +221,15 @@ not assume every value under a reference-only field was server-generated.
 
 ## Exactly-once & delivery
 
-**In-process classification.** For every request that finishes inside this process, exactly
-one of three things happens: an authenticated route request (`/chat`, `/chat/stream`,
-`/rag`, `/agent`) produces exactly one route event; an auth rejection (401/403) produces
-exactly one `auth.rejected`; a malformed-JSON body that fails validation *before*
-`require_principal` ran produces zero events (there is no verified identity to attribute one
-to). No request falls into two of these at once — the same-endpoint emission points and the
+**In-process classification.** For every request that reaches a terminal this contract
+*classifies*, exactly one of three things happens: an authenticated route request (`/chat`,
+`/chat/stream`, `/rag`, `/agent`) produces exactly one route event; an auth rejection
+(401/403) produces exactly one `auth.rejected`; a malformed-JSON body that fails to parse
+*before* `require_principal` ran produces zero events (there is no verified identity to
+attribute one to). An out-of-contract exception — a genuine bug — deliberately falls outside
+this classification altogether: zero events, original exception propagated (next heading).
+The guarantee is therefore scoped to classified terminals, not to "every authenticated
+request" unqualified. No request falls into two of these at once — the same-endpoint emission points and the
 422 handler's own emission are mutually exclusive by construction (validation failure means
 the route handler body was never entered).
 
@@ -246,6 +253,15 @@ default handling (an unstyled 500, no error envelope, no audit line). A reader d
 class of gap exists: it is not a missing feature, it is the deliberate line between "a case
 this system classifies" and "a bug that should be loud, not silently reclassified as a
 disconnect or a clean outcome."
+
+One known boundary qualifies this rule. It holds at each route's own audit boundary, but
+`/agent`'s framework adapter (`AgentFrameworkService.run()`, a Day 17 design) wraps *any*
+exception raised inside the framework run — including a genuine bug in that scope — into
+`AgentRunError`, which reaches the endpoint as an in-contract `upstream_error` (502) with
+exactly one audit event. A bug raised outside that adapter scope (endpoint, service, or
+store code) still propagates with zero events. As stated, the rule is exact for `/chat`,
+`/chat/stream`, and `/rag`; for `/agent` it is a route-boundary rule with this
+framework-scope exception.
 
 **`/rag`'s service-level emission has a context guard.** Because `RagService.answer()` is a
 plain method (not a request handler) that unit tests also call directly with no request in
@@ -278,6 +294,13 @@ The alternative — recording `committed=false` whenever the socket dropped, reg
 cutoff — would have the log claim a turn wasn't saved when the store, in fact, has it: a
 worse lie than the one this design accepts. **The audit log records commit truth, not
 delivery truth**, and that is a deliberate, disclosed trade rather than an oversight.
+
+`client_disconnect` names the *usual* cause, not a proven one. The emitting branch catches
+both `GeneratorExit` and `asyncio.CancelledError`, and a `CancelledError` can also originate
+server-side — process shutdown, task cancellation — not only from a dropped client. The
+event proves the stream was cancelled before its terminal; it cannot prove which side
+initiated the cancellation, and a reader inferring client behavior from these events should
+know that.
 
 ### A known gap in the delivery chain
 
@@ -316,6 +339,15 @@ with it, and it rests on the same finalization machinery this section already fl
 unproven end-to-end. A hard process kill can lose a streaming success event exactly as
 readily as it can lose a disconnect event; the finalizer reliance above covers both states,
 not disconnect alone.
+
+A narrower zero-event window sits at the other end of the stream's life. `_audit_observed`
+is an async generator, so nothing in its body — including its exception handling — executes
+until the first iteration. If the request is abandoned after the iterator was handed to
+`StreamingResponse` but before the server pulls the first frame, the generator is closed
+without ever having started: no branch runs, no event is emitted. This window loses an
+event; it can never mis-classify one — but it is a genuine exception to "exactly one event
+per classified terminal" for a request that got that far, and it is disclosed here rather
+than papered over.
 
 ## Consuming the log
 
