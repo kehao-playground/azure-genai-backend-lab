@@ -325,9 +325,10 @@ gives up on a dead connection.
 This propagation is **unit-tested only at the generator level** — the test suite drives
 `_audit_observed` directly with `gen.aclose()` at a controlled point (see
 `tests/unit/test_audit_streaming.py`), which is deliberate: an end-to-end test that kills a
-`TestClient` connection cannot pin the exact point of disconnect the way calling `aclose()`
-by hand can, so the generator-level test is the more precise one for the two-state
-disconnect logic above. What it does **not** cover is the real ASGI/Starlette machinery that
+`TestClient` connection cannot pin the exact cutoff point relative to `StreamDone` the way
+calling `aclose()` by hand can — `aclose()` controls *where* the consumer close/cancellation
+lands relative to the terminal, not *which side* initiated it — so the generator-level test
+is the more precise one for the two-state cancellation logic above. What it does **not** cover is the real ASGI/Starlette machinery that
 turns an actual dropped socket into a `GeneratorExit` reaching this three-deep chain in the
 first place. This is recorded here as a known gap because it is a controller requirement,
 not an optional nice-to-have: a reader relying on the disconnect accounting above should
