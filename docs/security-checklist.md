@@ -74,7 +74,7 @@ Full schema, presence rules, and honest limits: [audit-logging.md](audit-logging
 - [ ] A 401 carries no identity at all — an unverified claim never reaches the audit log; only a 403 (already-authenticated, permission-denied) records `tenant_id`/`user_id` — `core/audit.py` (`AuthRejected`), [audit-logging.md](audit-logging.md#authrejected)
 - [ ] The audit logger is level-isolated from diagnostic verbosity: `LOG_LEVEL=WARNING` silences INFO diagnostics but never the audit trail — `core/logging.py` (`configure_logging`)
 - [ ] Every audit event passes a validated schema boundary before it is written; a value that doesn't fit raises instead of being logged — `core/audit.py` (`emit_audit_event`)
-- [ ] Emission is owned at one point per route (an endpoint finalizer, a service-level terminal, or `require_principal`), never scattered across call sites, so exactly one event (or zero, for a non-`UpstreamError` bug) is possible per request — [audit-logging.md](audit-logging.md#exactly-once--delivery)
+- [ ] Emission is owned at one point per route (an endpoint finalizer, a service-level terminal, or `require_principal`), never scattered across call sites, so exactly one event is possible per classified request — and zero for the disclosed exceptions: a non-`UpstreamError` bug, a malformed-JSON body that never established identity, and a streaming observer closed before its first iteration — [audit-logging.md](audit-logging.md#exactly-once--delivery)
 
 ## External extensions (evaluated, not wired in)
 

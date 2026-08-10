@@ -1,8 +1,11 @@
 # Audit logging (Day 22)
 
 The audit log is a second logging channel, separate from the diagnostic lines the rest of
-this codebase already writes: one JSON line per authenticated request, carrying who/when/
-which/outcome and nothing else. Content — the message text, the retrieved chunks, the tool
+this codebase already writes: one JSON line per authenticated request that reaches a
+terminal this contract classifies, carrying who/when/which/outcome and nothing else. The
+exact scope of that guarantee — including the deliberate zero-event paths and one narrow
+disclosed exception — is defined in [Exactly-once & delivery](#exactly-once--delivery), not
+here. Content — the message text, the retrieved chunks, the tool
 arguments — never enters it; the conversation store remains the system of record for
 content, and an audit event's job is to be joinable back to it by id, not to duplicate it.
 
@@ -22,7 +25,8 @@ lives in `core/audit.py`; the exported, CI-drift-checked JSON Schema is
   diagnostic-only: prompt attribution (`llm call …`, Day 8), usage (`llm usage …`, Day 9),
   RAG stage latency (`rag stage=…`, Day 14), and agent-turn stage latency plus
   tool-execution logging (`agent_turn_stage stage=…` / `agent_tool_execution …`, Day 18).
-  The audit log adds one additional line per request, on top of all of these, emitted at
+  The audit log adds one additional line per classified request (scope in
+  [Exactly-once & delivery](#exactly-once--delivery)), on top of all of these, emitted at
   the point the request's outcome is known.
 - **One event type per route, plus one for rejected auth:** `chat.turn`, `rag.query`,
   `agent.run`, and `auth.rejected`. A budget rejection is not a separate event type — it is
@@ -182,8 +186,9 @@ enforced the same validator way:
   malformed JSON body** fails to parse before `require_principal` ever runs, so no identity
   was established and **zero events** are emitted; a body that parses but fails schema
   validation *after* the principal was resolved produces exactly one
-  `error_code="validation_error"` rejected event — identity present, every per-request field
-  null — see [Exactly-once & delivery](#exactly-once--delivery).
+  `error_code="validation_error"` rejected event — identity present; the route/provider
+  terminal fields the request never reached (usage, attribution, commit state) are null —
+  see [Exactly-once & delivery](#exactly-once--delivery).
 
 ## Never-log
 
@@ -229,7 +234,9 @@ not assume every value under a reference-only field was server-generated.
 attribute one to). An out-of-contract exception — a genuine bug — deliberately falls outside
 this classification altogether: zero events, original exception propagated (next heading).
 The guarantee is therefore scoped to classified terminals, not to "every authenticated
-request" unqualified. No request falls into two of these at once — the same-endpoint emission points and the
+request" unqualified — and even within that scope it has one narrow disclosed exception, a
+streaming observer closed before its first iteration
+([A known gap in the delivery chain](#a-known-gap-in-the-delivery-chain)). No request falls into two of these at once — the same-endpoint emission points and the
 422 handler's own emission are mutually exclusive by construction (validation failure means
 the route handler body was never entered).
 
@@ -240,15 +247,17 @@ the route handler body was never entered).
 | `/rag` | `RagService.answer()`, at its three terminals, guarded by `has_audit_context()` | matches the existing `rag stage=complete` diagnostic line's terminal points |
 | `/agent` | `api/agent.py::agent_turn`'s finalizer, wrapping the whole call to `service.run_turn()` | 400 (including the service's own `validate_task()`), 404, 429, run error, success |
 | `auth.rejected` | `require_principal`, the one place that sees both resolvers' rejections | both `headers` and `entra` modes |
-| 422 | the `RequestValidationError` handler, guarded on `request.state.principal` being set | only fires when identity was already resolved before the body failed to parse |
+| 422 | the `RequestValidationError` handler, guarded on `request.state.principal` being set | only fires when identity was already resolved and the parsed body then failed field/schema validation (a body that never parsed as JSON fails before identity exists — zero events) |
 
 **A non-`UpstreamError` exception is an out-of-contract bug, not a case this system
-classifies.** Every endpoint's exception handling is written against the `UpstreamError`
+classifies — a rule that is exact for `/chat`, `/chat/stream`, and `/rag`, and holds at the
+route boundary only for `/agent` (framework-scope exception, next paragraph).** At each
+route's own audit boundary, exception handling is written against the `UpstreamError`
 hierarchy specifically (`except UpstreamError as exc:` in `/chat`, `/chat/stream`, `/agent`;
 an `isinstance(exc, UpstreamError)` guard inside `/rag`'s broader diagnostic `except
 Exception`). Anything else — a genuine programming error — is not caught for audit purposes
-anywhere: **no event is emitted, and the original exception propagates** to Starlette's
-default handling (an unstyled 500, no error envelope, no audit line). A reader diffing
+at that boundary: **no event is emitted, and the original exception propagates** to
+Starlette's default handling (an unstyled 500, no error envelope, no audit line). A reader diffing
 "requests the server actually served" against "audit events on disk" needs to know this
 class of gap exists: it is not a missing feature, it is the deliberate line between "a case
 this system classifies" and "a bug that should be loud, not silently reclassified as a
@@ -287,8 +296,8 @@ succeeded, because from the server's side it did everything it promised.
 
 | Cutoff | Audit event |
 |---|---|
-| Disconnect before the terminal is observed | `outcome="error"`, `error_code="client_disconnect"`, `committed=false`, `usage=null` |
-| Disconnect after `StreamDone` is observed (commit decision already made) | Built from the terminal as normal — `committed`, `usage`, `status`, `model_version` reflect the known values. Whether `message.done` actually reached the client cannot be proven either way. |
+| Cancellation (consumer close or task cancellation) before the terminal is observed | `outcome="error"`, `error_code="client_disconnect"`, `committed=false`, `usage=null` |
+| Cancellation after `StreamDone` is observed (commit decision already made) | Built from the terminal as normal — `committed`, `usage`, `status`, `model_version` reflect the known values. Whether `message.done` actually reached the client cannot be proven either way. |
 
 The alternative — recording `committed=false` whenever the socket dropped, regardless of
 cutoff — would have the log claim a turn wasn't saved when the store, in fact, has it: a
