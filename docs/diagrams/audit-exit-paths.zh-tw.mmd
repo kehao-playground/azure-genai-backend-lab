@@ -1,0 +1,24 @@
+%% Publication source (zh-TW) for the Day 22 article figure.
+%% English semantic companion: audit-exit-paths.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    req["HTTP request"] --> parse{"body 是合法 JSON？"}
+    parse -- "否（422）" --> z1["零 event<br/>身分從未驗證——<br/>發了就是捏造"]
+    parse -- "是" --> auth{"require_principal<br/>驗證身分"}
+    auth -- "401／403" --> ar["auth.rejected<br/>恰好一筆"]
+    auth -- "通過" --> val{"欄位驗證過？"}
+    val -- "否（422）" --> rj["rejected<br/>恰好一筆"]
+    val -- "是" --> handler["endpoint／service 執行"]
+    handler -- "2xx" --> s["success<br/>恰好一筆"]
+    handler -- "4xx envelope<br/>（400／404／429）" --> rj
+    handler -- "5xx envelope" --> er["error<br/>恰好一筆"]
+    handler -- "client 斷線<br/>（streaming）" --> dis{"StreamDone<br/>已觀察到？"}
+    dis -- "是：commit 已完成" --> s
+    dis -- "否" --> er
+    handler -- "合約外例外<br/>＝真 bug" --> z2["零 event<br/>原例外原樣傳播"]
+    style s fill:#d3f0d8,stroke:#2e7d32
+    style rj fill:#fff3cd,stroke:#b26a00
+    style ar fill:#fff3cd,stroke:#b26a00
+    style er fill:#fde3e0,stroke:#c62828
+    style z1 fill:#e2e3e5,stroke:#495057
+    style z2 fill:#e2e3e5,stroke:#495057
