@@ -5,11 +5,13 @@ endpoint finalizer and mirror ``/chat``'s classification exactly (same
 ``chat_upstream_audit_args`` helper — see test_audit_chat_api.py). Once
 ``open_stream()`` returns an iterator, ownership moves to ``_audit_observed``,
 the post-transfer observer generator: its three-way exception routing (r6-2)
-is exercised directly at the generator level so the two disconnect states
+is exercised directly at the generator level so the two cancellation states
 (before/after the terminal was observed) land unambiguously on either side of
 ``StreamDone`` — an endpoint-level approximation (killing a TestClient
-connection) cannot pin the exact point of disconnect the way driving
-``aclose()`` by hand can.
+connection) cannot pin the exact cutoff point relative to ``StreamDone`` the
+way driving ``aclose()`` by hand can. ``aclose()`` controls *where* the
+consumer close/cancellation lands relative to the terminal; it does not (and
+cannot) prove *which side* initiated it.
 """
 
 import asyncio

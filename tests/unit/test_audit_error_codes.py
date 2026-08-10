@@ -115,8 +115,9 @@ async def _drive_chat_disconnect(caplog: pytest.LogCaptureFixture) -> None:
     """Task 7's post-transfer observer generator, driven directly (not
     through TestClient) -- same as test_audit_streaming.py's own disconnect
     tests, and for the same reason: an endpoint-level TestClient disconnect
-    cannot pin the exact point of disconnect the way calling ``aclose()`` by
-    hand can."""
+    cannot pin the exact cutoff point relative to ``StreamDone`` the way
+    calling ``aclose()`` by hand can (``aclose()`` controls where the
+    consumer close/cancellation lands, not which side initiated it)."""
 
     async def deltas_forever():
         yield TextDelta("a")

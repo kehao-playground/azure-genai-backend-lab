@@ -216,12 +216,14 @@ async def _audit_observed(
     endpoint finalizer — owns the terminal ``chat.turn`` event. Exception
     routing (r6-2): ``UpstreamError`` -> emit + raise (the Day 6 mid-stream
     case, same classification as /chat via ``chat_upstream_audit_args``);
-    ``GeneratorExit``/``CancelledError`` -> client disconnect, two-state emit
-    + raise (see below); any other exception is an out-of-contract bug — NO
-    event, the original exception propagates untouched, so a genuine
-    programmer error is never misrecorded as a disconnect or a clean success.
+    ``GeneratorExit``/``CancelledError`` -> cancellation (consumer close or
+    task cancellation; ``client_disconnect`` names the usual source, not a
+    proven attribution), two-state emit + raise (see below); any other
+    exception is an out-of-contract bug — NO event, the original exception
+    propagates untouched, so a genuine programmer error is never misrecorded
+    as a cancellation or a clean success.
 
-    Disconnect two-state: the store commits the turn *before* the terminal
+    Cancellation two-state: the store commits the turn *before* the terminal
     event is yielded (services/conversation.py's ``_commit_on_done``), so
     once ``seen_done`` is set the commit decision is already made and
     unrelated to whether the client actually received the frame — the audit
