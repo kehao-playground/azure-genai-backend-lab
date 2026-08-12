@@ -60,27 +60,61 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     The budget is one deadline shared across all four closers, not a
     per-closer timeout: the thing that has to fit inside the remaining grace
     period is the *sum* of however long cleanup takes, and four independent
-    per-closer allowances could still add up to more than that. Every closer
-    still runs, in order, even if an earlier one times out or raises —
-    matching the exception semantics the nested try/finally chain this
-    replaces already had (every closer attempted, first exception wins),
-    extended to also bound total wall time. A timeout is logged and treated
-    as "moved on", not raised.
+    per-closer allowances could still add up to more than that. This bounds
+    *cooperative* delay only: a closer that keeps doing real work (e.g.
+    behind `asyncio.shield`) after being cancelled still takes however long
+    that work takes — measured a 1.05s overrun against a 0.05s budget from a
+    closer built to do exactly that (Day 23 review, second wave).
+
+    Every closer still runs, in order, even if an earlier one times out or
+    raises. This deliberately does *not* preserve the exception behaviour of
+    the nested try/finally chain it replaces: that chain was last-wins — an
+    exception from a later closer replaced an earlier in-flight one as the
+    propagated exception, keeping the earlier one only as `__context__`
+    (verified empirically: closers 1 and 3 both raising propagated closer
+    3's exception with closer 1's chained into `__context__`). This
+    implementation is first-wins instead, by design — but to make up for no
+    longer keeping the others in `__context__`, every closer's failure
+    (timeout or not, first or not) is logged, so a second or third real
+    close failure is never silently dropped even though only the first is
+    re-raised.
+
+    Uses `asyncio.timeout` rather than `asyncio.wait_for` so a closer's own
+    `TimeoutError` (e.g. from a socket/SSL teardown) can be told apart from
+    the budget itself expiring: since Python 3.11, `asyncio.TimeoutError`
+    *is* the builtin `TimeoutError`, so `wait_for`'s single `except
+    TimeoutError` could not distinguish "the closer raised this" from "I
+    cancelled the closer" and would have silently swallowed the former as a
+    logged-and-ignored timeout instead of a real failure.
     """
     deadline = time.monotonic() + budget_seconds
     first_exception: Exception | None = None
     for label, attr in _LIFESPAN_CLOSERS:
         # Clamped to 0, never left negative: an already-exhausted budget
-        # must still *attempt* the remaining closers (and time out
-        # immediately) rather than skip them — "never tried" and "timed
-        # out" are different facts or the log below would be lying.
+        # must still be handed to the timeout machinery rather than skipped
+        # outright — "never tried" and "timed out" are different facts, and
+        # the log line below is the only observable proof of the
+        # difference. (A closer with no internal await point of its own,
+        # unlike every real closer in this app, can still complete
+        # synchronously even at a zero remaining budget: asyncio.timeout
+        # only interrupts at a suspension point, and one that never
+        # suspends never gives it the chance.)
         remaining = max(deadline - time.monotonic(), 0.0)
-        closer = getattr(app.state, attr)
         try:
-            await asyncio.wait_for(closer.aclose(), timeout=remaining)
-        except TimeoutError:
-            logger.warning("shutdown cleanup timed out closer=%s", label)
-        except Exception as exc:  # collected below, re-raised after every closer runs
+            closer = getattr(app.state, attr)
+            async with asyncio.timeout(remaining) as cm:
+                await closer.aclose()
+        except TimeoutError as exc:
+            if cm.expired():
+                logger.warning("shutdown cleanup timed out closer=%s", label)
+            else:
+                # The closer raised its own TimeoutError before the budget
+                # actually expired -- a real failure, not a budget timeout.
+                logger.warning("shutdown cleanup closer=%s raised %s", label, exc)
+                if first_exception is None:
+                    first_exception = exc
+        except Exception as exc:
+            logger.warning("shutdown cleanup closer=%s raised %s", label, exc)
             if first_exception is None:
                 first_exception = exc
     if first_exception is not None:
