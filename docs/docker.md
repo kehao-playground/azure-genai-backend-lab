@@ -10,8 +10,14 @@ resources, no keys, no outbound network.
 
 ```bash
 docker build -f docker/Dockerfile -t azgenai-lab .
-docker run --name azgenai-lab -p 8000:8000 azgenai-lab
+docker run --rm --name azgenai-lab -p 127.0.0.1:8000:8000 azgenai-lab
 ```
+
+`-p 127.0.0.1:8000:8000` binds the published port to localhost only; a bare
+`-p 8000:8000` publishes to every address the host answers on, which is
+further than a local quick start needs to reach. `--rm` removes the
+container once it stops, so running this command again under the same
+name does not collide with a leftover exited container.
 
 Open <http://127.0.0.1:8000/health> and <http://127.0.0.1:8000/docs>.
 
@@ -24,7 +30,10 @@ docker stop -t 30 azgenai-lab
 
 ## What is in the image
 
-- **Builder stage**: `python:3.13-slim` plus a pinned uv. `uv sync --frozen
+- **Builder stage**: `python:3.13-slim` plus uv, copied from
+  `ghcr.io/astral-sh/uv:0.11` — a floating minor tag, not a pin; it
+  resolved to `uv 0.11.33` on this machine on 2026-08-12 and will pick up
+  later 0.11.x patches without this file changing. `uv sync --frozen
   --no-dev --no-editable` installs the dependencies and the project itself —
   including `azgenai_lab/prompts/*.md` — into `/app/.venv`.
   `UV_PYTHON_DOWNLOADS=0` keeps the venv on the interpreter the runtime
@@ -88,11 +97,21 @@ docker stop -t 30 azgenai-lab
 
 Settings come from the environment (plus `.env` in local development; the
 image never bakes one in — `.dockerignore` blocks it as well). Every
-variable has a safe default and the fake switches default to on, so an
-empty environment runs entirely offline. Secrets are injected at runtime
-only, never at build time; on Azure prefer Key Vault references
+variable has a demo-oriented default and the fake switches default to on,
+so an empty environment runs entirely offline. Secrets are injected at
+runtime only, never at build time; on Azure prefer Key Vault references
 ([key-vault-config.md](key-vault-config.md)) and Container Apps secrets
 (Day 24).
+
+**Read before deploying past a lab environment**: `AUTH_MODE`'s default,
+`headers`, is a development mode — it trusts `X-Tenant-Id`/`X-User-Id`/
+`X-Group-Ids` as-is, so anyone who can reach this container directly can
+declare any tenant, user, or group it accepts
+([api-conventions.md § Trust boundary](api-conventions.md#trust-boundary-read-before-deploying-past-a-lab-environment)).
+A deployment reachable from outside a trusted network must either set
+`AUTH_MODE=entra` or sit behind a gateway that strips or overrides those
+three headers and cannot itself be bypassed by a direct connection to the
+container.
 
 | Variable | Default | Needed when |
 |---|---|---|
@@ -143,11 +162,12 @@ and only falls back to `--interval` once the start period has elapsed
 branch in `getInterval()`, in
 [`daemon/health.go`](https://github.com/moby/moby/blob/master/daemon/health.go),
 checked 2026-08-12). With a 5s `--start-period`, that first ≈5s probe is
-also the only one that can land inside it. Measured: the health-check log
-recorded a single probe at ≈5.1s after container start — close to that
-default 5s start interval, not "matching the start period" in any causal
-sense, since the two happen to share the same number here only because
-`--start-period=5s` was chosen. What was **not** observed is the
+also the only one that can land inside it. Measured on this machine
+(Docker 29.4.0, 2026-08-12): the health-check log recorded a single probe
+at ≈5.1s after container start — close to that default 5s start interval,
+not "matching the start period" in any causal sense, since the two happen
+to share the same number here only because `--start-period=5s` was chosen.
+What was **not** observed is the
 `starting` state itself: several `docker exec` calls landed between
 container start and the first `docker inspect` read, which already showed
 `healthy` — the ≈5.1s figure comes from subtracting `StartedAt` from the
@@ -210,15 +230,20 @@ held-stream setup is replayable: `tools/slow_stream_mock.py`.
 
 A turn cancelled by drain emits an audit event with
 `error_code: "client_disconnect"` and `committed: false`; an operator
-watching a rolling restart will see a burst of these. That code names the
+watching a rolling restart may see a burst of these. That code names the
 *usual* cause, not a proven one — see
 [audit-logging.md](audit-logging.md#commit-truth-versus-delivery-truth).
 
 ## Production hardening beyond this lab
 
-- **Pin the base image by digest** (`python:3.13-slim@sha256:...`) to
-  freeze the supply chain; the lab keeps the tag for readability and says
-  so instead of pretending.
+- **Pin by digest, both images the build pulls** — the runtime base
+  (`python:3.13-slim@sha256:...`) and the uv image this Dockerfile copies
+  the binary from (`ghcr.io/astral-sh/uv:0.11@sha256:...`), currently a
+  floating minor tag. `image:tag@sha256:...` keeps the readable tag in the
+  Dockerfile for a human to see what it roughly is, while the digest is
+  what Docker actually resolves and pulls — readability and immutability
+  are not a trade-off here. The lab keeps both unpinned for readability and
+  says so instead of pretending otherwise.
 - **Registry**: push to Azure Container Registry once a real runtime needs
   to pull the image (Day 24).
 - **Smaller bases** (distroless-style) drop the shell and package manager
