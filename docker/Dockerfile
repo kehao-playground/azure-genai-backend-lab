@@ -11,13 +11,18 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Dependency layer first: src/ changes must not invalidate it.
-COPY pyproject.toml uv.lock README.md ./
+# Dependency layer first: src/ changes must not invalidate it. README.md
+# lives in this second COPY, not the one above: --no-install-project does
+# not read it (confirmed by building this layer without it), but the
+# second sync below installs the project itself, and pyproject.toml's
+# `readme = "README.md"` makes that sync need the file to exist.
+COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # --no-editable installs the project (including azgenai_lab/prompts/*.md)
 # into site-packages, so the runtime stage needs .venv and nothing else.
 COPY src/ src/
+COPY README.md ./
 RUN uv sync --frozen --no-dev --no-editable
 
 FROM python:3.13-slim
@@ -35,7 +40,7 @@ COPY --from=builder /app/.venv /app/.venv
 # bundled sample corpus at startup (services/agent_tools.py). That corpus is
 # repo data, not wheel content, so the image ships it explicitly and points
 # the loader at it: the module-relative default cannot find it once the
-# project is installed non-editable (see Task 1b).
+# project is installed non-editable (Day 23; see docs/docker.md).
 COPY data/sample-docs /app/data/sample-docs
 ENV SAMPLE_DOCS_DIR=/app/data/sample-docs
 

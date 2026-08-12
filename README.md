@@ -34,7 +34,8 @@ Implemented in the initial skeleton:
 - OpenAPI export script (committed contract with CI drift check)
 - Docs structure
 - Astro site skeleton
-- Multi-stage, non-root Dockerfile
+- Single-stage Dockerfile (hardened to a multi-stage, non-root build in
+  Day 23 — see [docs/docker.md](docs/docker.md))
 
 ## Quick Start
 
@@ -88,6 +89,7 @@ docs/openapi/openapi.yaml
 - [Microsoft Entra ID Authentication](docs/entra-id-auth.md)
 - [Testing Strategy](docs/testing-strategy.md)
 - [Production Readiness Checklist](docs/production-readiness-checklist.md)
+- [Docker](docs/docker.md)
 - [Traditional Chinese Companion Notes](docs/zh-tw/README.md)
 
 ## License
