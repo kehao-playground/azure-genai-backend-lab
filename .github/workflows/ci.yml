@@ -76,8 +76,8 @@ jobs:
         # separate `docker exec` probe with no involvement from HEALTHCHECK at
         # all would pass even if that instruction were broken (confirmed by
         # deliberately pointing HEALTHCHECK at the wrong port: the exec probe
-        # below still succeeds while the inspect poll goes unhealthy -- see
-        # hermes-lab-report.md). The exact-body `docker exec` check
+        # below still succeeds while the inspect poll goes unhealthy -- Day 23
+        # review r03 R3, second wave). The exact-body `docker exec` check
         # afterwards proves what /health actually returns, against the
         # container's own loopback instead of a published port, so this
         # never needs a port on the runner.
