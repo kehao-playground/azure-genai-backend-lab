@@ -47,18 +47,28 @@ docker stop -t 30 azgenai-lab
   figure is given for the build context: the two builds' contexts were
   measured on differently-dirty working trees, so the comparison would not
   mean anything. What the measurement did find is in the next bullet.
-- One measurement here, not a documented guarantee: a throwaway
-  single-instruction Dockerfile (`COPY . /ctx`), built and inspected,
-  showed that unreferenced local caches (`.mypy_cache/` and similar) never
-  reached the transferred build context — only paths a real `COPY`
-  instruction in this Dockerfile actually names did. That is what this
-  probe found for BuildKit resolving the literal `COPY` sources this
-  Dockerfile uses; it was not checked against the classic builder
-  (`DOCKER_BUILDKIT=0`), and it stops being true the moment any
-  instruction reads `COPY . .`. On that basis, `.dockerignore` below does
-  not bother excluding `.mypy_cache/` and the like — they cost nothing in
-  this build, by this measurement, not by a documented promise. Bytecode
-  under `src/` is a different story: Docker's
+- Two builds, not one, establish what actually rides into the context: this
+  Dockerfile's own cold build transfers 1.12MB (reproduced identically on
+  two independent cold builders) — its `COPY` instructions name only
+  `pyproject.toml`, `uv.lock`, `README.md`, `src/`, and `data/sample-docs`,
+  never `.`. A throwaway single-instruction Dockerfile (`COPY . /ctx`),
+  built against the identical directory and `.dockerignore` on its own
+  throwaway builder, transferred **43.60MB**, and a `du -sh` run inside
+  that build found `.mypy_cache` alone accounted for **40.3M** of it — so
+  the cache genuinely is present, sync-eligible content, not something
+  `.dockerignore` was already excluding. Put side by side, the two numbers
+  show BuildKit's local-source sync is instruction-aware: it only walks and
+  transfers the specific paths a `COPY`/`ADD` instruction actually
+  references, so `.mypy_cache/`, `.pytest_cache/`, `.ruff_cache/`, and
+  everything else outside this Dockerfile's five referenced paths never
+  enters the 1.12MB build, cold or not. That is what this Dockerfile's own
+  instructions do today; it was not checked against the classic builder
+  (`DOCKER_BUILDKIT=0`), and it stops being true the moment any instruction
+  reads `COPY . .`. `.dockerignore` below excludes those three cache
+  directories anyway, on the same defense-in-depth basis as its two `.env`
+  lines: not because today's build needs it, but so a future `COPY . .`
+  does not silently ship them. Bytecode under `src/` is a different story:
+  Docker's
   `.dockerignore` matching uses Go's `filepath.Match` rules, and only the
   `**` wildcard matches any number of directories, including zero
   ([Docker Build docs, build context](https://docs.docker.com/build/concepts/context/#dockerignore-files),
