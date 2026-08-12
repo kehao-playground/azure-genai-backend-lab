@@ -755,3 +755,46 @@ async def test_shutdown_cleanup_cancellation_wins_over_a_closer_exception(
         "shutdown cleanup closer=rag service raised RuntimeError: rag close failed"
         in capsys.readouterr().err
     )
+
+
+class _SelfCancellingCloser:
+    """Cancels the running task from inside aclose(), without awaiting.
+
+    That is the "cancel arrived while the task was not suspended" case:
+    `_must_cancel` is set and fires at the *next* suspension point, which
+    belongs to the following closer.
+    """
+
+    async def aclose(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+
+async def test_shutdown_cleanup_a_single_cancel_interrupts_exactly_one_later_closer() -> None:
+    """Pins the measured semantics, not the intuitive ones.
+
+    A cancellation delivered while the task is running interrupts one
+    subsequent await and is then consumed: the closers after that run
+    normally, even though `Task.cancelling()` is still 1. This docstring's
+    predecessor claimed every remaining closer would no-op, which is false
+    on CPython 3.13 (a fresh re-raise needs another `cancel()` call) — the
+    Day 23 reviewer caught the claim, and this test is what checks it.
+    """
+    from azgenai_lab.main import _close_with_budget, create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(8.0)
+    closed: list[str] = []
+    app.state.principal_resolver = _SelfCancellingCloser()
+    app.state.conversation_service = _AwaitingRecordingCloser(closed, "conversation")
+    app.state.rag_service = _AwaitingRecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _AwaitingRecordingCloser(closed, "agent")
+
+    task = asyncio.create_task(_close_with_budget(app, 8.0))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    # "conversation" is the one interrupted; the two after it complete.
+    assert closed == ["rag", "agent"]
