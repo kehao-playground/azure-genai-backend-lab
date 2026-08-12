@@ -561,3 +561,88 @@ async def test_shutdown_cleanup_first_exception_wins_and_later_ones_are_logged(
         "shutdown cleanup closer=rag service raised RuntimeError: rag close failed"
         in capsys.readouterr().err
     )
+
+
+class _RaisingCloser:
+    """A closer whose aclose() always raises the given exception, with no
+    internal await -- see the corresponding note on `_HangingCloser`: a
+    synchronous raise is enough for `asyncio.timeout`'s `__aexit__` to see
+    the exception is unrelated to its own (not-yet-fired) deadline callback,
+    so `cm.expired()` reads False without needing a suspension point.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def aclose(self) -> None:
+        raise self._exc
+
+
+async def test_shutdown_cleanup_closers_own_timeout_error_propagates_and_is_not_swallowed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The non-expired-TimeoutError branch: a closer's own TimeoutError
+    (e.g. a socket/SSL teardown), not the budget expiring. This is the
+    entire reason _close_with_budget uses asyncio.timeout + cm.expired()
+    instead of asyncio.wait_for (Important 2, Day 23 review second wave),
+    and its log line was touched again for the class name (N4, third wave)
+    -- reworked twice with no automated coverage until now.
+
+    A generous budget (5.0s, far larger than this test needs) rules out the
+    budget itself expiring as an alternative explanation for whatever
+    happens; the closer raises immediately, well inside it.
+    """
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(5.0)
+    closed: list[str] = []
+    app.state.principal_resolver = _RaisingCloser(TimeoutError("ssl teardown timed out"))
+    app.state.conversation_service = _RecordingCloser(closed, "conversation")
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    # Not swallowed as a logged-and-ignored budget expiry: it must actually
+    # propagate out of the lifespan.
+    with pytest.raises(TimeoutError, match="^ssl teardown timed out$"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    # The remaining three closers still ran despite the first one raising.
+    assert closed == ["conversation", "rag", "agent"]
+    stderr = capsys.readouterr().err
+    # Not logged as a budget timeout (that wording is reserved for a real
+    # expiry -- see the other shutdown_cleanup_timeout_logs_* tests)...
+    assert "shutdown cleanup timed out closer=principal resolver" not in stderr
+    # ...and the log line that *is* emitted names both the closer and the
+    # exception class.
+    assert "shutdown cleanup closer=principal resolver raised TimeoutError" in stderr
+
+
+async def test_shutdown_cleanup_closers_own_exception_with_empty_str_still_logs_diagnostic_content(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """N4's actual motivation: some exceptions stringify to nothing at all
+    -- a bare ConnectionResetError() has no message -- so the class name in
+    the log line is not decoration; without it this line would carry zero
+    diagnostic content.
+    """
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(5.0)
+    closed: list[str] = []
+    app.state.principal_resolver = _RaisingCloser(ConnectionResetError())
+    app.state.conversation_service = _RecordingCloser(closed, "conversation")
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    with pytest.raises(ConnectionResetError):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert closed == ["conversation", "rag", "agent"]
+    assert (
+        "shutdown cleanup closer=principal resolver raised ConnectionResetError: "
+        in capsys.readouterr().err
+    )
