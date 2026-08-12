@@ -1,5 +1,6 @@
 # Builder: uv and the build graph stay here; the runtime stage copies only
-# the finished virtualenv.
+# the finished virtualenv plus the sample corpus (see the runtime stage
+# below) -- no uv, no src/, no build graph.
 FROM python:3.13-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /bin/
 
@@ -20,7 +21,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # --no-editable installs the project (including azgenai_lab/prompts/*.md)
-# into site-packages, so the runtime stage needs .venv and nothing else.
+# into site-packages, so the runtime stage needs .venv and the sample
+# corpus (copied in below) and nothing else.
 COPY src/ src/
 COPY README.md ./
 RUN uv sync --frozen --no-dev --no-editable
