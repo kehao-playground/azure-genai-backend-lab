@@ -3,9 +3,9 @@
 The image is a two-stage build: a builder stage assembles a virtualenv with
 uv, and the runtime stage copies only that virtualenv plus the bundled
 sample corpus — no uv, no `src/`, no build graph. It runs as a non-root
-user, ships a container-local health check, and bounds request drain on
-shutdown. Zero configuration starts the API in fake mode — no Azure
-resources, no keys, no outbound network.
+user, ships a container-local health check, and bounds both request drain
+and application shutdown on the way down. Zero configuration starts the API
+in fake mode — no Azure resources, no keys, no outbound network.
 
 ## Quick start
 
@@ -147,6 +147,7 @@ container.
 | `RAG_TOP` | `5` | Retrieval hits handed to generation (Day 14). |
 | `AGENT_MAX_ITERATIONS` | `5` | Agent loop guardrail (Day 17). |
 | `AGENT_MAX_TOOL_CALLS` | `10` | Agent loop guardrail (Day 17). |
+| `SHUTDOWN_CLEANUP_BUDGET_SECONDS` | `8.0` | Total shutdown-time budget for the four lifespan closers (see [Graceful shutdown](#graceful-shutdown)); capped at `30` (the Container Apps SIGTERM-to-SIGKILL ceiling). |
 | `SAMPLE_DOCS_DIR` | unset (falls back to the checkout-relative path, which only resolves inside an editable install) | The bundled corpus the fake agent index is seeded from. The image sets it to `/app/data/sample-docs` because a non-editable install (this image's) cannot rely on that fallback. |
 
 The authoritative list is `src/azgenai_lab/core/config.py`; if this table
@@ -219,13 +220,28 @@ including SSE streams — up to `--timeout-graceful-shutdown 20` seconds,
 then cancels whatever remains.
 
 Those 20 seconds bound **request drain only**. Application shutdown (the
-lifespan chain that closes the upstream HTTP clients) runs after that
+lifespan chain that closes the four app-wide clients — the principal
+resolver, and the conversation, RAG and agent services) runs after that
 timeout, inside whatever grace the runtime grants: `docker stop` defaults
 to 10 seconds before SIGKILL, so use `docker stop -t 30`; Azure Container
 Apps sends SIGKILL 30 seconds after SIGTERM
 ([Application lifecycle management in Azure Container Apps § Shutdown](https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management#shutdown),
-checked 2026-08-12). If drain uses its full 20 seconds, roughly 10 remain
-for lifespan cleanup and runtime overhead.
+checked 2026-08-12).
+
+Application shutdown is itself bounded: `SHUTDOWN_CLEANUP_BUDGET_SECONDS`
+(default `8.0`, capped at `30`) is one deadline shared across all four
+closers, not four independent per-closer timeouts, so a closer that hangs
+cannot strand the rest indefinitely the way it could before Day 23 review
+A1. A closer that times out is logged (`shutdown cleanup timed out
+closer=...`) and the loop moves on to the next one; every closer still runs
+regardless of what an earlier one did. This only bounds *cooperative*
+delay — a closer still doing real (e.g. shielded) work after being
+cancelled takes however long that work takes, so the 8s default is a
+target, not a hard ceiling on wall time. If drain uses its full 20 seconds
+and cleanup uses its full default 8, that is 28 of the platform's 30,
+leaving roughly 2 seconds of margin for runtime overhead — thin enough that
+Day 24 must either measure real-Azure teardown latency or shorten one of
+the two budgets (see the Honest boundary paragraph below).
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
 (fake mode, zero env vars) stops in 0.669s; with a deliberately held SSE
