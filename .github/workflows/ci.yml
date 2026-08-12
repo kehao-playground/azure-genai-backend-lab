@@ -64,3 +64,31 @@ jobs:
       - uses: actions/checkout@v4
       - name: Docker build (gate only; Day 24 adds a manual push to ACR, Day 25 automates push and deploy here)
         run: docker build -f docker/Dockerfile -t azgenai-lab:ci .
+      - name: Docker boot smoke
+        # A build that succeeds is not proof the image runs -- this milestone's worst bug
+        # was exactly that (a module-relative default path that only breaks once the
+        # project is installed non-editable, which every image build does). Runs with
+        # zero configuration, the same way the Quick start in docs/docker.md does. Uses
+        # `docker exec` against the container's own loopback instead of a published port,
+        # so it never needs a port on the runner.
+        run: |
+          set -euo pipefail
+          NAME="azgenai-lab-ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$NAME" azgenai-lab:ci
+          ready=no
+          for _ in $(seq 1 30); do
+            if docker exec "$NAME" python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)" >/dev/null 2>&1; then
+              ready=yes
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != yes ]; then
+            echo "container never became healthy; full log follows" >&2
+            docker logs "$NAME" >&2
+            exit 1
+          fi
+          body="$(docker exec "$NAME" python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read().decode())")"
+          echo "health body: $body"
+          test "$body" = '{"status":"ok","service":"azure-genai-backend-lab"}'
