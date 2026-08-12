@@ -88,10 +88,14 @@ async def test_rag_service_aclose_closes_retriever_and_chat_service() -> None:
 
 
 async def test_rag_service_aclose_isolates_a_retriever_failure_from_the_chat_service() -> None:
-    """The one composed closer in the app that didn't already follow the
-    isolation discipline Day 14 review finding 4 established (Day 23
-    review, second wave): a retriever close failure must not strand the
-    chat service's own client.
+    """Two composed closers in the app didn't already follow the isolation
+    discipline Day 14 review finding 4 established (Day 23 review, third
+    wave): RagService.aclose() (fixed in the prior commit) and, one level
+    down, Retriever.aclose() itself -- an embedding-client close failure
+    must not strand the search client's own httpx pool, or RagService's fix
+    only isolates the wrong layer. `_ExplodingEmbeddingClient` explodes in
+    the first of Retriever's two closers, so this also exercises exactly
+    the case the fix must cover.
     """
     embedding = _ExplodingEmbeddingClient()
     search = _RecordingSearchClient()
@@ -101,6 +105,7 @@ async def test_rag_service_aclose_isolates_a_retriever_failure_from_the_chat_ser
     with pytest.raises(RuntimeError, match="embedding close failed"):
         await rag.aclose()
 
+    assert search.close_count == 1
     assert chat.close_count == 1
 
 
