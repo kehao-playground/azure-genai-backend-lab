@@ -76,9 +76,15 @@ class Retriever:
         return result
 
     async def aclose(self) -> None:
-        """Close both composed clients. Each adapter's own aclose() is idempotent."""
-        await self._embedding_client.aclose()
-        await self._search_client.aclose()
+        """Close both composed clients. Each adapter's own aclose() is
+        idempotent. Isolated: an embedding-client close failure must not
+        strand the search client's own httpx pool -- the same discipline
+        Day 14 review finding 4 established, applied here since it was
+        missing at this layer too (Day 23 review, third wave)."""
+        try:
+            await self._embedding_client.aclose()
+        finally:
+            await self._search_client.aclose()
 
 
 def build_retriever(settings: Settings) -> Retriever:
