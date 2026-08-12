@@ -47,9 +47,18 @@ docker stop -t 30 azgenai-lab
   figure is given for the build context: the two builds' contexts were
   measured on differently-dirty working trees, so the comparison would not
   mean anything. What the measurement did find is in the next bullet.
-- The build context only ever carries what a `COPY` instruction names —
-  BuildKit does not walk the whole tree — so unreferenced local caches cost
-  nothing. Bytecode under `src/` is a different story: Docker's
+- One measurement here, not a documented guarantee: a throwaway
+  single-instruction Dockerfile (`COPY . /ctx`), built and inspected,
+  showed that unreferenced local caches (`.mypy_cache/` and similar) never
+  reached the transferred build context — only paths a real `COPY`
+  instruction in this Dockerfile actually names did. That is what this
+  probe found for BuildKit resolving the literal `COPY` sources this
+  Dockerfile uses; it was not checked against the classic builder
+  (`DOCKER_BUILDKIT=0`), and it stops being true the moment any
+  instruction reads `COPY . .`. On that basis, `.dockerignore` below does
+  not bother excluding `.mypy_cache/` and the like — they cost nothing in
+  this build, by this measurement, not by a documented promise. Bytecode
+  under `src/` is a different story: Docker's
   `.dockerignore` matching uses Go's `filepath.Match` rules, and only the
   `**` wildcard matches any number of directories, including zero
   ([Docker Build docs, build context](https://docs.docker.com/build/concepts/context/#dockerignore-files),
@@ -113,25 +122,45 @@ and the code disagree, the code wins.
 The Dockerfile ships a `HEALTHCHECK` that probes `/health` with a Python
 one-liner — the slim base has no curl, and installing one just for a probe
 would be backwards. Parameters: every 30s, 3s timeout, 5s start period,
-3 retries. `docker inspect` reports `starting` → `healthy` after the first
-probe interval (measured: ≈5.1s after container start, matching the 5s
-`--start-period`). The probe command runs inside the container, as the
+3 retries.
+
+The first probe does not wait for the regular 30s `--interval`. While a
+container is still in its `--start-period` and its health status is
+`Starting`, moby's health-check runner uses a shorter, separate cadence —
+`--start-interval`, which defaults to 5s and was not set explicitly here —
+and only falls back to `--interval` once the start period has elapsed
+(`defaultStartInterval = 5 * time.Second` and the status/elapsed-time
+branch in `getInterval()`, in
+[`daemon/health.go`](https://github.com/moby/moby/blob/master/daemon/health.go),
+checked 2026-08-12). With a 5s `--start-period`, that first ≈5s probe is
+also the only one that can land inside it. Measured: the health-check log
+recorded a single probe at ≈5.1s after container start — close to that
+default 5s start interval, not "matching the start period" in any causal
+sense, since the two happen to share the same number here only because
+`--start-period=5s` was chosen. What was **not** observed is the
+`starting` state itself: several `docker exec` calls landed between
+container start and the first `docker inspect` read, which already showed
+`healthy` — the ≈5.1s figure comes from subtracting `StartedAt` from the
+one health-check log entry's timestamp, not from watching the transition
+happen.
+
+The probe command runs inside the container, as the
 image's active user — confirmed against Docker's own reference
 implementation rather than its prose docs: moby's health-check runner sets
 the probe's exec user from the container's configured `USER`
-(`execConfig.User = cntr.Config.User` in
-[`daemon/health.go`](https://github.com/moby/moby/blob/master/daemon/health.go),
-checked 2026-08-12). docs.docker.com's Dockerfile reference does not state
-this outside its general `USER` section, and that section does not itself
-name `HEALTHCHECK`.
+(`execConfig.User = cntr.Config.User`, same file). docs.docker.com's
+Dockerfile reference does not state this outside its general `USER`
+section, and that section does not itself name `HEALTHCHECK`.
 
 Scope this honestly: the instruction serves **local `docker run` / Compose
 observability only**. Azure Container Apps runs its own startup, liveness
 and readiness probes (HTTP/TCP only; `exec` probes are not supported), and
 its default TCP probes are added by the portal only under specific
 conditions — ingress enabled, main app container, non-GPU workload
-profile; sidecars never get them. A CLI/IaC deployment must configure
-probes explicitly; Day 24 points them at this same `/health`.
+profile; sidecars never get them
+([Azure Container Apps health probes](https://learn.microsoft.com/en-us/azure/container-apps/health-probes),
+ms.date 2025-11-06, checked 2026-08-12). A CLI/IaC deployment must
+configure probes explicitly; Day 24 points them at this same `/health`.
 Kubernetes does not execute a Docker image's `HEALTHCHECK` either: a
 containerd maintainer confirmed containerd does not implement it, and that
 "Kubernetes does not use Dockerfile's `HEALTHCHECK` but uses its own
@@ -157,8 +186,10 @@ Those 20 seconds bound **request drain only**. Application shutdown (the
 lifespan chain that closes the upstream HTTP clients) runs after that
 timeout, inside whatever grace the runtime grants: `docker stop` defaults
 to 10 seconds before SIGKILL, so use `docker stop -t 30`; Azure Container
-Apps sends SIGKILL 30 seconds after SIGTERM. If drain uses its full 20
-seconds, roughly 10 remain for lifespan cleanup and runtime overhead.
+Apps sends SIGKILL 30 seconds after SIGTERM
+([Application lifecycle management in Azure Container Apps § Shutdown](https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management#shutdown),
+checked 2026-08-12). If drain uses its full 20 seconds, roughly 10 remain
+for lifespan cleanup and runtime overhead.
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
 stops in 0.669s; with a deliberately held SSE stream, drain is cut off
@@ -166,6 +197,12 @@ after ~20s (the `Cancel 1 running task(s), timeout graceful shutdown
 exceeded` log line, which appeared ~20s after drain began) and the
 container exits with code 0 in 20.822s total (`docker stop -t 30`). The
 held-stream setup is replayable: `tools/slow_stream_mock.py`.
+
+A turn cancelled by drain emits an audit event with
+`error_code: "client_disconnect"` and `committed: false`; an operator
+watching a rolling restart will see a burst of these. That code names the
+*usual* cause, not a proven one — see
+[audit-logging.md](audit-logging.md#commit-truth-versus-delivery-truth).
 
 ## Production hardening beyond this lab
 

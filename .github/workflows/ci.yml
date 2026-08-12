@@ -62,5 +62,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Docker build (gate only; Day 25 adds push and deploy)
+      - name: Docker build (gate only; Day 24 adds a manual push to ACR, Day 25 automates push and deploy here)
         run: docker build -f docker/Dockerfile -t azgenai-lab:ci .

@@ -37,7 +37,7 @@ from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.rag import Chunk, IndexingAction, make_parent_id
 from azgenai_lab.services.chunking import chunk_markdown
-from azgenai_lab.services.document_loader import load_documents
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 from azgenai_lab.services.embeddings import build_embedding_client, embed_chunks
 from azgenai_lab.services.indexing_results import IndexingResult
 from azgenai_lab.services.search_data_plane import IndexingBatch, SearchDataPlane, plan_batches
@@ -165,7 +165,7 @@ async def _index(
     replacer = DocumentReplacer(plan_batches, measured_post, plane.list_chunk_ids)
 
     total_documents = 0
-    for source in load_documents():
+    for source in load_documents(settings.sample_docs_dir or SAMPLE_DOCS_DIR):
         chunks: list[Chunk] = chunk_markdown(
             source,
             max_chars=settings.chunk_max_chars,
