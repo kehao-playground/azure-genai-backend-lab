@@ -227,11 +227,30 @@ checked 2026-08-12). If drain uses its full 20 seconds, roughly 10 remain
 for lifespan cleanup and runtime overhead.
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
-stops in 0.669s; with a deliberately held SSE stream, drain is cut off
-after ~20s (the `Cancel 1 running task(s), timeout graceful shutdown
-exceeded` log line, which appeared ~20s after drain began) and the
-container exits with code 0 in 20.822s total (`docker stop -t 30`). The
-held-stream setup is replayable: `tools/slow_stream_mock.py`.
+(fake mode, zero env vars) stops in 0.669s; with a deliberately held SSE
+stream — real (non-fake) LLM adapter code pointed at
+`tools/slow_stream_mock.py`, a local stand-in for the Responses API, with
+`LLM_TIMEOUT_SECONDS=60` so the 20s drain cutoff is what gets exercised
+and not the SDK's own per-attempt timeout — drain is cut off after ~20s
+(the `Cancel 1 running task(s), timeout graceful shutdown exceeded` log
+line) and the container exits with code 0 in 20.819s total
+(`docker stop -t 30`). The audit line for the drained turn records
+`duration_ms: 26862.34`, comfortably inside that 60s ceiling. (An earlier
+run against the same mock, without raising the timeout, produced a
+similar-looking `duration_ms: 28139.00` under the SDK's 30s default — only
+1.9s of margin, too close to rule out that run having hit the SDK's own
+timeout instead of the drain cutoff. Raising `LLM_TIMEOUT_SECONDS` to 60s
+removes that ambiguity without changing the drain number itself, which
+this rerun reproduces.) The held-stream setup is replayable:
+`tools/slow_stream_mock.py`.
+
+Honest boundary: `tools/slow_stream_mock.py` is a small, cooperative local
+server, not genuine Azure infrastructure — what these numbers isolate is
+uvicorn's own drain cutoff, not how long the lifespan chain's `aclose()`
+on the real httpx client would take against an actual Azure connection's
+teardown latency, which was not measured here. Azure Container Apps' 30
+second SIGKILL grace after SIGTERM is a platform-fixed ceiling, unlike
+`docker stop -t`: a deployment on that platform cannot extend it.
 
 A turn cancelled by drain emits an audit event with
 `error_code: "client_disconnect"` and `committed: false`; an operator
