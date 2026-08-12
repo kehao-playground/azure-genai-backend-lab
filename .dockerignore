@@ -1,8 +1,15 @@
 .venv/
 .git/
+.github/
 __pycache__/
 *.pyc
-site/node_modules/
-site/dist/
+.env
+.env.*
 docs/
 tests/
+site/
+examples/
+infra/
+scripts/
+tools/
+agent-demo-capture.json
