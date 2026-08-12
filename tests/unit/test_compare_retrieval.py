@@ -16,7 +16,7 @@ from pathlib import Path
 
 from azgenai_lab.models.rag import Chunk, make_chunk_id, make_parent_id
 from azgenai_lab.services.chunking import chunk_markdown
-from azgenai_lab.services.document_loader import load_documents
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 
 # tools/ is not a package (no __init__.py, not installed) — it is a
 # directory of standalone scripts, so this is a plain file import rather
@@ -38,7 +38,7 @@ CHUNK_OVERLAP_CHARS = 500
 def _current_chunks() -> dict[str, Chunk]:
     """Chunk id -> Chunk, for every document in the live sample corpus."""
     chunks: dict[str, Chunk] = {}
-    for document in load_documents():
+    for document in load_documents(SAMPLE_DOCS_DIR):
         for chunk in chunk_markdown(
             document, max_chars=CHUNK_MAX_CHARS, overlap_chars=CHUNK_OVERLAP_CHARS
         ):

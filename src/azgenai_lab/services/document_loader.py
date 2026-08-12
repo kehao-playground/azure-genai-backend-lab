@@ -14,10 +14,11 @@ from azgenai_lab.models.principal import validate_identifier
 from azgenai_lab.models.rag import DOC_ID_MAX_LENGTH, SourceDocument
 from azgenai_lab.models.search_index import DocumentKeyError, validate_document_key
 
-# Default corpus location, computed from this module's path: the repository
-# checkout. It is sample data, not wheel content, so an installed
-# (non-editable) layout has to be told where the corpus went --
-# `sample_docs_dir` in Settings does that. Tests pass an explicit directory.
+# Checkout-relative corpus location, computed from this module's path. It is
+# sample data, not wheel content, so an installed (non-editable) layout
+# cannot find it this way -- `load_documents` takes `base_dir` explicitly
+# (no default) and callers at the composition boundary pass this constant,
+# `settings.sample_docs_dir`, or a test's own `tmp_path`.
 SAMPLE_DOCS_DIR = Path(__file__).resolve().parents[3] / "data" / "sample-docs"
 
 _DELIMITER = "---"
@@ -137,7 +138,7 @@ def load_document(path: Path) -> SourceDocument:
     )
 
 
-def load_documents(base_dir: Path = SAMPLE_DOCS_DIR) -> list[SourceDocument]:
+def load_documents(base_dir: Path) -> list[SourceDocument]:
     # Documents live one directory per tenant: <base_dir>/<tenant>/<doc_id>.md.
     paths = sorted(base_dir.glob("*/*.md"))
     if not paths:
