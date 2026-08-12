@@ -140,7 +140,10 @@ equivalents (probes)"
 comment by @AkihiroSuda, checked 2026-08-12) — Kubernetes' own
 liveness/readiness/startup probe documentation doesn't mention
 `HEALTHCHECK` at all, so this maintainer statement is the closest
-available authority.
+available authority. Kubernetes does not discover `/health` on its own
+either: a deployment of this image onto Kubernetes would need its own pod
+spec configuring liveness/readiness probes against this same `/health`
+endpoint, the same way Day 24's Container Apps deployment does.
 
 ## Graceful shutdown
 
