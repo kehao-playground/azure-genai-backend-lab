@@ -361,15 +361,16 @@ async def test_agent_turn_service_aclose_delegates_exactly_once() -> None:
 
 class _HangingCloser:
     """A closer whose aclose() never returns on its own -- it must be cut
-    off by the budget, not waited out. `hang_seconds` is a stand-in for
+    off by the budget, not waited out. The 90s sleep is a stand-in for
     "forever": long enough that no test budget below would ever let it
     finish naturally, short enough that a bug reverting to the old,
     unbounded behaviour fails the test suite in under two minutes rather
-    than hanging pytest indefinitely.
+    than hanging pytest indefinitely. Critically, `asyncio.sleep` is a real
+    suspension point: `asyncio.timeout` can only interrupt a closer at one,
+    which is what makes this fixture (unlike `_RecordingCloser`, whose
+    aclose() never awaits anything) actually exercise the cancellation
+    path.
     """
-
-    def __init__(self, name: str) -> None:
-        self.name = name
 
     async def aclose(self) -> None:
         await asyncio.sleep(90)
@@ -392,7 +393,7 @@ async def test_shutdown_cleanup_timeout_logs_the_offending_closer_by_name(
 
     app = create_app()
     app.state.settings = _budget_settings(0.05)
-    app.state.principal_resolver = _HangingCloser("principal")
+    app.state.principal_resolver = _HangingCloser()
     closed: list[str] = []
     app.state.conversation_service = _RecordingCloser(closed, "conversation")
     app.state.rag_service = _RecordingCloser(closed, "rag")
@@ -421,10 +422,10 @@ async def test_shutdown_cleanup_budget_bounds_total_wall_time_when_every_closer_
 
     app = create_app()
     app.state.settings = _budget_settings(0.05)
-    app.state.principal_resolver = _HangingCloser("principal")
-    app.state.conversation_service = _HangingCloser("conversation")
-    app.state.rag_service = _HangingCloser("rag")
-    app.state.agent_turn_service = _HangingCloser("agent")
+    app.state.principal_resolver = _HangingCloser()
+    app.state.conversation_service = _HangingCloser()
+    app.state.rag_service = _HangingCloser()
+    app.state.agent_turn_service = _HangingCloser()
 
     start = time.monotonic()
     async with app.router.lifespan_context(app):
@@ -454,19 +455,28 @@ async def test_shutdown_cleanup_budget_bounds_total_wall_time_when_every_closer_
 async def test_shutdown_cleanup_already_exhausted_budget_still_attempts_the_next_closer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A budget spent entirely by the first closer's hang leaves the second
-    with zero remaining time -- this must still surface as its own logged
-    timeout, not a silent skip: "never tried" and "timed out" are different
-    facts, and only the log line -- not whatever the closer's own aclose()
-    managed to execute in zero time -- can tell an operator which one it
-    was.
+    """A budget spent entirely by the first two closers' hangs leaves the
+    last two with zero remaining time. For the two hanging closers this
+    must still surface as its own logged timeout, not a silent skip --
+    "never tried" and "timed out" are different facts, and the log line is
+    the only observable proof.
+
+    The two `_RecordingCloser`s that follow are the honest asterisk on that
+    claim: `asyncio.timeout` can only interrupt a closer at a suspension
+    point of its own, and `_RecordingCloser.aclose()` never awaits anything,
+    so it runs to completion in the same synchronous step even at a zero
+    remaining budget -- no timeout, no log line, and `closed` ends up
+    non-empty. Every closer with any real I/O (httpx, AsyncOpenAI --
+    everything this budget exists for in production) does have a
+    suspension point and would be cut off like the two hanging closers
+    above; this is a property of the test double, not of the mechanism.
     """
     from azgenai_lab.main import create_app
 
     app = create_app()
     app.state.settings = _budget_settings(0.03)
-    app.state.principal_resolver = _HangingCloser("principal")
-    app.state.conversation_service = _HangingCloser("conversation")
+    app.state.principal_resolver = _HangingCloser()
+    app.state.conversation_service = _HangingCloser()
     closed: list[str] = []
     app.state.rag_service = _RecordingCloser(closed, "rag")
     app.state.agent_turn_service = _RecordingCloser(closed, "agent")
@@ -477,3 +487,44 @@ async def test_shutdown_cleanup_already_exhausted_budget_still_attempts_the_next
     stderr = capsys.readouterr().err
     assert "shutdown cleanup timed out closer=principal resolver" in stderr
     assert "shutdown cleanup timed out closer=conversation service" in stderr
+    assert closed == ["rag", "agent"]
+
+
+async def test_shutdown_cleanup_first_exception_wins_and_later_ones_are_logged(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The nested try/finally chain this replaces was last-wins: an
+    exception from a later closer replaced an earlier in-flight one as the
+    propagated exception, keeping the earlier one only as `__context__`
+    (verified empirically against the old code: closers 1 and 3 both
+    raising propagated closer 3's RuntimeError with closer 1's chained into
+    `__context__`, not the other way around).
+
+    `_close_with_budget` is deliberately first-wins instead. That is a
+    change, not a preservation, and it drops information the old chain
+    didn't: without `__context__` linking them, a later real failure needs
+    its own log line or it vanishes with no trace at all. This pins both
+    halves: closer 1's exception (not closer 3's) is what propagates, and
+    closer 3's failure still shows up in the log even though it lost.
+    """
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(8.0)
+    closed: list[str] = []
+    app.state.principal_resolver = _ExplodingCloser(closed, "principal")
+    app.state.conversation_service = _RecordingCloser(closed, "conversation")
+    app.state.rag_service = _ExplodingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    with pytest.raises(RuntimeError, match="^principal close failed$"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    # All four still ran, in order, despite the first failure.
+    assert closed == ["principal", "conversation", "rag", "agent"]
+    # The propagated exception is closer 1's ("principal"), not closer 3's
+    # ("rag") -- first-wins, confirmed via pytest.raises' exact match above,
+    # not just this log check. Closer 3's own failure is not silently
+    # dropped just because it lost the re-raise.
+    assert "shutdown cleanup closer=rag service raised rag close failed" in capsys.readouterr().err

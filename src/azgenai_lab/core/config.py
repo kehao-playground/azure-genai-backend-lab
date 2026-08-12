@@ -93,8 +93,13 @@ class Settings(BaseSettings):
     # remaining ~10s some margin for runtime overhead around the cleanup
     # itself (Day 23 review A1). gt=0: a non-positive budget could never let
     # a closer run at all, which is a deployment mistake, not a legitimate
-    # zero-time policy.
-    shutdown_cleanup_budget_seconds: float = Field(default=8.0, gt=0)
+    # zero-time policy. le=30: that same 30s SIGTERM-to-SIGKILL ceiling is a
+    # hard upper bound on any value that could still matter -- a larger
+    # number would silently reinstate the SIGKILL risk this setting exists
+    # to prevent, and there is no real-Azure or `docker stop -t` value to
+    # cross-validate it against from here (drain lives in the Dockerfile,
+    # not in this process).
+    shutdown_cleanup_budget_seconds: float = Field(default=8.0, gt=0, le=30)
 
     # Day 19: caller authentication mode, selected once at startup. "headers"
     # is the existing trusted-development path (require_principal reads
