@@ -84,6 +84,18 @@ class Settings(BaseSettings):
     agent_max_iterations: int = Field(default=5, gt=0)
     agent_max_tool_calls: int = Field(default=10, gt=0)
 
+    # Total budget, in seconds, for the four sequential lifespan closers on
+    # shutdown (principal resolver, conversation service, RAG service, agent
+    # turn service — see main.py). This is a shared *total*, not a per-closer
+    # allowance: Container Apps allows 30s from SIGTERM to SIGKILL, request
+    # drain (docker/Dockerfile's --timeout-graceful-shutdown) can use up to
+    # 20s of that before lifespan cleanup even starts, and 8s leaves the
+    # remaining ~10s some margin for runtime overhead around the cleanup
+    # itself (Day 23 review A1). gt=0: a non-positive budget could never let
+    # a closer run at all, which is a deployment mistake, not a legitimate
+    # zero-time policy.
+    shutdown_cleanup_budget_seconds: float = Field(default=8.0, gt=0)
+
     # Day 19: caller authentication mode, selected once at startup. "headers"
     # is the existing trusted-development path (require_principal reads
     # X-Tenant-Id/X-User-Id directly); "entra" validates a real Microsoft

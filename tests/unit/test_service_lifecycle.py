@@ -8,6 +8,8 @@ except an explicit ``aclose()``. Each composed service must forward
 builds at startup.
 """
 
+import asyncio
+import time
 from collections.abc import AsyncIterator, Sequence
 
 import pytest
@@ -343,3 +345,135 @@ async def test_agent_turn_service_aclose_delegates_exactly_once() -> None:
     # The wrapper's own _closed guard (Task 8) — not the adapter's — makes
     # the second call a no-op before it ever reaches the delegate.
     assert calls == ["close"]
+
+
+# ---------------------------------------------------------------------------
+# Day 23 review A1: the four closers above used to run inside a nested
+# try/finally with no timeout anywhere. These tests exercise the bounded
+# replacement (`main._close_with_budget`) via the real lifespan, the same
+# way the tests above do — `test_lifespan_isolates_close_failures` already
+# covers "a closer raising a non-timeout error still runs the rest of the
+# closers and then propagates" against this same bounded implementation
+# (its RecordingCloser/ExplodingCloser instances are effectively instant, so
+# they exercise the exception path, not the timeout path, of the new code).
+# ---------------------------------------------------------------------------
+
+
+class _HangingCloser:
+    """A closer whose aclose() never returns on its own -- it must be cut
+    off by the budget, not waited out. `hang_seconds` is a stand-in for
+    "forever": long enough that no test budget below would ever let it
+    finish naturally, short enough that a bug reverting to the old,
+    unbounded behaviour fails the test suite in under two minutes rather
+    than hanging pytest indefinitely.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(90)
+
+
+def _budget_settings(budget_seconds: float) -> Settings:
+    return Settings(_env_file=None, shutdown_cleanup_budget_seconds=budget_seconds)
+
+
+async def test_shutdown_cleanup_timeout_logs_the_offending_closer_by_name(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # create_app() (below) calls configure_logging(), whose
+    # logging.basicConfig(force=True) replaces every root handler --
+    # including caplog's -- with its own stderr StreamHandler each time it
+    # runs. That handler is what these tests read back via capsys rather
+    # than caplog: capsys is already patching sys.stderr by the time
+    # create_app() (re-)binds the handler to it.
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(0.05)
+    app.state.principal_resolver = _HangingCloser("principal")
+    closed: list[str] = []
+    app.state.conversation_service = _RecordingCloser(closed, "conversation")
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    async with app.router.lifespan_context(app):
+        pass  # must not hang, and must not raise TimeoutError outward
+
+    assert "shutdown cleanup timed out closer=principal resolver" in capsys.readouterr().err
+
+
+async def test_shutdown_cleanup_budget_bounds_total_wall_time_when_every_closer_hangs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One shared 0.05s budget across four closers that would each hang for
+    90s proves two things at once: total wall time is bounded near the
+    budget (not the 360s four independent per-closer timeouts would allow),
+    and every closer past the first -- including the three left with an
+    already-exhausted (zero) remaining budget once the first one's timeout
+    alone consumes the whole thing -- is still individually handed to
+    asyncio.wait_for and gets its own timeout log line, rather than the loop
+    stopping after the first timeout or silently dropping the rest of the
+    accounting.
+    """
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(0.05)
+    app.state.principal_resolver = _HangingCloser("principal")
+    app.state.conversation_service = _HangingCloser("conversation")
+    app.state.rag_service = _HangingCloser("rag")
+    app.state.agent_turn_service = _HangingCloser("agent")
+
+    start = time.monotonic()
+    async with app.router.lifespan_context(app):
+        pass
+    elapsed = time.monotonic() - start
+
+    # Comfortably above the 0.05s budget (scheduling overhead, four
+    # sequential wait_for cancellations) and comfortably below what any
+    # single one of the four 90s hangs would take alone -- the two-order-
+    # of-magnitude gap is the point, not the exact figure.
+    assert elapsed < 2.0
+
+    stderr = capsys.readouterr().err
+    timed_out = [
+        line.rsplit("closer=", 1)[1]
+        for line in stderr.splitlines()
+        if "shutdown cleanup timed out" in line
+    ]
+    assert timed_out == [
+        "principal resolver",
+        "conversation service",
+        "rag service",
+        "agent turn service",
+    ]
+
+
+async def test_shutdown_cleanup_already_exhausted_budget_still_attempts_the_next_closer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A budget spent entirely by the first closer's hang leaves the second
+    with zero remaining time -- this must still surface as its own logged
+    timeout, not a silent skip: "never tried" and "timed out" are different
+    facts, and only the log line -- not whatever the closer's own aclose()
+    managed to execute in zero time -- can tell an operator which one it
+    was.
+    """
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(0.03)
+    app.state.principal_resolver = _HangingCloser("principal")
+    app.state.conversation_service = _HangingCloser("conversation")
+    closed: list[str] = []
+    app.state.rag_service = _RecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _RecordingCloser(closed, "agent")
+
+    async with app.router.lifespan_context(app):
+        pass
+
+    stderr = capsys.readouterr().err
+    assert "shutdown cleanup timed out closer=principal resolver" in stderr
+    assert "shutdown cleanup timed out closer=conversation service" in stderr
