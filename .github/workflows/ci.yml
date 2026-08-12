@@ -57,3 +57,10 @@ jobs:
         run: npm ci
       - name: Build Astro site
         run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build (gate only; Day 25 adds push and deploy)
+        run: docker build -f docker/Dockerfile -t azgenai-lab:ci .
