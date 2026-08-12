@@ -1,0 +1,178 @@
+# Running the API in Docker
+
+The image is a two-stage build: a builder stage assembles a virtualenv with
+uv, and the runtime stage copies only that virtualenv. It runs as a non-root
+user, ships a container-local health check, and bounds request drain on
+shutdown. Zero configuration starts the API in fake mode — no Azure
+resources, no keys, no outbound network.
+
+## Quick start
+
+```bash
+docker build -f docker/Dockerfile -t azgenai-lab .
+docker run --name azgenai-lab -p 8000:8000 azgenai-lab
+```
+
+Open <http://127.0.0.1:8000/health> and <http://127.0.0.1:8000/docs>.
+
+Stop it with a grace period larger than the drain budget (see
+[Graceful shutdown](#graceful-shutdown)):
+
+```bash
+docker stop -t 30 azgenai-lab
+```
+
+## What is in the image
+
+- **Builder stage**: `python:3.13-slim` plus a pinned uv. `uv sync --frozen
+  --no-dev --no-editable` installs the dependencies and the project itself —
+  including `azgenai_lab/prompts/*.md` — into `/app/.venv`.
+  `UV_PYTHON_DOWNLOADS=0` keeps the venv on the interpreter the runtime
+  stage ships.
+- **Runtime stage**: `python:3.13-slim` plus `/app/.venv`. No uv, no source
+  tree, no build graph. The prompt loader fails fast at startup, so a
+  container that serves `/health` has proven the packaged prompts are
+  present.
+- **Non-root**: the process runs as the system user `app`. The virtualenv
+  is root-owned and read-only to it — the runtime user cannot rewrite its
+  own code, which is a feature, not a limitation.
+- **Sample corpus**: `/app/data/sample-docs`, copied in as repository data
+  rather than wheel content, with `SAMPLE_DOCS_DIR` pointing at it. Fake
+  search is the default and seeds the agent's index from that corpus at
+  startup; the loader's default location is derived from the source tree
+  the package was installed from, which does not survive installation. A
+  deployment that turns fake search off does not need the corpus at all.
+- Measured on this machine (Docker 29.4.0, 2026-08-12) — a data point, not a
+  promise: single-stage baseline 321MB → multi-stage 202MB. No before/after
+  figure is given for the build context: the two builds' contexts were
+  measured on differently-dirty working trees, so the comparison would not
+  mean anything. What the measurement did find is in the next bullet.
+- The build context only ever carries what a `COPY` instruction names —
+  BuildKit does not walk the whole tree — so unreferenced local caches cost
+  nothing. Bytecode under `src/` is a different story: Docker's
+  `.dockerignore` matching uses Go's `filepath.Match` rules, and only the
+  `**` wildcard matches any number of directories, including zero
+  ([Docker Build docs, build context](https://docs.docker.com/build/concepts/context/#dockerignore-files),
+  checked 2026-08-12) — so a pattern like `__pycache__/` without a leading
+  `**/` matches only that literal path relative to the build context root,
+  not nested occurrences under `src/`. Until this was fixed to
+  `**/__pycache__/`, 444,079 bytes (`wc -c`, not `du`'s block-rounded
+  output) of local bytecode rode into the builder stage and invalidated the
+  `COPY src/ src/` layer every time someone ran the tests. Measured cold on
+  a throwaway builder, on one working tree that had been used for local
+  test runs, before and after that one-line-pair change: 1.12MB →
+  671.22kB. (Only that pair is a valid comparison; the single-stage
+  baseline's context was measured on a pristine checkout with no bytecode
+  at all, so it is not comparable to either.)
+
+## Environment variables
+
+Settings come from the environment (plus `.env` in local development; the
+image never bakes one in — `.dockerignore` blocks it as well). Every
+variable has a safe default and the fake switches default to on, so an
+empty environment runs entirely offline. Secrets are injected at runtime
+only, never at build time; on Azure prefer Key Vault references
+([key-vault-config.md](key-vault-config.md)) and Container Apps secrets
+(Day 24).
+
+| Variable | Default | Needed when |
+|---|---|---|
+| `USE_FAKE_LLM` | `true` | Set `false` to call Azure OpenAI for chat. |
+| `USE_FAKE_EMBEDDINGS` | `true` | Set `false` to call the embeddings deployment. |
+| `USE_FAKE_SEARCH` | `true` | Set `false` to call Azure AI Search. |
+| `AZURE_OPENAI_ENDPOINT` | — | `USE_FAKE_LLM=false` or `USE_FAKE_EMBEDDINGS=false`. |
+| `AZURE_OPENAI_API_KEY` | — | `USE_FAKE_LLM=false` or `USE_FAKE_EMBEDDINGS=false`. |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | — | `USE_FAKE_LLM=false`. |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | `USE_FAKE_EMBEDDINGS=false`. |
+| `AZURE_SEARCH_ENDPOINT` | — | `USE_FAKE_SEARCH=false`. |
+| `AZURE_SEARCH_ADMIN_KEY` | — | `USE_FAKE_SEARCH=false`. |
+| `AUTH_MODE` | `headers` | `entra` switches caller auth to Entra ID JWTs (Day 19). |
+| `ENTRA_TENANT_ID` | — | `AUTH_MODE=entra`. |
+| `ENTRA_AUDIENCE` | — | `AUTH_MODE=entra`. |
+| `ENTRA_REQUIRED_SCOPE` | — | `AUTH_MODE=entra`: this or `ENTRA_REQUIRED_APP_ROLE`. |
+| `ENTRA_REQUIRED_APP_ROLE` | — | `AUTH_MODE=entra`: this or `ENTRA_REQUIRED_SCOPE`. |
+| `LOG_LEVEL` | `INFO` | Tuning log volume. |
+| `APP_NAME` | `azure-genai-backend-lab` | Cosmetic (health/root payloads). |
+| `APP_ENV` | `local` | Environment label. |
+| `LLM_TIMEOUT_SECONDS` | `30.0` | Per-attempt upstream timeout. |
+| `LLM_MAX_RETRIES` | `2` | Upstream retry policy. |
+| `LLM_MAX_OUTPUT_TOKENS` | `1000` | Per-call output cap (Day 9). |
+| `CONVERSATION_TOKEN_BUDGET` | `50000` | Per-conversation lifetime token budget (Day 9). |
+| `CHUNK_MAX_CHARS` | `2000` | Offline indexing (`tools/index_corpus.py`) and the fake-agent corpus seeded at startup when `USE_FAKE_SEARCH=true`. |
+| `CHUNK_OVERLAP_CHARS` | `500` | Same chunking paths; must stay below half of `CHUNK_MAX_CHARS` (startup validation). |
+| `RAG_TOP` | `5` | Retrieval hits handed to generation (Day 14). |
+| `AGENT_MAX_ITERATIONS` | `5` | Agent loop guardrail (Day 17). |
+| `AGENT_MAX_TOOL_CALLS` | `10` | Agent loop guardrail (Day 17). |
+| `SAMPLE_DOCS_DIR` | — (repository checkout) | The bundled corpus the fake agent index is seeded from. The image sets it to `/app/data/sample-docs`, because the default is resolved from the source tree the package was installed from. |
+
+The authoritative list is `src/azgenai_lab/core/config.py`; if this table
+and the code disagree, the code wins.
+
+## Health check
+
+The Dockerfile ships a `HEALTHCHECK` that probes `/health` with a Python
+one-liner — the slim base has no curl, and installing one just for a probe
+would be backwards. Parameters: every 30s, 3s timeout, 5s start period,
+3 retries. `docker inspect` reports `starting` → `healthy` after the first
+probe interval (measured: ≈5.1s after container start, matching the 5s
+`--start-period`). The probe command runs inside the container, as the
+image's active user — confirmed against Docker's own reference
+implementation rather than its prose docs: moby's health-check runner sets
+the probe's exec user from the container's configured `USER`
+(`execConfig.User = cntr.Config.User` in
+[`daemon/health.go`](https://github.com/moby/moby/blob/master/daemon/health.go),
+checked 2026-08-12). docs.docker.com's Dockerfile reference does not state
+this outside its general `USER` section, and that section does not itself
+name `HEALTHCHECK`.
+
+Scope this honestly: the instruction serves **local `docker run` / Compose
+observability only**. Azure Container Apps runs its own startup, liveness
+and readiness probes (HTTP/TCP only; `exec` probes are not supported), and
+its default TCP probes are added by the portal only under specific
+conditions — ingress enabled, main app container, non-GPU workload
+profile; sidecars never get them. A CLI/IaC deployment must configure
+probes explicitly; Day 24 points them at this same `/health`.
+Kubernetes does not execute a Docker image's `HEALTHCHECK` either: a
+containerd maintainer confirmed containerd does not implement it, and that
+"Kubernetes does not use Dockerfile's `HEALTHCHECK` but uses its own
+equivalents (probes)"
+([containerd/containerd discussion #7657](https://github.com/containerd/containerd/discussions/7657),
+comment by @AkihiroSuda, checked 2026-08-12) — Kubernetes' own
+liveness/readiness/startup probe documentation doesn't mention
+`HEALTHCHECK` at all, so this maintainer statement is the closest
+available authority.
+
+## Graceful shutdown
+
+The `CMD` is exec-form, so uvicorn runs as PID 1 and receives SIGTERM
+directly (shell-form would strand the signal in `/bin/sh`). On SIGTERM,
+uvicorn stops accepting connections and waits for in-flight requests —
+including SSE streams — up to `--timeout-graceful-shutdown 20` seconds,
+then cancels whatever remains.
+
+Those 20 seconds bound **request drain only**. Application shutdown (the
+lifespan chain that closes the upstream HTTP clients) runs after that
+timeout, inside whatever grace the runtime grants: `docker stop` defaults
+to 10 seconds before SIGKILL, so use `docker stop -t 30`; Azure Container
+Apps sends SIGKILL 30 seconds after SIGTERM. If drain uses its full 20
+seconds, roughly 10 remain for lifespan cleanup and runtime overhead.
+
+Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
+stops in 0.669s; with a deliberately held SSE stream, drain is cut off
+after ~20s (the `Cancel 1 running task(s), timeout graceful shutdown
+exceeded` log line, which appeared ~20s after drain began) and the
+container exits with code 0 in 20.822s total (`docker stop -t 30`). The
+held-stream setup is replayable: `tools/slow_stream_mock.py`.
+
+## Production hardening beyond this lab
+
+- **Pin the base image by digest** (`python:3.13-slim@sha256:...`) to
+  freeze the supply chain; the lab keeps the tag for readability and says
+  so instead of pretending.
+- **Registry**: push to Azure Container Registry once a real runtime needs
+  to pull the image (Day 24).
+- **Smaller bases** (distroless-style) drop the shell and package manager
+  this image still carries. The lab keeps them for debuggability — a
+  deliberate trade, not an oversight.
+- **Image scanning** (Docker Scout, Microsoft Defender for Cloud) belongs
+  in CI once images are published; the Day 23 gate only proves the build.

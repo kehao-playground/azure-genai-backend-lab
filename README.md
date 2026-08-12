@@ -34,7 +34,7 @@ Implemented in the initial skeleton:
 - OpenAPI export script (committed contract with CI drift check)
 - Docs structure
 - Astro site skeleton
-- Working minimal Dockerfile
+- Multi-stage, non-root Dockerfile
 
 ## Quick Start
 
@@ -49,6 +49,16 @@ Open:
 http://127.0.0.1:8000/health
 http://127.0.0.1:8000/docs
 ```
+
+## Run in Docker
+
+```bash
+docker build -f docker/Dockerfile -t azgenai-lab .
+docker run -p 8000:8000 azgenai-lab
+```
+
+Zero configuration runs in fake mode. See [docs/docker.md](docs/docker.md) for
+environment variables, health check and graceful-shutdown behaviour.
 
 ## Run Tests
 
