@@ -31,15 +31,13 @@ WORKDIR /app
 # Root-owned on purpose: the runtime user cannot rewrite its own code.
 COPY --from=builder /app/.venv /app/.venv
 
-# The default fake-mode agent tools seed the ops-assistant index from
-# bundled sample documents at startup (services/agent_tools.py), and
-# document_loader.SAMPLE_DOCS_DIR resolves that path relative to its own
-# module location on disk. Under this --no-editable install that lands
-# under the venv's stdlib directory, not /app -- this copy is not project
-# code, it is what that resolution already expects for this venv layout,
-# and it is what makes the zero-env-var "docker run" experience work at
-# all (see docs/docker.md).
-COPY data/sample-docs /app/.venv/lib/python3.13/data/sample-docs
+# Fake search is the default, and it seeds the agent's index from the
+# bundled sample corpus at startup (services/agent_tools.py). That corpus is
+# repo data, not wheel content, so the image ships it explicitly and points
+# the loader at it: the module-relative default cannot find it once the
+# project is installed non-editable (see Task 1b).
+COPY data/sample-docs /app/data/sample-docs
+ENV SAMPLE_DOCS_DIR=/app/data/sample-docs
 
 USER app
 EXPOSE 8000

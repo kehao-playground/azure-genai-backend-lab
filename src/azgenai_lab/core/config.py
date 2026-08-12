@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
@@ -44,6 +45,13 @@ class Settings(BaseSettings):
     chunk_max_chars: int = Field(default=2000, gt=0)
     # Overlap applies only within one oversized section (see services/chunking).
     chunk_overlap_chars: int = Field(default=500, ge=0)
+
+    # Where the bundled sample corpus lives. None keeps the repo-relative
+    # default in services/document_loader.py, which is computed from that
+    # module's own path -- correct in a source tree, wrong once the project
+    # is installed non-editable (the container does exactly that, Day 23).
+    # Deployments that ship the corpus elsewhere point this at it.
+    sample_docs_dir: Path | None = None
 
     azure_openai_embedding_deployment: str | None = None
 
