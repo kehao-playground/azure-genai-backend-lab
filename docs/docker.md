@@ -1,7 +1,8 @@
 # Running the API in Docker
 
 The image is a two-stage build: a builder stage assembles a virtualenv with
-uv, and the runtime stage copies only that virtualenv. It runs as a non-root
+uv, and the runtime stage copies only that virtualenv plus the bundled
+sample corpus — no uv, no `src/`, no build graph. It runs as a non-root
 user, ships a container-local health check, and bounds request drain on
 shutdown. Zero configuration starts the API in fake mode — no Azure
 resources, no keys, no outbound network.
@@ -38,10 +39,10 @@ docker stop -t 30 azgenai-lab
   including `azgenai_lab/prompts/*.md` — into `/app/.venv`.
   `UV_PYTHON_DOWNLOADS=0` keeps the venv on the interpreter the runtime
   stage ships.
-- **Runtime stage**: `python:3.13-slim` plus `/app/.venv`. No uv, no source
-  tree, no build graph. The prompt loader fails fast at startup, so a
-  container that serves `/health` has proven the packaged prompts are
-  present.
+- **Runtime stage**: `python:3.13-slim` plus `/app/.venv` and the sample
+  corpus described below — no uv, no source tree, no build graph. The
+  prompt loader fails fast at startup, so a container that serves `/health`
+  has proven the packaged prompts are present.
 - **Non-root**: the process runs as the system user `app`. The virtualenv
   is root-owned and read-only to it — the runtime user cannot rewrite its
   own code, which is a feature, not a limitation.
