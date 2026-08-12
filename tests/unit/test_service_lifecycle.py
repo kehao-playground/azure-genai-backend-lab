@@ -442,7 +442,7 @@ async def test_shutdown_cleanup_budget_bounds_total_wall_time_when_every_closer_
     and every closer past the first -- including the three left with an
     already-exhausted (zero) remaining budget once the first one's timeout
     alone consumes the whole thing -- is still individually handed to
-    asyncio.wait_for and gets its own timeout log line, rather than the loop
+    asyncio.timeout and gets its own timeout log line, rather than the loop
     stopping after the first timeout or silently dropping the rest of the
     accounting.
     """
@@ -461,9 +461,9 @@ async def test_shutdown_cleanup_budget_bounds_total_wall_time_when_every_closer_
     elapsed = time.monotonic() - start
 
     # Comfortably above the 0.05s budget (scheduling overhead, four
-    # sequential wait_for cancellations) and comfortably below what any
-    # single one of the four 90s hangs would take alone -- the two-order-
-    # of-magnitude gap is the point, not the exact figure.
+    # sequential asyncio.timeout cancellations) and comfortably below what
+    # any single one of the four 90s hangs would take alone -- the two-
+    # order-of-magnitude gap is the point, not the exact figure.
     assert elapsed < 2.0
 
     stderr = capsys.readouterr().err
@@ -554,5 +554,10 @@ async def test_shutdown_cleanup_first_exception_wins_and_later_ones_are_logged(
     # The propagated exception is closer 1's ("principal"), not closer 3's
     # ("rag") -- first-wins, confirmed via pytest.raises' exact match above,
     # not just this log check. Closer 3's own failure is not silently
-    # dropped just because it lost the re-raise.
-    assert "shutdown cleanup closer=rag service raised rag close failed" in capsys.readouterr().err
+    # dropped just because it lost the re-raise; the class name (RuntimeError)
+    # is present alongside the message, not relied on alone (Day 23 review,
+    # third wave N4).
+    assert (
+        "shutdown cleanup closer=rag service raised RuntimeError: rag close failed"
+        in capsys.readouterr().err
+    )

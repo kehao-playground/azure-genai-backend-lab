@@ -110,11 +110,19 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
             else:
                 # The closer raised its own TimeoutError before the budget
                 # actually expired -- a real failure, not a budget timeout.
-                logger.warning("shutdown cleanup closer=%s raised %s", label, exc)
+                logger.warning(
+                    "shutdown cleanup closer=%s raised %s: %s", label, type(exc).__name__, exc
+                )
                 if first_exception is None:
                     first_exception = exc
         except Exception as exc:
-            logger.warning("shutdown cleanup closer=%s raised %s", label, exc)
+            # Class name always present, unlike str(exc): some exceptions
+            # (e.g. a bare ConnectionResetError()) stringify to empty,
+            # which would otherwise leave this line with no diagnostic
+            # content at all.
+            logger.warning(
+                "shutdown cleanup closer=%s raised %s: %s", label, type(exc).__name__, exc
+            )
             if first_exception is None:
                 first_exception = exc
     if first_exception is not None:
