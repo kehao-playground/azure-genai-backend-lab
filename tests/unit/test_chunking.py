@@ -11,7 +11,7 @@ import pytest
 
 from azgenai_lab.models.rag import Chunk, SourceDocument, make_parent_id
 from azgenai_lab.services.chunking import ChunkingError, chunk_markdown
-from azgenai_lab.services.document_loader import load_documents
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 
 
 def _document(body: str) -> SourceDocument:
@@ -484,7 +484,7 @@ def test_headings_outside_fences_still_split_sections() -> None:
 def _corpus_chunks() -> list[Chunk]:
     return [
         chunk
-        for document in load_documents()
+        for document in load_documents(SAMPLE_DOCS_DIR)
         for chunk in chunk_markdown(document, max_chars=2000, overlap_chars=500)
     ]
 
