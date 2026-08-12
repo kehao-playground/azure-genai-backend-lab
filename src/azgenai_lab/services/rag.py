@@ -447,9 +447,18 @@ class RagService:
         )
 
     async def aclose(self) -> None:
-        """Close the composed retriever and chat service."""
-        await self._retriever.aclose()
-        await self._chat_service.aclose()
+        """Close the composed retriever and chat service.
+
+        Isolated: a retriever close failure must not strand the chat
+        service's own client -- the same discipline Day 14 review finding 4
+        established for the top-level lifespan closers (Day 23 review,
+        second wave; this was the one composed closer in the app that
+        didn't already follow it).
+        """
+        try:
+            await self._retriever.aclose()
+        finally:
+            await self._chat_service.aclose()
 
 
 def build_rag_service(settings: Settings) -> RagService:

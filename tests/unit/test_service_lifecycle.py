@@ -57,6 +57,12 @@ class _RecordingSearchClient(FakeSearchClient):
         self.close_count += 1
 
 
+class _ExplodingEmbeddingClient(_RecordingEmbeddingClient):
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise RuntimeError("embedding close failed")
+
+
 async def test_retriever_aclose_closes_embedding_and_search_clients() -> None:
     embedding = _RecordingEmbeddingClient()
     search = _RecordingSearchClient()
@@ -78,6 +84,23 @@ async def test_rag_service_aclose_closes_retriever_and_chat_service() -> None:
 
     assert embedding.close_count == 1
     assert search.close_count == 1
+    assert chat.close_count == 1
+
+
+async def test_rag_service_aclose_isolates_a_retriever_failure_from_the_chat_service() -> None:
+    """The one composed closer in the app that didn't already follow the
+    isolation discipline Day 14 review finding 4 established (Day 23
+    review, second wave): a retriever close failure must not strand the
+    chat service's own client.
+    """
+    embedding = _ExplodingEmbeddingClient()
+    search = _RecordingSearchClient()
+    chat = _RecordingChatService()
+    rag = RagService(Retriever(embedding, search, top=5), chat)
+
+    with pytest.raises(RuntimeError, match="embedding close failed"):
+        await rag.aclose()
+
     assert chat.close_count == 1
 
 
