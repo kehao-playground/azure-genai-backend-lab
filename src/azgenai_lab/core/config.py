@@ -6,6 +6,35 @@ from uuid import UUID
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The shutdown arithmetic, as three named terms rather than one hand-computed
+# ceiling (Day 23 review F1). Shutdown spends the platform's grace period in
+# two consecutive phases -- request drain, then lifespan cleanup -- so the
+# only defensible upper bound on the second is what the first leaves behind.
+# An upper bound picked to look safe on its own (the earlier `le=30`) still
+# permitted 20 + 30 = 50 nominal seconds against a 30-second ceiling.
+#
+# Azure Container Apps SIGKILLs the process 30s after SIGTERM, and that
+# number is not tunable:
+# https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management#shutdown
+# (checked 2026-08-12). It is the tightest platform grace this image targets;
+# `docker stop`'s default 10s is shorter, which is why docs/docker.md
+# prescribes `docker stop -t 30` instead of quietly assuming the default.
+PLATFORM_SIGTERM_GRACE_SECONDS = 30.0
+# Mirrors --timeout-graceful-shutdown in docker/Dockerfile's CMD. It lives
+# there because it is a uvicorn CLI flag, not a setting this process reads;
+# tests/unit/test_config.py parses the Dockerfile and fails if the two drift,
+# so this is a checked mirror rather than a second source of truth.
+REQUEST_DRAIN_SECONDS = 20.0
+# Unmeasured allowance for everything between "SIGTERM delivered" and "the
+# cleanup loop's deadline arithmetic starts": signal delivery, uvicorn's own
+# teardown, and the interpreter's exit path. Honest status: a guess, like the
+# 8s default it produces. Day 24 measures real Azure teardown or shortens the
+# terms; what this constant fixes is only that the terms now compose.
+SHUTDOWN_OVERHEAD_MARGIN_SECONDS = 2.0
+MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS = (
+    PLATFORM_SIGTERM_GRACE_SECONDS - REQUEST_DRAIN_SECONDS - SHUTDOWN_OVERHEAD_MARGIN_SECONDS
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -87,19 +116,22 @@ class Settings(BaseSettings):
     # Total budget, in seconds, for the four sequential lifespan closers on
     # shutdown (principal resolver, conversation service, RAG service, agent
     # turn service — see main.py). This is a shared *total*, not a per-closer
-    # allowance: Container Apps allows 30s from SIGTERM to SIGKILL, request
-    # drain (docker/Dockerfile's --timeout-graceful-shutdown) can use up to
-    # 20s of that before lifespan cleanup even starts, and 8s leaves the
-    # remaining ~10s some margin for runtime overhead around the cleanup
-    # itself (Day 23 review A1). gt=0: a non-positive budget could never let
-    # a closer run at all, which is a deployment mistake, not a legitimate
-    # zero-time policy. le=30: that same 30s SIGTERM-to-SIGKILL ceiling is a
-    # hard upper bound on any value that could still matter -- a larger
-    # number would silently reinstate the SIGKILL risk this setting exists
-    # to prevent, and there is no real-Azure or `docker stop -t` value to
-    # cross-validate it against from here (drain lives in the Dockerfile,
-    # not in this process).
-    shutdown_cleanup_budget_seconds: float = Field(default=8.0, gt=0, le=30)
+    # allowance (Day 23 review A1).
+    #
+    # gt=0: a non-positive budget could never let a closer run at all, which
+    # is a deployment mistake, not a legitimate zero-time policy.
+    #
+    # The upper bound is *derived*, not chosen: grace − drain − margin = 8.0s
+    # (Day 23 review F1). Default equals maximum on purpose — with a 20s
+    # drain there is no headroom left to spend, so this knob only goes down.
+    # Raising it means first shortening the drain in docker/Dockerfile and
+    # REQUEST_DRAIN_SECONDS with it, which is exactly the trade being made
+    # and should be visible in the diff rather than hidden in an env var.
+    shutdown_cleanup_budget_seconds: float = Field(
+        default=MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS,
+        gt=0,
+        le=MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS,
+    )
 
     # Day 19: caller authentication mode, selected once at startup. "headers"
     # is the existing trusted-development path (require_principal reads

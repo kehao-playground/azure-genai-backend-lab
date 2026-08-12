@@ -1,9 +1,16 @@
+import re
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from azgenai_lab.core.config import Settings
+from azgenai_lab.core.config import (
+    MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS,
+    PLATFORM_SIGTERM_GRACE_SECONDS,
+    REQUEST_DRAIN_SECONDS,
+    SHUTDOWN_OVERHEAD_MARGIN_SECONDS,
+    Settings,
+)
 from azgenai_lab.models.search_index import INDEX_NAME
 
 
@@ -163,3 +170,48 @@ def test_sample_docs_dir_is_unset_by_default_and_accepts_an_override() -> None:
     assert Settings(_env_file=None, sample_docs_dir="/srv/corpus").sample_docs_dir == Path(
         "/srv/corpus"
     )
+
+
+# ---------------------------------------------------------------------------
+# Day 23 review F1: the shutdown cleanup budget's upper bound is derived from
+# the platform grace period and the request-drain phase that precedes it, not
+# picked to look safe on its own. The earlier standalone `le=30` accepted a
+# 30s cleanup budget on top of a 20s drain: 50 nominal seconds against a 30s
+# SIGTERM-to-SIGKILL ceiling.
+# ---------------------------------------------------------------------------
+
+_DOCKERFILE = Path(__file__).resolve().parents[2] / "docker" / "Dockerfile"
+
+
+def test_cleanup_budget_bound_is_what_the_drain_leaves_of_the_platform_grace() -> None:
+    assert (
+        MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS
+        + REQUEST_DRAIN_SECONDS
+        + SHUTDOWN_OVERHEAD_MARGIN_SECONDS
+        == PLATFORM_SIGTERM_GRACE_SECONDS
+    )
+    # The default is the whole of what is left -- this knob only goes down.
+    assert Settings(_env_file=None).shutdown_cleanup_budget_seconds == (
+        MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS
+    )
+
+
+@pytest.mark.parametrize("budget", [11, 30, 300])
+def test_cleanup_budget_rejects_values_that_overrun_the_combined_deadline(budget: int) -> None:
+    """11 and 30 are the two values an independent probe accepted under the
+    old standalone cap (nominal 31s and 50s of drain-plus-cleanup); 300 is
+    the value it already rejected. All three must fail now.
+    """
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, shutdown_cleanup_budget_seconds=budget)
+
+
+def test_request_drain_constant_matches_the_dockerfile_cmd() -> None:
+    """REQUEST_DRAIN_SECONDS mirrors a uvicorn CLI flag the process itself
+    never reads, so nothing else would notice the two drifting apart -- and
+    the derived cleanup bound above is only correct while they agree.
+    """
+    cmd = _DOCKERFILE.read_text()
+    match = re.search(r'"--timeout-graceful-shutdown",\s*"(\d+(?:\.\d+)?)"', cmd)
+    assert match is not None, "no --timeout-graceful-shutdown in the Dockerfile CMD"
+    assert float(match.group(1)) == REQUEST_DRAIN_SECONDS
