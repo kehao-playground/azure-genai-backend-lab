@@ -80,10 +80,22 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     over any closer exception as the propagated result, so the task still
     ends up cancelled. (`asyncio.Task.uncancel()` is deliberately not called:
     leaving the cancellation request recorded is what lets an enclosing
-    `asyncio.timeout`/`wait_for` still recognise its own cancellation. The
-    cost is that if the cancel arrived while this task was *not* suspended,
-    the next closer's first await re-raises immediately — each remaining
-    closer is then attempted and logged, but does no work.)
+    `asyncio.timeout`/`wait_for` still recognise its own cancellation.)
+
+    Two limits on "every closer still runs", both measured on CPython 3.13
+    rather than reasoned about (Day 23 review, fifth wave):
+
+    - A cancel that arrives while this task is *not* suspended is delivered
+      at the next suspension point, so exactly **one** further closer is
+      interrupted — not all of them. A non-zero `Task.cancelling()` count
+      does not by itself re-raise at later awaits; that needs another
+      `cancel()` call. An earlier version of this docstring claimed the
+      stronger, wrong thing.
+    - A caller that keeps calling `cancel()` can therefore interrupt each
+      closer in turn: they are all entered, but need not all complete. The
+      contract here is *attempted*, not *completed*. Buying "completed"
+      means running cleanup in a separately bounded child task, which is a
+      Day 24 decision, not a silent `uncancel()`.
 
     This deliberately does *not* preserve the exception behaviour of
     the nested try/finally chain it replaces: that chain was last-wins — an

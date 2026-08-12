@@ -237,6 +237,9 @@ moves on to the next one; every closer still runs regardless of what an
 earlier one did — including when the cleanup task is cancelled from
 outside, in which case the cancellation is re-raised once the remaining
 closers have had their turn rather than stranding them (Day 23 review F2).
+The guarantee is that every closer is *attempted*, not that every closer
+finishes: a caller that keeps calling `cancel()` can interrupt them one
+after another. A single cancellation interrupts at most one further closer.
 This only bounds *cooperative* delay — a closer still doing real (e.g.
 shielded) work after being cancelled takes however long that work takes, so
 the 8s default is a target, not a hard ceiling on wall time.
