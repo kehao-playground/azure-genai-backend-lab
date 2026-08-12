@@ -48,9 +48,14 @@ docker stop -t 30 azgenai-lab
 - **Sample corpus**: `/app/data/sample-docs`, copied in as repository data
   rather than wheel content, with `SAMPLE_DOCS_DIR` pointing at it. Fake
   search is the default and seeds the agent's index from that corpus at
-  startup; the loader's default location is derived from the source tree
-  the package was installed from, which does not survive installation. A
-  deployment that turns fake search off does not need the corpus at all.
+  startup. The loader (`load_documents`) takes its base directory as a
+  required argument — no default — because the one candidate default, the
+  checkout-relative path computed from the loader module's own location,
+  does not survive a non-editable install. Any non-Docker deployment that
+  installs this package non-editable and leaves fake search on must set
+  `SAMPLE_DOCS_DIR` (or otherwise supply the corpus path) itself; this
+  image is one way to satisfy that, not the only one. A deployment that
+  turns fake search off does not need the corpus at all.
 - Measured on this machine (Docker 29.4.0, 2026-08-12) — a data point, not a
   promise: single-stage baseline 321MB → multi-stage 202MB. No before/after
   figure is given for the build context: the two builds' contexts were
@@ -141,7 +146,7 @@ container.
 | `RAG_TOP` | `5` | Retrieval hits handed to generation (Day 14). |
 | `AGENT_MAX_ITERATIONS` | `5` | Agent loop guardrail (Day 17). |
 | `AGENT_MAX_TOOL_CALLS` | `10` | Agent loop guardrail (Day 17). |
-| `SAMPLE_DOCS_DIR` | — (repository checkout) | The bundled corpus the fake agent index is seeded from. The image sets it to `/app/data/sample-docs`, because the default is resolved from the source tree the package was installed from. |
+| `SAMPLE_DOCS_DIR` | unset (falls back to the checkout-relative path, which only resolves inside an editable install) | The bundled corpus the fake agent index is seeded from. The image sets it to `/app/data/sample-docs` because a non-editable install (this image's) cannot rely on that fallback. |
 
 The authoritative list is `src/azgenai_lab/core/config.py`; if this table
 and the code disagree, the code wins.
