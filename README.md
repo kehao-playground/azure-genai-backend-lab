@@ -55,11 +55,15 @@ http://127.0.0.1:8000/docs
 
 ```bash
 docker build -f docker/Dockerfile -t azgenai-lab .
-docker run -p 8000:8000 azgenai-lab
+docker run --rm --name azgenai-lab -p 127.0.0.1:8000:8000 azgenai-lab
 ```
 
-Zero configuration runs in fake mode. See [docs/docker.md](docs/docker.md) for
-environment variables, health check and graceful-shutdown behaviour.
+Zero configuration runs in fake mode. This is a demo default, not a
+deployment default: `AUTH_MODE` defaults to `headers`, which trusts
+caller-declared identity headers as-is, so `-p 127.0.0.1:8000:8000` keeps
+the published port on localhost only rather than every address the host
+answers on. See [docs/docker.md](docs/docker.md) for environment variables,
+health check and graceful-shutdown behaviour.
 
 ## Run Tests
 
