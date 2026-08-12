@@ -275,4 +275,6 @@ watching a rolling restart may see a burst of these. That code names the
   this image still carries. The lab keeps them for debuggability — a
   deliberate trade, not an oversight.
 - **Image scanning** (Docker Scout, Microsoft Defender for Cloud) belongs
-  in CI once images are published; the Day 23 gate only proves the build.
+  in CI once images are published; the Day 23 gate proves the build, boots
+  the image, and checks the declared `HEALTHCHECK` itself reports
+  `healthy` — it does not scan the image for vulnerabilities.

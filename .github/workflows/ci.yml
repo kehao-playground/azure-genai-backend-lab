@@ -68,27 +68,44 @@ jobs:
         # A build that succeeds is not proof the image runs -- this milestone's worst bug
         # was exactly that (a module-relative default path that only breaks once the
         # project is installed non-editable, which every image build does). Runs with
-        # zero configuration, the same way the Quick start in docs/docker.md does. Uses
-        # `docker exec` against the container's own loopback instead of a published port,
-        # so it never needs a port on the runner.
+        # zero configuration, the same way the Quick start in docs/docker.md does.
+        #
+        # Two different assertions, both needed (Day 23 review r03 R3): polling
+        # `docker inspect` proves the Dockerfile's own declared HEALTHCHECK --
+        # its command, URL, user and flags -- actually reports healthy; a
+        # separate `docker exec` probe with no involvement from HEALTHCHECK at
+        # all would pass even if that instruction were broken. The exact-body
+        # `docker exec` check afterwards proves what /health actually returns.
+        # Both use `docker exec` against the container's own loopback instead
+        # of a published port, so this never needs a port on the runner.
         run: |
           set -euo pipefail
           NAME="azgenai-lab-ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
           trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$NAME" azgenai-lab:ci
-          ready=no
-          for _ in $(seq 1 30); do
-            if docker exec "$NAME" python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)" >/dev/null 2>&1; then
-              ready=yes
+
+          # The image's HEALTHCHECK has --start-period=5s and an unset (so
+          # default 5s) --start-interval, meaning the first probe fires
+          # around 5s in. Poll every 2s for up to 60 attempts (120s) --
+          # comfortable room above that without slowing CI down once the
+          # status flips to healthy, which is typically within the first
+          # couple of attempts.
+          status=unknown
+          for _ in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$NAME" 2>/dev/null || echo unknown)"
+            if [ "$status" = healthy ] || [ "$status" = unhealthy ]; then
               break
             fi
-            sleep 1
+            sleep 2
           done
-          if [ "$ready" != yes ]; then
-            echo "container never became healthy; full log follows" >&2
+          if [ "$status" != healthy ]; then
+            echo "container HEALTHCHECK never reported healthy (status: $status); docker inspect health output and container log follow" >&2
+            docker inspect --format '{{json .State.Health}}' "$NAME" >&2 || true
             docker logs "$NAME" >&2
             exit 1
           fi
+          echo "HEALTHCHECK status: $status"
+
           body="$(docker exec "$NAME" python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read().decode())")"
           echo "health body: $body"
           test "$body" = '{"status":"ok","service":"azure-genai-backend-lab"}'
