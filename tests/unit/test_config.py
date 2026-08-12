@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -154,3 +156,10 @@ def test_entra_accepts_role_only() -> None:
     )
     assert settings.entra_required_scope is None
     assert settings.entra_required_app_role == "Api.Access"
+
+
+def test_sample_docs_dir_is_unset_by_default_and_accepts_an_override() -> None:
+    assert Settings(_env_file=None).sample_docs_dir is None
+    assert Settings(_env_file=None, sample_docs_dir="/srv/corpus").sample_docs_dir == Path(
+        "/srv/corpus"
+    )

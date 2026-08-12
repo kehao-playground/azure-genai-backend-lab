@@ -14,8 +14,10 @@ from azgenai_lab.models.principal import validate_identifier
 from azgenai_lab.models.rag import DOC_ID_MAX_LENGTH, SourceDocument
 from azgenai_lab.models.search_index import DocumentKeyError, validate_document_key
 
-# Repo-relative: the corpus is sample data checked into the repository, not
-# packaged with the wheel. Tests pass an explicit directory.
+# Default corpus location, computed from this module's path: the repository
+# checkout. It is sample data, not wheel content, so an installed
+# (non-editable) layout has to be told where the corpus went --
+# `sample_docs_dir` in Settings does that. Tests pass an explicit directory.
 SAMPLE_DOCS_DIR = Path(__file__).resolve().parents[3] / "data" / "sample-docs"
 
 _DELIMITER = "---"

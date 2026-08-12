@@ -17,7 +17,7 @@ from azgenai_lab.models.principal import Principal
 from azgenai_lab.services.azure_search import FakeSearchClient
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.conversation_store import ConversationStore
-from azgenai_lab.services.document_loader import load_documents
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 from azgenai_lab.services.embeddings import FakeEmbeddingClient
 from azgenai_lab.services.retrieval import Retriever, build_retriever
 
@@ -196,7 +196,7 @@ def _seed_index_documents(
     service's ACL filter expresses in OData.
     """
     index_documents: list[dict[str, Any]] = []
-    for source in load_documents():
+    for source in load_documents(settings.sample_docs_dir or SAMPLE_DOCS_DIR):
         chunks = chunk_markdown(
             source, max_chars=settings.chunk_max_chars, overlap_chars=settings.chunk_overlap_chars
         )
