@@ -1,3 +1,6 @@
+import asyncio
+import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -29,6 +32,60 @@ _VALIDATION_RESPONSES: dict[int | str, dict[str, Any]] = {
     422: {"model": ErrorEnvelope, "description": "Validation Error"}
 }
 
+logger = logging.getLogger(__name__)
+
+# The shutdown order, and the app.state attribute each closer lives on.
+# tests/unit/test_service_lifecycle.py's _CLOSE_ORDER asserts this exact
+# order too and must stay in sync with it.
+_LIFESPAN_CLOSERS: tuple[tuple[str, str], ...] = (
+    ("principal resolver", "principal_resolver"),
+    ("conversation service", "conversation_service"),
+    ("rag service", "rag_service"),
+    ("agent turn service", "agent_turn_service"),
+)
+
+
+async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
+    """Close the four app-wide clients under one shared shutdown budget.
+
+    AsyncOpenAI and the httpx clients behind search and JWKS have no other
+    shutdown path in a running API process, and would otherwise leak
+    connections until the process exits (Day 14 review finding 4) — hence
+    one aclose() per closer, every time. What changed (Day 23 review A1) is
+    that a hang in any one of them used to strand the rest indefinitely:
+    uvicorn's own --timeout-graceful-shutdown bounds request drain only and
+    finishes before this function even starts, and Container Apps SIGKILLs
+    the process 30s after SIGTERM regardless of what this code is doing.
+
+    The budget is one deadline shared across all four closers, not a
+    per-closer timeout: the thing that has to fit inside the remaining grace
+    period is the *sum* of however long cleanup takes, and four independent
+    per-closer allowances could still add up to more than that. Every closer
+    still runs, in order, even if an earlier one times out or raises —
+    matching the exception semantics the nested try/finally chain this
+    replaces already had (every closer attempted, first exception wins),
+    extended to also bound total wall time. A timeout is logged and treated
+    as "moved on", not raised.
+    """
+    deadline = time.monotonic() + budget_seconds
+    first_exception: Exception | None = None
+    for label, attr in _LIFESPAN_CLOSERS:
+        # Clamped to 0, never left negative: an already-exhausted budget
+        # must still *attempt* the remaining closers (and time out
+        # immediately) rather than skip them — "never tried" and "timed
+        # out" are different facts or the log below would be lying.
+        remaining = max(deadline - time.monotonic(), 0.0)
+        closer = getattr(app.state, attr)
+        try:
+            await asyncio.wait_for(closer.aclose(), timeout=remaining)
+        except TimeoutError:
+            logger.warning("shutdown cleanup timed out closer=%s", label)
+        except Exception as exc:  # collected below, re-raised after every closer runs
+            if first_exception is None:
+                first_exception = exc
+    if first_exception is not None:
+        raise first_exception
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -43,21 +100,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # Runs for both paths: normal shutdown, and a startup failure that
-        # never reached `yield`. Each close is isolated so one failure cannot
-        # strand the remaining app-wide clients (Day 14 review finding 4) —
-        # AsyncOpenAI and the httpx clients behind search and JWKS have no
-        # other shutdown path in a running API process, and would otherwise
-        # leak connections until the process exits.
-        try:
-            await app.state.principal_resolver.aclose()
-        finally:
-            try:
-                await app.state.conversation_service.aclose()
-            finally:
-                try:
-                    await app.state.rag_service.aclose()
-                finally:
-                    await app.state.agent_turn_service.aclose()
+        # never reached `yield`.
+        await _close_with_budget(app, settings.shutdown_cleanup_budget_seconds)
 
 
 def create_app() -> FastAPI:
