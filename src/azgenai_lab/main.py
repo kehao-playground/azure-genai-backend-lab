@@ -67,7 +67,25 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     closer built to do exactly that (Day 23 review, second wave).
 
     Every closer still runs, in order, even if an earlier one times out or
-    raises. This deliberately does *not* preserve the exception behaviour of
+    raises — and, since Day 23 review F2, even if this function's own task is
+    cancelled from outside. `asyncio.CancelledError` derives from
+    `BaseException`, not `Exception`, so it used to escape the loop through
+    both handlers and strand every closer after the running one: exactly the
+    connection leak the fan-out exists to prevent, in the one situation
+    (something upstream has stopped waiting) where it is most likely. It is
+    caught, recorded, and re-raised after the fan-out finishes instead.
+    Delaying delivery of a cancellation is a real cost, but a bounded one:
+    the whole function is already capped by the same shared deadline, which
+    cancellation does not extend. Cancellation is never *swallowed* — it wins
+    over any closer exception as the propagated result, so the task still
+    ends up cancelled. (`asyncio.Task.uncancel()` is deliberately not called:
+    leaving the cancellation request recorded is what lets an enclosing
+    `asyncio.timeout`/`wait_for` still recognise its own cancellation. The
+    cost is that if the cancel arrived while this task was *not* suspended,
+    the next closer's first await re-raises immediately — each remaining
+    closer is then attempted and logged, but does no work.)
+
+    This deliberately does *not* preserve the exception behaviour of
     the nested try/finally chain it replaces: that chain was last-wins — an
     exception from a later closer replaced an earlier in-flight one as the
     propagated exception, keeping the earlier one only as `__context__`
@@ -89,6 +107,7 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     """
     deadline = time.monotonic() + budget_seconds
     first_exception: Exception | None = None
+    cancellation: asyncio.CancelledError | None = None
     for label, attr in _LIFESPAN_CLOSERS:
         # Clamped to 0, never left negative: an already-exhausted budget
         # must still be handed to the timeout machinery rather than skipped
@@ -104,6 +123,13 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
             closer = getattr(app.state, attr)
             async with asyncio.timeout(remaining) as cm:
                 await closer.aclose()
+        except asyncio.CancelledError as exc:
+            # Not a subclass of Exception, so neither handler below sees it.
+            # Record the first one, keep closing, re-raise after the loop.
+            logger.warning("shutdown cleanup cancelled during closer=%s", label)
+            if cancellation is None:
+                cancellation = exc
+            continue
         except TimeoutError as exc:
             if cm.expired():
                 logger.warning("shutdown cleanup timed out closer=%s", label)
@@ -125,6 +151,10 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
             )
             if first_exception is None:
                 first_exception = exc
+    if cancellation is not None:
+        # Ahead of first_exception: a cancelled task must end up cancelled.
+        # Any closer exception raised along the way was already logged above.
+        raise cancellation
     if first_exception is not None:
         raise first_exception
 

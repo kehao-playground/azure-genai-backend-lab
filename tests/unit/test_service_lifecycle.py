@@ -646,3 +646,112 @@ async def test_shutdown_cleanup_closers_own_exception_with_empty_str_still_logs_
         "shutdown cleanup closer=principal resolver raised ConnectionResetError: "
         in capsys.readouterr().err
     )
+
+
+# ---------------------------------------------------------------------------
+# Day 23 review F2: external cancellation. `asyncio.CancelledError` derives
+# from BaseException, so neither `except TimeoutError` nor `except Exception`
+# in _close_with_budget sees it -- before the fix, cancelling the cleanup
+# task while a closer was suspended skipped every closer after it. These
+# tests drive _close_with_budget as its own task (rather than through the
+# lifespan) because `task.cancel()` needs a task handle to aim at.
+# ---------------------------------------------------------------------------
+
+
+class _SignallingHangingCloser:
+    """Announces that it has started, then hangs at a real suspension point
+    -- so the test can cancel at a deterministic moment (closer 1 suspended)
+    instead of racing the event loop.
+    """
+
+    def __init__(self, started: asyncio.Event) -> None:
+        self._started = started
+
+    async def aclose(self) -> None:
+        self._started.set()
+        await asyncio.sleep(90)
+
+
+class _AwaitingRecordingCloser(_RecordingCloser):
+    """Suspends before recording.
+
+    `_RecordingCloser` never awaits, so it would complete in the same
+    synchronous step even inside a cancelled task -- which would leave "the
+    remaining closers still ran" proven only for closers that do nothing.
+    This one yields to the event loop first: it can only record if the task
+    is genuinely still runnable after the cancellation was absorbed.
+    """
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(0)
+        await super().aclose()
+
+
+def _cancellation_app(started: asyncio.Event, closed: list[str]) -> FastAPI:
+    from azgenai_lab.main import create_app
+
+    app = create_app()
+    app.state.settings = _budget_settings(8.0)
+    app.state.principal_resolver = _SignallingHangingCloser(started)
+    app.state.conversation_service = _AwaitingRecordingCloser(closed, "conversation")
+    app.state.rag_service = _AwaitingRecordingCloser(closed, "rag")
+    app.state.agent_turn_service = _AwaitingRecordingCloser(closed, "agent")
+    return app
+
+
+async def test_shutdown_cleanup_external_cancellation_still_attempts_every_closer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from azgenai_lab.main import _close_with_budget
+
+    started = asyncio.Event()
+    closed: list[str] = []
+    app = _cancellation_app(started, closed)
+
+    task = asyncio.create_task(_close_with_budget(app, 8.0))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Cancellation is delayed, never swallowed: the task still ends cancelled.
+    assert task.cancelled()
+    # ...and the three closers after the cancelled one each got their turn,
+    # each of them across a real suspension point.
+    assert closed == ["conversation", "rag", "agent"]
+    assert "shutdown cleanup cancelled during closer=principal resolver" in capsys.readouterr().err
+
+
+async def test_shutdown_cleanup_cancellation_wins_over_a_closer_exception(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cancellation outranks first-wins.
+
+    A closer that raises *after* the cancellation was absorbed must not
+    convert a cancelled task into a merely-failed one -- callers that
+    cancelled this task are entitled to see CancelledError, and asyncio
+    itself treats "returned an ordinary exception after being cancelled" as
+    a task that ignored its cancellation. The losing exception is still
+    logged, exactly as in the first-wins test above.
+    """
+    from azgenai_lab.main import _close_with_budget
+
+    started = asyncio.Event()
+    closed: list[str] = []
+    app = _cancellation_app(started, closed)
+    app.state.rag_service = _RaisingCloser(RuntimeError("rag close failed"))
+
+    task = asyncio.create_task(_close_with_budget(app, 8.0))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert closed == ["conversation", "agent"]
+    assert (
+        "shutdown cleanup closer=rag service raised RuntimeError: rag close failed"
+        in capsys.readouterr().err
+    )

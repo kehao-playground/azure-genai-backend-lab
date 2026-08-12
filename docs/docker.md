@@ -147,7 +147,7 @@ container.
 | `RAG_TOP` | `5` | Retrieval hits handed to generation (Day 14). |
 | `AGENT_MAX_ITERATIONS` | `5` | Agent loop guardrail (Day 17). |
 | `AGENT_MAX_TOOL_CALLS` | `10` | Agent loop guardrail (Day 17). |
-| `SHUTDOWN_CLEANUP_BUDGET_SECONDS` | `8.0` | Total shutdown-time budget for the four lifespan closers (see [Graceful shutdown](#graceful-shutdown)); capped at `30` (the Container Apps SIGTERM-to-SIGKILL ceiling). |
+| `SHUTDOWN_CLEANUP_BUDGET_SECONDS` | `8.0` | Total shutdown-time budget for the four lifespan closers (see [Graceful shutdown](#graceful-shutdown)). `8.0` is also the maximum: it is what the 30s platform grace leaves after the 20s request drain and a 2s overhead margin, so this knob only goes down. |
 | `SAMPLE_DOCS_DIR` | unset (falls back to the checkout-relative path, which only resolves inside an editable install) | The bundled corpus the fake agent index is seeded from. The image sets it to `/app/data/sample-docs` because a non-editable install (this image's) cannot rely on that fallback. |
 
 The authoritative list is `src/azgenai_lab/core/config.py`; if this table
@@ -229,19 +229,30 @@ Apps sends SIGKILL 30 seconds after SIGTERM
 checked 2026-08-12).
 
 Application shutdown is itself bounded: `SHUTDOWN_CLEANUP_BUDGET_SECONDS`
-(default `8.0`, capped at `30`) is one deadline shared across all four
-closers, not four independent per-closer timeouts, so a closer that hangs
-cannot strand the rest indefinitely the way it could before Day 23 review
-A1. A closer that times out is logged (`shutdown cleanup timed out
-closer=...`) and the loop moves on to the next one; every closer still runs
-regardless of what an earlier one did. This only bounds *cooperative*
-delay — a closer still doing real (e.g. shielded) work after being
-cancelled takes however long that work takes, so the 8s default is a
-target, not a hard ceiling on wall time. If drain uses its full 20 seconds
-and cleanup uses its full default 8, that is 28 of the platform's 30,
-leaving roughly 2 seconds of margin for runtime overhead — thin enough that
-Day 24 must either measure real-Azure teardown latency or shorten one of
-the two budgets (see the Honest boundary paragraph below).
+(default `8.0`) is one deadline shared across all four closers, not four
+independent per-closer timeouts, so a closer that hangs cannot strand the
+rest indefinitely the way it could before Day 23 review A1. A closer that
+times out is logged (`shutdown cleanup timed out closer=...`) and the loop
+moves on to the next one; every closer still runs regardless of what an
+earlier one did — including when the cleanup task is cancelled from
+outside, in which case the cancellation is re-raised once the remaining
+closers have had their turn rather than stranding them (Day 23 review F2).
+This only bounds *cooperative* delay — a closer still doing real (e.g.
+shielded) work after being cancelled takes however long that work takes, so
+the 8s default is a target, not a hard ceiling on wall time.
+
+That default is also the configurable maximum, because the two shutdown
+phases are consecutive and share one grace period:
+`grace 30 − drain 20 − overhead margin 2 = 8`. The bound is computed from
+those three named terms in `core/config.py`, and a unit test parses this
+image's `--timeout-graceful-shutdown` back out of the Dockerfile so the
+drain term cannot drift away from the flag it mirrors. Raising the cleanup
+budget therefore means lowering the drain first — a visible trade, not an
+env-var override. (Before Day 23 review F1 the cap was a standalone `30`,
+which accepted 20 + 30 = 50 nominal seconds against a 30-second ceiling.)
+The 2-second margin and the 8-second budget are both unmeasured
+hypotheses — Day 24 must measure real-Azure teardown latency or shorten the
+terms (see the Honest boundary paragraph below).
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
 (fake mode, zero env vars) stops in 0.669s; with a deliberately held SSE
