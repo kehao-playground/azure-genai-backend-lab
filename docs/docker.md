@@ -92,7 +92,9 @@ docker stop -t 30 azgenai-lab
   not nested occurrences under `src/`. Until this was fixed to
   `**/__pycache__/`, 444,079 bytes (`wc -c`, not `du`'s block-rounded
   output) of local bytecode rode into the builder stage and invalidated the
-  `COPY src/ src/` layer every time someone ran the tests. Measured cold on
+  `COPY src/ src/` layer whenever a test run added or updated nested `.pyc`
+  files (a test run does not necessarily rewrite bytecode; an unchanged
+  tree re-reads the cached files). Measured cold on
   a throwaway builder, on one working tree that had been used for local
   test runs, before and after that one-line-pair change: 1.12MB →
   671.22kB. (Only that pair is a valid comparison; the single-stage
