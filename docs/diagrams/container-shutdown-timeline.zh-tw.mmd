@@ -6,7 +6,7 @@ gantt
     dateFormat X
     axisFormat %Ss
     section runtime 所有
-    SIGTERM→SIGKILL grace 30s（ACA 固定；本地用 docker stop -t 30 對齊） :crit, grace, 0, 30s
+    SIGTERM→SIGKILL grace 30s（ACA 預設、本系列釘住；本地用 docker stop -t 30 對齊） :crit, grace, 0, 30s
     section uvicorn 所有
     request drain ≤20s（--timeout-graceful-shutdown 只框這段） :active, drain, 0, 20s
     section app 所有

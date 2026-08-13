@@ -13,8 +13,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # An upper bound picked to look safe on its own (the earlier `le=30`) still
 # permitted 20 + 30 = 50 nominal seconds against a 30-second ceiling.
 #
-# Azure Container Apps SIGKILLs the process 30s after SIGTERM, and that
-# number is not tunable:
+# Azure Container Apps SIGKILLs the process when the termination grace
+# expires. That grace is a platform *default*, not a fixed constant (Day 23
+# review R1): the ARM template exposes
+# `template.terminationGracePeriodSeconds` — "Defaults to 30 seconds", nil
+# means the default applies —
+# https://learn.microsoft.com/en-us/azure/templates/microsoft.app/2025-07-01/containerapps
+# (checked 2026-08). This series keeps the 30s default as its design point,
+# and Day 24's IaC pins `terminationGracePeriodSeconds: 30` explicitly, so
+# the arithmetic below targets 30.0 as a chosen contract:
 # https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management#shutdown
 # (checked 2026-08-12). It is the tightest platform grace this image targets;
 # `docker stop`'s default 10s is shorter, which is why docs/docker.md

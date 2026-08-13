@@ -224,9 +224,16 @@ lifespan chain that closes the four app-wide clients — the principal
 resolver, and the conversation, RAG and agent services) runs after that
 timeout, inside whatever grace the runtime grants: `docker stop` defaults
 to 10 seconds before SIGKILL, so use `docker stop -t 30`; Azure Container
-Apps sends SIGKILL 30 seconds after SIGTERM
+Apps sends SIGKILL when the termination grace expires — 30 seconds by
+default
 ([Application lifecycle management in Azure Container Apps § Shutdown](https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management#shutdown),
-checked 2026-08-12).
+checked 2026-08-12). That default is tunable: the ARM template exposes
+`template.terminationGracePeriodSeconds` (non-negative integer; nil means
+the 30s default —
+[Microsoft.App/containerApps template reference](https://learn.microsoft.com/en-us/azure/templates/microsoft.app/2025-07-01/containerapps),
+checked 2026-08). This series keeps the default as its design point, and
+Day 24's IaC pins `terminationGracePeriodSeconds: 30` explicitly rather
+than relying on today's default staying put.
 
 Application shutdown is itself bounded: `SHUTDOWN_CLEANUP_BUDGET_SECONDS`
 (default `8.0`) is one deadline shared across all four closers, not four
@@ -280,8 +287,12 @@ server, not genuine Azure infrastructure — what these numbers isolate is
 uvicorn's own drain cutoff, not how long the lifespan chain's `aclose()`
 on the real httpx client would take against an actual Azure connection's
 teardown latency, which was not measured here. Azure Container Apps' 30
-second SIGKILL grace after SIGTERM is a platform-fixed ceiling, unlike
-`docker stop -t`: a deployment on that platform cannot extend it.
+second grace is the platform default, not a fixed ceiling —
+`template.terminationGracePeriodSeconds` can raise or lower it (see
+[Graceful shutdown](#graceful-shutdown) above). The budget arithmetic in
+this document holds because this series pins 30 as its design point (Day
+24's IaC sets it explicitly), not because the platform forces 30 on every
+deployment.
 
 A turn cancelled by drain emits an audit event with
 `error_code: "client_disconnect"` and `committed: false`; an operator
