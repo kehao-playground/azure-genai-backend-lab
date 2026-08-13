@@ -176,8 +176,9 @@ def test_sample_docs_dir_is_unset_by_default_and_accepts_an_override() -> None:
 # Day 23 review F1: the shutdown cleanup budget's upper bound is derived from
 # the platform grace period and the request-drain phase that precedes it, not
 # picked to look safe on its own. The earlier standalone `le=30` accepted a
-# 30s cleanup budget on top of a 20s drain: 50 nominal seconds against a 30s
-# SIGTERM-to-SIGKILL ceiling.
+# 30s cleanup budget on top of a 20s drain: 50 nominal seconds against the
+# 30s SIGTERM-to-SIGKILL grace this series targets (the ACA default, pinned
+# as a design point — Day 23 review R1).
 # ---------------------------------------------------------------------------
 
 _DOCKERFILE = Path(__file__).resolve().parents[2] / "docker" / "Dockerfile"

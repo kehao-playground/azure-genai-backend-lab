@@ -2,7 +2,8 @@
 
 The 30 seconds after SIGTERM are three deadlines owned by three different layers, per
 [docker.md § Graceful shutdown](../docker.md#graceful-shutdown): the runtime owns the
-outer grace (Container Apps sends SIGKILL 30s after SIGTERM, not tunable; locally
+outer grace (30s is the Container Apps *default* — this series' pinned design point,
+with Day 24's IaC setting `terminationGracePeriodSeconds: 30` explicitly; locally
 `docker stop -t 30` matches it), uvicorn's `--timeout-graceful-shutdown 20` bounds
 request drain only, and the app's lifespan cleanup runs *after* that timeout under its
 own shared budget (`SHUTDOWN_CLEANUP_BUDGET_SECONDS`, default and maximum 8.0 — derived
@@ -21,7 +22,7 @@ gantt
     dateFormat X
     axisFormat %Ss
     section runtime-owned
-    SIGTERM→SIGKILL grace 30s (fixed on ACA; match locally with docker stop -t 30) :crit, grace, 0, 30s
+    SIGTERM→SIGKILL grace 30s (ACA default, pinned by this series; match locally with docker stop -t 30) :crit, grace, 0, 30s
     section uvicorn-owned
     request drain ≤20s (--timeout-graceful-shutdown bounds only this) :active, drain, 0, 20s
     section app-owned

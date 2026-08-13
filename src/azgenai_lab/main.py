@@ -55,7 +55,9 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     that a hang in any one of them used to strand the rest indefinitely:
     uvicorn's own --timeout-graceful-shutdown bounds request drain only and
     finishes before this function even starts, and Container Apps SIGKILLs
-    the process 30s after SIGTERM regardless of what this code is doing.
+    the process once the termination grace expires (30s by default — this
+    series' pinned design point, Day 23 review R1) regardless of what this
+    code is doing.
 
     The budget is one deadline shared across all four closers, not a
     per-closer timeout: the thing that has to fit inside the remaining grace
