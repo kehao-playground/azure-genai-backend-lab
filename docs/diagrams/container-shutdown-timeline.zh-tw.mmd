@@ -1,0 +1,14 @@
+%% Publication source (zh-TW) for the Day 23 article figure.
+%% English semantic companion: container-shutdown-timeline.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+gantt
+    title SIGTERM 之後的 30 秒——三層 deadline 各自屬於誰
+    dateFormat X
+    axisFormat %Ss
+    section runtime 所有
+    SIGTERM→SIGKILL grace 30s（ACA 固定；本地用 docker stop -t 30 對齊） :crit, grace, 0, 30s
+    section uvicorn 所有
+    request drain ≤20s（--timeout-graceful-shutdown 只框這段） :active, drain, 0, 20s
+    section app 所有
+    lifespan cleanup ≤8s（四 closer 共用一條 deadline） :cleanup, after drain, 8s
+    margin 2s（未量測假設） :margin, after cleanup, 2s
