@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     azure_openai_endpoint: str | None = None
     azure_openai_api_key: SecretStr | None = None
     azure_openai_deployment_name: str | None = None
+    # Day 24: authentication mode for Azure OpenAI. "api_key" uses the key above;
+    # "entra" mints a bearer token from the Azure credential, identified by
+    # azure_client_id (the managed identity's client GUID). The client ID is not a
+    # secret — it is public; only the Azure credential that mints the token is.
+    azure_openai_auth: Literal["api_key", "entra"] = "api_key"
+    azure_client_id: str | None = None
 
     llm_timeout_seconds: float = 30.0
     llm_max_retries: int = 2
