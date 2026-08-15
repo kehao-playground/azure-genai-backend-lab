@@ -1,6 +1,12 @@
 %% Publication source (zh-TW) for the Day 23 article figure.
 %% English semantic companion: container-shutdown-timeline.md — keep the two in the same topology.
 %% The planning repo stores only the rendered PNG snapshot (proposal 005).
+%% The init directive is a legibility fix, not a topology change: mermaid's
+%% default gantt font is ~11px against the 1400px layout width the pinned
+%% renderer uses, which lands at ~5px once the PNG is scaled to article width.
+%% It belongs here rather than in render_diagram.sh, whose parameters must stay
+%% uniform across every diagram in the series.
+%%{init: {"gantt": {"fontSize": 20, "sectionFontSize": 20, "barHeight": 38, "barGap": 8, "leftPadding": 190, "titleTopMargin": 30}}}%%
 gantt
     title SIGTERM 之後的 30 秒——三層 deadline 各自屬於誰
     dateFormat X
