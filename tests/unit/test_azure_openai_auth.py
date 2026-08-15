@@ -2,6 +2,8 @@
 argument — a static string (api_key mode) or a per-request bearer callable
 (entra mode, Day 20 ruling: explicit ManagedIdentityCredential)."""
 
+from collections.abc import Callable
+
 import pytest
 
 from azgenai_lab.core.config import Settings
@@ -35,14 +37,20 @@ def test_entra_mode_missing_client_id_fails_fast() -> None:
 
 def test_entra_bearer_without_minting(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict[str, object] = {}
+    token_calls: list[str] = []
 
     class FakeCredential:
         def __init__(self, client_id: str) -> None:
             created["client_id"] = client_id
 
-    def fake_provider(credential: object, scope: str):  # noqa: ANN202
+    def fake_provider(credential: object, scope: str) -> Callable[[], str]:
         created["scope"] = scope
-        return lambda: "tok"
+
+        def token_callable() -> str:
+            token_calls.append("called")
+            return "tok"
+
+        return token_callable
 
     monkeypatch.setattr(
         "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential", FakeCredential
@@ -54,4 +62,8 @@ def test_entra_bearer_without_minting(monkeypatch: pytest.MonkeyPatch) -> None:
                                     azure_client_id="cid"))
     assert callable(key)
     assert created == {"client_id": "cid", "scope": COGNITIVE_SERVICES_SCOPE}
+    # Verify the token callable was NOT invoked at construction time (no minting)
+    assert token_calls == [], "token provider should not be called during resolve_api_key"
+    # Verify it IS callable and returns the token when invoked
     assert key() == "tok"
+    assert token_calls == ["called"], "token provider should be called exactly once"
