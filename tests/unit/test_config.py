@@ -216,3 +216,25 @@ def test_request_drain_constant_matches_the_dockerfile_cmd() -> None:
     match = re.search(r'"--timeout-graceful-shutdown",\s*"(\d+(?:\.\d+)?)"', cmd)
     assert match is not None, "no --timeout-graceful-shutdown in the Dockerfile CMD"
     assert float(match.group(1)) == REQUEST_DRAIN_SECONDS
+
+
+def test_azure_openai_auth_defaults_to_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AZURE_OPENAI_AUTH", raising=False)
+    monkeypatch.delenv("AZURE_CLIENT_ID", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.azure_openai_auth == "api_key"
+    assert settings.azure_client_id is None
+
+
+def test_azure_openai_auth_env_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_AUTH", "entra")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "11111111-2222-3333-4444-555555555555")
+    settings = Settings(_env_file=None)
+    assert settings.azure_openai_auth == "entra"
+    assert settings.azure_client_id == "11111111-2222-3333-4444-555555555555"
+
+
+def test_azure_openai_auth_rejects_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_AUTH", "managed")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
