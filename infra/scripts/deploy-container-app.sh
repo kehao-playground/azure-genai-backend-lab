@@ -10,15 +10,25 @@
 # closed on an empty `-o tsv` result -- Day 19 and Day 21 each lost a live
 # session to an empty read treated as a value.
 #
-# What this creates, all of it ephemeral and all of it removed by
-# delete-container-app.sh:
+# What this creates is all ephemeral, but it is NOT all removed by one
+# script, and the split matters: an operator who reads "teardown removes
+# everything" and runs only delete-container-app.sh is left paying for what
+# it never claimed to touch.
+#
+# Removed by delete-container-app.sh:
 #   * a user-assigned managed identity (the app's identity in every direction)
 #   * three role assignments on three existing resources (ACR, Key Vault, AOAI)
-#   * one Key Vault secret holding the Search admin key
-#   * one image tag in the existing registry
 #   * a Log Analytics workspace, created explicitly under a per-run unique
 #     name rather than left to auto-provision (see stage 6)
 #   * a Container Apps environment and the app itself
+#
+# NOT removed by delete-container-app.sh -- each outlives it and is owned by
+# the script that owns its host resource (see the full teardown order in
+# docs/container-apps.md §8.5):
+#   * one Key Vault secret (azure-search-admin-key) -- goes with the vault,
+#     via delete-keyvault.sh
+#   * one image tag in the existing registry -- goes with the registry, via
+#     delete-acr.sh
 #
 # The identity is user-assigned rather than system-assigned because its role
 # assignments must exist BEFORE the app first runs (docs/managed-identity.md
@@ -37,6 +47,10 @@
 # depending on `extension.use_dynamic_install`. Install it once up front
 # (`az extension add --name containerapp`) rather than discovering the answer
 # at stage 7, after the identity, its roles and the secret already exist.
+# Stage 1 checks for it and says so loudly if it is absent, but does not
+# refuse to continue: dynamic install genuinely works on many configurations,
+# and turning a working setup into a hard abort would be a worse failure than
+# the warning it replaces.
 #
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID   - target subscription (never rely on the default context)
@@ -176,6 +190,21 @@ require_seconds() {
     exit 1
   fi
 }
+# core/config.py parses ENTRA_TENANT_ID and ENTRA_AUDIENCE with UUID(), so a
+# non-GUID makes Settings() raise at import time and the container exits
+# before it ever binds a port. The trap is not hypothetical: the portal
+# displays the API application's Application ID URI as `api://<guid>`, and
+# pasting that whole string into ENTRA_AUDIENCE is the obvious thing to do.
+# Caught here, that is a one-line message; caught by the container, it is a
+# boot loop discovered at stage 11, after all eleven stages of mutation.
+require_guid() {
+  local name="$1" value="$2"
+  if ! [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "$name must be a bare GUID; got '$value'." >&2
+    echo "The portal shows the Application ID URI as api://<guid> -- pass only the guid." >&2
+    exit 1
+  fi
+}
 require_count ACA_POLL_ATTEMPTS "$ACA_POLL_ATTEMPTS"
 require_count ROLE_POLL_ATTEMPTS "$ROLE_POLL_ATTEMPTS"
 require_seconds ACA_POLL_INTERVAL "$ACA_POLL_INTERVAL"
@@ -213,6 +242,26 @@ trap on_exit EXIT
 
 # === stage 1: preflight ======================================================
 echo "== stage 1: preflight =="
+# Everything in this stage is a check. Nothing below it creates, writes or
+# bills anything -- that starts at stage 2 -- which is the whole reason the
+# checks that would otherwise surface at stage 8 or stage 11 were pulled up
+# to here.
+require_guid ENTRA_TENANT_ID "$ENTRA_TENANT_ID"
+require_guid ENTRA_AUDIENCE "$ENTRA_AUDIENCE"
+
+# A check, not a gate. `az containerapp` lives in an extension; recent CLI
+# versions install it on first use, so its absence here is not proof the
+# deploy will fail -- refusing to continue would abort runs that dynamic
+# install would have handled fine. What is NOT acceptable is finding out at
+# stage 7, with the identity, its roles and the secret already created, from
+# an error message that says nothing about extensions. So: say it, now, with
+# the fix in it, and continue.
+if ! az extension show --name containerapp >/dev/null 2>&1; then
+  echo "  WARNING: the 'containerapp' az extension is not installed." >&2
+  echo "  Recent CLI versions install it on first use, but in a non-interactive shell that can prompt or fail" >&2
+  echo "  depending on extension.use_dynamic_install. Install it up front with: az extension add --name containerapp" >&2
+fi
+
 # Every command below also passes --subscription explicitly; this additionally
 # repoints the DEFAULT az context, which `az acr build` and the directory-object
 # commands read. It is a side effect on shared mutable state, so it is
@@ -233,6 +282,29 @@ for NAMESPACE in Microsoft.App Microsoft.ManagedIdentity Microsoft.OperationalIn
     az provider register --namespace "$NAMESPACE" --subscription "$AZ_SUBSCRIPTION_ID" --wait
   fi
 done
+
+# This script only creates an app from scratch, and that refusal belongs
+# HERE rather than at stage 8, where it used to live. Stage 6 creates a
+# fresh, randomly-named Log Analytics workspace on every run; a rerun
+# against an existing deployment would therefore create workspace B, leave
+# the reused environment still wired to workspace A, abort at stage 8, and
+# print a teardown command naming B -- so A survives, billing, under a
+# random name the operator no longer has. Checked before stage 2, the whole
+# sequence is a no-op, and the doomed run also skips stage 5's `az acr
+# build`. It needs the containerapp extension and the provider registration
+# above, which is why it is the last thing in this stage rather than the
+# first.
+APP_COUNT=$(az containerapp list \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --query "length([?name=='$AZ_ACA_APP_NAME'])" -o tsv)
+require_value "$APP_COUNT" "the existing app count"
+if [ "$APP_COUNT" != "0" ]; then
+  echo "App '$AZ_ACA_APP_NAME' already exists. This script only creates from scratch:" >&2
+  echo "run delete-container-app.sh first, or deploy under a different AZ_ACA_APP_NAME." >&2
+  exit 1
+fi
+echo "  preflight passed; nothing has been created yet"
 
 # === stage 2: user-assigned managed identity =================================
 echo "== stage 2: user-assigned managed identity =="
@@ -494,6 +566,13 @@ for ((ATTEMPT = 1; ATTEMPT <= ACA_POLL_ATTEMPTS; ATTEMPT++)); do
   if [ "$ENV_STATE" = "Succeeded" ]; then
     break
   fi
+  # Terminal states are terminal: polling a Failed or Canceled environment
+  # for the rest of the budget cannot change the answer, it just spends ten
+  # minutes of a paid live session restating what Azure already called
+  # final. Same early break stage 9 uses on the app.
+  if [ "$ENV_STATE" = "Failed" ] || [ "$ENV_STATE" = "Canceled" ]; then
+    break
+  fi
   if ((ATTEMPT < ACA_POLL_ATTEMPTS)); then
     sleep "$ACA_POLL_INTERVAL"
   fi
@@ -502,20 +581,28 @@ if [ "$ENV_STATE" != "Succeeded" ]; then
   echo "Environment '$AZ_ACA_ENV_NAME' is $ENV_STATE after $ACA_POLL_ATTEMPTS attempts." >&2
   exit 1
 fi
+
+# Read the environment's resource id for the YAML below. `az containerapp
+# create --help` is explicit that with --yaml "all other parameters will be
+# ignored", so --environment on that call cannot be relied on to bind the
+# app to this environment -- the YAML has to say so itself, via
+# properties.environmentId. This read is redundant if the flag happens to
+# win, and it saves the session if it does not: without it, a --yaml that
+# names no environment fails at stage 8, i.e. after the identity, its three
+# roles, the secret, the image, the workspace and the environment all exist.
+ENV_ID=$(az containerapp env show \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --name "$AZ_ACA_ENV_NAME" \
+  --query id -o tsv)
+require_value "$ENV_ID" "the environment resource id"
 echo "  environment provisioned"
 
 # === stage 8: the app, from one YAML =========================================
 echo "== stage 8: create the app =="
-APP_COUNT=$(az containerapp list \
-  --subscription "$AZ_SUBSCRIPTION_ID" \
-  --resource-group "$AZ_RESOURCE_GROUP" \
-  --query "length([?name=='$AZ_ACA_APP_NAME'])" -o tsv)
-require_value "$APP_COUNT" "the existing app count"
-if [ "$APP_COUNT" != "0" ]; then
-  echo "App '$AZ_ACA_APP_NAME' already exists. This script only creates from scratch:" >&2
-  echo "run delete-container-app.sh first, or deploy under a different AZ_ACA_APP_NAME." >&2
-  exit 1
-fi
+# The "app already exists" refusal is stage 1's, deliberately: by the time
+# this stage runs, a rerun would already have created a second Log Analytics
+# workspace that nothing would ever tear down.
 
 APP_YAML="$(mktemp)"
 # The whole app definition in one file, so what is deployed can be read in one
@@ -530,6 +617,10 @@ identity:
   userAssignedIdentities:
     "${MI_ID}": {}
 properties:
+  # The binding to the environment, stated in the file rather than left to
+  # the --environment flag on the create call below: `--yaml` documents that
+  # "all other parameters will be ignored".
+  environmentId: ${ENV_ID}
   configuration:
     activeRevisionsMode: single
     ingress:
@@ -597,6 +688,10 @@ properties:
       maxReplicas: 1
 YAML
 
+# --environment is kept alongside --yaml even though the CLI documents that
+# it ignores it: harmless if ignored, correct if honoured, and the binding
+# does not depend on which of the two is true -- properties.environmentId in
+# the file above is what actually decides.
 az containerapp create \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \

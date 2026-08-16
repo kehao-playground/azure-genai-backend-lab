@@ -407,17 +407,32 @@ finished are all deploys reporting a success they never earned:
 
 | Stage | What it does |
 |---|---|
-| 1 | Preflight: register `Microsoft.App`, `Microsoft.ManagedIdentity`, `Microsoft.OperationalInsights` if needed |
+| 1 | Preflight, and nothing here creates or bills anything: GUID-check `ENTRA_TENANT_ID` / `ENTRA_AUDIENCE`, warn if the `containerapp` extension is missing, register `Microsoft.App`, `Microsoft.ManagedIdentity`, `Microsoft.OperationalInsights` if needed, and **refuse if the app already exists** |
 | 2 | Create the user-assigned identity; read back its resource id, principal id and client id |
 | 3 | Assign the three roles, each **verified by read-back** rather than by the create call's exit code |
 | 4 | Read the Search admin key and store it in Key Vault as `azure-search-admin-key` |
 | 5 | `az acr build --platform linux/amd64` — the registry builds the image, no local Docker daemon and no push credentials |
 | 6 | Create the Log Analytics workspace explicitly, under a per-run unique name |
 | 7 | Create the Container Apps environment (CLI flags — `env create` has no `--yaml`) and poll it to `Succeeded` |
-| 8 | Create the app from one generated YAML file |
+| 8 | Create the app from one generated YAML file, which names its own `properties.environmentId` |
 | 9 | Poll `provisioningState` to `Succeeded`, then read back the ingress FQDN |
 | 10 | Gate 1 (control plane): state the verdict on everything read back so far |
 | 11 | Gate 2 (data plane): poll `/health` to 200, then run the authenticated readiness gate |
+
+Stage 1 is where three otherwise-late failures were pulled back to. The
+one that mattered most is the "app already exists" refusal: it used to sit
+in stage 8, by which point stage 6 had already created a *second*,
+freshly-named Log Analytics workspace. The run then aborted and printed a
+teardown command naming the new workspace — while the environment stayed
+wired to the old one, which survived, billing, under a random name the
+operator no longer had. The other two are cheaper but the same shape: a
+non-GUID `ENTRA_AUDIENCE` (the portal displays the Application ID URI as
+`api://<guid>`, and pasting the whole thing is the obvious mistake) makes
+`Settings()` raise at import so the container never binds a port — a
+failure that would otherwise surface at stage 11, after every stage of
+mutation. The extension check is deliberately a **warning, not a gate**:
+dynamic install genuinely works on many configurations, so refusing to
+continue would break working setups to prevent a message.
 
 Stage 3 is worth a second look. `az role assignment create` cannot decide
 anything on its own here: an identical existing assignment is reported as
@@ -445,6 +460,18 @@ teardown could never remove, because it was never told the name Azure
 chose. Creating it explicitly, under a per-run unique name the script
 prints, is what makes the teardown deterministic. Guessing the name would
 be the Day 21 mistake all over again.
+
+Stage 8 binds the app to that environment **in the YAML**, not on the
+command line. `az containerapp create --help` states that with `--yaml`,
+"all other parameters will be ignored" — so `--environment` on that call
+cannot be what carries the binding, and a YAML without
+`properties.environmentId` is a stage 8 failure that arrives after the
+identity, its three roles, the secret, the image, the workspace and the
+environment all exist and all bill. Stage 7 therefore reads the
+environment's resource id back (fail-closed, like every other read here)
+and stage 8 writes it into the file. `--environment` is passed anyway:
+harmless if ignored, correct if honoured, and the binding does not depend
+on which is true.
 
 ### 8.4 Smoke
 
@@ -501,9 +528,14 @@ design:
 3. Delete the Log Analytics workspace, if a name was given.
 4. Read back the managed identity's **principal id**.
 5. Delete the role assignment at each scope (ACR, Key Vault, Azure OpenAI).
-6. Read back **all** role assignments still held by that principal — fail
-   closed.
+6. Read back **all** role assignments still held by that principal, at
+   every scope (`--all`) — fail closed.
 7. Only then delete the identity — read back to confirm gone.
+
+What it does **not** delete, because each belongs to a resource that
+outlives the deployment: the `azure-search-admin-key` secret (goes with
+the vault, via `delete-keyvault.sh`) and the image tag in the registry
+(goes with the registry, via `delete-acr.sh`). §8.5 is the full order.
 
 **Azure does not delete a managed identity's role assignments when the
 identity is deleted.** They are left behind, each one displaying "Identity
@@ -520,10 +552,22 @@ recoverable state (an identity that can still be re-queried) into a
 permanent one.
 
 Step 6 deliberately queries **by assignee alone** — no `--scope`, no
-`--role`. That is what catches a scope this run skipped because its name
-knob was unset, or one a future deploy grants that this script does not
-know about yet. A missing name knob in step 5 is skipped with a warning to
-stderr, never silently.
+`--role` — and with `--all`. That is what catches a scope this run skipped
+because its name knob was unset, or one a future deploy grants that this
+script does not know about yet. A missing name knob in step 5 is skipped
+with a warning to stderr, never silently.
+
+`--all` is load-bearing, not tidiness. `az role assignment list` documents
+its own default as subscription scope only ("To view assignments scoped by
+resource or group, use `--all`"), and all three assignments here are at
+*resource* scope — the ACR, the vault, the Azure OpenAI account. Without
+it the query returns `0` no matter what is actually assigned, and the
+entire step is vacuous: run the teardown with `AZ_ACR_NAME` unset, step 5
+warns and skips, a scope-blind step 6 reports zero remain, step 7 deletes
+the identity, and the `AcrPull` assignment is orphaned permanently. No
+behavioural test can catch a flag that only ever narrows what a query
+sees, which is why the regression that pins it asserts on the command's
+arguments.
 
 ## 10. Trust boundary
 
