@@ -9,6 +9,8 @@
 | `create-search.sh` | Create an ephemeral Azure AI Search service (free tier by default, `AZ_SEARCH_SKU=basic` when needed) | working |
 | `delete-search.sh` | Delete that service only — `teardown.sh` deletes the whole resource group, including the Azure OpenAI resource this series keeps | working |
 | `teardown.sh` | Delete the demo resource group and everything in it | working |
+| `create-acr.sh` | Ephemeral Azure Container Registry (Basic SKU by default; per-run unique name) with provider pre-check | working |
+| `delete-acr.sh` | Delete that registry — synchronous, no soft-delete/purge step (unlike Key Vault / Content Safety) | working |
 | `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
 | `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
