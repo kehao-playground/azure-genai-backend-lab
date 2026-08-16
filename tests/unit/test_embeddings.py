@@ -3,7 +3,7 @@ batch is attributable to a known set of chunks."""
 
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import date
 
 import httpx
@@ -11,6 +11,7 @@ import openai
 import pytest
 from openai.types import Embedding
 from openai.types.create_embedding_response import CreateEmbeddingResponse, Usage
+from tests.unit.aoai_auth_helpers import CloseTrackingCredential, patch_entra_credential
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
@@ -286,45 +287,10 @@ async def test_real_client_api_key_mode_aclose_is_a_safe_no_op_and_still_closes_
     assert client._client.is_closed()
 
 
-class _CloseTrackingCredential:
-    def __init__(self, client_id: str) -> None:
-        self.client_id = client_id
-        self.close_count = 0
-
-    async def close(self) -> None:
-        self.close_count += 1
-
-
-def _patch_entra_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    created: dict[str, object] = {}
-
-    def fake_credential_ctor(client_id: str) -> _CloseTrackingCredential:
-        credential = _CloseTrackingCredential(client_id)
-        created["credential"] = credential
-        return credential
-
-    def fake_provider(credential: object, scope: str) -> Callable[[], Awaitable[str]]:
-        created["scope"] = scope
-
-        async def token_callable() -> str:
-            return "tok"
-
-        return token_callable
-
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential",
-        fake_credential_ctor,
-    )
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.get_bearer_token_provider", fake_provider
-    )
-    return created
-
-
 def test_composition_point_builds_the_real_client_in_entra_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = Settings(
         _env_file=None,
         use_fake_embeddings=False,
@@ -338,16 +304,18 @@ def test_composition_point_builds_the_real_client_in_entra_mode(
 
     assert isinstance(client, AzureOpenAIEmbeddingClient)
     provider = client._client._api_key_provider
-    assert provider is not None
+    # Identity, not just "some coroutine function": this is the exact
+    # object the resolver's fake provider returned, not a lookalike.
+    assert provider is created["provider"]
     assert inspect.iscoroutinefunction(provider)
     assert created["scope"] == "https://cognitiveservices.azure.com/.default"
-    assert isinstance(created["credential"], _CloseTrackingCredential)
+    assert isinstance(created["credential"], CloseTrackingCredential)
 
 
 async def test_real_client_entra_mode_aclose_closes_credential_and_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = Settings(
         _env_file=None,
         use_fake_embeddings=False,
@@ -359,7 +327,7 @@ async def test_real_client_entra_mode_aclose_closes_credential_and_client(
     client = build_embedding_client(settings)
     assert isinstance(client, AzureOpenAIEmbeddingClient)
     credential = created["credential"]
-    assert isinstance(credential, _CloseTrackingCredential)
+    assert isinstance(credential, CloseTrackingCredential)
 
     await client.aclose()
 
