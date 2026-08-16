@@ -24,7 +24,9 @@
 #   5. delete the role assignment at each scope this identity was granted
 #      (ACR, Key Vault, Azure OpenAI); a scope whose name knob is unset is
 #      skipped with a warning, never silently
-#   6. read back ALL role assignments still held by that principal id --
+#   6. read back ALL role assignments still held by that principal id, at
+#      every scope (`--all`, without which az lists subscription-scope
+#      assignments only and this whole step reads zero no matter what) --
 #      fail-closed: a non-empty result, or a read that fails outright, aborts
 #      BEFORE step 7
 #   7. delete the managed identity -- read back to confirm gone
@@ -262,9 +264,23 @@ echo "== step 6: read back -- confirm zero role assignments remain =="
 # a future deploy grants that this script does not yet know about. An empty
 # read here is a failed query, not "zero found" -- `length([])` always
 # prints a number when the call actually worked.
+#
+# --all is LOAD-BEARING, not noise. `az role assignment list` documents its
+# own default as subscription scope only: "By default, only assignments
+# scoped to subscription will be displayed. To view assignments scoped by
+# resource or group, use --all." Every assignment deploy-container-app.sh
+# grants is at RESOURCE scope (the ACR, the vault, the Azure OpenAI
+# account), so without --all this query returns 0 unconditionally and this
+# entire step -- the guarantee the seven-step ordering exists to provide --
+# is vacuous. Concretely: run this script with AZ_ACR_NAME unset (easy, it
+# is a per-run random name), step 5 warns and skips the ACR delete, a
+# scope-blind step 6 reports zero remain, step 7 deletes the identity, and
+# the AcrPull assignment is orphaned forever with no principal left to find
+# it by. Removing --all silently restores exactly that bug.
 REMAINING=$(az role assignment list \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --assignee-object-id "$MI_PRINCIPAL_ID" \
+  --all \
   --fill-principal-name false \
   --query "length([])" -o tsv)
 require_value "$REMAINING" "the role-assignment read-back"

@@ -58,6 +58,8 @@ ACR_ID = resource_id("Microsoft.ContainerRegistry", "registries", "acrfaked24")
 KV_ID = resource_id("Microsoft.KeyVault", "vaults", "kvfaked24")
 AOAI_ID = resource_id("Microsoft.CognitiveServices", "accounts", "aoaifaked24")
 
+ENV_ID = resource_id("Microsoft.App", "managedEnvironments", "acaenv-faked24")
+
 FAKE_AZ = '''#!/usr/bin/env python3
 import json, os, re, sys
 
@@ -88,6 +90,11 @@ joined = " ".join(args)
 
 if args[:2] == ["account", "set"]:
     done()
+if args[:2] == ["extension", "show"]:
+    # Absent extension: az exits non-zero and prints nothing to stdout.
+    if opt("--name") in state.get("extensions", []):
+        done("{}")
+    done(code=1)
 if args[:2] == ["provider", "show"]:
     ns = opt("--namespace")
     done(state["providers"].get(ns, "Registered"))
@@ -192,6 +199,8 @@ if args[:3] == ["containerapp", "env", "create"]:
     state["envs"].append(opt("--name"))
     done("{}")
 if args[:3] == ["containerapp", "env", "show"]:
+    if query_value() == "id":
+        done(state.get("env_id", ""))
     done(state["env_state"])
 if args[:3] == ["containerapp", "env", "delete"]:
     name = opt("--name")
@@ -254,6 +263,7 @@ class Harness:
     def __init__(self, tmp_path: Path, **overrides: object) -> None:
         state: dict[str, object] = {
             "providers": {},
+            "extensions": ["containerapp"],
             "identities": [],
             "identity_reads": {
                 "id": MI_RESOURCE_ID,
@@ -277,6 +287,7 @@ class Harness:
             "law_shared_key": LAW_SHARED_KEY,
             "envs": [],
             "env_state": "Succeeded",
+            "env_id": ENV_ID,
             "apps": [],
             "app_state": "Succeeded",
             "fqdn": "aca-faked24.japaneast.azurecontainerapps.io",
@@ -364,6 +375,9 @@ def test_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
 
     order = [
         "provider show",
+        # The "app already exists" refusal is preflight's, ahead of every
+        # mutation -- see test_existing_app_is_refused_in_preflight_before_any_mutation.
+        "containerapp list",
         "identity create",
         "role assignment create",
         "search admin-key show",
@@ -432,6 +446,144 @@ def test_law_shared_key_reaches_env_create_but_never_the_terminal(tmp_path: Path
     assert "+ az acr build" in traced.stderr
     # And the read that fetches the key is itself dark.
     assert "az monitor log-analytics workspace get-shared-keys" not in traced.stderr
+
+
+def test_environment_binding_is_in_the_yaml_not_only_the_flag(tmp_path: Path) -> None:
+    """`az containerapp create --help` states that with ``--yaml`` "all other
+    parameters will be ignored", so ``--environment`` on that call cannot be
+    what binds the app to its environment. The YAML has to say so itself.
+
+    Getting this wrong fails at stage 8 -- i.e. after the identity, its three
+    role assignments, the Key Vault secret, the image, the Log Analytics
+    workspace and the environment have all been created and are all billing.
+    """
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert isinstance(yaml_text, str)
+    assert f"environmentId: {ENV_ID}" in yaml_text
+
+    # The id is read back from Azure, not assembled from a naming convention,
+    # and fails closed like every other read in this script.
+    assert any(
+        call.startswith("containerapp env show") and "--query id" in call for call in h.calls
+    )
+
+
+def test_empty_environment_id_read_aborts_before_the_app_is_created(tmp_path: Path) -> None:
+    h = Harness(tmp_path, env_id="")
+    result = h.run()
+    assert result.returncode != 0
+    assert "empty output" in result.stderr
+    assert not h.has("containerapp create")
+
+
+def test_terminal_environment_state_stops_polling_immediately(tmp_path: Path) -> None:
+    """A Failed or Canceled environment is a verdict Azure has already
+    reached; polling it for the rest of the budget spends ten minutes of a
+    paid live session restating it. Stage 9 breaks out on the app's terminal
+    states -- stage 7 must do the same for the environment's.
+    """
+    h = Harness(tmp_path, env_state="Failed")
+    result = h.run()
+    assert result.returncode != 0
+    assert "Failed" in result.stderr
+
+    provisioning_polls = [
+        call
+        for call in h.calls
+        if call.startswith("containerapp env show") and "provisioning" in call
+    ]
+    assert len(provisioning_polls) == 1  # not ACA_POLL_ATTEMPTS (2)
+    assert not h.has("containerapp create")
+
+
+# ---------------------------------------------------------------------------
+# 1b. Preflight is where a doomed run has to die: everything after it bills.
+# ---------------------------------------------------------------------------
+
+
+def test_existing_app_is_refused_in_preflight_before_any_mutation(tmp_path: Path) -> None:
+    """The refusal used to live in stage 8, which was too late to be safe.
+
+    Stage 6 generates a FRESH randomly-named Log Analytics workspace on every
+    run. Refusing at stage 8 meant a rerun against an existing deployment
+    created workspace B, left the reused environment still wired to workspace
+    A, aborted, and then printed a teardown command naming B -- so A survived,
+    billing for ingestion and retention, under a random name the operator no
+    longer had. Checked in stage 1, the entire run is a no-op (and skips the
+    `az acr build` it was never going to use).
+    """
+    h = Harness(tmp_path, apps=["aca-faked24"])
+    result = h.run()
+    assert result.returncode != 0
+    assert "already exists" in result.stderr
+
+    # Nothing was created. Not the identity, not its roles, not the secret,
+    # not the image, and above all not a second Log Analytics workspace.
+    for mutation in (
+        "identity create",
+        "role assignment create",
+        "keyvault secret set",
+        "acr build",
+        "monitor log-analytics workspace create",
+        "containerapp env create",
+    ):
+        assert not h.has(mutation), mutation
+    # Nor was anything even read that only a mutating stage needs.
+    assert not h.has("search admin-key show")
+    # The refusal really is in preflight, not merely early: stage 2 never
+    # started, so not even its existence read ran.
+    assert not h.has("identity list")
+
+
+def test_non_guid_entra_audience_fails_before_any_azure_call(tmp_path: Path) -> None:
+    """`api://<guid>` is exactly what the portal displays as the Application
+    ID URI, and core/config.py parses ENTRA_AUDIENCE with ``UUID()``. Pasting
+    the URI makes ``Settings()`` raise at import time, so the container exits
+    before binding a port -- and without this check the deploy learns about it
+    at stage 11, after all eleven stages of mutation.
+    """
+    h = Harness(tmp_path)
+    result = h.run(ENTRA_AUDIENCE="api://66666666-6666-6666-6666-666666666666")
+    assert result.returncode != 0
+    assert "ENTRA_AUDIENCE" in result.stderr
+    assert "api://<guid>" in result.stderr
+    assert not h.has("account set")
+
+
+def test_non_guid_entra_tenant_id_fails_before_any_azure_call(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run(ENTRA_TENANT_ID="contoso.onmicrosoft.com")
+    assert result.returncode != 0
+    assert "ENTRA_TENANT_ID" in result.stderr
+    assert not h.has("account set")
+
+
+def test_missing_containerapp_extension_warns_but_does_not_abort(tmp_path: Path) -> None:
+    """A check, deliberately not a gate.
+
+    `az containerapp` lives in an extension that recent CLI versions install
+    on first use, so its absence is not proof this deploy will fail -- a hard
+    abort here would kill runs that dynamic install handles fine. What the
+    warning buys is that the answer arrives in stage 1 with the fix in it,
+    instead of as an opaque stage 7 error after the identity, its roles and
+    the secret already exist.
+    """
+    h = Harness(tmp_path, extensions=[])
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert "containerapp" in result.stderr
+    assert "az extension add --name containerapp" in result.stderr
+    # And it really did check, rather than the message being unconditional:
+    # with the extension present the same run says nothing about it.
+    present_dir = tmp_path / "present"
+    present_dir.mkdir()
+    present = Harness(present_dir).run()
+    assert present.returncode == 0, present.stderr
+    assert "az extension add" not in present.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +944,42 @@ def test_delete_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
     assert h.count("role assignment list") == 1
     assert h.state["assigned_scopes"] == []
     assert h.state["law_workspaces"] == []
+
+
+def test_delete_readback_queries_every_scope_not_just_the_subscription(
+    tmp_path: Path,
+) -> None:
+    """Step 6's read-back must pass ``--all``, and only an argv assertion can
+    prove it.
+
+    `az role assignment list` documents its own default as subscription scope
+    only: "By default, only assignments scoped to subscription will be
+    displayed. To view assignments scoped by resource or group, use --all."
+    All three assignments deploy-container-app.sh creates are at RESOURCE
+    scope (the ACR, the vault, the Azure OpenAI account), so without --all
+    this query returns 0 unconditionally and step 6 -- the guarantee the whole
+    seven-step ordering exists to provide -- is vacuous. The concrete failure:
+    with AZ_ACR_NAME unset (easy; it is a per-run random name), step 5 warns
+    and skips the ACR delete, a scope-blind step 6 reports zero remain, step 7
+    deletes the identity, and the AcrPull assignment is orphaned forever with
+    no principal left to find it by.
+
+    No behavioural test can catch this. The fake `az` answers with a scripted
+    count regardless of which scopes it was asked about, exactly as a real
+    subscription-scoped query would answer 0 regardless of what is assigned at
+    resource scope -- which is precisely why the missing flag survived four
+    reviews of tests that all pass either way. So this asserts on the argv.
+    """
+    h = deployed_harness(tmp_path)
+    result = h.run_delete()
+    assert result.returncode == 0, result.stderr
+
+    readback = next(call for call in h.calls if call.startswith("role assignment list"))
+    assert " --all" in f" {readback}", readback
+    # And it stays scope-blind in the other direction too: narrowing it by
+    # --scope or --role would re-hide exactly the leftovers it exists to find.
+    assert "--scope" not in readback
+    assert "--role" not in readback
 
 
 def test_delete_app_readback_failure_aborts_before_env_delete(tmp_path: Path) -> None:
