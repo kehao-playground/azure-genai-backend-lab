@@ -15,6 +15,7 @@ import base64
 import importlib.util
 import json
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -1495,7 +1496,19 @@ def test_gate_exit_code_is_1_on_deadline_exceeded_and_0_on_success(
 ) -> None:
     """The exit-code contract `deploy-container-app.sh`'s `set -e` depends on,
     driven through `main()` with the real clock replaced so the test does not
-    wait 1200 seconds."""
+    wait 1200 seconds.
+
+    The elapsed-time assertion below is load-bearing, not decoration: if
+    `poll_chat_gate`'s `sleep`/`monotonic` parameters were ever early-bound to
+    `time.sleep`/`time.monotonic` again (a real regression this test caught --
+    a default expression like `= time.sleep` captures the function at import
+    time, before this monkeypatch runs), the loop would fall back to a real
+    clock and really sleep through the 5s/10s backoff schedule until the
+    real 5-second `--deadline-seconds` elapsed. Confirmed by hand: reverting
+    `poll_chat_gate` to bind `time.sleep`/`time.monotonic` as signature
+    defaults makes this specific call take ~5.0s wall-clock and this
+    assertion fail.
+    """
     monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
     monkeypatch.setattr(
         entra_smoke, "acquire_app_token", lambda *a, **k: unsigned_test_token({"roles": []})
@@ -1507,6 +1520,7 @@ def test_gate_exit_code_is_1_on_deadline_exceeded_and_0_on_success(
     monkeypatch.setattr(_StubClient, "response", _chat_gate_response(503))
     monkeypatch.setattr(entra_smoke.httpx, "Client", _StubClient)
 
+    started = time.perf_counter()
     exit_code = entra_smoke.main(
         [
             "--gate",
@@ -1516,7 +1530,12 @@ def test_gate_exit_code_is_1_on_deadline_exceeded_and_0_on_success(
             "--deadline-seconds", "5",
         ]
     )
+    elapsed = time.perf_counter() - started
     assert exit_code == 1
+    # A real deadline-exceeded loop over the injected clock decides it is
+    # done after a handful of iterations with no real sleep in between; a
+    # dead clock injection would instead really wait out the 5s deadline.
+    assert elapsed < 1.0, f"gate loop took {elapsed:.3f}s -- the injected clock is not being used"
 
     monkeypatch.setattr(
         _StubClient, "response", _chat_gate_response(200, json_body={"message": "ok"})

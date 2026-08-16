@@ -80,8 +80,33 @@ set -euo pipefail
 : "${AZ_OPENAI_NAME:?Set AZ_OPENAI_NAME}"
 : "${ENTRA_TENANT_ID:?Set ENTRA_TENANT_ID (create-entra-app.sh prints it)}"
 : "${ENTRA_AUDIENCE:?Set ENTRA_AUDIENCE (the API application id)}"
-: "${ENTRA_CLIENT_APP_ID:?Set ENTRA_CLIENT_APP_ID (create-entra-app.sh prints it; the readiness gate's own credential)}"
-: "${ENTRA_CLIENT_SECRET:?Set ENTRA_CLIENT_SECRET (that client application's secret; never logged)}"
+# No apostrophe in either message below: an unmatched `'` inside a
+# `${VAR:?word}` word is significant to bash's parser even though the whole
+# thing sits inside double quotes -- it has to be, so the word can itself
+# contain a balanced nested quote -- and a single stray one does not just
+# fail loudly. It silently merges the rest of the statement (and the next
+# one) into one swallowed literal, so the *next* guard's `${VAR:?...}` never
+# actually expands or checks anything. Confirmed by hand: the previous
+# wording here paired an apostrophe in this line with one in the
+# ENTRA_CLIENT_SECRET line below, and with both present the secret guard
+# silently never ran, at all, in any mode -- not merely traced or untraced.
+: "${ENTRA_CLIENT_APP_ID:?Set ENTRA_CLIENT_APP_ID (create-entra-app.sh prints it; the client id the readiness gate uses for its own credential)}"
+
+# Tracing suspended for this one guard, the same pattern stage 4 uses for the
+# Search admin key: `${VAR:?msg}` traces as `+ : <value>` whenever the
+# variable IS set -- the message is dead code on that path, so wording alone
+# can never make this safe -- and an operator running with `bash -x` (or
+# SHELLOPTS=xtrace inherited from a parent) would otherwise put the secret on
+# stderr the moment this line runs. Restored immediately after, not assumed
+# off.
+XTRACE_RESTORE=false
+case "$-" in
+  *x*) XTRACE_RESTORE=true; set +x ;;
+esac
+: "${ENTRA_CLIENT_SECRET:?Set ENTRA_CLIENT_SECRET (the secret for that client application; never logged)}"
+if [ "$XTRACE_RESTORE" = true ]; then
+  set -x
+fi
 
 AZ_LOCATION="${AZ_LOCATION:-japaneast}"
 AZ_ACA_ENV_NAME="${AZ_ACA_ENV_NAME:-acaenv-azgenai-lab}"

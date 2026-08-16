@@ -920,14 +920,25 @@ def poll_chat_gate(
     token: str,
     *,
     deadline_seconds: float,
-    sleep: Callable[[float], None] = time.sleep,
-    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
 ) -> Check:
     """POST /api/v1/chat with backoff until it succeeds or the deadline
     passes. The deadline bounds total elapsed time, not attempt count: it is
     computed once, and every iteration re-checks how much of it is left
     before deciding whether -- and how long -- to sleep again.
+
+    `sleep`/`monotonic` default to `None`, resolved to `time.sleep`/
+    `time.monotonic` here in the body rather than as `= time.sleep` in the
+    signature: a default expression is evaluated once, at import time, so it
+    would capture the module's `time.sleep` *before* a test ever gets a
+    chance to monkeypatch `entra_smoke.time.sleep` -- the patch would then
+    land on an attribute nothing still reads. Resolving at call time means
+    the lookup happens on every invocation, so a monkeypatched `time.sleep`
+    is what actually runs.
     """
+    sleep = sleep if sleep is not None else time.sleep
+    monotonic = monotonic if monotonic is not None else time.monotonic
     deadline = monotonic() + deadline_seconds
     attempt = 0
     last_detail = "no attempt was made"
@@ -996,8 +1007,8 @@ def run_gate_checks(
     check_agent: bool,
     rag_question: str,
     agent_task: str,
-    sleep: Callable[[float], None] = time.sleep,
-    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
 ) -> list[Check]:
     """The gate check, then `--check-rag`/`--check-agent` if the gate passed.
 
@@ -1006,6 +1017,11 @@ def run_gate_checks(
     not be a meaningful result, and an explicit "not evaluated" check is the
     same convention `accepted_token_checks` already uses -- a result, not a
     silently shorter check list.
+
+    `sleep`/`monotonic` default to `None` and are passed through unresolved:
+    `poll_chat_gate` is what actually calls `time.sleep`/`time.monotonic`,
+    and it resolves them itself (see its docstring for why that has to
+    happen at call time, not as a signature default here).
     """
     gate_check = poll_chat_gate(
         client, token, deadline_seconds=deadline_seconds, sleep=sleep, monotonic=monotonic
