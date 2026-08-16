@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "infra" / "scripts"
 
 SEARCH_KEY = "s3cr3t-search-admin-key-value"
+LAW_SHARED_KEY = "s3cr3t-law-shared-key-value"  # noqa: S105 - fake, never a real credential
 
 
 def resource_id(provider: str, kind: str, name: str) -> str:
@@ -107,7 +108,9 @@ if args[:2] == ["identity", "show"]:
     done(value)
 if args[:2] == ["identity", "delete"]:
     name = opt("--name")
-    if name in state.get("identities", []):
+    if not state.get("identity_delete_ineffective") and name in state.get(
+        "identities", []
+    ):
         state["identities"].remove(name)
     done()
 
@@ -162,6 +165,25 @@ if args[:3] == ["keyvault", "secret", "set"]:
 if args[:2] == ["acr", "build"]:
     done("{}")
 
+# --- Log Analytics workspace --------------------------------------------------
+if args[:4] == ["monitor", "log-analytics", "workspace", "list"]:
+    m = re.search(r"name=='([^']*)'", query_value())
+    done("1" if m and m.group(1) in state.get("law_workspaces", []) else "0")
+if args[:4] == ["monitor", "log-analytics", "workspace", "create"]:
+    state.setdefault("law_workspaces", []).append(opt("--workspace-name"))
+    done("{}")
+if args[:4] == ["monitor", "log-analytics", "workspace", "show"]:
+    done(state.get("law_customer_id", ""))
+if args[:4] == ["monitor", "log-analytics", "workspace", "get-shared-keys"]:
+    done(state.get("law_shared_key", ""))
+if args[:4] == ["monitor", "log-analytics", "workspace", "delete"]:
+    name = opt("--workspace-name")
+    if not state.get("law_delete_ineffective") and name in state.get(
+        "law_workspaces", []
+    ):
+        state["law_workspaces"].remove(name)
+    done()
+
 # --- Container Apps environment ---------------------------------------------
 if args[:3] == ["containerapp", "env", "list"]:
     m = re.search(r"name=='([^']*)'", query_value())
@@ -173,7 +195,7 @@ if args[:3] == ["containerapp", "env", "show"]:
     done(state["env_state"])
 if args[:3] == ["containerapp", "env", "delete"]:
     name = opt("--name")
-    if name in state.get("envs", []):
+    if not state.get("env_delete_ineffective") and name in state.get("envs", []):
         state["envs"].remove(name)
     done()
 
@@ -195,7 +217,7 @@ if args[:2] == ["containerapp", "show"]:
     done("")
 if args[:2] == ["containerapp", "delete"]:
     name = opt("--name")
-    if name in state.get("apps", []):
+    if not state.get("app_delete_ineffective") and name in state.get("apps", []):
         state["apps"].remove(name)
     done()
 
@@ -250,6 +272,9 @@ class Harness:
             },
             "search_key": SEARCH_KEY,
             "secret_id": "https://kvfaked24.vault.azure.net/secrets/azure-search-admin-key/abc123",
+            "law_workspaces": [],
+            "law_customer_id": "88888888-8888-8888-8888-888888888888",
+            "law_shared_key": LAW_SHARED_KEY,
             "envs": [],
             "env_state": "Succeeded",
             "apps": [],
@@ -280,6 +305,7 @@ class Harness:
             "AZ_MI_NAME": "mi-faked24",
             "AZ_ACA_ENV_NAME": "acaenv-faked24",
             "AZ_ACA_APP_NAME": "aca-faked24",
+            "AZ_LAW_NAME": "law-faked24",
             "ENTRA_TENANT_ID": "55555555-5555-5555-5555-555555555555",
             "ENTRA_AUDIENCE": "66666666-6666-6666-6666-666666666666",
             "ENTRA_CLIENT_APP_ID": "77777777-7777-7777-7777-777777777777",
@@ -343,6 +369,7 @@ def test_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
         "search admin-key show",
         "keyvault secret set",
         "acr build",
+        "monitor log-analytics workspace create",
         "containerapp env create",
         "containerapp create",
     ]
@@ -354,6 +381,57 @@ def test_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
     assert sorted(h.state["roles"]) == sorted(  # type: ignore[arg-type]
         ["AcrPull", "Key Vault Secrets User", "Cognitive Services OpenAI User"]
     )
+
+
+def test_log_analytics_workspace_created_explicitly_and_wired_into_the_env(
+    tmp_path: Path,
+) -> None:
+    # The whole point of creating this workspace ourselves rather than
+    # letting `az containerapp env create` auto-provision one: the
+    # environment must be told to use THIS workspace (by its customerId and
+    # shared key), so delete-container-app.sh can later find and delete it
+    # by the name printed here.
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    create_call = next(
+        call
+        for call in h.calls
+        if call.startswith("monitor log-analytics workspace create")
+    )
+    assert "--workspace-name law-faked24" in create_call
+
+    env_create_call = next(call for call in h.calls if call.startswith("containerapp env create"))
+    assert "--logs-destination log-analytics" in env_create_call
+    assert f"--logs-workspace-id {h.state['law_customer_id']}" in env_create_call
+    assert f"--logs-workspace-key {LAW_SHARED_KEY}" in env_create_call
+
+
+def test_law_shared_key_reaches_env_create_but_never_the_terminal(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert LAW_SHARED_KEY not in result.stdout
+    assert LAW_SHARED_KEY not in result.stderr
+
+    # Again under `set -x`, which prints every assignment WITH its
+    # substituted value -- the same leak vector the Search admin key test
+    # below exercises. A fresh harness: the first run already created the
+    # app, and this script only creates from scratch.
+    traced_dir = tmp_path / "traced"
+    traced_dir.mkdir()
+    traced_h = Harness(traced_dir)
+    traced = traced_h.run(SHELLOPTS="xtrace")
+    assert traced.returncode == 0, traced.stderr
+    assert LAW_SHARED_KEY not in traced.stdout
+    assert LAW_SHARED_KEY not in traced.stderr
+    # Tracing really was on before and after the suspended block, so the
+    # clean stderr above is suppression working, not xtrace never starting.
+    assert "+ az account set" in traced.stderr
+    assert "+ az acr build" in traced.stderr
+    # And the read that fetches the key is itself dark.
+    assert "az monitor log-analytics workspace get-shared-keys" not in traced.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -633,12 +711,14 @@ def test_script_exists_and_is_executable() -> None:
 
 def deployed_harness(tmp_path: Path, **overrides: object) -> Harness:
     """A Harness whose fake state already looks like a completed deploy:
-    app, environment and identity all present, and the identity holding all
-    three role assignments deploy-container-app.sh would have granted it.
+    app, environment, Log Analytics workspace and identity all present, and
+    the identity holding all three role assignments deploy-container-app.sh
+    would have granted it.
     """
     state = {
         "apps": ["aca-faked24"],
         "envs": ["acaenv-faked24"],
+        "law_workspaces": ["law-faked24"],
         "identities": ["mi-faked24"],
         "assigned_scopes": [ACR_ID, KV_ID, AOAI_ID],
     }
@@ -654,6 +734,7 @@ def test_delete_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
     order = [
         "containerapp delete",
         "containerapp env delete",
+        "monitor log-analytics workspace delete",
         "identity show",
         "role assignment delete",
         "role assignment list",
@@ -667,6 +748,75 @@ def test_delete_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
     assert h.count("role assignment delete") == 3
     assert h.count("role assignment list") == 1
     assert h.state["assigned_scopes"] == []
+    assert h.state["law_workspaces"] == []
+
+
+def test_delete_app_readback_failure_aborts_before_env_delete(tmp_path: Path) -> None:
+    # The delete call itself reports success, but the resource is still
+    # listed afterward -- the same "don't trust the exit code alone" case
+    # delete-acr.sh guards against. This must stop the teardown right there,
+    # not just log a warning and carry on to the environment.
+    h = deployed_harness(tmp_path, app_delete_ineffective=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+    assert "still listed after delete" in result.stderr
+    assert not h.has("containerapp env delete")
+    assert not h.has("monitor log-analytics workspace delete")
+    assert not h.has("identity delete")
+
+
+def test_delete_env_readback_failure_aborts_before_workspace_delete(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path, env_delete_ineffective=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+    assert "still listed after delete" in result.stderr
+    assert h.has("containerapp delete")
+    assert not h.has("monitor log-analytics workspace delete")
+    assert not h.has("identity delete")
+
+
+def test_delete_workspace_readback_failure_aborts_before_identity_steps(
+    tmp_path: Path,
+) -> None:
+    h = deployed_harness(tmp_path, law_delete_ineffective=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+    assert "still listed after delete" in result.stderr
+    assert h.has("containerapp delete")
+    assert h.has("containerapp env delete")
+    # Never even reaches reading the identity's principal id.
+    assert not h.has("identity show")
+    assert not h.has("role assignment")
+    assert not h.has("identity delete")
+
+
+def test_delete_identity_readback_failure_is_reported(tmp_path: Path) -> None:
+    # The last step: nothing downstream to protect, but a delete that didn't
+    # actually take must still be reported as a failure, not a silent success.
+    h = deployed_harness(tmp_path, identity_delete_ineffective=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+    assert "still listed after delete" in result.stderr
+    assert h.count("role assignment delete") == 3
+
+
+def test_delete_skips_workspace_with_missing_name_knob_and_warns(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path)
+    result = h.run_delete(AZ_LAW_NAME="")
+    assert result.returncode == 0, result.stderr
+    assert "AZ_LAW_NAME not set" in result.stderr
+    assert not h.has("monitor log-analytics workspace")
+    # The rest of the teardown is unaffected by the skip.
+    assert h.has("identity delete")
+    assert h.state["law_workspaces"] == ["law-faked24"]  # untouched, not deleted
+
+
+def test_delete_workspace_absent_is_a_clean_noop(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path, law_workspaces=[])
+    result = h.run_delete()
+    assert result.returncode == 0, result.stderr
+    assert not h.has("monitor log-analytics workspace delete")
+    assert h.has("identity delete")
 
 
 def test_delete_role_assignment_failure_prevents_identity_delete(tmp_path: Path) -> None:

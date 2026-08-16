@@ -10,18 +10,28 @@
 # recoverable state (an identity that still exists to be re-queried) into a
 # permanent one (orphaned assignments with no principal left to look up).
 #
-# Six steps, in order:
-#   1. delete the Container App, if it exists
-#   2. delete the Container Apps environment, if it exists
-#   3. read back the managed identity's principal id -- absent identity means
+# Seven steps, in order:
+#   1. delete the Container App, if it exists -- read back to confirm gone
+#   2. delete the Container Apps environment, if it exists -- read back to
+#      confirm gone
+#   3. delete the Log Analytics workspace, if a name was given -- Azure does
+#      NOT delete this on its own when the environment above is deleted (a
+#      separate Microsoft.OperationalInsights/workspaces resource, its own
+#      lifecycle); a missing name knob is skipped with a warning, the same
+#      not-silent discipline step 5 uses for the ACR/Key Vault/AOAI scopes
+#   4. read back the managed identity's principal id -- absent identity means
 #      nothing identity-related is left to do, so this exits 0 here
-#   4. delete the role assignment at each scope this identity was granted
+#   5. delete the role assignment at each scope this identity was granted
 #      (ACR, Key Vault, Azure OpenAI); a scope whose name knob is unset is
 #      skipped with a warning, never silently
-#   5. read back ALL role assignments still held by that principal id --
+#   6. read back ALL role assignments still held by that principal id --
 #      fail-closed: a non-empty result, or a read that fails outright, aborts
-#      BEFORE step 6
-#   6. delete the managed identity
+#      BEFORE step 7
+#   7. delete the managed identity -- read back to confirm gone
+#
+# The identity ordering (now steps 4-7) is unchanged from the original
+# six-step contract -- step 3 is an independent addition ahead of it, not a
+# reordering of it.
 #
 # What this does NOT delete: the resources deploy-container-app.sh only
 # reads and mutates in place -- the ACR, Key Vault (and the Search-key secret
@@ -38,6 +48,10 @@
 #   AZ_ACA_APP_NAME  - defaults to aca-azgenai-lab (deploy-container-app.sh's default)
 #   AZ_ACA_ENV_NAME  - defaults to acaenv-azgenai-lab (ditto)
 #   AZ_MI_NAME       - defaults to mi-azgenai-lab (ditto)
+#   AZ_LAW_NAME      - Log Analytics workspace name deploy-container-app.sh printed;
+#                      unset skips the workspace delete (warned, not silent) --
+#                      there is no sensible default, since deploy generates a
+#                      fresh per-run name each time
 #   AZ_ACR_NAME      - registry the identity was granted AcrPull on; unset skips
 #                      that scope's role-assignment delete (warned, not silent)
 #   AZ_KEYVAULT_NAME - vault the identity was granted Key Vault Secrets User on;
@@ -67,10 +81,13 @@ require_value() {
 
 # === step 1: delete the app ==================================================
 echo "== step 1: delete the app =="
-APP_COUNT=$(az containerapp list \
-  --subscription "$AZ_SUBSCRIPTION_ID" \
-  --resource-group "$AZ_RESOURCE_GROUP" \
-  --query "length([?name=='$AZ_ACA_APP_NAME'])" -o tsv)
+app_count() {
+  az containerapp list \
+    --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --query "length([?name=='$AZ_ACA_APP_NAME'])" -o tsv
+}
+APP_COUNT=$(app_count)
 require_value "$APP_COUNT" "the existing app count"
 if [ "$APP_COUNT" = "0" ]; then
   echo "  '$AZ_ACA_APP_NAME' does not exist -- nothing to do"
@@ -80,15 +97,26 @@ else
     --resource-group "$AZ_RESOURCE_GROUP" \
     --name "$AZ_ACA_APP_NAME" \
     --yes >/dev/null
+  # Never trust the delete call's exit code alone -- the same fail-closed
+  # confirm-gone discipline delete-acr.sh uses.
+  AFTER_APP_COUNT=$(app_count)
+  require_value "$AFTER_APP_COUNT" "post-delete app count"
+  if [ "$AFTER_APP_COUNT" != "0" ]; then
+    echo "App '$AZ_ACA_APP_NAME' still listed after delete." >&2
+    exit 1
+  fi
   echo "  deleted '$AZ_ACA_APP_NAME'"
 fi
 
 # === step 2: delete the environment ==========================================
 echo "== step 2: delete the environment =="
-ENV_COUNT=$(az containerapp env list \
-  --subscription "$AZ_SUBSCRIPTION_ID" \
-  --resource-group "$AZ_RESOURCE_GROUP" \
-  --query "length([?name=='$AZ_ACA_ENV_NAME'])" -o tsv)
+env_count() {
+  az containerapp env list \
+    --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --query "length([?name=='$AZ_ACA_ENV_NAME'])" -o tsv
+}
+ENV_COUNT=$(env_count)
 require_value "$ENV_COUNT" "the existing environment count"
 if [ "$ENV_COUNT" = "0" ]; then
   echo "  '$AZ_ACA_ENV_NAME' does not exist -- nothing to do"
@@ -98,11 +126,58 @@ else
     --resource-group "$AZ_RESOURCE_GROUP" \
     --name "$AZ_ACA_ENV_NAME" \
     --yes >/dev/null
+  AFTER_ENV_COUNT=$(env_count)
+  require_value "$AFTER_ENV_COUNT" "post-delete environment count"
+  if [ "$AFTER_ENV_COUNT" != "0" ]; then
+    echo "Environment '$AZ_ACA_ENV_NAME' still listed after delete." >&2
+    exit 1
+  fi
   echo "  deleted '$AZ_ACA_ENV_NAME'"
 fi
 
-# === step 3: read back the identity's principal id ===========================
-echo "== step 3: read back the identity's principal id =="
+# === step 3: delete the Log Analytics workspace ==============================
+echo "== step 3: delete the Log Analytics workspace =="
+# deploy-container-app.sh creates this workspace explicitly (rather than
+# letting `az containerapp env create` auto-provision one) precisely so this
+# step can find it by name -- an auto-provisioned workspace has no name this
+# script would ever know to look for, and Azure does not delete it when the
+# environment above is deleted.
+if [ -n "${AZ_LAW_NAME:-}" ]; then
+  law_count() {
+    az monitor log-analytics workspace list \
+      --subscription "$AZ_SUBSCRIPTION_ID" \
+      --resource-group "$AZ_RESOURCE_GROUP" \
+      --query "length([?name=='$AZ_LAW_NAME'])" -o tsv
+  }
+  LAW_COUNT=$(law_count)
+  require_value "$LAW_COUNT" "the existing Log Analytics workspace count"
+  if [ "$LAW_COUNT" = "0" ]; then
+    echo "  '$AZ_LAW_NAME' does not exist -- nothing to do"
+  else
+    # --force releases the name immediately instead of leaving it reserved
+    # for 14 days under Azure's default recoverable delete: this script only
+    # ever names a fresh per-run workspace, so there is nothing to recover
+    # and nothing gained by leaving a reservation behind.
+    az monitor log-analytics workspace delete \
+      --subscription "$AZ_SUBSCRIPTION_ID" \
+      --resource-group "$AZ_RESOURCE_GROUP" \
+      --workspace-name "$AZ_LAW_NAME" \
+      --force --yes >/dev/null
+    AFTER_LAW_COUNT=$(law_count)
+    require_value "$AFTER_LAW_COUNT" "post-delete Log Analytics workspace count"
+    if [ "$AFTER_LAW_COUNT" != "0" ]; then
+      echo "Log Analytics workspace '$AZ_LAW_NAME' still listed after delete." >&2
+      exit 1
+    fi
+    echo "  deleted '$AZ_LAW_NAME'"
+  fi
+else
+  echo "  WARNING: AZ_LAW_NAME not set -- skipping the Log Analytics workspace delete" >&2
+  echo "  (deploy-container-app.sh prints the generated name; an orphaned workspace bills for ingestion and retention until removed by hand)" >&2
+fi
+
+# === step 4: read back the identity's principal id ===========================
+echo "== step 4: read back the identity's principal id =="
 MI_COUNT=$(az identity list \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
@@ -123,8 +198,8 @@ MI_PRINCIPAL_ID=$(az identity show \
   --query principalId -o tsv)
 require_value "$MI_PRINCIPAL_ID" "the managed identity principal id"
 
-# === step 4: delete role assignments ==========================================
-echo "== step 4: delete role assignments =="
+# === step 5: delete role assignments ==========================================
+echo "== step 5: delete role assignments =="
 # Scopes are read from the same name knobs deploy-container-app.sh grants
 # roles against. --assignee-object-id, not --assignee: the plain form
 # resolves the principal through Microsoft Graph, which the operator running
@@ -141,7 +216,7 @@ delete_assignment_at() {
 
 # A missing scope knob is skipped, not treated as an error: this script may
 # be run against a partial or hand-built deployment. It is never SILENT
-# about it though -- the warning goes to stderr, and step 5's read-back is
+# about it though -- the warning goes to stderr, and step 6's read-back is
 # by assignee alone (no --scope) precisely so a skipped scope's leftover
 # assignment does not slip past this teardown unnoticed.
 SKIPPED_SCOPES=""
@@ -180,10 +255,10 @@ if [ -n "$SKIPPED_SCOPES" ]; then
   echo "  skipped scopes (name knob not set):$SKIPPED_SCOPES"
 fi
 
-# === step 5: read back -- the identity must hold zero role assignments ======
-echo "== step 5: read back -- confirm zero role assignments remain =="
+# === step 6: read back -- the identity must hold zero role assignments ======
+echo "== step 6: read back -- confirm zero role assignments remain =="
 # Fail-closed, and deliberately by assignee alone (no --scope, no --role):
-# this is the check that catches a scope this run skipped in step 4, or one
+# this is the check that catches a scope this run skipped in step 5, or one
 # a future deploy grants that this script does not yet know about. An empty
 # read here is a failed query, not "zero found" -- `length([])` always
 # prints a number when the call actually worked.
@@ -194,19 +269,28 @@ REMAINING=$(az role assignment list \
   --query "length([])" -o tsv)
 require_value "$REMAINING" "the role-assignment read-back"
 if [ "$REMAINING" != "0" ]; then
-  echo "$REMAINING role assignment(s) still held by '$AZ_MI_NAME' after step 4; not deleting the identity." >&2
+  echo "$REMAINING role assignment(s) still held by '$AZ_MI_NAME' after step 5; not deleting the identity." >&2
   echo "Deleting it now would orphan them permanently -- the principal id would be gone." >&2
   exit 1
 fi
 echo "  confirmed: zero role assignments remain"
 
-# === step 6: delete the identity =============================================
-echo "== step 6: delete the identity =="
+# === step 7: delete the identity =============================================
+echo "== step 7: delete the identity =="
 az identity delete \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --name "$AZ_MI_NAME" >/dev/null
+AFTER_MI_COUNT=$(az identity list \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --query "length([?name=='$AZ_MI_NAME'])" -o tsv)
+require_value "$AFTER_MI_COUNT" "post-delete managed identity count"
+if [ "$AFTER_MI_COUNT" != "0" ]; then
+  echo "Managed identity '$AZ_MI_NAME' still listed after delete." >&2
+  exit 1
+fi
 echo "  deleted '$AZ_MI_NAME'"
 
 echo
-echo "Torn down: app, environment, role assignments and identity all gone."
+echo "Torn down: app, environment, Log Analytics workspace, role assignments and identity all gone."
