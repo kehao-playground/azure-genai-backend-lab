@@ -17,8 +17,8 @@
 set -euo pipefail
 
 : "${ENTRA_TENANT_ID:?Set ENTRA_TENANT_ID}"
-: "${ENTRA_API_APP_ID:?Set ENTRA_API_APP_ID (the API application's client id)}"
-: "${ENTRA_CLIENT_APP_ID:?Set ENTRA_CLIENT_APP_ID (the client application's client id)}"
+: "${ENTRA_API_APP_ID:?Set ENTRA_API_APP_ID (the API application client id)}"
+: "${ENTRA_CLIENT_APP_ID:?Set ENTRA_CLIENT_APP_ID (the client application client id)}"
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
