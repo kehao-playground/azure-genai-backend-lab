@@ -384,9 +384,12 @@ def test_search_key_reaches_key_vault_but_never_the_terminal(tmp_path: Path) -> 
     assert traced.returncode == 0, traced.stderr
     assert SEARCH_KEY not in traced.stdout
     assert SEARCH_KEY not in traced.stderr
-    # ENTRA_CLIENT_SECRET is never assigned or read by name anywhere in this
-    # script -- it reaches the gate subprocess by plain environment
-    # inheritance -- so no line of it can ever appear in a trace either.
+    # ENTRA_CLIENT_SECRET IS read by name (the `${ENTRA_CLIENT_SECRET:?...}`
+    # guard near the top of the script) -- tracing is suspended around that
+    # one line, the same XTRACE_RESTORE pattern as the Search admin key
+    # block below, because `${VAR:?msg}` traces as `+ : <value>` whenever the
+    # variable is set: the message is dead code on that path, so nothing
+    # about wording could make an untraced guard safe on its own.
     assert "not-a-real-secret" not in traced.stdout
     assert "not-a-real-secret" not in traced.stderr
     # Tracing really was on before the secret block and again after it, so the
@@ -397,6 +400,51 @@ def test_search_key_reaches_key_vault_but_never_the_terminal(tmp_path: Path) -> 
     # And the block itself is genuinely dark: not even the command that reads
     # the key is traced, because bash would print the assignment's value.
     assert "az search admin-key show" not in traced.stderr
+    # The ENTRA_CLIENT_SECRET guard itself must not appear as `+ : <secret>`
+    # either -- proving THIS suspension window, not just the Search key's.
+    assert "+ : not-a-real-secret" not in traced.stderr
+
+
+def test_missing_entra_client_secret_fails_before_any_azure_call(tmp_path: Path) -> None:
+    """A regression test for a bug worse than a trace leak: an apostrophe
+    inside `${ENTRA_CLIENT_SECRET:?message}` previously corrupted bash's
+    parsing of this guard together with the one above it, so with both
+    guards present the secret guard silently never ran at all -- a missing
+    `ENTRA_CLIENT_SECRET` sailed straight through to the first `az` call
+    instead of failing here. Confirmed by hand while diagnosing the trace
+    finding above; this test pins the fix (both guards reworded with no
+    apostrophe).
+    """
+    h = Harness(tmp_path)
+    env = dict(h.env)
+    del env["ENTRA_CLIENT_SECRET"]
+    result = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "deploy-container-app.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "ENTRA_CLIENT_SECRET" in result.stderr
+    # Failed at the top of the script, before touching Azure at all.
+    assert not h.has("account set")
+
+
+def test_missing_entra_client_app_id_fails_before_any_azure_call(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    env = dict(h.env)
+    del env["ENTRA_CLIENT_APP_ID"]
+    result = subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "deploy-container-app.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "ENTRA_CLIENT_APP_ID" in result.stderr
+    assert not h.has("account set")
 
 
 # ---------------------------------------------------------------------------
