@@ -76,11 +76,11 @@ def test_apply_tenant_override_is_a_no_op_when_absent() -> None:
 def test_apply_tenant_override_replaces_every_documents_tenant_id() -> None:
     documents = [_document("acme", "a"), _document("globex", "b")]
 
-    result = _apply_tenant_override(documents, "7d268483-0000-0000-0000-000000000000")
+    result = _apply_tenant_override(documents, "99999999-9999-9999-9999-999999999999")
 
     assert [document.tenant_id for document in result] == [
-        "7d268483-0000-0000-0000-000000000000",
-        "7d268483-0000-0000-0000-000000000000",
+        "99999999-9999-9999-9999-999999999999",
+        "99999999-9999-9999-9999-999999999999",
     ]
     # Every other field survives untouched -- this is a tenant_id override,
     # not a document rebuild.
