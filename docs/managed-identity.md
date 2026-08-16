@@ -166,7 +166,11 @@ environment, not runtime discovery:
 
 ## 4. The Day 24 identity plan (this is the deployment note)
 
-Decided now, executed when `deploy-container-app.sh` stops being a placeholder:
+**Executed on Day 24** — `infra/scripts/deploy-container-app.sh` now
+implements every bullet below, and
+[container-apps.md](container-apps.md) is the guide to the deployment it
+produces. What follows is the plan as decided here; where the two ever
+disagree, the script is the truth.
 
 - **User-assigned managed identity**, created by script *before* the app. The
   documented constraint decides this: "System assigned identity can't be used with
@@ -214,16 +218,21 @@ Honesty about the gap between posture and practice:
   smoke test depends on is a bad trade for a lab; for production it is the right
   final step *after* clients are verified keyless.
 - The application code path for bearer tokens (token provider at the composition
-  point) is a Day 24 change, landing with the deployment that needs it — not
-  before, per this series' rule against speculative abstraction.
+  point) was a Day 24 change, landing with the deployment that needs it — not
+  before, per this series' rule against speculative abstraction. It now exists as
+  `services/azure_openai_auth.py`, selected by `AZURE_OPENAI_AUTH`, whose default
+  (`api_key`) leaves local development exactly as it was.
 
 ## 6. Honest boundaries
 
-- **No managed identity was live-tested** — there is no deployed compute yet. The
-  probe's identity was a user via `AzureCliCredential`; token acquisition and RBAC
-  evaluation follow the same path, but IMDS behavior, the 24-hour token cache, and
-  user-assigned client-ID wiring are documented claims here, measured claims only
-  after Day 24.
+- **No managed identity has been live-tested.** The probe's identity was a user
+  via `AzureCliCredential`; token acquisition and RBAC evaluation follow the same
+  path, but IMDS behavior, the 24-hour token cache, and user-assigned client-ID
+  wiring remain documented claims here. Day 24 built the deployment that can
+  exercise them — the identity, the roles, the token provider and the readiness
+  gate all exist in code ([container-apps.md](container-apps.md)) — but this
+  section is upgraded to measured claims only by the live deploy session's
+  evidence, not by the code existing.
 - **Search keyless is asserted from docs, not measured.** Current pages even
   disagree on whether Free tier supports RBAC ("any tier, including free" vs
   "must be a billable tier (basic or higher)", both checked 2026-08). The series'

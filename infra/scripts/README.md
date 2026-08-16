@@ -11,7 +11,8 @@
 | `teardown.sh` | Delete the demo resource group and everything in it | working |
 | `create-acr.sh` | Ephemeral Azure Container Registry (Basic SKU by default; per-run unique name) with provider pre-check | working |
 | `delete-acr.sh` | Delete that registry — synchronous, no soft-delete/purge step (unlike Key Vault / Content Safety) | working |
-| `deploy-container-app.sh` | Deploy to Azure Container Apps | placeholder (Day 24) |
+| `deploy-container-app.sh` | Deploy to Azure Container Apps in eleven stages: managed identity, three role assignments, Search key → Key Vault, `az acr build`, Log Analytics workspace, environment, app, two-stage readiness gate | working |
+| `delete-container-app.sh` | Tear that down in seven steps — app, environment, workspace, **role assignments before the identity** (see below) | working |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
 | `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
 | `create-keyvault.sh` | Ephemeral Key Vault (explicit RBAC flag; purge protection off by omission — the API rejects an explicit `false` — with read-back asserted; 7-day soft delete) + idempotent Secrets Officer role for the signed-in user | working |
@@ -145,3 +146,45 @@ Each script's required/optional env vars (defaults in the script headers):
 `delete-content-safety.sh` deletes and purges from any state (live / soft-deleted / absent), with bounded waits, and exits by asserting the name is gone from both the active and soft-deleted listings. Purging matters here for the same reason it does for Key Vault: Cognitive Services accounts (Content Safety included) soft-delete and **block re-creation of the same name for 48 hours**. A per-run name means a skipped purge no longer blocks the *next* run by name — but it leaves a soft-deleted account holding a name and a resource until something purges it, and those accumulate silently. Run the delete script for anything left behind.
 
 One reading of "in neither listing" is not proof of absence, so the absent branch is conditional. If Azure accepted the create but the CLI reported failure and the listings have not caught up, exiting 0 there would abandon an account that materialises moments later with no teardown ever running. When `AZ_CS_CREATE_ATTEMPTED=1` — set by the orchestrator *before* it issues the create, precisely because the case it covers is a create whose outcome never came back — the script re-reads both listings on the same bounded-poll schedule as its other waits before concluding there is nothing to delete, and every query still aborts on failure rather than being read as "still absent". Standalone runs leave the variable unset and keep the immediate fast path.
+
+## Container Apps (Day 24)
+
+The full deploy session — which scripts to run, in what order, with which
+variables — is documented in
+[docs/container-apps.md § The deploy session, end to end](../../docs/container-apps.md#8-the-deploy-session-end-to-end).
+Three things about these two scripts belong here.
+
+**`create-acr.sh` generates its own name.** `AZ_ACR_NAME` defaults to a
+prefix plus an 8-hex CSPRNG suffix, freshly generated each run, and the
+resolved name is printed so it can be exported for the deploy step. Same
+discipline as the Content Safety orchestrator above, for the same reason:
+Day 21's cleanup irreversibly purged a *concurrent* run's resource because
+it identified that resource by a fixed name. `deploy-container-app.sh`
+generates its Log Analytics workspace name the same way and prints it —
+hand that value to `delete-container-app.sh`, because there is no sensible
+default to fall back on and an unnamed workspace keeps billing.
+
+**The deploy script creates the Log Analytics workspace on purpose.**
+`az containerapp env create` will auto-provision one if you don't, and
+`env delete` does not remove it — it is a separate
+`Microsoft.OperationalInsights/workspaces` resource with its own
+lifecycle. Auto-provisioning it would leave a recurring charge behind that
+this teardown could never find, because it was never told the name Azure
+chose.
+
+**Teardown order is the contract, not a convenience.** Azure does *not*
+delete a managed identity's role assignments when the identity is deleted;
+it leaves them behind on the ACR, Key Vault and Azure OpenAI resources,
+each reading "Identity not found" and none of them visible unless you go
+looking ([managed identity best practices § Maintenance](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/managed-identity-best-practice-recommendations#maintenance),
+checked 2026-08-16). So `delete-container-app.sh` reads the principal id
+*first* — it is the only handle for finding those assignments, and it dies
+with the identity — deletes each assignment, proves zero remain with a
+read-back by assignee alone, and only then deletes the identity. A
+non-empty read-back aborts before the identity is touched: an identity
+that still exists can be re-queried, an orphaned assignment cannot be
+traced back to anything.
+
+Both scripts follow the same fail-closed rule as everything else here: an
+`az ... -o tsv` read that returns empty output aborts, and is never read
+as "absent", "zero" or "not yet".

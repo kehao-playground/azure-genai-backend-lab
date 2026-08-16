@@ -109,7 +109,7 @@ variable has a demo-oriented default and the fake switches default to on,
 so an empty environment runs entirely offline. Secrets are injected at
 runtime only, never at build time; on Azure prefer Key Vault references
 ([key-vault-config.md](key-vault-config.md)) and Container Apps secrets
-(Day 24).
+([container-apps.md § Environment variables and secrets](container-apps.md#7-environment-variables-and-secrets)).
 
 **Read before deploying past a lab environment**: `AUTH_MODE`'s default,
 `headers`, is a development mode — it trusts `X-Tenant-Id`/`X-User-Id`/
@@ -127,7 +127,9 @@ container.
 | `USE_FAKE_EMBEDDINGS` | `true` | Set `false` to call the embeddings deployment. |
 | `USE_FAKE_SEARCH` | `true` | Set `false` to call Azure AI Search. |
 | `AZURE_OPENAI_ENDPOINT` | — | `USE_FAKE_LLM=false` or `USE_FAKE_EMBEDDINGS=false`. |
-| `AZURE_OPENAI_API_KEY` | — | `USE_FAKE_LLM=false` or `USE_FAKE_EMBEDDINGS=false`. |
+| `AZURE_OPENAI_AUTH` | `api_key` | `entra` mints a bearer token from a managed identity instead of reading a key (Day 24). |
+| `AZURE_OPENAI_API_KEY` | — | A real Azure OpenAI adapter under the default `AZURE_OPENAI_AUTH=api_key`; unused, and absent, in `entra` mode. |
+| `AZURE_CLIENT_ID` | — | `AZURE_OPENAI_AUTH=entra`: the user-assigned managed identity's client id (a public GUID, not a secret). Startup fails fast without it. |
 | `AZURE_OPENAI_DEPLOYMENT_NAME` | — | `USE_FAKE_LLM=false`. |
 | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | `USE_FAKE_EMBEDDINGS=false`. |
 | `AZURE_SEARCH_ENDPOINT` | — | `USE_FAKE_SEARCH=false`. |
@@ -199,7 +201,11 @@ conditions — ingress enabled, main app container, non-GPU workload
 profile; sidecars never get them
 ([Azure Container Apps health probes](https://learn.microsoft.com/en-us/azure/container-apps/health-probes),
 ms.date 2025-11-06, checked 2026-08-12). A CLI/IaC deployment must
-configure probes explicitly; Day 24 points them at this same `/health`.
+configure probes explicitly. As deployed on Day 24, all three probes —
+startup, liveness and readiness — are written out in the app's YAML as
+HTTP `GET /health` on port 8000
+([container-apps.md § Probes](container-apps.md#6-probes) has the
+settings).
 Kubernetes does not execute a Docker image's `HEALTHCHECK` either: a
 containerd maintainer confirmed containerd does not implement it, and that
 "Kubernetes does not use Dockerfile's `HEALTHCHECK` but uses its own
@@ -234,8 +240,9 @@ checked 2026-08-12). That default is tunable: the ARM template exposes
 the 30s default —
 [Microsoft.App/containerApps template reference](https://learn.microsoft.com/en-us/azure/templates/microsoft.app/2025-07-01/containerapps),
 checked 2026-08). This series keeps the default as its design point, and
-Day 24's IaC pins `terminationGracePeriodSeconds: 30` explicitly rather
-than relying on today's default staying put.
+Day 24's app definition pins `terminationGracePeriodSeconds: 30`
+explicitly rather than relying on today's default staying put
+([container-apps.md](container-apps.md)).
 
 Application shutdown is itself bounded: `SHUTDOWN_CLEANUP_BUDGET_SECONDS`
 (default `8.0`) is one deadline shared across all four closers, not four
@@ -263,8 +270,13 @@ budget therefore means lowering the drain first — a visible trade, not an
 env-var override. (Before Day 23 review F1 the cap was a standalone `30`,
 which accepted 20 + 30 = 50 nominal seconds against a 30-second ceiling.)
 The 2-second margin and the 8-second budget are both unmeasured
-hypotheses — Day 24 must measure real-Azure teardown latency or shorten the
-terms (see the Honest boundary paragraph below).
+hypotheses. Day 24 takes them on: the measurement *contract* — which
+markers are read, from which log source, what invalidates a run, and which
+of the three terms the result can and cannot verify — is written down in
+[container-apps.md § The shutdown measurement contract](container-apps.md#11-the-shutdown-measurement-contract),
+and the measured values are recorded there after the deploy session. Until
+they are, both terms stay hypotheses (see the Honest boundary paragraph
+below).
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
 (fake mode, zero env vars) stops in 0.669s; with a deliberately held SSE
@@ -313,7 +325,9 @@ watching a rolling restart may see a burst of these. That code names the
   are not a trade-off here. The lab keeps both unpinned for readability and
   says so instead of pretending otherwise.
 - **Registry**: push to Azure Container Registry once a real runtime needs
-  to pull the image (Day 24).
+  to pull the image — Day 24 does exactly that, building in the registry
+  with `az acr build` and pulling with a managed identity rather than
+  registry credentials ([container-apps.md](container-apps.md)).
 - **Smaller bases** (distroless-style) drop the shell and package manager
   this image still carries. The lab keeps them for debuggability — a
   deliberate trade, not an oversight.
