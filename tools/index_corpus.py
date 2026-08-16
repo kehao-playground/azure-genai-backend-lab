@@ -28,20 +28,34 @@ is why the destructive flag is safe only in a lab.
 Usage:
     uv run python tools/index_corpus.py --create-index
     uv run python tools/index_corpus.py --recreate-index
+    uv run python tools/index_corpus.py --create-index --tenant-id <entra-tenant-guid>
 """
 
 import argparse
 import asyncio
+from collections.abc import Sequence
+from dataclasses import replace
 
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
-from azgenai_lab.models.rag import Chunk, IndexingAction, make_parent_id
+from azgenai_lab.models.principal import validate_identifier
+from azgenai_lab.models.rag import Chunk, IndexingAction, SourceDocument, make_parent_id
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 from azgenai_lab.services.embeddings import build_embedding_client, embed_chunks
 from azgenai_lab.services.indexing_results import IndexingResult
 from azgenai_lab.services.search_data_plane import IndexingBatch, SearchDataPlane, plan_batches
 from azgenai_lab.services.search_indexing import DocumentReplacer
+
+
+def _tenant_id_type(value: str) -> str:
+    try:
+        return validate_identifier(value, field="--tenant-id")
+    except ValueError as exc:
+        # argparse turns this into a usage error and exits before any of
+        # this run's network calls -- an operator's typo should not be
+        # discovered partway through an indexing pass.
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -67,6 +81,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "re-load). Lab-only: production migrates via a new index "
             "generation plus an alias cutover, not by deleting the one "
             "serving reads."
+        ),
+    )
+    parser.add_argument(
+        "--tenant-id",
+        type=_tenant_id_type,
+        default=None,
+        help=(
+            "Override every loaded document's front-matter tenant_id for "
+            "this run only (the source files on disk are untouched). "
+            "Every chunk, parent/chunk key, and stale-cleanup enumeration "
+            "in this run then uses this value instead of each document's "
+            "own tenant. Omitting this flag is the default and leaves "
+            "today's behavior unchanged: acme/globex/opsdemo stay separate "
+            "tenants, which Day 15's multi-tenant behave scenarios and the "
+            "local workflow depend on. Passing a value COLLAPSES every "
+            "source tenant into this one tenant for the run — use it "
+            "deliberately, e.g. to point a single-tenant live smoke "
+            "(indexing against a real Entra tenant GUID) at the corpus, "
+            "never as a default."
         ),
     )
     return parser
@@ -95,7 +128,31 @@ async def main() -> None:
             settings,
             create_index=arguments.create_index,
             recreate_index=arguments.recreate_index,
+            tenant_id=arguments.tenant_id,
         )
+
+
+def _apply_tenant_override(
+    documents: Sequence[SourceDocument], tenant_id: str | None
+) -> list[SourceDocument]:
+    """Override every document's tenant_id for this run, or pass them through.
+
+    ``tenant_id=None`` (the default) is a strict no-op: the returned list
+    carries the same per-document tenant_id values ``load_documents()``
+    produced, so ``acme``/``globex``/``opsdemo`` stay separate tenants.
+
+    A supplied value COLLAPSES every source document onto that one tenant
+    for this run — every chunk's ``tenant_id`` field, every parent/chunk key
+    derived from it, and the stale-cleanup enumeration all follow, because
+    they are all derived from ``SourceDocument.tenant_id``. This is the
+    deliberate, documented consequence for a single-tenant live smoke (e.g.
+    indexing against a real Entra tenant GUID); it destroys the isolation
+    Day 15's per-document ACL model exists to enforce, so it must never be
+    the default.
+    """
+    if tenant_id is None:
+        return list(documents)
+    return [replace(document, tenant_id=tenant_id) for document in documents]
 
 
 async def _rebuild_schema(
@@ -122,7 +179,12 @@ async def _rebuild_schema(
 
 
 async def _index(
-    plane: SearchDataPlane, settings: Settings, *, create_index: bool, recreate_index: bool
+    plane: SearchDataPlane,
+    settings: Settings,
+    *,
+    create_index: bool,
+    recreate_index: bool,
+    tenant_id: str | None = None,
 ) -> None:
     await _rebuild_schema(plane, create_index=create_index, recreate_index=recreate_index)
 
@@ -164,8 +226,12 @@ async def _index(
 
     replacer = DocumentReplacer(plan_batches, measured_post, plane.list_chunk_ids)
 
+    documents_to_index = _apply_tenant_override(
+        load_documents(settings.sample_docs_dir or SAMPLE_DOCS_DIR), tenant_id
+    )
+
     total_documents = 0
-    for source in load_documents(settings.sample_docs_dir or SAMPLE_DOCS_DIR):
+    for source in documents_to_index:
         chunks: list[Chunk] = chunk_markdown(
             source,
             max_chars=settings.chunk_max_chars,
