@@ -10,8 +10,10 @@ freezes them so an SDK upgrade that breaks either fails here before the doc
 goes stale (Day 20 review, finding R1).
 """
 
+import asyncio
+
 import httpx
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 EMPTY_LIST_BODY = {"object": "list", "data": []}
 
@@ -58,3 +60,39 @@ def test_eagerly_called_provider_freezes_one_token() -> None:
     client.models.list()
 
     assert seen_auth == ["Bearer token-frozen", "Bearer token-frozen"]
+
+
+def test_async_client_reinvokes_callable_api_key_per_request() -> None:
+    # This app uses AsyncOpenAI everywhere (all three real adapters), not the
+    # sync OpenAI client above — the pinned per-request refresh behavior must
+    # be proven on the client this app actually constructs, not inferred from
+    # its sync sibling. The provider must be *async*: the pinned SDK's async
+    # client does `self.api_key = await self._api_key_provider()`
+    # unconditionally (openai/_client.py), so a sync callable returning
+    # `str` raises `TypeError: object str can't be used in 'await'
+    # expression'` on the first request — this is exactly why
+    # `resolve_aoai_auth`'s entra branch uses `azure.identity.aio`.
+    minted: list[str] = []
+
+    async def provider() -> str:
+        minted.append(f"token-{len(minted) + 1}")
+        return minted[-1]
+
+    seen_auth: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("Authorization"))
+        return httpx.Response(200, json=EMPTY_LIST_BODY)
+
+    async def run() -> None:
+        client = AsyncOpenAI(
+            base_url="http://testserver/v1",
+            api_key=provider,  # type: ignore[arg-type]  # str | Callable per pinned SDK
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        assert minted == []
+        await client.models.list()
+        await client.models.list()
+
+    asyncio.run(run())
+    assert seen_auth == ["Bearer token-1", "Bearer token-2"]

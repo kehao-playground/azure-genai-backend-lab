@@ -20,7 +20,7 @@ only on the :class:`ChatService` protocol.
 """
 
 import logging
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -42,6 +42,7 @@ from azgenai_lab.core.errors import (
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts.loader import PromptTemplate
+from azgenai_lab.services.azure_openai_auth import resolve_aoai_auth
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +371,13 @@ async def _translate_stream(
         await stream.close()
 
 
+async def _no_op_aclose() -> None:
+    """Default for direct construction (this file's own stub-client tests):
+    build_chat_service() always supplies the resolver's real ``aclose``
+    instead."""
+    return None
+
+
 class AzureOpenAIChatService:
     def __init__(
         self,
@@ -377,6 +385,7 @@ class AzureOpenAIChatService:
         deployment_name: str,
         prompt: PromptTemplate,
         max_output_tokens: int,
+        credential_aclose: Callable[[], Coroutine[Any, Any, None]] = _no_op_aclose,
     ) -> None:
         self._client = client
         self._deployment_name = deployment_name
@@ -387,6 +396,11 @@ class AzureOpenAIChatService:
         # is responsible for closing it. Guarded so a double aclose() (e.g.
         # both direct and via a composing service) is safe.
         self._closed = False
+        # entra mode only (Day 24): closes the ManagedIdentityCredential
+        # backing `client`'s callable api_key. A no-op in api_key mode. It
+        # owns its own aiohttp session and leaks a ResourceWarning at
+        # teardown if never closed — see azure_openai_auth.py's docstring.
+        self._credential_aclose = credential_aclose
 
     async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
         _log_llm_call(self._prompt, streaming=False)
@@ -459,7 +473,14 @@ class AzureOpenAIChatService:
         if self._closed:
             return
         self._closed = True
-        await self._client.close()
+        # A credential-close failure must not strand the client, and vice
+        # versa (same isolation discipline as the rest of this app's closers,
+        # Day 14 review finding 4). No None-check needed: `_credential_aclose`
+        # is always a valid awaitable, a no-op in api_key mode.
+        try:
+            await self._client.close()
+        finally:
+            await self._credential_aclose()
 
 
 def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatService:
@@ -471,17 +492,13 @@ def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatSer
     """
     if settings.use_fake_llm:
         return FakeChatService(prompt=prompt)
-    if not (
-        settings.azure_openai_endpoint
-        and settings.azure_openai_api_key
-        and settings.azure_openai_deployment_name
-    ):
+    if not (settings.azure_openai_endpoint and settings.azure_openai_deployment_name):
         raise ValueError(
-            "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT, "
-            "AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME"
+            "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT_NAME"
         )
+    auth = resolve_aoai_auth(settings)  # raises ValueError per mode (Day 24 keyless)
     client = AsyncOpenAI(
-        api_key=settings.azure_openai_api_key.get_secret_value(),
+        api_key=auth.api_key,  # str | async Callable — matches AsyncOpenAI's own type
         base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
         timeout=settings.llm_timeout_seconds,  # per attempt (default 30s), not end-to-end
         max_retries=settings.llm_max_retries,  # explicit policy; the SDK default is 2
@@ -491,4 +508,5 @@ def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatSer
         settings.azure_openai_deployment_name,
         prompt,
         max_output_tokens=settings.llm_max_output_tokens,
+        credential_aclose=auth.aclose,
     )

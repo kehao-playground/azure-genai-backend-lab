@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -74,11 +76,128 @@ async def test_fake_service_makes_received_history_visible() -> None:
     assert result.message == "[fake-llm] three (history=2)"
 
 
-def test_real_service_requires_endpoint_key_and_deployment() -> None:
+def test_real_service_requires_endpoint_and_deployment() -> None:
+    # The API-key requirement moved into resolve_aoai_auth (Task 2); this
+    # pre-check now only owns endpoint + deployment, so the message must not
+    # mention AZURE_OPENAI_API_KEY.
     settings = Settings(_env_file=None, use_fake_llm=False)
 
-    with pytest.raises(ValueError, match="USE_FAKE_LLM=false requires"):
+    with pytest.raises(
+        ValueError,
+        match="USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT_NAME",
+    ):
         build_chat_service(settings, prompt=PROMPT)
+
+
+def test_real_service_endpoint_and_deployment_present_still_requires_a_key() -> None:
+    # Endpoint + deployment satisfy the pre-check; the missing-key error now
+    # comes from the resolver, not this module's own check.
+    settings = Settings(
+        _env_file=None,
+        use_fake_llm=False,
+        azure_openai_endpoint="https://example.openai.azure.com/",
+        azure_openai_deployment_name="chat-mini",
+    )
+
+    with pytest.raises(ValueError, match="AZURE_OPENAI_AUTH=api_key requires AZURE_OPENAI_API_KEY"):
+        build_chat_service(settings, prompt=PROMPT)
+
+
+async def test_real_service_api_key_mode_aclose_is_a_safe_no_op_and_still_closes_client() -> None:
+    # api_key mode never mints a credential; aclose() must still close the
+    # AsyncOpenAI client, and awaiting the resolver's no-op closer must not
+    # raise.
+    service = build_chat_service(make_real_settings(), prompt=PROMPT)
+    assert isinstance(service, AzureOpenAIChatService)
+
+    await service.aclose()
+
+    assert service._client.is_closed()
+
+
+class _CloseTrackingCredential:
+    def __init__(self, client_id: str) -> None:
+        self.client_id = client_id
+        self.close_count = 0
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
+def _patch_entra_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    created: dict[str, object] = {}
+
+    def fake_credential_ctor(client_id: str) -> _CloseTrackingCredential:
+        credential = _CloseTrackingCredential(client_id)
+        created["credential"] = credential
+        return credential
+
+    def fake_provider(credential: object, scope: str) -> Callable[[], Awaitable[str]]:
+        created["scope"] = scope
+
+        async def token_callable() -> str:
+            return "tok"
+
+        return token_callable
+
+    monkeypatch.setattr(
+        "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential",
+        fake_credential_ctor,
+    )
+    monkeypatch.setattr(
+        "azgenai_lab.services.azure_openai_auth.get_bearer_token_provider", fake_provider
+    )
+    return created
+
+
+def test_real_service_builds_in_entra_mode_with_no_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _patch_entra_credential(monkeypatch)
+    settings = Settings(
+        _env_file=None,
+        use_fake_llm=False,
+        azure_openai_auth="entra",
+        azure_client_id="cid",
+        azure_openai_endpoint="https://example.openai.azure.com/",
+        azure_openai_deployment_name="chat-mini",
+    )
+
+    service = build_chat_service(settings, prompt=PROMPT)
+
+    assert isinstance(service, AzureOpenAIChatService)
+    provider = service._client._api_key_provider
+    assert provider is not None
+    assert inspect.iscoroutinefunction(provider)
+    assert created["scope"] == "https://cognitiveservices.azure.com/.default"
+    assert isinstance(created["credential"], _CloseTrackingCredential)
+
+
+async def test_real_service_entra_mode_aclose_closes_credential_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _patch_entra_credential(monkeypatch)
+    settings = Settings(
+        _env_file=None,
+        use_fake_llm=False,
+        azure_openai_auth="entra",
+        azure_client_id="cid",
+        azure_openai_endpoint="https://example.openai.azure.com/",
+        azure_openai_deployment_name="chat-mini",
+    )
+    service = build_chat_service(settings, prompt=PROMPT)
+    assert isinstance(service, AzureOpenAIChatService)
+    credential = created["credential"]
+    assert isinstance(credential, _CloseTrackingCredential)
+
+    await service.aclose()
+
+    assert credential.close_count == 1
+    assert service._client.is_closed()
+
+    await service.aclose()  # idempotent: no second close
+
+    assert credential.close_count == 1
 
 
 def make_real_settings() -> Settings:
