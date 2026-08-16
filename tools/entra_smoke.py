@@ -43,6 +43,35 @@ redacted details, and sorted claim key names. No tenant id, no app ids, no
 `oid`, no client secret, no access token, no ID token, no device `user_code`.
 The short-lived `user_code` is the single value printed to the interactive
 terminal, and it is printed before evidence collection begins.
+
+`--gate` mode is Day 24's readiness gate, not a Day 19 phase: it does not
+prove a specific rejection contract, it proves the deployed app is usable end
+to end. `infra/scripts/deploy-container-app.sh` runs it, with the same
+client-credentials token acquisition `--phase no-role`/`full` already use, as
+the second half of a two-stage gate (the first stage is bounded reads of
+Azure's own state plus a `/health` poll). It polls authenticated
+`POST /api/v1/chat` with exponential backoff (5s, 10s, 20s, then a 30s cap)
+until `--deadline-seconds` (default 1200) is exhausted.
+
+The retry policy is narrower than it might look: only connection errors, 429
+and 5xx are retried. A 401 or 403 *with a token attached* is not, because
+`azgenai_lab.api.principal` decides those before anything touches Azure
+OpenAI -- no amount of waiting turns a bad audience, scope or app-role
+configuration into a 200. What waiting *does* fix is Azure OpenAI role
+assignment propagation, which surfaces as a 5xx from this API (Day 20 measured
+`Cognitive Services OpenAI User` taking up to 14m44s to take effect) -- that
+is what the long default deadline and the backoff schedule are for. A 200
+whose body carries an `error` envelope is treated the same as a non-200: it is
+not success, and it is not retried either, since a contract violation on a
+200 will not resolve itself by waiting.
+
+`--check-rag` and `--check-agent` are additive, single-shot checks that only
+run after the gate itself reaches 200, reusing the same token: `--check-rag`
+asserts `POST /api/v1/rag` returns 200 with a non-empty `sources` array (the
+question must match content actually indexed for the caller's tenant --
+`--rag-question` exists to let an operator override the default), and
+`--check-agent` asserts `POST /api/v1/agent` returns 200. Both flags require
+`--gate`.
 """
 
 import argparse
@@ -84,6 +113,19 @@ LOG_JOIN_DELAY_SECONDS = 0.5
 # recommended default of 5.
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_DEVICE_CODE_LIFETIME_SECONDS = 900
+
+# Gate mode. The schedule is the brief's literal wording: 5s, 10s, 20s, then a
+# 30s cap for every attempt after that. 1200s (20 minutes) comfortably exceeds
+# Day 20's measured 14m44s role-propagation delay with room to spare.
+GATE_BACKOFF_SCHEDULE_SECONDS: tuple[float, ...] = (5.0, 10.0, 20.0)
+GATE_BACKOFF_CAP_SECONDS = 30.0
+DEFAULT_GATE_DEADLINE_SECONDS = 1200.0
+# "refund window?" matches a heading in the sample corpus's
+# data/sample-docs/acme/returns-policy.md (tenant-wide, allowed_groups: []),
+# and is the same question several unit tests already use against that
+# fixture. An operator indexing different content overrides it.
+DEFAULT_RAG_QUESTION = "refund window?"
+DEFAULT_AGENT_TASK = "Reply with a short greeting. No tools are required for this check."
 
 
 class SmokeError(RuntimeError):
@@ -700,6 +742,22 @@ def post_chat(client: httpx.Client, token: str) -> httpx.Response:
     )
 
 
+def post_rag(client: httpx.Client, token: str, question: str) -> httpx.Response:
+    return client.post(
+        "/api/v1/rag",
+        json={"question": question},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+def post_agent(client: httpx.Client, token: str, task: str) -> httpx.Response:
+    return client.post(
+        "/api/v1/agent",
+        json={"task": task},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
 def response_correlation_id(response: httpx.Response) -> str:
     correlation_id = response.headers.get("x-correlation-id", "")
     return correlation_id if isinstance(correlation_id, str) else ""
@@ -783,13 +841,202 @@ def identity_checks_with_retry(
 
 
 # ---------------------------------------------------------------------------
+# Gate mode: poll an authenticated /api/v1/chat with backoff until it is
+# genuinely usable, then optionally assert on /rag and /agent too.
+# ---------------------------------------------------------------------------
+
+
+def gate_backoff_seconds(attempt: int) -> float:
+    """5s -> 10s -> 20s -> 30s cap. `attempt` is the attempt that just failed
+    (1-indexed): the wait returned is how long to sleep before the next one."""
+    index = attempt - 1
+    if 0 <= index < len(GATE_BACKOFF_SCHEDULE_SECONDS):
+        return GATE_BACKOFF_SCHEDULE_SECONDS[index]
+    return GATE_BACKOFF_CAP_SECONDS
+
+
+def _success_body(response: httpx.Response) -> tuple[dict[str, Any] | None, str]:
+    """The parsed JSON object for a 200 that is not an error envelope, or
+    `None` plus why not.
+
+    A 200 status code is necessary but not sufficient: something between the
+    client and this API (or a bug in this API's own error handling) could
+    still hand back an `error` envelope with a 200, and that must not read as
+    success -- the brief says so explicitly.
+    """
+    if response.status_code != 200:
+        return None, f"HTTP {response.status_code}"
+    try:
+        body = response.json()
+    except ValueError:
+        return None, "response body was not valid JSON"
+    if not isinstance(body, dict):
+        return None, "response body was not a JSON object"
+    if "error" in body:
+        return None, "response was HTTP 200 but the body carries an `error` envelope"
+    return body, ""
+
+
+def _gate_status_detail(response: httpx.Response) -> str:
+    """Status, error code (named or described through the same bounded-
+    vocabulary gate every other channel in this tool uses) and correlation id
+    -- enough for an operator to diagnose a terminal failure without a second
+    run, and never the raw `error.message`, which is free text this tool does
+    not control.
+    """
+    code, problem = _error_code(response)
+    correlation_id = response_correlation_id(response) or "(none)"
+    if code is not None:
+        described = describe(code, API_ERROR_CODES, "error code")
+        return f"HTTP {response.status_code}, error {described}, correlation id {correlation_id}"
+    return f"HTTP {response.status_code} ({problem}), correlation id {correlation_id}"
+
+
+def _gate_outcome(response: httpx.Response) -> tuple[str, str]:
+    """One of "success" / "retry" / "terminal", plus a detail string.
+
+    Retryable is deliberately narrow -- 429 and 5xx, the shape of Azure OpenAI
+    role assignment not having propagated yet. Everything else, including a
+    200 whose body fails `_success_body`, is terminal: none of it is fixed by
+    waiting, and retrying it would spend the whole deadline reaching a
+    conclusion available on the first attempt (see the module docstring).
+    """
+    if response.status_code == 200:
+        body, reason = _success_body(response)
+        if body is not None and isinstance(body.get("message"), str):
+            return "success", ""
+        return "terminal", reason or "response has no `message` field"
+    detail = _gate_status_detail(response)
+    if response.status_code == 429 or response.status_code >= 500:
+        return "retry", detail
+    return "terminal", detail
+
+
+GATE_CHECK_NAME = "gate: authenticated POST /api/v1/chat returned 200"
+
+
+def poll_chat_gate(
+    client: httpx.Client,
+    token: str,
+    *,
+    deadline_seconds: float,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Check:
+    """POST /api/v1/chat with backoff until it succeeds or the deadline
+    passes. The deadline bounds total elapsed time, not attempt count: it is
+    computed once, and every iteration re-checks how much of it is left
+    before deciding whether -- and how long -- to sleep again.
+    """
+    deadline = monotonic() + deadline_seconds
+    attempt = 0
+    last_detail = "no attempt was made"
+    while True:
+        attempt += 1
+        try:
+            response = post_chat(client, token)
+        except httpx.RequestError as exc:
+            # The exception message is never used: httpx embeds the request
+            # URL in it, and with `--base-url` pointing at a real deployment
+            # that is not a value this tool's check details carry.
+            outcome, detail = "retry", f"{type(exc).__name__} contacting /api/v1/chat"
+        else:
+            outcome, detail = _gate_outcome(response)
+
+        if outcome == "success":
+            return Check(GATE_CHECK_NAME, True, "")
+        if outcome == "terminal":
+            print(f"Gate terminal failure on attempt {attempt}: {detail}", file=sys.stderr)
+            return Check(GATE_CHECK_NAME, False, f"terminal failure on attempt {attempt}: {detail}")
+
+        last_detail = detail
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return Check(
+                GATE_CHECK_NAME,
+                False,
+                f"deadline of {deadline_seconds:g}s exceeded after {attempt} attempt(s); "
+                f"last: {last_detail}",
+            )
+        wait = min(gate_backoff_seconds(attempt), remaining)
+        print(
+            f"  gate attempt {attempt} not ready ({last_detail}); retrying in {wait:g}s",
+            file=sys.stderr,
+        )
+        sleep(wait)
+
+
+RAG_CHECK_NAME = "check-rag: authenticated POST /api/v1/rag returned non-empty sources"
+AGENT_CHECK_NAME = "check-agent: authenticated POST /api/v1/agent returned 200"
+
+
+def _rag_check(response: httpx.Response) -> Check:
+    body, reason = _success_body(response)
+    if body is None:
+        return Check(RAG_CHECK_NAME, False, reason)
+    sources = body.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return Check(RAG_CHECK_NAME, False, "`sources` is missing, not a list, or empty")
+    return Check(RAG_CHECK_NAME, True, "")
+
+
+def _agent_check(response: httpx.Response) -> Check:
+    body, reason = _success_body(response)
+    if body is None:
+        return Check(AGENT_CHECK_NAME, False, reason)
+    return Check(AGENT_CHECK_NAME, True, "")
+
+
+def run_gate_checks(
+    client: httpx.Client,
+    token: str,
+    *,
+    deadline_seconds: float,
+    check_rag: bool,
+    check_agent: bool,
+    rag_question: str,
+    agent_task: str,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> list[Check]:
+    """The gate check, then `--check-rag`/`--check-agent` if the gate passed.
+
+    Skipped rather than attempted when the gate failed: hitting `/rag` or
+    `/agent` against an app that has not even proven `/chat` works yet would
+    not be a meaningful result, and an explicit "not evaluated" check is the
+    same convention `accepted_token_checks` already uses -- a result, not a
+    silently shorter check list.
+    """
+    gate_check = poll_chat_gate(
+        client, token, deadline_seconds=deadline_seconds, sleep=sleep, monotonic=monotonic
+    )
+    checks = [gate_check]
+    if not gate_check.passed:
+        not_evaluated = (
+            "not evaluated: the gate did not reach 200, and this check only "
+            "runs against an app already proven usable"
+        )
+        if check_rag:
+            checks.append(Check(RAG_CHECK_NAME, False, not_evaluated))
+        if check_agent:
+            checks.append(Check(AGENT_CHECK_NAME, False, not_evaluated))
+        return checks
+    if check_rag:
+        checks.append(_rag_check(post_rag(client, token, rag_question)))
+    if check_agent:
+        checks.append(_agent_check(post_agent(client, token, agent_task)))
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Phases.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Config:
-    phase: str
+    phase: str | None
+    gate: bool
     base_url: str
     tenant_id: str
     api_app_id: str
@@ -799,6 +1046,11 @@ class Config:
     server_log: Path | None
     evidence_out: Path | None
     timeout: float
+    deadline_seconds: float
+    check_rag: bool
+    check_agent: bool
+    rag_question: str
+    agent_task: str
 
 
 @dataclass
@@ -809,6 +1061,37 @@ class PhaseState:
     checks: list[Check] = field(default_factory=list)
     delegated_claim_keys: list[str] = field(default_factory=list)
     app_claim_keys: list[str] = field(default_factory=list)
+
+
+def run_gate(config: Config, client_secret: str, state: PhaseState) -> None:
+    """The `main()` wiring for `--gate`: acquire one app-only token (reused
+    for the whole poll loop and any `--check-rag`/`--check-agent` calls --
+    a client-credentials token is valid far longer than the deadline, and
+    what is flaky here is Azure OpenAI role propagation, not this token),
+    then hand off to `run_gate_checks`.
+    """
+    with httpx.Client(timeout=config.timeout) as oauth:
+        token = acquire_app_token(
+            oauth,
+            tenant_id=config.tenant_id,
+            client_id=config.client_id,
+            client_secret=client_secret,
+            api_app_id=config.api_app_id,
+        )
+    state.app_claim_keys = claim_keys(token)
+
+    with httpx.Client(base_url=config.base_url, timeout=config.timeout) as api:
+        state.checks.extend(
+            run_gate_checks(
+                api,
+                token,
+                deadline_seconds=config.deadline_seconds,
+                check_rag=config.check_rag,
+                check_agent=config.check_agent,
+                rag_question=config.rag_question,
+                agent_task=config.agent_task,
+            )
+        )
 
 
 def run_no_role_phase(config: Config, client_secret: str, state: PhaseState) -> None:
@@ -937,7 +1220,13 @@ def _parse_args(argv: Sequence[str] | None) -> Config:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--phase", choices=("no-role", "full"), required=True)
+    parser.add_argument("--phase", choices=("no-role", "full"))
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="poll authenticated POST /api/v1/chat with backoff until it "
+        "succeeds, instead of running --phase; mutually exclusive with --phase",
+    )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--tenant-id", required=True)
     parser.add_argument("--api-app-id", required=True, help="the API application's client id")
@@ -951,11 +1240,44 @@ def _parse_args(argv: Sequence[str] | None) -> Config:
     )
     parser.add_argument("--evidence-out", type=Path)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_GATE_DEADLINE_SECONDS,
+        help="--gate only: total wall-clock budget for the backoff loop",
+    )
+    parser.add_argument(
+        "--check-rag",
+        action="store_true",
+        help="--gate only: also assert POST /api/v1/rag returns non-empty sources",
+    )
+    parser.add_argument(
+        "--check-agent",
+        action="store_true",
+        help="--gate only: also assert POST /api/v1/agent returns 200",
+    )
+    parser.add_argument(
+        "--rag-question",
+        default=DEFAULT_RAG_QUESTION,
+        help="--check-rag only: question to send, matching indexed content",
+    )
+    parser.add_argument(
+        "--agent-task",
+        default=DEFAULT_AGENT_TASK,
+        help="--check-agent only: task to send",
+    )
     args = parser.parse_args(argv)
+    if args.gate and args.phase:
+        parser.error("--gate and --phase are mutually exclusive")
+    if not args.gate and not args.phase:
+        parser.error("one of --gate or --phase is required")
+    if not args.gate and (args.check_rag or args.check_agent):
+        parser.error("--check-rag and --check-agent require --gate")
     if args.phase == "full" and args.server_log is None:
         parser.error("--phase full requires --server-log (the identity log line is asserted)")
     return Config(
         phase=args.phase,
+        gate=args.gate,
         base_url=args.base_url,
         tenant_id=args.tenant_id,
         api_app_id=args.api_app_id,
@@ -965,6 +1287,11 @@ def _parse_args(argv: Sequence[str] | None) -> Config:
         server_log=args.server_log,
         evidence_out=args.evidence_out,
         timeout=args.timeout,
+        deadline_seconds=args.deadline_seconds,
+        check_rag=args.check_rag,
+        check_agent=args.check_agent,
+        rag_question=args.rag_question,
+        agent_task=args.agent_task,
     )
 
 
@@ -983,14 +1310,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Server log {config.server_log} does not exist.", file=sys.stderr)
         return EXIT_CONFIGURATION
 
+    # "gate" here is a label, not a `--phase` value: `--gate` and `--phase`
+    # are mutually exclusive (parser-enforced), so `config.phase` is `None`
+    # in gate mode and this is the only thing left to call the run.
+    mode_label = config.phase if config.phase is not None else "gate"
+
     state = PhaseState()
     try:
-        if config.phase == "no-role":
+        if config.gate:
+            run_gate(config, client_secret, state)
+        elif config.phase == "no-role":
             run_no_role_phase(config, client_secret, state)
         else:
             run_full_phase(config, client_secret, state)
     except SmokeError as exc:
-        state.checks.append(Check(f"{config.phase}: prerequisite step", False, str(exc)))
+        state.checks.append(Check(f"{mode_label}: prerequisite step", False, str(exc)))
     except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
         # The message goes to the terminal, under the same warning
         # `_oauth_failure` prints for a provider `error_description`: httpx
@@ -1016,7 +1350,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # evidence through a different door.
         state.checks.append(
             Check(
-                f"{config.phase}: prerequisite step",
+                f"{mode_label}: prerequisite step",
                 False,
                 f"{type(exc).__name__} while contacting the token endpoint, the API, "
                 "or the server log",
@@ -1024,7 +1358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     evidence = render_evidence(
-        phase=config.phase,
+        phase=mode_label,
         checks=state.checks,
         delegated_claim_keys=state.delegated_claim_keys,
         app_claim_keys=state.app_claim_keys,

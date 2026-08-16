@@ -15,6 +15,7 @@ import base64
 import importlib.util
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +34,10 @@ SmokeError = entra_smoke.SmokeError
 accepted_token_checks = entra_smoke.accepted_token_checks
 claim_keys = entra_smoke.claim_keys
 decode_claims_unverified = entra_smoke.decode_claims_unverified
+gate_backoff_seconds = entra_smoke.gate_backoff_seconds
 identity_checks = entra_smoke.identity_checks
 identity_log_check = entra_smoke.identity_log_check
+poll_chat_gate = entra_smoke.poll_chat_gate
 poll_device_token = entra_smoke.poll_device_token
 redact_sensitive = entra_smoke.redact_sensitive
 rejection_checks = entra_smoke.rejection_checks
@@ -1282,3 +1285,420 @@ def test_device_poll_rejects_a_non_json_error_body_without_quoting_it() -> None:
         )
     assert "502" in str(raised.value)
     assert ACCESS_TOKEN not in str(raised.value)
+
+
+# ---------------------------------------------------------------------------
+# Gate mode: the ACA deploy script's readiness gate (Task 8).
+#
+# Retry policy is a deliberate correction of the original brief, which said
+# "retry on 401/503". A 401 from THIS API's own bearer-token check is decided
+# before anything touches Azure OpenAI (see `principal.py`), so it can never
+# become a 200 by waiting -- unlike a 5xx, which is exactly the shape of the
+# role-assignment-not-propagated-yet case Day 20 measured (14m44s). So the
+# tests below retry 429/5xx/connection errors and treat 401/403 as terminal.
+# ---------------------------------------------------------------------------
+
+
+def _chat_gate_response(
+    status: int,
+    *,
+    json_body: dict[str, Any] | None = None,
+    correlation_id: str = "corr-gate",
+) -> httpx.Response:
+    return _response(
+        status,
+        json_body=json_body,
+        headers={"X-Correlation-Id": correlation_id},
+    )
+
+
+class _SequenceClient:
+    """Answers each `.post()` with the next response in a fixed sequence.
+
+    Raising the sentinel on exhaustion (rather than a generic `StopIteration`)
+    is what makes "the loop retried more times than the test expected" fail
+    with a readable message instead of an opaque `RuntimeError` from a
+    generator being driven past its end.
+    """
+
+    def __init__(self, responses: Sequence[httpx.Response | Exception]) -> None:
+        self._responses = list(responses)
+        self.calls: list[str] = []
+
+    def post(
+        self, url: str, *, json: dict[str, Any], headers: dict[str, str]
+    ) -> httpx.Response:
+        self.calls.append(url)
+        if not self._responses:
+            raise AssertionError(f"gate polled more times than expected (call {len(self.calls)})")
+        next_response = self._responses.pop(0)
+        if isinstance(next_response, Exception):
+            raise next_response
+        return next_response
+
+
+def test_gate_backoff_schedule_is_5_10_20_then_30_cap() -> None:
+    assert [gate_backoff_seconds(n) for n in (1, 2, 3, 4, 5, 100)] == [
+        5.0,
+        10.0,
+        20.0,
+        30.0,
+        30.0,
+        30.0,
+    ]
+
+
+def test_gate_retries_503_and_429_then_succeeds_on_200() -> None:
+    client = _SequenceClient(
+        [
+            _chat_gate_response(503, json_body={"error": {"code": "upstream_error"}}),
+            _chat_gate_response(429, json_body={"error": {"code": "upstream_throttled"}}),
+            _chat_gate_response(200, json_body={"message": "ok", "conversation_id": "c"}),
+        ]
+    )
+    sleeps: list[float] = []
+    clock = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        sleep=sleeps.append,
+        monotonic=lambda: next(clock),
+    )
+
+    assert check.passed
+    assert len(client.calls) == 3
+    assert sleeps == [5.0, 10.0]  # the schedule for attempts 1 and 2
+
+
+def test_gate_retries_a_connection_error() -> None:
+    client = _SequenceClient(
+        [
+            httpx.ConnectError(f"connection refused for {TENANT_ID}"),
+            _chat_gate_response(200, json_body={"message": "ok"}),
+        ]
+    )
+    sleeps: list[float] = []
+    clock = iter([0.0, 1.0, 2.0])
+
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        sleep=sleeps.append,
+        monotonic=lambda: next(clock),
+    )
+
+    assert check.passed
+    assert sleeps == [5.0]
+    # the exception message (which embeds the tenant) never reaches the check
+    assert TENANT_ID not in check.detail
+
+
+def test_gate_treats_401_as_terminal_and_does_not_retry() -> None:
+    client = _SequenceClient(
+        [
+            _chat_gate_response(
+                401,
+                json_body={"error": {"code": "unauthorized", "message": "bad token"}},
+                correlation_id="corr-401",
+            )
+        ]
+    )
+    sleeps: list[float] = []
+
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        sleep=sleeps.append,
+        monotonic=lambda: 0.0,
+    )
+
+    assert not check.passed
+    assert len(client.calls) == 1  # never retried
+    assert sleeps == []
+    assert "401" in check.detail
+    assert "unauthorized" in check.detail
+    assert "corr-401" in check.detail
+    # the raw error message never reaches the check either
+    assert "bad token" not in check.detail
+
+
+def test_gate_treats_403_as_terminal_and_does_not_retry() -> None:
+    client = _SequenceClient(
+        [
+            _chat_gate_response(
+                403, json_body={"error": {"code": "insufficient_scope", "message": "no role"}}
+            )
+        ]
+    )
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    assert not check.passed
+    assert len(client.calls) == 1
+    assert "403" in check.detail
+    assert "insufficient_scope" in check.detail
+
+
+def test_gate_a_200_with_an_error_envelope_is_not_success() -> None:
+    """The brief's explicit example of what "authenticated 200" must exclude."""
+    client = _SequenceClient(
+        [_chat_gate_response(200, json_body={"error": {"code": "content_filtered"}})]
+    )
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    assert not check.passed
+    assert len(client.calls) == 1  # a 200 body defect is terminal, not retried
+    assert "error" in check.detail
+
+
+def test_gate_deadline_bounds_total_elapsed_time_not_attempt_count() -> None:
+    """A short deadline that would allow several 5s/10s/20s retries by attempt
+    count must still stop as soon as simulated elapsed time exceeds it."""
+    client = _SequenceClient(
+        [_chat_gate_response(503) for _ in range(10)]
+    )
+    sleeps: list[float] = []
+    # Each poll advances the clock by 1s; the backoff schedule (5s, 10s, ...)
+    # is what actually exhausts a 12s deadline, not the number of attempts.
+    clock = iter([0.0, 1.0, 2.0, 12.0, 22.0, 42.0, 100.0])
+
+    check = poll_chat_gate(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=12.0,
+        sleep=sleeps.append,
+        monotonic=lambda: next(clock),
+    )
+
+    assert not check.passed
+    assert "deadline" in check.detail
+    assert "12" in check.detail
+    # stopped well short of exhausting the 10-response sequence
+    assert len(client.calls) < 10
+
+
+def test_gate_exit_code_is_1_on_deadline_exceeded_and_0_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit-code contract `deploy-container-app.sh`'s `set -e` depends on,
+    driven through `main()` with the real clock replaced so the test does not
+    wait 1200 seconds."""
+    monkeypatch.setenv("ENTRA_CLIENT_SECRET", CLIENT_SECRET)
+    monkeypatch.setattr(
+        entra_smoke, "acquire_app_token", lambda *a, **k: unsigned_test_token({"roles": []})
+    )
+
+    clock = iter([0.0] + [100.0] * 20)
+    monkeypatch.setattr(entra_smoke.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(entra_smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(_StubClient, "response", _chat_gate_response(503))
+    monkeypatch.setattr(entra_smoke.httpx, "Client", _StubClient)
+
+    exit_code = entra_smoke.main(
+        [
+            "--gate",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+            "--deadline-seconds", "5",
+        ]
+    )
+    assert exit_code == 1
+
+    monkeypatch.setattr(
+        _StubClient, "response", _chat_gate_response(200, json_body={"message": "ok"})
+    )
+    exit_code = entra_smoke.main(
+        [
+            "--gate",
+            "--tenant-id", TENANT_ID,
+            "--api-app-id", CLIENT_APP_ID,
+            "--client-id", CLIENT_APP_ID,
+            "--deadline-seconds", "5",
+        ]
+    )
+    assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# --check-rag / --check-agent: additive checks the brief specifies.
+# ---------------------------------------------------------------------------
+
+
+class _RoutedClient:
+    """Dispatches by URL path, so a single fake stands in for chat + rag."""
+
+    def __init__(self, responses: dict[str, httpx.Response]) -> None:
+        self._responses = responses
+        self.calls: list[str] = []
+
+    def post(
+        self, url: str, *, json: dict[str, Any], headers: dict[str, str]
+    ) -> httpx.Response:
+        self.calls.append(url)
+        return self._responses[url]
+
+
+def test_check_rag_passes_on_200_with_non_empty_sources() -> None:
+    client = _RoutedClient(
+        {
+            "/api/v1/chat": _chat_gate_response(200, json_body={"message": "ok"}),
+            "/api/v1/rag": _chat_gate_response(
+                200,
+                json_body={
+                    "status": "answered",
+                    "answer": "30 days",
+                    "sources": [{"doc_id": "returns-policy"}],
+                    "correlation_id": "corr-rag",
+                },
+            ),
+        }
+    )
+    checks = entra_smoke.run_gate_checks(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        check_rag=True,
+        check_agent=False,
+        rag_question="refund window?",
+        agent_task="",
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    assert all(check.passed for check in checks)
+    assert any("rag" in check.name for check in checks)
+
+
+def test_check_rag_fails_on_empty_sources() -> None:
+    """The `no_answer` shape: 200, but `sources` is an empty array."""
+    client = _RoutedClient(
+        {
+            "/api/v1/chat": _chat_gate_response(200, json_body={"message": "ok"}),
+            "/api/v1/rag": _chat_gate_response(
+                200,
+                json_body={
+                    "status": "no_answer",
+                    "answer": None,
+                    "sources": [],
+                    "correlation_id": "c",
+                },
+            ),
+        }
+    )
+    checks = entra_smoke.run_gate_checks(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        check_rag=True,
+        check_agent=False,
+        rag_question="refund window?",
+        agent_task="",
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    rag_check = next(check for check in checks if "rag" in check.name)
+    assert not rag_check.passed
+    assert "sources" in rag_check.detail
+
+
+def test_check_agent_passes_on_200() -> None:
+    client = _RoutedClient(
+        {
+            "/api/v1/chat": _chat_gate_response(200, json_body={"message": "ok"}),
+            "/api/v1/agent": _chat_gate_response(
+                200, json_body={"answer": "hi", "status": "completed", "correlation_id": "c"}
+            ),
+        }
+    )
+    checks = entra_smoke.run_gate_checks(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=1200.0,
+        check_rag=False,
+        check_agent=True,
+        rag_question="",
+        agent_task="say hi",
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    assert all(check.passed for check in checks)
+    assert any("agent" in check.name for check in checks)
+
+
+def test_check_rag_and_check_agent_are_not_evaluated_when_the_gate_fails() -> None:
+    client = _RoutedClient({"/api/v1/chat": _chat_gate_response(503)})
+    checks = entra_smoke.run_gate_checks(
+        client,  # type: ignore[arg-type]
+        "app-token",
+        deadline_seconds=0.0,
+        check_rag=True,
+        check_agent=True,
+        rag_question="refund window?",
+        agent_task="say hi",
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    assert not checks[0].passed
+    rag_check = next(check for check in checks if "rag" in check.name)
+    agent_check = next(check for check in checks if "agent" in check.name)
+    assert not rag_check.passed
+    assert not agent_check.passed
+    assert "not evaluated" in rag_check.detail
+    assert "not evaluated" in agent_check.detail
+    # neither downstream endpoint was ever called
+    assert client.calls == ["/api/v1/chat"]
+
+
+# ---------------------------------------------------------------------------
+# CLI validation for the new flags.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_and_phase_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        entra_smoke.main(
+            [
+                "--gate",
+                "--phase", "no-role",
+                "--tenant-id", TENANT_ID,
+                "--api-app-id", CLIENT_APP_ID,
+                "--client-id", CLIENT_APP_ID,
+            ]
+        )
+
+
+def test_neither_gate_nor_phase_is_an_argument_error() -> None:
+    with pytest.raises(SystemExit):
+        entra_smoke.main(
+            [
+                "--tenant-id", TENANT_ID,
+                "--api-app-id", CLIENT_APP_ID,
+                "--client-id", CLIENT_APP_ID,
+            ]
+        )
+
+
+def test_check_rag_without_gate_is_an_argument_error() -> None:
+    with pytest.raises(SystemExit):
+        entra_smoke.main(
+            [
+                "--phase", "no-role",
+                "--tenant-id", TENANT_ID,
+                "--api-app-id", CLIENT_APP_ID,
+                "--client-id", CLIENT_APP_ID,
+                "--check-rag",
+            ]
+        )

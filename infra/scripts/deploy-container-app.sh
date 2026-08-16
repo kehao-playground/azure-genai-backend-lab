@@ -45,6 +45,11 @@
 #   AZ_OPENAI_NAME       - existing Azure OpenAI account (create-openai.sh)
 #   ENTRA_TENANT_ID      - tenant of the API app registration (create-entra-app.sh)
 #   ENTRA_AUDIENCE       - the API application's client id, the `aud` the server validates
+#   ENTRA_CLIENT_APP_ID  - the client application's id (create-entra-app.sh); stage 10's
+#                          readiness gate uses it to acquire its own app-only token
+#   ENTRA_CLIENT_SECRET  - that client application's secret; read only from the
+#                          environment, never logged, never an argv (same discipline
+#                          tools/entra_smoke.py already applies to it)
 # Optional env vars:
 #   AZ_LOCATION                       - defaults to japaneast
 #   AZ_ACA_ENV_NAME                   - defaults to acaenv-azgenai-lab
@@ -75,6 +80,8 @@ set -euo pipefail
 : "${AZ_OPENAI_NAME:?Set AZ_OPENAI_NAME}"
 : "${ENTRA_TENANT_ID:?Set ENTRA_TENANT_ID (create-entra-app.sh prints it)}"
 : "${ENTRA_AUDIENCE:?Set ENTRA_AUDIENCE (the API application id)}"
+: "${ENTRA_CLIENT_APP_ID:?Set ENTRA_CLIENT_APP_ID (create-entra-app.sh prints it; the readiness gate's own credential)}"
+: "${ENTRA_CLIENT_SECRET:?Set ENTRA_CLIENT_SECRET (that client application's secret; never logged)}"
 
 AZ_LOCATION="${AZ_LOCATION:-japaneast}"
 AZ_ACA_ENV_NAME="${AZ_ACA_ENV_NAME:-acaenv-azgenai-lab}"
@@ -563,11 +570,22 @@ echo "  /health returned 200"
 # the managed identity's model access, or the Search index -- all of which are
 # exactly what changed in this deployment. The gate exercises the real endpoints
 # with a real token, and its non-zero exit fails this script.
+#
+# The gate needs its own credential to call an app that runs with AUTH_MODE=entra:
+# a request with no bearer token at all is a 401 this API decides at parse time,
+# never a symptom of role-assignment propagation, so it would never turn into a
+# 200 no matter how long the gate waited. --tenant-id/--client-id/--api-app-id
+# feed the same client-credentials acquisition tools/entra_smoke.py's --phase
+# no-role/full already use; ENTRA_CLIENT_SECRET is read from this process's own
+# environment by the tool itself (never a flag, never traced, never logged).
 echo "  running the authenticated readiness gate (deadline ${GATE_DEADLINE_SECONDS}s)"
 (cd "$REPO_ROOT" && uv run python tools/entra_smoke.py \
   --gate \
   --base-url "$BASE_URL" \
-  --deadline-seconds "$GATE_DEADLINE_SECONDS")
+  --deadline-seconds "$GATE_DEADLINE_SECONDS" \
+  --tenant-id "$ENTRA_TENANT_ID" \
+  --client-id "$ENTRA_CLIENT_APP_ID" \
+  --api-app-id "$ENTRA_AUDIENCE")
 
 cat <<SUMMARY
 
