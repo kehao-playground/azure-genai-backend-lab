@@ -32,7 +32,7 @@ Two mock shapes are driven, because the limits behave differently under each:
 import asyncio
 import inspect
 import itertools
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -46,6 +46,7 @@ from openai.types.responses import (
     ResponseOutputText,
 )
 from openai.types.responses.response_usage import ResponseUsage
+from tests.unit.aoai_auth_helpers import CloseTrackingCredential, patch_entra_credential
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
@@ -610,45 +611,10 @@ async def test_real_service_api_key_mode_aclose_is_a_safe_no_op_and_still_closes
     await deps.retriever.aclose()
 
 
-class _CloseTrackingCredential:
-    def __init__(self, client_id: str) -> None:
-        self.client_id = client_id
-        self.close_count = 0
-
-    async def close(self) -> None:
-        self.close_count += 1
-
-
-def _patch_entra_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    created: dict[str, object] = {}
-
-    def fake_credential_ctor(client_id: str) -> _CloseTrackingCredential:
-        credential = _CloseTrackingCredential(client_id)
-        created["credential"] = credential
-        return credential
-
-    def fake_provider(credential: object, scope: str) -> Callable[[], Awaitable[str]]:
-        created["scope"] = scope
-
-        async def token_callable() -> str:
-            return "tok"
-
-        return token_callable
-
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential",
-        fake_credential_ctor,
-    )
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.get_bearer_token_provider", fake_provider
-    )
-    return created
-
-
 async def test_real_service_builds_in_entra_mode_and_shares_the_credentialed_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = REAL.model_copy(
         update={
             "azure_openai_auth": "entra",
@@ -662,10 +628,12 @@ async def test_real_service_builds_in_entra_mode_and_shares_the_credentialed_tra
     service = AgentFrameworkService(settings, deps, prompt=PROMPT)
     try:
         provider = service._client._api_key_provider
-        assert provider is not None
+        # Identity, not just "some coroutine function": this is the exact
+        # object the resolver's fake provider returned, not a lookalike.
+        assert provider is created["provider"]
         assert inspect.iscoroutinefunction(provider)
         assert created["scope"] == "https://cognitiveservices.azure.com/.default"
-        assert isinstance(created["credential"], _CloseTrackingCredential)
+        assert isinstance(created["credential"], CloseTrackingCredential)
         # `_build_agent` hands `async_client=self._client` to OpenAIChatClient
         # (agent_framework.py) — there is only ever one AsyncOpenAI instance
         # here, so this is the same credentialed transport the framework
@@ -678,7 +646,7 @@ async def test_real_service_builds_in_entra_mode_and_shares_the_credentialed_tra
 async def test_real_service_entra_mode_aclose_closes_credential_and_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = REAL.model_copy(
         update={
             "azure_openai_auth": "entra",
@@ -691,7 +659,7 @@ async def test_real_service_entra_mode_aclose_closes_credential_and_client(
     )
     service = AgentFrameworkService(settings, deps, prompt=PROMPT)
     credential = created["credential"]
-    assert isinstance(credential, _CloseTrackingCredential)
+    assert isinstance(credential, CloseTrackingCredential)
 
     await service.aclose()
 
@@ -702,6 +670,62 @@ async def test_real_service_entra_mode_aclose_closes_credential_and_client(
     assert credential.close_count == 1
 
     await deps.retriever.aclose()
+
+
+async def test_partial_construction_in_entra_mode_closes_the_credential_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entra-mode sibling of test_partial_construction_closes_the_transport.
+
+    That test only ever ran in api_key mode, where `credential_aclose` is a
+    no-op — so `_close_transport_best_effort`'s credential-closing branch
+    (added to wire the resolver's credential through this guard) had no
+    test exercising it at all. This drives the same `_build_agent` failure
+    in entra mode and asserts the credential is actually closed, not merely
+    that the guard runs without raising.
+    """
+    import agent_framework
+
+    created = patch_entra_credential(monkeypatch)
+
+    real_client_cls = openai.AsyncOpenAI
+    created_clients: list[openai.AsyncOpenAI] = []
+
+    class _CapturingClient(real_client_cls):  # type: ignore[valid-type, misc]
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            created_clients.append(self)
+
+    def _exploding_agent(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("agent construction failed")
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _CapturingClient)
+    monkeypatch.setattr(agent_framework, "Agent", _exploding_agent)
+
+    settings = REAL.model_copy(
+        update={
+            "azure_openai_auth": "entra",
+            "azure_client_id": "cid",
+            "azure_openai_api_key": None,
+        }
+    )
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    with pytest.raises(RuntimeError, match="agent construction failed"):
+        AgentFrameworkService(settings, deps, prompt=PROMPT)
+    await deps.retriever.aclose()
+
+    credential = created["credential"]
+    assert isinstance(credential, CloseTrackingCredential)
+    assert len(created_clients) == 1
+    # __init__ is sync, so both closes are scheduled on this loop; give them a step.
+    for _ in range(5):
+        if credential.close_count == 1 and created_clients[0].is_closed():
+            break
+        await asyncio.sleep(0)
+    assert credential.close_count == 1
+    assert created_clients[0].is_closed()
 
 
 async def test_iteration_limit_forced_final_fallback_is_stripped() -> None:

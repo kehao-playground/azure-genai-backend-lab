@@ -1,6 +1,5 @@
 import hashlib
 import inspect
-from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -9,6 +8,7 @@ import openai
 import pytest
 from openai import AsyncOpenAI
 from pydantic import SecretStr
+from tests.unit.aoai_auth_helpers import CloseTrackingCredential, patch_entra_credential
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import (
@@ -115,45 +115,10 @@ async def test_real_service_api_key_mode_aclose_is_a_safe_no_op_and_still_closes
     assert service._client.is_closed()
 
 
-class _CloseTrackingCredential:
-    def __init__(self, client_id: str) -> None:
-        self.client_id = client_id
-        self.close_count = 0
-
-    async def close(self) -> None:
-        self.close_count += 1
-
-
-def _patch_entra_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    created: dict[str, object] = {}
-
-    def fake_credential_ctor(client_id: str) -> _CloseTrackingCredential:
-        credential = _CloseTrackingCredential(client_id)
-        created["credential"] = credential
-        return credential
-
-    def fake_provider(credential: object, scope: str) -> Callable[[], Awaitable[str]]:
-        created["scope"] = scope
-
-        async def token_callable() -> str:
-            return "tok"
-
-        return token_callable
-
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential",
-        fake_credential_ctor,
-    )
-    monkeypatch.setattr(
-        "azgenai_lab.services.azure_openai_auth.get_bearer_token_provider", fake_provider
-    )
-    return created
-
-
 def test_real_service_builds_in_entra_mode_with_no_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = Settings(
         _env_file=None,
         use_fake_llm=False,
@@ -167,16 +132,18 @@ def test_real_service_builds_in_entra_mode_with_no_api_key(
 
     assert isinstance(service, AzureOpenAIChatService)
     provider = service._client._api_key_provider
-    assert provider is not None
+    # Identity, not just "some coroutine function": this is the exact
+    # object the resolver's fake provider returned, not a lookalike.
+    assert provider is created["provider"]
     assert inspect.iscoroutinefunction(provider)
     assert created["scope"] == "https://cognitiveservices.azure.com/.default"
-    assert isinstance(created["credential"], _CloseTrackingCredential)
+    assert isinstance(created["credential"], CloseTrackingCredential)
 
 
 async def test_real_service_entra_mode_aclose_closes_credential_and_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created = _patch_entra_credential(monkeypatch)
+    created = patch_entra_credential(monkeypatch)
     settings = Settings(
         _env_file=None,
         use_fake_llm=False,
@@ -188,7 +155,7 @@ async def test_real_service_entra_mode_aclose_closes_credential_and_client(
     service = build_chat_service(settings, prompt=PROMPT)
     assert isinstance(service, AzureOpenAIChatService)
     credential = created["credential"]
-    assert isinstance(credential, _CloseTrackingCredential)
+    assert isinstance(credential, CloseTrackingCredential)
 
     await service.aclose()
 
