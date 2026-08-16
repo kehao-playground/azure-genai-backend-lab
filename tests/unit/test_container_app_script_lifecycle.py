@@ -48,6 +48,15 @@ MI_RESOURCE_ID = resource_id(
 MI_PRINCIPAL_ID = "33333333-3333-3333-3333-333333333333"
 MI_CLIENT_ID = "44444444-4444-4444-4444-444444444444"
 
+# The same three scope ids delete-container-app.sh's fake-CLI tests grant the
+# identity, built the same way the Harness default state below builds them --
+# so a delete test can assert against the exact resource id the fake `az acr
+# show` / `az keyvault show` / `az cognitiveservices account show` calls
+# would read back for the default resource names.
+ACR_ID = resource_id("Microsoft.ContainerRegistry", "registries", "acrfaked24")
+KV_ID = resource_id("Microsoft.KeyVault", "vaults", "kvfaked24")
+AOAI_ID = resource_id("Microsoft.CognitiveServices", "accounts", "aoaifaked24")
+
 FAKE_AZ = '''#!/usr/bin/env python3
 import json, os, re, sys
 
@@ -96,6 +105,11 @@ if args[:2] == ["identity", "show"]:
     field = query_value()
     value = state["identity_reads"].get(field, "")
     done(value)
+if args[:2] == ["identity", "delete"]:
+    name = opt("--name")
+    if name in state.get("identities", []):
+        state["identities"].remove(name)
+    done()
 
 # --- scope resource ids ------------------------------------------------------
 if args[:2] == ["acr", "show"]:
@@ -114,9 +128,28 @@ if args[:3] == ["role", "assignment", "create"]:
     state.setdefault("roles", []).append(opt("--role"))
     done("{}")
 if args[:3] == ["role", "assignment", "list"]:
-    if state.get("role_readback_empty"):
+    if opt("--role"):
+        # deploy-container-app.sh's per-role read-back (scoped by --role).
+        if state.get("role_readback_empty"):
+            done("")
+        done("1" if opt("--role") in state.get("roles", []) else "0")
+    # delete-container-app.sh's final read-back: ALL assignments still held
+    # by the assignee, regardless of role or scope.
+    if state.get("delete_readback_query_fails"):
         done("")
-    done("1" if opt("--role") in state.get("roles", []) else "0")
+    if "leftover_override" in state:
+        done(str(state["leftover_override"]))
+    done(str(len(state.get("assigned_scopes", []))))
+if args[:3] == ["role", "assignment", "delete"]:
+    if state.get("role_delete_fails"):
+        print("ERROR: injected role assignment delete failure", file=sys.stderr)
+        done(code=1)
+    scope = opt("--scope")
+    assigned = state.get("assigned_scopes", [])
+    if scope in assigned:
+        assigned.remove(scope)
+    state["assigned_scopes"] = assigned
+    done()
 
 # --- Search admin key --------------------------------------------------------
 if args[:3] == ["search", "admin-key", "show"]:
@@ -138,6 +171,11 @@ if args[:3] == ["containerapp", "env", "create"]:
     done("{}")
 if args[:3] == ["containerapp", "env", "show"]:
     done(state["env_state"])
+if args[:3] == ["containerapp", "env", "delete"]:
+    name = opt("--name")
+    if name in state.get("envs", []):
+        state["envs"].remove(name)
+    done()
 
 # --- the app -----------------------------------------------------------------
 if args[:2] == ["containerapp", "list"]:
@@ -155,6 +193,11 @@ if args[:2] == ["containerapp", "show"]:
     if field.endswith("fqdn"):
         done(state["fqdn"])
     done("")
+if args[:2] == ["containerapp", "delete"]:
+    name = opt("--name")
+    if name in state.get("apps", []):
+        state["apps"].remove(name)
+    done()
 
 print(f"fake az: unhandled command: {joined}", file=sys.stderr)
 done(code=2)
@@ -250,6 +293,15 @@ class Harness:
     def run(self, **extra_env: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(SCRIPTS_DIR / "deploy-container-app.sh")],
+            env={**self.env, **extra_env},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def run_delete(self, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(SCRIPTS_DIR / "delete-container-app.sh")],
             env={**self.env, **extra_env},
             capture_output=True,
             text=True,
@@ -565,5 +617,157 @@ def test_failing_gate_fails_the_deploy(tmp_path: Path) -> None:
 
 def test_script_exists_and_is_executable() -> None:
     path = SCRIPTS_DIR / "deploy-container-app.sh"
+    assert path.is_file()
+    assert os.access(path, os.X_OK)
+
+
+# ---------------------------------------------------------------------------
+# delete-container-app.sh -- the ordering is the contract here too, in
+# reverse: role assignments are deleted (and proven gone) BEFORE the
+# identity that named them, because deleting the identity first destroys the
+# only handle Azure gives back for finding those assignments again. A
+# deployed-and-granted starting state is the default for every test below;
+# individual tests narrow it to exercise one branch.
+# ---------------------------------------------------------------------------
+
+
+def deployed_harness(tmp_path: Path, **overrides: object) -> Harness:
+    """A Harness whose fake state already looks like a completed deploy:
+    app, environment and identity all present, and the identity holding all
+    three role assignments deploy-container-app.sh would have granted it.
+    """
+    state = {
+        "apps": ["aca-faked24"],
+        "envs": ["acaenv-faked24"],
+        "identities": ["mi-faked24"],
+        "assigned_scopes": [ACR_ID, KV_ID, AOAI_ID],
+    }
+    state.update(overrides)
+    return Harness(tmp_path, **state)
+
+
+def test_delete_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path)
+    result = h.run_delete()
+    assert result.returncode == 0, result.stderr
+
+    order = [
+        "containerapp delete",
+        "containerapp env delete",
+        "identity show",
+        "role assignment delete",
+        "role assignment list",
+        "identity delete",
+    ]
+    indices = [h.first_index(prefix) for prefix in order]
+    assert indices == sorted(indices), list(zip(order, indices, strict=True))
+
+    # All three grants undone, and the read-back that gates the identity
+    # delete ran exactly once, after all three deletes.
+    assert h.count("role assignment delete") == 3
+    assert h.count("role assignment list") == 1
+    assert h.state["assigned_scopes"] == []
+
+
+def test_delete_role_assignment_failure_prevents_identity_delete(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path, role_delete_fails=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+
+    # The first delete call fails, `set -e` stops the script right there:
+    # no second or third scope attempted, no read-back, no identity delete.
+    # A deploy that reports the assignments as gone when even one delete
+    # call errored would be exactly the false confidence this ordering
+    # exists to prevent.
+    assert h.count("role assignment delete") == 1
+    assert not h.has("role assignment list")
+    assert not h.has("identity delete")
+
+
+def test_delete_readback_leftover_aborts_before_identity_delete(tmp_path: Path) -> None:
+    # All three known scopes delete cleanly, but the read-back reports one
+    # assignment still held anyway -- e.g. a scope this script does not know
+    # about. The read-back's verdict overrides three apparently-successful
+    # deletes; the identity must not be deleted while it does.
+    h = deployed_harness(tmp_path, leftover_override=1)
+    result = h.run_delete()
+    assert result.returncode != 0
+
+    assert h.count("role assignment delete") == 3
+    assert h.has("role assignment list")
+    assert not h.has("identity delete")
+
+
+def test_delete_absent_app_and_env_continues_to_identity_cleanup(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path, apps=[], envs=[])
+    result = h.run_delete()
+    assert result.returncode == 0, result.stderr
+
+    assert not h.has("containerapp delete")
+    assert not h.has("containerapp env delete")
+    # The rest of the teardown is unaffected by the app/env already being gone.
+    assert h.count("role assignment delete") == 3
+    assert h.has("identity delete")
+
+
+def test_delete_absent_identity_is_a_clean_noop(tmp_path: Path) -> None:
+    h = deployed_harness(tmp_path, identities=[], assigned_scopes=[])
+    result = h.run_delete()
+    assert result.returncode == 0, result.stderr
+
+    # App and env cleanup still ran -- those are independent of the identity.
+    assert h.has("containerapp delete")
+    assert h.has("containerapp env delete")
+    # But nothing identity-related was touched: no scope lookups, no role
+    # calls, no identity delete.
+    assert not h.has("role assignment")
+    assert not h.has("acr show")
+    assert not h.has("keyvault show")
+    assert not h.has("cognitiveservices account show")
+    assert not h.has("identity delete")
+
+
+def test_delete_skips_scope_with_missing_name_knob_and_warns(tmp_path: Path) -> None:
+    # ACR is genuinely not assigned in this fixture (mirrors a deploy that
+    # never granted it, or one already cleaned up by hand) -- so skipping it
+    # here is correct, not merely tolerated, and the teardown still finishes.
+    h = deployed_harness(tmp_path, assigned_scopes=[KV_ID, AOAI_ID])
+    result = h.run_delete(AZ_ACR_NAME="")
+    assert result.returncode == 0, result.stderr
+
+    assert "AZ_ACR_NAME not set" in result.stderr
+    assert h.count("role assignment delete") == 2
+    assert not h.has("acr show")
+    assert h.has("identity delete")
+
+
+def test_delete_skipped_scope_leftover_is_caught_by_final_readback(tmp_path: Path) -> None:
+    # This time the ACR assignment DOES still exist when AZ_ACR_NAME is
+    # unset -- the exact scenario the assignee-only (no --scope) read-back in
+    # step 5 exists to catch. Skipping a scope must not silently let its
+    # assignment survive the teardown.
+    h = deployed_harness(tmp_path)
+    result = h.run_delete(AZ_ACR_NAME="")
+    assert result.returncode != 0
+
+    assert "AZ_ACR_NAME not set" in result.stderr
+    assert h.count("role assignment delete") == 2  # Key Vault + Azure OpenAI only
+    assert not h.has("identity delete")
+
+
+def test_delete_readback_query_failure_aborts_before_identity_delete(tmp_path: Path) -> None:
+    # An empty read-back is a failed query, never "zero found" -- `length([])`
+    # always prints a number when the call actually worked.
+    h = deployed_harness(tmp_path, delete_readback_query_fails=True)
+    result = h.run_delete()
+    assert result.returncode != 0
+
+    assert "empty output" in result.stderr
+    assert h.count("role assignment delete") == 3
+    assert not h.has("identity delete")
+
+
+def test_delete_script_exists_and_is_executable() -> None:
+    path = SCRIPTS_DIR / "delete-container-app.sh"
     assert path.is_file()
     assert os.access(path, os.X_OK)
