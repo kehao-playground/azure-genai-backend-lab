@@ -120,6 +120,7 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
     logged-and-ignored timeout instead of a real failure.
     """
     deadline = time.monotonic() + budget_seconds
+    logger.info("shutdown cleanup started budget_seconds=%s", budget_seconds)
     first_exception: Exception | None = None
     cancellation: asyncio.CancelledError | None = None
     for label, attr in _LIFESPAN_CLOSERS:
@@ -165,6 +166,14 @@ async def _close_with_budget(app: FastAPI, budget_seconds: float) -> None:
             )
             if first_exception is None:
                 first_exception = exc
+    # Recorded here -- after the loop, before either re-raise below -- because
+    # the contract this function documents is *attempted* cleanup: the marker
+    # records that the loop completed its attempts, whether or not something
+    # is about to be re-raised on top of that.
+    logger.info(
+        "shutdown cleanup finished elapsed_seconds=%.3f",
+        time.monotonic() - (deadline - budget_seconds),
+    )
     if cancellation is not None:
         # Ahead of first_exception: a cancelled task must end up cancelled.
         # Any closer exception raised along the way was already logged above.
@@ -186,7 +195,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # Runs for both paths: normal shutdown, and a startup failure that
-        # never reached `yield`.
+        # never reached `yield`. This is the drain-end marker: uvicorn only
+        # enters lifespan shutdown after --timeout-graceful-shutdown's request
+        # drain completes, so its timestamp is where "drain ended" shows up
+        # in the log stream (Day 24 D7 measurement).
+        logger.info("lifespan shutdown started")
         await _close_with_budget(app, settings.shutdown_cleanup_budget_seconds)
 
 
