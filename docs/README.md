@@ -8,6 +8,7 @@
 - [Security Checklist](security-checklist.md) — the operable checklist; Day 29 production checklist references it
 - [Audit Logging](audit-logging.md) — event taxonomy, presence rules, never-log list, exactly-once and delivery, consuming the log
 - [Docker](docker.md) — multi-stage build, non-root runtime, health check, graceful shutdown, environment variables
+- [Container Apps](container-apps.md) — the Day 24 deployment: ingress, revisions, scaling, Key Vault references, the readiness gate, teardown ordering
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
