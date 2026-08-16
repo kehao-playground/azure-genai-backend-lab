@@ -239,6 +239,8 @@ class Harness:
             "AZ_ACA_APP_NAME": "aca-faked24",
             "ENTRA_TENANT_ID": "55555555-5555-5555-5555-555555555555",
             "ENTRA_AUDIENCE": "66666666-6666-6666-6666-666666666666",
+            "ENTRA_CLIENT_APP_ID": "77777777-7777-7777-7777-777777777777",
+            "ENTRA_CLIENT_SECRET": "not-a-real-secret",  # noqa: S105 - fake, fake-uv never reads it
             # Fast knobs: no real sleeps, bounded loops observable in the log.
             "ACA_POLL_ATTEMPTS": "2",
             "ACA_POLL_INTERVAL": "0",
@@ -382,6 +384,11 @@ def test_search_key_reaches_key_vault_but_never_the_terminal(tmp_path: Path) -> 
     assert traced.returncode == 0, traced.stderr
     assert SEARCH_KEY not in traced.stdout
     assert SEARCH_KEY not in traced.stderr
+    # ENTRA_CLIENT_SECRET is never assigned or read by name anywhere in this
+    # script -- it reaches the gate subprocess by plain environment
+    # inheritance -- so no line of it can ever appear in a trace either.
+    assert "not-a-real-secret" not in traced.stdout
+    assert "not-a-real-secret" not in traced.stderr
     # Tracing really was on before the secret block and again after it, so the
     # clean stderr above is suppression working rather than xtrace never
     # starting -- and the restore is proven, not assumed.
@@ -486,8 +493,19 @@ def test_gate_runs_only_after_provisioning_succeeded(tmp_path: Path) -> None:
 
     gate_call = next(call for call in h.calls if call.startswith("uv "))
     assert "tools/entra_smoke.py" in gate_call
-    assert "--gate" in gate_call.split()
+    args = gate_call.split()
+    assert "--gate" in args
     assert "aca-faked24.japaneast.azurecontainerapps.io" in gate_call
+    # The gate calls an AUTH_MODE=entra app: with no credentials at all it can
+    # only ever see a 401 this API decides before touching Azure OpenAI, which
+    # no amount of backoff turns into a 200. So it needs the same
+    # client-credentials inputs --phase no-role/full already use.
+    assert "--tenant-id" in args and "55555555-5555-5555-5555-555555555555" in args
+    assert "--client-id" in args and "77777777-7777-7777-7777-777777777777" in args
+    assert "--api-app-id" in args and "66666666-6666-6666-6666-666666666666" in args
+    # The secret travels through the environment, never the argv the fake `uv`
+    # call log records.
+    assert "not-a-real-secret" not in gate_call
 
 
 def test_failing_gate_fails_the_deploy(tmp_path: Path) -> None:
