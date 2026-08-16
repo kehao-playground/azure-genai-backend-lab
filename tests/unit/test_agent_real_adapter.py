@@ -30,8 +30,9 @@ Two mock shapes are driven, because the limits behave differently under each:
 """
 
 import asyncio
+import inspect
 import itertools
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -574,6 +575,132 @@ async def test_missing_azure_configuration_fails_fast() -> None:
     )
     with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
         AgentFrameworkService(settings, deps, prompt=PROMPT)
+    await deps.retriever.aclose()
+
+
+async def test_missing_endpoint_or_deployment_still_fails_fast_without_key_check() -> None:
+    # The API-key requirement moved into resolve_aoai_auth (Task 2); this
+    # pre-check now only owns endpoint + deployment.
+    settings = REAL.model_copy(
+        update={"azure_openai_deployment_name": None, "azure_openai_api_key": None}
+    )
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    with pytest.raises(
+        ValueError,
+        match="USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT_NAME",
+    ):
+        AgentFrameworkService(settings, deps, prompt=PROMPT)
+    await deps.retriever.aclose()
+
+
+async def test_real_service_api_key_mode_aclose_is_a_safe_no_op_and_still_closes_client() -> None:
+    # api_key mode never mints a credential; aclose() must still close the
+    # AsyncOpenAI client, and awaiting the resolver's no-op closer must not
+    # raise.
+    deps = build_agent_tool_deps(
+        REAL, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    service = AgentFrameworkService(REAL, deps, prompt=PROMPT)
+
+    await service.aclose()
+
+    assert service._client.is_closed()
+    await deps.retriever.aclose()
+
+
+class _CloseTrackingCredential:
+    def __init__(self, client_id: str) -> None:
+        self.client_id = client_id
+        self.close_count = 0
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
+def _patch_entra_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    created: dict[str, object] = {}
+
+    def fake_credential_ctor(client_id: str) -> _CloseTrackingCredential:
+        credential = _CloseTrackingCredential(client_id)
+        created["credential"] = credential
+        return credential
+
+    def fake_provider(credential: object, scope: str) -> Callable[[], Awaitable[str]]:
+        created["scope"] = scope
+
+        async def token_callable() -> str:
+            return "tok"
+
+        return token_callable
+
+    monkeypatch.setattr(
+        "azgenai_lab.services.azure_openai_auth.ManagedIdentityCredential",
+        fake_credential_ctor,
+    )
+    monkeypatch.setattr(
+        "azgenai_lab.services.azure_openai_auth.get_bearer_token_provider", fake_provider
+    )
+    return created
+
+
+async def test_real_service_builds_in_entra_mode_and_shares_the_credentialed_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _patch_entra_credential(monkeypatch)
+    settings = REAL.model_copy(
+        update={
+            "azure_openai_auth": "entra",
+            "azure_client_id": "cid",
+            "azure_openai_api_key": None,
+        }
+    )
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    service = AgentFrameworkService(settings, deps, prompt=PROMPT)
+    try:
+        provider = service._client._api_key_provider
+        assert provider is not None
+        assert inspect.iscoroutinefunction(provider)
+        assert created["scope"] == "https://cognitiveservices.azure.com/.default"
+        assert isinstance(created["credential"], _CloseTrackingCredential)
+        # `_build_agent` hands `async_client=self._client` to OpenAIChatClient
+        # (agent_framework.py) — there is only ever one AsyncOpenAI instance
+        # here, so this is the same credentialed transport the framework
+        # actually calls through, not a second one built alongside it.
+    finally:
+        await service.aclose()
+        await deps.retriever.aclose()
+
+
+async def test_real_service_entra_mode_aclose_closes_credential_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _patch_entra_credential(monkeypatch)
+    settings = REAL.model_copy(
+        update={
+            "azure_openai_auth": "entra",
+            "azure_client_id": "cid",
+            "azure_openai_api_key": None,
+        }
+    )
+    deps = build_agent_tool_deps(
+        settings, conversation_store=InMemoryConversationStore(), token_budget=400
+    )
+    service = AgentFrameworkService(settings, deps, prompt=PROMPT)
+    credential = created["credential"]
+    assert isinstance(credential, _CloseTrackingCredential)
+
+    await service.aclose()
+
+    assert credential.close_count == 1
+    assert service._client.is_closed()
+
+    await service.aclose()  # idempotent: no second close
+    assert credential.close_count == 1
+
     await deps.retriever.aclose()
 
 

@@ -29,6 +29,7 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.models.rag import Chunk
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+from azgenai_lab.services.azure_openai_auth import resolve_aoai_auth
 
 logger = logging.getLogger(__name__)
 
@@ -181,20 +182,29 @@ class AzureOpenAIEmbeddingClient:
     """
 
     def __init__(self, settings: Settings) -> None:
-        if not settings.azure_openai_endpoint or not settings.azure_openai_api_key:
-            raise ConfigurationError("azure_openai_endpoint and api key are required")
+        if not settings.azure_openai_endpoint:
+            raise ConfigurationError("azure_openai_endpoint is required")
         if not settings.azure_openai_embedding_deployment:
             raise ConfigurationError(
                 "azure_openai_embedding_deployment is required when "
                 "use_fake_embeddings is false"
             )
+        try:
+            auth = resolve_aoai_auth(settings)  # raises ValueError per mode (Day 24 keyless)
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from exc
         self._deployment = settings.azure_openai_embedding_deployment
         self._client = AsyncOpenAI(
             base_url=f"{settings.azure_openai_endpoint.rstrip('/')}/openai/v1/",
-            api_key=settings.azure_openai_api_key.get_secret_value(),
+            api_key=auth.api_key,  # str | async Callable — matches AsyncOpenAI's own type
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+        # entra mode only (Day 24): closes the ManagedIdentityCredential
+        # backing `self._client`'s callable api_key. A no-op in api_key
+        # mode. It owns its own aiohttp session and leaks a ResourceWarning
+        # at teardown if never closed — see azure_openai_auth.py's docstring.
+        self._credential_aclose = auth.aclose
         # This constructor built the AsyncOpenAI client itself, so this
         # adapter owns it and is responsible for closing it. Guarded so a
         # double aclose() is safe.
@@ -267,7 +277,14 @@ class AzureOpenAIEmbeddingClient:
         if self._closed:
             return
         self._closed = True
-        await self._client.close()
+        # A credential-close failure must not strand the client, and vice
+        # versa (same isolation discipline as the rest of this app's closers,
+        # Day 14 review finding 4). No None-check needed: `_credential_aclose`
+        # is always a valid awaitable, a no-op in api_key mode.
+        try:
+            await self._client.close()
+        finally:
+            await self._credential_aclose()
 
 
 def build_embedding_client(settings: Settings) -> EmbeddingClient:

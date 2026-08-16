@@ -13,7 +13,7 @@ import functools
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -25,6 +25,7 @@ from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.agent_tools import AgentToolDeps, AgentToolFn, bind_principal_tools
+from azgenai_lab.services.azure_openai_auth import resolve_aoai_auth
 
 logger = logging.getLogger(__name__)
 
@@ -135,16 +136,21 @@ class AgentRunError(Exception):
         self.audit_snapshot = audit_snapshot
 
 
-def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
-    """Close a transport from synchronous code (partial-construction cleanup).
+def _close_transport_best_effort(
+    client: openai.AsyncOpenAI, credential_aclose: Callable[[], Coroutine[Any, Any, None]]
+) -> None:
+    """Close a transport and its credential from synchronous code
+    (partial-construction cleanup). `credential_aclose` is a no-op in
+    api_key mode, so this always schedules both, no `None`-check needed.
 
     Best-effort only: `__init__` cannot await, and this runs while a real
     construction error is already propagating, so a failure here must never
     replace it — `contextlib.suppress` guarantees that. When no loop is
-    running there is nothing to schedule the close on, so the client is left
-    for garbage collection instead: only two pure-sync constructors run
-    between transport creation and here, so no request has been sent and the
-    pool holds no live connection to release.
+    running there is nothing to schedule the close on, so both are left for
+    garbage collection instead: only two pure-sync constructors run between
+    transport creation and here, so no request has been sent and neither the
+    client's pool nor the credential's session holds a live connection to
+    release.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -152,6 +158,8 @@ def _close_transport_best_effort(client: openai.AsyncOpenAI) -> None:
         return  # no running loop: connection-less client, dropped to GC
     with contextlib.suppress(Exception):
         loop.create_task(client.close())
+    with contextlib.suppress(Exception):
+        loop.create_task(credential_aclose())
 
 
 @dataclass(frozen=True)
@@ -659,14 +667,9 @@ class AgentFrameworkService:
     def __init__(
         self, settings: Settings, deps: AgentToolDeps, *, prompt: PromptTemplate
     ) -> None:
-        if not (
-            settings.azure_openai_endpoint
-            and settings.azure_openai_api_key
-            and settings.azure_openai_deployment_name
-        ):
+        if not (settings.azure_openai_endpoint and settings.azure_openai_deployment_name):
             raise ValueError(
-                "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT, "
-                "AZURE_OPENAI_API_KEY and AZURE_OPENAI_DEPLOYMENT_NAME"
+                "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT_NAME"
             )
         self._settings = settings
         self._deps = deps
@@ -674,8 +677,15 @@ class AgentFrameworkService:
         self._closed = False
         # Project-owned transport: same timeout/retry policy as the chat
         # adapter — the framework never reads its own env vars here.
+        auth = resolve_aoai_auth(settings)  # raises ValueError per mode (Day 24 keyless)
+        # entra mode only: closes the ManagedIdentityCredential backing
+        # `self._client`'s callable api_key. A no-op in api_key mode. Set
+        # before the transport so the partial-construction guard below can
+        # close it too — see azure_openai_auth.py's docstring on why it
+        # must be closed at all.
+        self._credential_aclose = auth.aclose
         self._client = openai.AsyncOpenAI(
-            api_key=settings.azure_openai_api_key.get_secret_value(),
+            api_key=auth.api_key,  # str | async Callable — matches AsyncOpenAI's own type
             base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
@@ -687,7 +697,7 @@ class AgentFrameworkService:
         try:
             self._build_agent(settings)
         except BaseException:
-            _close_transport_best_effort(self._client)
+            _close_transport_best_effort(self._client, self._credential_aclose)
             raise
 
     def _build_agent(self, settings: Settings) -> None:
@@ -839,12 +849,17 @@ class AgentFrameworkService:
         if self._closed:
             return
         self._closed = True
-        # Both handles are owned from construction, so both must be released:
-        # a raising transport close must not strand the retriever (`__init__`
-        # already guards the mirror case). `_closed` is set above, so this
-        # stays idempotent whichever close raises.
+        # Three handles are owned from construction, so all three must be
+        # released: a raising close must not strand either of the other two
+        # (`__init__` already guards the client+credential pair for the
+        # partial-construction case). `_closed` is set above, so this stays
+        # idempotent whichever close raises. No None-check on the credential
+        # closer: it's always a valid awaitable, a no-op in api_key mode.
         try:
-            await self._client.close()
+            try:
+                await self._client.close()
+            finally:
+                await self._credential_aclose()
         finally:
             await self._deps.retriever.aclose()
 
