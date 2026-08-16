@@ -2,7 +2,7 @@
 # Deploy the backend to Azure Container Apps (Day 24), keyless where Azure
 # allows it and gated on readiness rather than on "the CLI returned 0".
 #
-# Ten labelled stages, in an order that is a contract rather than a
+# Eleven labelled stages, in an order that is a contract rather than a
 # convenience: a role granted before the identity exists, an app created
 # before its image is in the registry, or a readiness gate run before
 # provisioning finished are all deploys that report a success they never
@@ -16,6 +16,8 @@
 #   * three role assignments on three existing resources (ACR, Key Vault, AOAI)
 #   * one Key Vault secret holding the Search admin key
 #   * one image tag in the existing registry
+#   * a Log Analytics workspace, created explicitly under a per-run unique
+#     name rather than left to auto-provision (see stage 6)
 #   * a Container Apps environment and the app itself
 #
 # The identity is user-assigned rather than system-assigned because its role
@@ -34,7 +36,7 @@
 # it on first use, which in a non-interactive shell can either prompt or fail
 # depending on `extension.use_dynamic_install`. Install it once up front
 # (`az extension add --name containerapp`) rather than discovering the answer
-# at stage 6, after the identity, its roles and the secret already exist.
+# at stage 7, after the identity, its roles and the secret already exist.
 #
 # Required env vars:
 #   AZ_SUBSCRIPTION_ID   - target subscription (never rely on the default context)
@@ -45,7 +47,7 @@
 #   AZ_OPENAI_NAME       - existing Azure OpenAI account (create-openai.sh)
 #   ENTRA_TENANT_ID      - tenant of the API app registration (create-entra-app.sh)
 #   ENTRA_AUDIENCE       - the API application's client id, the `aud` the server validates
-#   ENTRA_CLIENT_APP_ID  - the client application's id (create-entra-app.sh); stage 10's
+#   ENTRA_CLIENT_APP_ID  - the client application's id (create-entra-app.sh); stage 11's
 #                          readiness gate uses it to acquire its own app-only token
 #   ENTRA_CLIENT_SECRET  - that client application's secret; read only from the
 #                          environment, never logged, never an argv (same discipline
@@ -65,6 +67,12 @@
 #   GATE_DEADLINE_SECONDS             - readiness gate deadline, defaults to 1200
 #   ACA_POLL_ATTEMPTS / ACA_POLL_INTERVAL - provisioning and health polling bounds
 #   ROLE_POLL_ATTEMPTS                - role-assignment read-back attempts
+#   AZ_LAW_NAME                       - Log Analytics workspace name; defaults to a
+#                                        fresh per-run name (lawazgenai + 8 hex chars
+#                                        from python3's secrets module), the same
+#                                        per-run-unique discipline create-acr.sh uses.
+#                                        Printed at the end so it can be handed to
+#                                        delete-container-app.sh.
 #
 # Privileges the caller needs: resource write on the resource group, role
 # assignment write (Microsoft.Authorization/roleAssignments/write, e.g. Owner
@@ -175,6 +183,10 @@ require_count GATE_DEADLINE_SECONDS "$GATE_DEADLINE_SECONDS"
 
 APP_YAML=""
 MUTATED=false
+# Defaulted (not overwritten) here so the trap below can always reference it
+# under `set -u`, even if a failure happens before stage 6 assigns its own
+# value -- and without clobbering a value the operator already exported.
+AZ_LAW_NAME="${AZ_LAW_NAME:-}"
 on_exit() {
   local status=$?
   if [ -n "$APP_YAML" ]; then
@@ -186,7 +198,8 @@ on_exit() {
     echo "Tear down whatever exists with:" >&2
     echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP \\" >&2
     echo "    AZ_ACA_APP_NAME=$AZ_ACA_APP_NAME AZ_ACA_ENV_NAME=$AZ_ACA_ENV_NAME \\" >&2
-    echo "    AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME ./delete-container-app.sh" >&2
+    echo "    AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME \\" >&2
+    echo "    AZ_LAW_NAME=$AZ_LAW_NAME ./delete-container-app.sh" >&2
   fi
 }
 trap on_exit EXIT
@@ -201,10 +214,9 @@ az account set --subscription "$AZ_SUBSCRIPTION_ID"
 echo "  default az context now points at $AZ_SUBSCRIPTION_ID"
 
 # Microsoft.App and Microsoft.ManagedIdentity are the two providers this script
-# creates resources under. Microsoft.OperationalInsights is here because
-# `az containerapp env create` provisions a Log Analytics workspace for the
-# environment's default log destination -- without it stage 6 fails after the
-# identity and its roles already exist.
+# creates resources under. Microsoft.OperationalInsights is here for the Log
+# Analytics workspace this script creates explicitly in stage 6 -- without it
+# that stage fails after the identity and its roles already exist.
 for NAMESPACE in Microsoft.App Microsoft.ManagedIdentity Microsoft.OperationalInsights; do
   REG_STATE=$(az provider show --namespace "$NAMESPACE" \
     --subscription "$AZ_SUBSCRIPTION_ID" --query registrationState -o tsv)
@@ -382,10 +394,51 @@ az acr build \
   --file docker/Dockerfile \
   "$REPO_ROOT"
 
-# === stage 6: Container Apps environment =====================================
-echo "== stage 6: Container Apps environment =="
+# === stage 6: Log Analytics workspace ========================================
+echo "== stage 6: Log Analytics workspace =="
+# `az containerapp env create` auto-provisions a Log Analytics workspace when
+# none is given -- convenient, but that workspace is a separate
+# Microsoft.OperationalInsights/workspaces resource with its own lifecycle,
+# and deleting the Container Apps environment does NOT delete it. An
+# auto-provisioned workspace is therefore a silent recurring bill this
+# teardown could never find, because it was never told the workspace's name.
+# Creating it explicitly, under a name this script controls and prints, is
+# what lets delete-container-app.sh delete it afterward.
+#
+# Per-run unique default name, the same discipline create-acr.sh uses: a
+# fixed name risks colliding with -- and a concurrent run's teardown
+# deleting -- another run's workspace (Day 21's lesson).
+AZ_LAW_NAME="${AZ_LAW_NAME:-lawazgenai$(python3 -c "import secrets; print(secrets.token_hex(4))")}"
+echo "  workspace name: $AZ_LAW_NAME"
+
+LAW_COUNT=$(az monitor log-analytics workspace list \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --query "length([?name=='$AZ_LAW_NAME'])" -o tsv)
+require_value "$LAW_COUNT" "the existing Log Analytics workspace count"
+if [ "$LAW_COUNT" = "0" ]; then
+  MUTATED=true
+  az monitor log-analytics workspace create \
+    --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --workspace-name "$AZ_LAW_NAME" \
+    --location "$AZ_LOCATION" >/dev/null
+else
+  echo "  '$AZ_LAW_NAME' already exists — reusing it"
+fi
+
+LAW_CUSTOMER_ID=$(az monitor log-analytics workspace show \
+  --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" \
+  --workspace-name "$AZ_LAW_NAME" \
+  --query customerId -o tsv)
+require_value "$LAW_CUSTOMER_ID" "the Log Analytics workspace id"
+echo "  workspace ready"
+
+# === stage 7: Container Apps environment =====================================
+echo "== stage 7: Container Apps environment =="
 # CLI flags, not YAML: `az containerapp env create` has no --yaml. Only the app
-# itself (stage 7) is defined declaratively.
+# itself (stage 8) is defined declaratively.
 ENV_COUNT=$(az containerapp env list \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
@@ -393,11 +446,32 @@ ENV_COUNT=$(az containerapp env list \
 require_value "$ENV_COUNT" "the existing environment count"
 if [ "$ENV_COUNT" = "0" ]; then
   echo "  creating environment '$AZ_ACA_ENV_NAME' in $AZ_LOCATION"
+  # Shell tracing prints an assignment together with its substituted value, so
+  # `bash -x` would put the workspace's shared key in stderr -- the same
+  # reason stage 4 suspends tracing around the Search admin key. Restored
+  # immediately after the one call that needs the key, not assumed off.
+  XTRACE_RESTORE=false
+  case "$-" in
+    *x*) XTRACE_RESTORE=true; set +x ;;
+  esac
+  LAW_SHARED_KEY=$(az monitor log-analytics workspace get-shared-keys \
+    --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --workspace-name "$AZ_LAW_NAME" \
+    --query primarySharedKey -o tsv)
+  require_value "$LAW_SHARED_KEY" "the Log Analytics workspace shared key"
   az containerapp env create \
     --subscription "$AZ_SUBSCRIPTION_ID" \
     --resource-group "$AZ_RESOURCE_GROUP" \
     --name "$AZ_ACA_ENV_NAME" \
-    --location "$AZ_LOCATION" >/dev/null
+    --location "$AZ_LOCATION" \
+    --logs-destination log-analytics \
+    --logs-workspace-id "$LAW_CUSTOMER_ID" \
+    --logs-workspace-key "$LAW_SHARED_KEY" >/dev/null
+  unset LAW_SHARED_KEY
+  if [ "$XTRACE_RESTORE" = true ]; then
+    set -x
+  fi
 else
   echo "  environment '$AZ_ACA_ENV_NAME' already exists — reusing it"
 fi
@@ -423,8 +497,8 @@ if [ "$ENV_STATE" != "Succeeded" ]; then
 fi
 echo "  environment provisioned"
 
-# === stage 7: the app, from one YAML =========================================
-echo "== stage 7: create the app =="
+# === stage 8: the app, from one YAML =========================================
+echo "== stage 8: create the app =="
 APP_COUNT=$(az containerapp list \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
@@ -523,8 +597,8 @@ az containerapp create \
   --environment "$AZ_ACA_ENV_NAME" \
   --yaml "$APP_YAML" >/dev/null
 
-# === stage 8: provisioning read-back =========================================
-echo "== stage 8: wait for provisioning =="
+# === stage 9: provisioning read-back =========================================
+echo "== stage 9: wait for provisioning =="
 APP_STATE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_POLL_ATTEMPTS; ATTEMPT++)); do
   APP_STATE=$(az containerapp show \
@@ -557,17 +631,17 @@ require_value "$FQDN" "the app ingress FQDN"
 BASE_URL="https://${FQDN}"
 echo "  provisioned at $BASE_URL"
 
-# === stage 9: gate 1, control plane ==========================================
-echo "== stage 9: gate 1 (control plane) =="
+# === stage 10: gate 1, control plane ==========================================
+echo "== stage 10: gate 1 (control plane) =="
 # No new calls: this stage is the verdict on the read-backs above, stated
 # rather than implied. Azure agrees the identity, its three roles, the secret,
-# the image, the environment and the app all exist. None of that is evidence
-# that the container serves a request -- that is stage 10's job, and the
-# distinction is the point of having two gates.
-echo "  identity, three role assignments, secret, image, environment and app all read back"
+# the image, the workspace, the environment and the app all exist. None of
+# that is evidence that the container serves a request -- that is stage 11's
+# job, and the distinction is the point of having two gates.
+echo "  identity, three role assignments, secret, image, workspace, environment and app all read back"
 
-# === stage 10: gate 2, data plane ============================================
-echo "== stage 10: gate 2 (data plane) =="
+# === stage 11: gate 2, data plane ============================================
+echo "== stage 11: gate 2 (data plane) =="
 HEALTH_OK=false
 HTTP_CODE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_POLL_ATTEMPTS; ATTEMPT++)); do
@@ -615,13 +689,15 @@ echo "  running the authenticated readiness gate (deadline ${GATE_DEADLINE_SECON
 cat <<SUMMARY
 
 Deployed and gated.
-  app:      $AZ_ACA_APP_NAME
-  url:      $BASE_URL
-  identity: $AZ_MI_NAME (client id $MI_CLIENT_ID)
-  image:    ${AZ_ACR_NAME}.azurecr.io/azgenai-lab:${IMAGE_TAG}
+  app:           $AZ_ACA_APP_NAME
+  url:           $BASE_URL
+  identity:      $AZ_MI_NAME (client id $MI_CLIENT_ID)
+  image:         ${AZ_ACR_NAME}.azurecr.io/azgenai-lab:${IMAGE_TAG}
+  log workspace: $AZ_LAW_NAME
 
 This deployment is ephemeral. Tear it down in the same session:
   AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP \\
     AZ_ACA_APP_NAME=$AZ_ACA_APP_NAME AZ_ACA_ENV_NAME=$AZ_ACA_ENV_NAME \\
-    AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME ./delete-container-app.sh
+    AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME \\
+    AZ_LAW_NAME=$AZ_LAW_NAME ./delete-container-app.sh
 SUMMARY
