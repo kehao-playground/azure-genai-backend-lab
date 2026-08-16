@@ -693,6 +693,49 @@ def test_failing_gate_fails_the_deploy(tmp_path: Path) -> None:
     assert h.has("uv ")
 
 
+def test_both_teardown_printers_name_every_scope_knob(tmp_path: Path) -> None:
+    """A printed teardown command that omits a scope knob is a broken teardown.
+
+    delete-container-app.sh SKIPS the role-assignment delete for any scope
+    whose name knob is unset (warned, not silently), and then its step 6
+    read-back -- by assignee alone -- finds the leftover and aborts BEFORE
+    deleting the identity. So an operator pasting an incomplete command gets
+    a teardown that stops halfway and leaves the orphaned assignments the
+    ordering exists to prevent. Both printers are pinned: the success summary
+    and the EXIT-trap recovery hint.
+    """
+    knobs = (
+        "AZ_SUBSCRIPTION_ID=",
+        "AZ_RESOURCE_GROUP=",
+        "AZ_ACA_APP_NAME=",
+        "AZ_ACA_ENV_NAME=",
+        "AZ_MI_NAME=",
+        "AZ_KEYVAULT_NAME=",
+        "AZ_ACR_NAME=",
+        "AZ_OPENAI_NAME=",
+        "AZ_LAW_NAME=",
+    )
+
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    fail_dir = tmp_path / "fail"
+    fail_dir.mkdir()
+
+    success = Harness(ok_dir).run()
+    assert success.returncode == 0, success.stderr
+    summary = success.stdout.split("Tear it down in the same session:")[-1]
+    for knob in knobs:
+        assert knob in summary, f"success summary omits {knob}"
+
+    # A failure late enough to have mutated something: the EXIT trap's hint is
+    # the only teardown command that run will ever print.
+    failed = Harness(fail_dir, role_create_fails=True).run()
+    assert failed.returncode != 0
+    hint = failed.stderr.split("Tear down whatever exists with:")[-1]
+    for knob in knobs:
+        assert knob in hint, f"failure recovery hint omits {knob}"
+
+
 def test_script_exists_and_is_executable() -> None:
     path = SCRIPTS_DIR / "deploy-container-app.sh"
     assert path.is_file()

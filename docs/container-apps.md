@@ -198,8 +198,9 @@ instruction serves local `docker run`/Compose only. Container Apps runs
 its own probes, does not support `exec` probes, and adds default TCP
 probes only under a specific set of portal conditions
 ([docker.md § Health check](docker.md#health-check)). A CLI or IaC
-deployment gets nothing for free — these four lines of YAML are what point
-the platform at the same endpoint the container already answers.
+deployment gets nothing for free — the app YAML's explicit `probes:` block
+is what points the platform at the same endpoint the container already
+answers.
 
 `/health` is unauthenticated by design (it is not under `/api/v1` and the
 Entra dependency does not apply to it), which is what lets a probe and the
@@ -284,22 +285,37 @@ az extension add --name containerapp
 ### 8.1 Bring up the supporting resources
 
 Each of these is an existing script with its own contract; none of them is
-created by the deploy script.
+created by the deploy script. **Every command in this runbook is run from
+the repository root**, which is also the only directory the `uv run
+python tools/…` invocations below resolve from.
 
 ```bash
 export AZ_SUBSCRIPTION_ID=<subscription-guid>
 export AZ_RESOURCE_GROUP=rg-azgenai-lab
+export AZ_LOCATION=japaneast
+export AZ_OPENAI_NAME=<openai-account>
+export AZ_SEARCH_NAME=<search-name>
+export AZ_KEYVAULT_NAME=<vault-name>
+export ENTRA_TENANT_ID=<tenant-guid>
 
-./create-resource-group.sh
-./create-openai.sh                       # skip if the standing account exists
-AZ_SEARCH_NAME=<search-name> ./create-search.sh
-AZ_KEYVAULT_NAME=<vault-name> ./create-keyvault.sh
-ENTRA_TENANT_ID=<tenant-guid> ENTRA_API_APP_NAME=azgenai-lab-api \
-  ENTRA_CLIENT_APP_NAME=azgenai-lab-client ./create-entra-app.sh
+infra/scripts/create-resource-group.sh
+infra/scripts/create-openai.sh           # skip if the standing account exists
+infra/scripts/create-search.sh
+infra/scripts/create-keyvault.sh
+ENTRA_API_APP_NAME=azgenai-lab-api ENTRA_CLIENT_APP_NAME=azgenai-lab-client \
+  infra/scripts/create-entra-app.sh      # prints both app ids and the secret, once
 ENTRA_API_APP_ID=<api-app-id> ENTRA_CLIENT_APP_ID=<client-app-id> \
-  ./assign-entra-app-role.sh
-./create-acr.sh                          # prints the generated registry name
+  infra/scripts/assign-entra-app-role.sh
+infra/scripts/create-acr.sh              # prints the generated registry name
 ```
+
+`export`, not a command-prefix assignment, for everything more than one
+script needs: a `VAR=value ./script.sh` prefix sets the variable for *that
+one command only*, and several of these scripts abort on a missing
+required variable rather than defaulting. `AZ_LOCATION` in particular is
+required by both `create-resource-group.sh` and `create-openai.sh`, and
+`ENTRA_TENANT_ID` is required by `assign-entra-app-role.sh` as well as by
+`create-entra-app.sh`.
 
 `create-acr.sh` and the Log Analytics workspace both use **per-run unique
 names** (a prefix plus a CSPRNG suffix). That is not tidiness: Day 21's
@@ -318,9 +334,27 @@ broken deployment.
 
 ```bash
 USE_FAKE_SEARCH=false USE_FAKE_EMBEDDINGS=false \
-AZURE_SEARCH_ENDPOINT=... AZURE_SEARCH_ADMIN_KEY=... \
-AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_EMBEDDING_DEPLOYMENT=embed-small \
+AZURE_SEARCH_ENDPOINT=https://<search-name>.search.windows.net \
+AZURE_SEARCH_ADMIN_KEY=<search-admin-key> \
+AZURE_OPENAI_ENDPOINT=https://<openai-account>.openai.azure.com \
+AZURE_OPENAI_API_KEY=<openai-key> \
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=embed-small \
   uv run python tools/index_corpus.py --recreate-index --tenant-id <tenant-guid>
+```
+
+This runs on the laptop, not in the container, so it takes the key path:
+`AZURE_OPENAI_AUTH` defaults to `api_key`, and the embedding client raises
+before the first chunk is embedded if `AZURE_OPENAI_API_KEY` is unset.
+There is no managed identity to borrow here — that is the whole reason the
+deployed app gets one and this tool does not. Read both values back from
+Azure rather than retyping them:
+
+```bash
+az cognitiveservices account keys list --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_OPENAI_NAME" --query key1 -o tsv
+az search admin-key show --subscription "$AZ_SUBSCRIPTION_ID" \
+  --resource-group "$AZ_RESOURCE_GROUP" --service-name "$AZ_SEARCH_NAME" \
+  --query primaryKey -o tsv
 ```
 
 Read the consequence before using the flag: `--tenant-id` **collapses
@@ -339,20 +373,32 @@ default `--rag-question` matches.
 
 ### 8.3 Deploy
 
+On top of §8.1's exports (`AZ_SUBSCRIPTION_ID`, `AZ_RESOURCE_GROUP`,
+`AZ_LOCATION`, `AZ_OPENAI_NAME`, `AZ_SEARCH_NAME`, `AZ_KEYVAULT_NAME`,
+`ENTRA_TENANT_ID`), which this step still needs:
+
 ```bash
 export AZ_ACR_NAME=<printed by create-acr.sh>
-export AZ_KEYVAULT_NAME=<vault-name> AZ_SEARCH_NAME=<search-name>
-export AZ_OPENAI_NAME=<openai-account>
-export ENTRA_TENANT_ID=<tenant-guid> ENTRA_AUDIENCE=<api-app-id>
+export ENTRA_AUDIENCE=<api-app-id>
 export ENTRA_CLIENT_APP_ID=<client-app-id>
 export ENTRA_CLIENT_SECRET=<client-secret>   # read from the environment only
 
-./deploy-container-app.sh
+infra/scripts/deploy-container-app.sh
 ```
 
 `ENTRA_CLIENT_SECRET` is never passed as an argument and never printed;
 the script even suspends shell tracing around the guard that reads it,
 because `${VAR:?msg}` traces as `+ : <value>` when the variable *is* set.
+
+**Stage 1 changes your machine's state.** It runs `az account set
+--subscription "$AZ_SUBSCRIPTION_ID"`, which repoints the *default* `az`
+context for every shell that reads it — including the terminal you are in
+after this script exits. Every command in the script also passes
+`--subscription` explicitly; the default is repointed anyway because
+`az acr build` and the directory-object commands read it. The script
+announces this on stdout for the same reason it is written down here: if
+your CLI was pointed at a work subscription, it is not any more. Point it
+back when the session ends.
 
 Eleven labelled stages, in an order that is a contract rather than a
 convenience — a role granted before the identity exists, an app created
@@ -421,20 +467,29 @@ silently dropped) if the gate itself never reached 200.
 
 ### 8.5 Tear down, in this order
 
+Still from the repository root, still with §8.1's exports in the shell:
+
 ```bash
 AZ_ACA_APP_NAME=aca-azgenai-lab AZ_ACA_ENV_NAME=acaenv-azgenai-lab \
 AZ_MI_NAME=mi-azgenai-lab AZ_LAW_NAME=<printed by the deploy script> \
-AZ_ACR_NAME=... AZ_KEYVAULT_NAME=... AZ_OPENAI_NAME=... \
-  ./delete-container-app.sh
+  infra/scripts/delete-container-app.sh
 
-AZ_ACR_NAME=... ./delete-acr.sh
-AZ_KEYVAULT_NAME=... ./delete-keyvault.sh
-AZ_SEARCH_NAME=... ./delete-search.sh
-ENTRA_API_APP_ID=... ENTRA_CLIENT_APP_ID=... ./delete-entra-app.sh
+infra/scripts/delete-acr.sh
+infra/scripts/delete-keyvault.sh
+infra/scripts/delete-search.sh
+ENTRA_API_APP_ID=<api-app-id> ENTRA_CLIENT_APP_ID=<client-app-id> \
+  infra/scripts/delete-entra-app.sh
 ```
 
-The deploy script prints this command with the run's real values filled
-in, both on success and on any failure that already mutated something.
+The first command is the one the deploy script prints for you, with the
+run's real values filled in — including the generated `AZ_LAW_NAME`, which
+has no default to fall back on — both on success and on any failure that
+already mutated something. It names every scope knob
+`delete-container-app.sh` needs, `AZ_ACR_NAME` and `AZ_OPENAI_NAME`
+included, because an omitted knob does not fail loudly: that scope's
+role-assignment delete is skipped with a warning, and step 6's fail-closed
+read-back then aborts the run *before* the identity is deleted, leaving
+behind exactly the orphaned assignments §9 exists to prevent.
 
 ## 9. Teardown ordering is a contract, not a convenience
 
@@ -600,8 +655,9 @@ subscription's budget alert is a delayed notification, not a cap.
   documentation conflict, and a number measured once is pinned to its
   date, region and API version rather than generalized. Day 20's
   14-minute-44-second role propagation is exactly that kind of number —
-  a counterexample to "up to 5 minutes", not a new bound (§8's gate
-  deadline is sized from it; see below).
+  a counterexample to "up to 5 minutes", not a new bound — and the reason
+  the readiness gate's default deadline is as long as the next bullet says
+  it is.
 - **The readiness gate's retry policy is asymmetric on purpose.** Only
   connection errors, 429 and 5xx are retried, on a 5 s → 10 s → 20 s →
   30 s-cap backoff against a 1200-second default deadline. That shape is

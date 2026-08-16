@@ -196,9 +196,16 @@ on_exit() {
     echo "" >&2
     echo "deploy-container-app.sh failed (exit $status) after creating Azure resources." >&2
     echo "Tear down whatever exists with:" >&2
+    # Every scope knob the teardown needs is printed, including AZ_ACR_NAME and
+    # AZ_OPENAI_NAME: delete-container-app.sh SKIPS a role-assignment scope whose
+    # knob is unset (warned, not silently), and its step 6 read-back is
+    # fail-closed by assignee alone -- so a command missing either one aborts
+    # before deleting the identity and leaves exactly the orphaned assignments
+    # this teardown exists to prevent.
     echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP \\" >&2
     echo "    AZ_ACA_APP_NAME=$AZ_ACA_APP_NAME AZ_ACA_ENV_NAME=$AZ_ACA_ENV_NAME \\" >&2
     echo "    AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME \\" >&2
+    echo "    AZ_ACR_NAME=$AZ_ACR_NAME AZ_OPENAI_NAME=$AZ_OPENAI_NAME \\" >&2
     echo "    AZ_LAW_NAME=$AZ_LAW_NAME ./delete-container-app.sh" >&2
   fi
 }
@@ -699,5 +706,6 @@ This deployment is ephemeral. Tear it down in the same session:
   AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP \\
     AZ_ACA_APP_NAME=$AZ_ACA_APP_NAME AZ_ACA_ENV_NAME=$AZ_ACA_ENV_NAME \\
     AZ_MI_NAME=$AZ_MI_NAME AZ_KEYVAULT_NAME=$AZ_KEYVAULT_NAME \\
+    AZ_ACR_NAME=$AZ_ACR_NAME AZ_OPENAI_NAME=$AZ_OPENAI_NAME \\
     AZ_LAW_NAME=$AZ_LAW_NAME ./delete-container-app.sh
 SUMMARY
