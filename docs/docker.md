@@ -269,14 +269,27 @@ drain term cannot drift away from the flag it mirrors. Raising the cleanup
 budget therefore means lowering the drain first — a visible trade, not an
 env-var override. (Before Day 23 review F1 the cap was a standalone `30`,
 which accepted 20 + 30 = 50 nominal seconds against a 30-second ceiling.)
-The 2-second margin and the 8-second budget are both unmeasured
-hypotheses. Day 24 takes them on: the measurement *contract* — which
-markers are read, from which log source, what invalidates a run, and which
-of the three terms the result can and cannot verify — is written down in
-[container-apps.md § The shutdown measurement contract](container-apps.md#11-the-shutdown-measurement-contract),
-and the measured values are recorded there after the deploy session. Until
-they are, both terms stay hypotheses (see the Honest boundary paragraph
-below).
+Day 24 measured this on Container Apps (2026-08-17, japaneast, one run,
+app idle): **cleanup finished in 0.001s against the 8.0s budget**, and
+total termination landed on the order of two seconds inside the 30-second
+grace. The budget is nowhere near binding, so it is left at 8.0 rather
+than shortened — there is no measured pressure to trade drain time for it.
+
+**The 2-second margin remains unmeasured**, and by construction rather
+than by omission: verifying a 2-second term would mean subtracting
+timestamps across two log sources with different clocks, which the
+measurement contract forbids. It stays a conservative allocation. The
+contract itself — which markers are read, from which source, what
+invalidates a run, and which of the three terms a result can and cannot
+verify — and the full measured result are in
+[container-apps.md § The shutdown measurement contract](container-apps.md#11-the-shutdown-measurement-contract).
+
+That run also corrects a phrase this page's model leaned on: the
+`--timeout-graceful-shutdown` value is a **ceiling** on the request drain,
+not a delay that gets spent. Idle, the drain finished about a tenth of a
+second after the platform's stop event and lifespan shutdown began
+immediately. The ~20s figure measured below is what the ceiling looks like
+when a held stream actually reaches it.
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
 (fake mode, zero env vars) stops in 0.669s; with a deliberately held SSE

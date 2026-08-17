@@ -225,14 +225,19 @@ Honesty about the gap between posture and practice:
 
 ## 6. Honest boundaries
 
-- **No managed identity has been live-tested.** The probe's identity was a user
-  via `AzureCliCredential`; token acquisition and RBAC evaluation follow the same
-  path, but IMDS behavior, the 24-hour token cache, and user-assigned client-ID
-  wiring remain documented claims here. Day 24 built the deployment that can
-  exercise them — the identity, the roles, the token provider and the readiness
-  gate all exist in code ([container-apps.md](container-apps.md)) — but this
-  section is upgraded to measured claims only by the live deploy session's
-  evidence, not by the code existing.
+- **A user-assigned managed identity has now been live-tested, once**
+  (2026-08-17, japaneast). The deployed container acquired an Azure OpenAI
+  token through its user-assigned identity and answered an authenticated
+  `POST /api/v1/chat` with 200, and the same identity pulled the image from ACR
+  and resolved a Key Vault reference secret. So user-assigned client-ID wiring
+  and keyless data-plane access are measured claims now, not documented ones.
+  Two things in this bullet are still **not** measured: IMDS behaviour under
+  failure, and the 24-hour token cache — a session of this length never reaches
+  a refresh.
+- **This session measured nothing about propagation.** The readiness gate passed
+  on its first authenticated attempt, but the role assignments had been created
+  roughly forty minutes earlier by an earlier attempt that day. A fast gate here
+  is evidence of nothing; the 14m44s below is still the only measured figure.
 - **Search keyless is asserted from docs, not measured.** Current pages even
   disagree on whether Free tier supports RBAC ("any tier, including free" vs
   "must be a billable tier (basic or higher)", both checked 2026-08). The series'
