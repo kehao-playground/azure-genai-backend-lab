@@ -636,8 +636,14 @@ identity:
     "${MI_ID}": {}
 properties:
   # The binding to the environment, stated in the file rather than left to
-  # the --environment flag on the create call below: `--yaml` documents that
-  # "all other parameters will be ignored".
+  # the --environment flag on the create call below, which is documented to
+  # ignore "all other parameters".
+  #
+  # No backticks anywhere in this heredoc. The delimiter is deliberately
+  # unquoted so the variables above expand -- which also means backticks in
+  # here are command substitutions, not punctuation. A prose backtick pair
+  # around a flag name in this very comment used to run that flag as a
+  # command: "line 632: --yaml: command not found".
   environmentId: ${ENV_ID}
   configuration:
     activeRevisionsMode: single
@@ -645,6 +651,19 @@ properties:
       external: true
       targetPort: 8000
       transport: auto
+      # Stated explicitly because omitting it does not mean "do not send it".
+      # The containerapp extension deserializes this YAML into its SDK model
+      # and serializes the WHOLE model back out, so every field left out here
+      # is transmitted as an explicit JSON null -- 84 of them in this app's
+      # PUT body. The API version the extension targets (2025-10-02-preview)
+      # rejects null for this non-nullable boolean, and says so from the
+      # server's own parse context rather than ours:
+      #   The JSON value could not be converted to System.Boolean.
+      #   Path: $ | LineNumber: 0 | BytePositionInLine: 4
+      # Position 4 is the end of the four characters of "null"; Path $ is the
+      # root of that value, not of the document, which is why the message
+      # names no field. allowInsecure is the only boolean among those nulls.
+      allowInsecure: false
     registries:
       - server: ${AZ_ACR_NAME}.azurecr.io
         identity: ${MI_ID}

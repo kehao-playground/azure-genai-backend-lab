@@ -829,6 +829,48 @@ def test_generated_yaml_carries_the_whole_app_contract(tmp_path: Path) -> None:
     assert f'value: "{MI_CLIENT_ID}"' in yaml_text
 
 
+def test_ingress_states_allow_insecure_explicitly(tmp_path: Path) -> None:
+    # Omitting an optional field from this YAML does not mean the field is not
+    # sent. The containerapp extension round-trips the document through its SDK
+    # model, so everything unstated goes out as an explicit JSON null -- and the
+    # API version it targets rejects null for this non-nullable boolean:
+    #   The JSON value could not be converted to System.Boolean.
+    #   Path: $ | LineNumber: 0 | BytePositionInLine: 4
+    # That reached the live session as a 400 with no field name in it, after
+    # the identity, its three roles, the secret, the image, the workspace and
+    # the environment had all been created.
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert isinstance(yaml_text, str)
+    assert "allowInsecure: false" in yaml_text
+
+
+def test_the_app_yaml_heredoc_contains_no_command_substitution(tmp_path: Path) -> None:
+    # A source-level test, because the failure it guards against is invisible in
+    # the generated YAML: the heredoc delimiter is unquoted on purpose, so the
+    # ${...} values expand -- and so a backtick pair anywhere in the body is a
+    # command substitution. A prose backtick around a flag name in a YAML
+    # comment ran that flag as a command and printed
+    # "line 632: --yaml: command not found" mid-deploy, while still producing a
+    # YAML file that parsed cleanly, which is what made it hard to see.
+    #
+    # $(...) is included for the same reason, and neither has any legitimate
+    # use in this block: every value it needs is already in a shell variable.
+    script = (SCRIPTS_DIR / "deploy-container-app.sh").read_text().splitlines()
+    start = next(i for i, line in enumerate(script) if line.endswith("<<YAML"))
+    end = next(i for i, line in enumerate(script) if i > start and line == "YAML")
+    body = script[start + 1 : end]
+    offenders = [
+        f"{start + 2 + n}: {line}"
+        for n, line in enumerate(body)
+        if "`" in line or "$(" in line
+    ]
+    assert not offenders, offenders
+
+
 # ---------------------------------------------------------------------------
 # 8. The readiness gate runs last, or it is measuring nothing.
 # ---------------------------------------------------------------------------
