@@ -464,13 +464,31 @@ echo "== stage 5: build the image in ACR =="
 #
 # The build context is the repo root and .dockerignore prunes it; the
 # Dockerfile is under docker/, so --file is not optional.
+#
+# --file is ABSOLUTE, and that is load-bearing. `az acr build --help` says the
+# value is "the relative path of the the docker file to the source code root
+# folder", but the CLI does not implement that: with an explicit --file it
+# resolves the path against the CALLER'S WORKING DIRECTORY, not against the
+# source location argument. The CLI's own source says so in as many words
+# (azure-cli 2.89.0, command_modules/acr/build.py, above the
+# `_check_local_docker_file` call: "If docker_file_path is not specified, the
+# default is Dockerfile in source_location. Otherwise, it's based on current
+# working directory."). A relative `docker/Dockerfile` therefore worked only
+# when this script happened to be invoked from the repo root, and failed with
+# `ERROR: Unable to find 'docker/Dockerfile'` from anywhere else -- including
+# from this script's own directory, which is how the runbook invokes it.
+#
+# Passing an absolute path outside the context is safe: the Dockerfile is not
+# picked up by the context walk at all. _archive_utils.py tars the source
+# location, then separately opens docker_file_path and adds it to the archive
+# under a generated name, which the build then references.
 az acr build \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --registry "$AZ_ACR_NAME" \
   --platform linux/amd64 \
   --image "azgenai-lab:${IMAGE_TAG}" \
-  --file docker/Dockerfile \
+  --file "$REPO_ROOT/docker/Dockerfile" \
   "$REPO_ROOT"
 
 # === stage 6: Log Analytics workspace ========================================

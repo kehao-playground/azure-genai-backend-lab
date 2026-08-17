@@ -397,6 +397,28 @@ def test_stage_ordering_is_pinned_end_to_end(tmp_path: Path) -> None:
     )
 
 
+def test_acr_build_passes_the_dockerfile_by_absolute_path(tmp_path: Path) -> None:
+    # This one has to be an argv assertion rather than a behavioural one,
+    # because the fake `az` never opens the file -- only the real CLI can fail
+    # the way this guards against, and it fails before any build starts:
+    #   ERROR: Unable to find 'docker/Dockerfile'.
+    #
+    # `az acr build --help` claims --file is relative to the source location.
+    # The implementation resolves it against the caller's working directory
+    # instead (azure-cli 2.89.0, acr/build.py). A relative value therefore
+    # depends on where the operator stood when they typed the command, which
+    # for this script is its own directory, not the repo root. Asserting the
+    # path is absolute is asserting that it does not depend on the caller's cwd.
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    build_call = next(call for call in h.calls if call.startswith("acr build"))
+    file_arg = build_call.split("--file ", 1)[1].split(" ")[0]
+    assert file_arg.startswith("/"), build_call
+    assert file_arg.endswith("/docker/Dockerfile"), build_call
+
+
 def test_log_analytics_workspace_created_explicitly_and_wired_into_the_env(
     tmp_path: Path,
 ) -> None:
