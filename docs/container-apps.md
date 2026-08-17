@@ -451,6 +451,45 @@ context and builds there, and ACR Tasks default to Linux/AMD64
 developed on arm64 Macs and the default is not something to bet a deploy
 on.
 
+Two things about that upload, both learned on 2026-08-17 by doing it.
+
+**`--file` is passed as an absolute path, and that is load-bearing.**
+`az acr build --help` describes it as "the relative path of the the docker
+file to the source code root folder". The CLI does not implement that: with
+an explicit `--file` the path is resolved against the *caller's working
+directory*, and only the default is relative to the source location. Its own
+source says so, directly above the existence check (azure-cli 2.89.0,
+`command_modules/acr/build.py`):
+
+```python
+# NOTE: If docker_file_path is not specified, the default is Dockerfile in source_location.
+# Otherwise, it's based on current working directory.
+```
+
+A relative `docker/Dockerfile` therefore worked only when the operator
+happened to stand in the repo root, and this script is invoked from
+`infra/scripts/`. An absolute path outside the context is safe:
+`_archive_utils.py` tars the source location and then *separately* opens the
+Dockerfile and adds it to the archive under a generated name.
+
+**`.dockerignore` prunes much less here than it does locally.** This
+repo's context uploaded as **41.081 MiB** (2026-08-17), against the 1.12MB
+that Day 23 measured a local build transferring from the same tree. Most of
+the difference is a bug: in `_archive_utils.py`, `IgnoreRule.__init__`
+strips a rule's trailing slash *only* inside the `if rule.startswith('!')`
+branch. So an exclusion written `site/` compiles to the regex `^site/$`
+while tar members are named `site` and `site/package.json` — it can never
+match — whereas the exception `!site/` compiles to `^site$` and does. That
+asymmetry is what makes it a bug rather than a convention. Every
+directory rule in this repo's `.dockerignore` is written with a trailing
+slash, so on this path none of them apply; `.venv` and `.git` are excluded
+only by az's own hardcoded lists. Rules without a trailing slash (`site`,
+`**/*.pyc`) work normally.
+
+The remaining difference is not a bug: local BuildKit prunes the context to
+the paths a `COPY` actually references, while `az acr build` tars the whole
+context first and prunes only by `.dockerignore`.
+
 Stage 6 exists because of a bill nobody would find. `az containerapp env
 create` will auto-provision a Log Analytics workspace when none is given,
 and deleting the environment does **not** delete that workspace — it is a
@@ -598,9 +637,10 @@ Day 23 shipped a shutdown budget derived from three named terms —
 `grace 30 − drain 20 − overhead margin 2 = 8` — and admitted that the
 2-second margin and the 8-second budget were both **unmeasured
 hypotheses**, to be measured or shortened on Day 24. This section is the
-contract for that measurement. **It has not been run yet. No number in
-this document is a measurement, and the values below are recorded here
-after the deploy session, or not at all.**
+contract for that measurement. **It has now been run** — once, on
+2026-08-17, in japaneast; the results are in
+[§11.1](#111-the-measured-result-2026-08-17) and every number there carries
+that date.
 
 **Trigger.** A revision change, in single revision mode, deactivates the
 old revision, and revision deactivation is one of the three documented
@@ -615,7 +655,7 @@ lines on the way down:
 | Point in the timeline | Source |
 |---|---|
 | SIGTERM received | the platform's system log / revision event — the app does **not** own the signal handler, uvicorn does |
-| Request drain ended | `lifespan shutdown started` (uvicorn enters lifespan shutdown only after `--timeout-graceful-shutdown` completes) |
+| Request drain ended | `lifespan shutdown started` (uvicorn enters lifespan shutdown once the drain finishes — `--timeout-graceful-shutdown` bounds that drain, it does not schedule it; an idle app drains at once, see §11.1) |
 | Cleanup began | `shutdown cleanup started budget_seconds=…` |
 | Cleanup ended | `shutdown cleanup finished elapsed_seconds=…` (the app's own `time.monotonic` delta) |
 | Process ended | the last line of the container's console log |
@@ -661,6 +701,61 @@ releases, and a child-task refactor buys complexity rather than
 correctness. If the measurement shows closers being interrupted in
 practice, that ruling flips and is recorded as debt.
 
+### 11.1 The measured result (2026-08-17)
+
+One run, japaneast, triggered by `az containerapp revision deactivate`,
+with the revision and replica recorded before the trigger. All three
+markers present and bound to that replica, so the run is valid under the
+rules above. Logs were read from the Log Analytics workspace rather than a
+log stream — after deactivation the replica is gone, and the workspace
+still has its logs.
+
+The app's markers, on the app's own clock:
+
+```
+02:09:06,351  lifespan shutdown started
+02:09:06,351  shutdown cleanup started budget_seconds=8.0
+02:09:06,352  shutdown cleanup finished elapsed_seconds=0.001
+```
+
+The platform's events for the same revision:
+
+```
+02:09:06.2106597Z  KEDAScalersStopped    stopping the watch for this revision
+02:09:07.1582116Z  ContainerTerminated   reason 'ManuallyStopped'
+```
+
+Against the three terms:
+
+- **Cleanup elapsed: 0.001s against the 8.0s budget.** Precisely
+  verifiable, single-source. The budget is nowhere near binding.
+- **Total termination: on the order of two seconds against a 30-second
+  grace.** Coarsely verifiable — the deactivate call returned at 02:09:05Z
+  and the platform reported termination at 02:09:07.16Z. Cross-source, so
+  it is a window, not a duration.
+- **The 2-second overhead margin: still not verified**, exactly as this
+  contract predicted. Verifying it would require subtracting across two
+  clocks. It remains a conservative allocation.
+
+The Day 23 *attempted*-vs-*completed* ruling therefore stands unchanged:
+nothing was interrupted, and no debt is recorded against it.
+
+**What this run does not measure.** The app was idle — no in-flight
+requests, no open upstream streams, no held conversation locks. This is the
+floor of the cleanup path, not its behaviour under load; a shutdown during
+active streaming could look very different, and nothing here speaks to it.
+Day 23's local held-stream measurement is the closest available datum.
+
+**A correction to how the drain was described.** The marker table
+previously said uvicorn "enters lifespan shutdown only after
+`--timeout-graceful-shutdown` completes", which reads as a fixed 20-second
+wait. This run shows otherwise: the platform's stop events are at
+02:09:06.21 and `lifespan shutdown started` is at 02:09:06.351, about a
+tenth of a second later. The flag is a **ceiling** on the drain, not a
+delay that is spent. Day 23's own local measurement is consistent — with a
+deliberately held SSE stream the drain *was* cut off at ~20s, because there
+the ceiling was reached.
+
 ## 12. Cost shape
 
 No prices are quoted here, because none were sourced for this document.
@@ -688,12 +783,23 @@ subscription's budget alert is a delayed notification, not a cap.
 
 ## 13. Honest boundaries
 
-- **Nothing on this page has been deployed yet.** It documents scripts and
-  code as they exist on this branch, verified by reading them. Every
-  observation from the live session — the shutdown timeline, whether a
-  failed Key Vault reference is visible in the app's provisioning state,
-  what `az acr build` actually uploads as build context — lands afterwards,
-  dated, or does not land.
+- **This page has now been deployed from, once, on 2026-08-17.** The
+  scripts ran end to end in japaneast and the app served authenticated
+  traffic. Three things this page previously listed as pending are
+  answered: the shutdown timeline is in §11.1; `az acr build` uploaded
+  41.081 MiB of build context, for the reasons in §8.3; and the readiness
+  gate passed on its first authenticated attempt. That last one is **not**
+  a propagation measurement — the role assignments already existed from an
+  earlier attempt that day, so this session consumed no propagation wait
+  and Day 20's 14m44s remains the only measured figure.
+- **Three defects in these scripts were found by deploying, not by
+  reviewing them.** `az acr build --file` is resolved against the caller's
+  working directory rather than the source location (the CLI's help says
+  the opposite; its source says this); an optional field omitted from the
+  app YAML is transmitted as an explicit JSON `null`, which the API rejects
+  for a non-nullable boolean; and a backtick inside a YAML *comment* in an
+  unquoted heredoc ran as a command substitution. Each had passed every
+  prior review of the same lines.
 - **Single-observation discipline applies to everything measured in that
   session.** Day 13's rule stands: one probe does not adjudicate a
   documentation conflict, and a number measured once is pinned to its

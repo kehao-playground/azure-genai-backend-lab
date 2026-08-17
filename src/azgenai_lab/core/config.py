@@ -32,11 +32,20 @@ PLATFORM_SIGTERM_GRACE_SECONDS = 30.0
 # tests/unit/test_config.py parses the Dockerfile and fails if the two drift,
 # so this is a checked mirror rather than a second source of truth.
 REQUEST_DRAIN_SECONDS = 20.0
-# Unmeasured allowance for everything between "SIGTERM delivered" and "the
-# cleanup loop's deadline arithmetic starts": signal delivery, uvicorn's own
-# teardown, and the interpreter's exit path. Honest status: a guess, like the
-# 8s default it produces. Day 24 measures real Azure teardown or shortens the
-# terms; what this constant fixes is only that the terms now compose.
+# Allowance for everything between "SIGTERM delivered" and "the cleanup loop's
+# deadline arithmetic starts": signal delivery, uvicorn's own teardown, and the
+# interpreter's exit path.
+#
+# Still unmeasured after Day 24, and now known to be unmeasurable under the
+# rules we set for ourselves: isolating a 2-second term means subtracting
+# timestamps across the platform's log and the app's own, which is exactly the
+# cross-clock subtraction docs/container-apps.md §11 forbids. It stays a
+# conservative allocation.
+#
+# What Day 24 did measure (2026-08-17, Container Apps, japaneast, app idle) is
+# the budget this term produces: cleanup finished in 0.001s against 8.0s, and
+# termination completed about two seconds into a 30-second grace. Nothing is
+# under pressure here, so the terms are left alone rather than tightened.
 SHUTDOWN_OVERHEAD_MARGIN_SECONDS = 2.0
 MAX_SHUTDOWN_CLEANUP_BUDGET_SECONDS = (
     PLATFORM_SIGTERM_GRACE_SECONDS - REQUEST_DRAIN_SECONDS - SHUTDOWN_OVERHEAD_MARGIN_SECONDS
