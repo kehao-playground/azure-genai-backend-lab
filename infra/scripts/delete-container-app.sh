@@ -128,10 +128,36 @@ else
     --resource-group "$AZ_RESOURCE_GROUP" \
     --name "$AZ_ACA_ENV_NAME" \
     --yes >/dev/null
-  AFTER_ENV_COUNT=$(env_count)
-  require_value "$AFTER_ENV_COUNT" "post-delete environment count"
+  # The delete is asynchronous. `az containerapp env delete` returns while the
+  # environment is still listed, in provisioningState ScheduledForDelete, and
+  # it disappears from the list some seconds later. Read back once and this
+  # step fails on a delete that is in fact working -- which is what happened
+  # on 2026-08-17: the guard fired, the teardown stopped with the identity and
+  # its three role assignments still live, and the environment was gone 26
+  # seconds later.
+  #
+  # So the read-back polls instead of asking once. It stays fail-closed: if the
+  # environment is still listed when the attempts run out, this still exits 1
+  # rather than proceeding to delete the identity. The only thing that changed
+  # is that "still there" now means "still there after waiting", not "still
+  # there in the same second the delete call returned".
+  ENV_DELETE_POLL_ATTEMPTS="${ENV_DELETE_POLL_ATTEMPTS:-30}"
+  ENV_DELETE_POLL_INTERVAL="${ENV_DELETE_POLL_INTERVAL:-10}"
+  AFTER_ENV_COUNT=""
+  for ((ATTEMPT = 1; ATTEMPT <= ENV_DELETE_POLL_ATTEMPTS; ATTEMPT++)); do
+    AFTER_ENV_COUNT=$(env_count)
+    require_value "$AFTER_ENV_COUNT" "post-delete environment count"
+    if [ "$AFTER_ENV_COUNT" = "0" ]; then
+      break
+    fi
+    if ((ATTEMPT < ENV_DELETE_POLL_ATTEMPTS)); then
+      sleep "$ENV_DELETE_POLL_INTERVAL"
+    fi
+  done
   if [ "$AFTER_ENV_COUNT" != "0" ]; then
-    echo "Environment '$AZ_ACA_ENV_NAME' still listed after delete." >&2
+    echo "Environment '$AZ_ACA_ENV_NAME' still listed after delete, and after" >&2
+    echo "waiting $((ENV_DELETE_POLL_ATTEMPTS * ENV_DELETE_POLL_INTERVAL))s for it to go." >&2
+    echo "Nothing further was deleted: the identity and its role assignments are untouched." >&2
     exit 1
   fi
   echo "  deleted '$AZ_ACA_ENV_NAME'"
