@@ -194,7 +194,24 @@ if args[:4] == ["monitor", "log-analytics", "workspace", "delete"]:
 # --- Container Apps environment ---------------------------------------------
 if args[:3] == ["containerapp", "env", "list"]:
     m = re.search(r"name=='([^']*)'", query_value())
-    done("1" if m and m.group(1) in state["envs"] else "0")
+    name = m.group(1) if m else None
+    # A deleted environment lingers in the list (provisioningState
+    # ScheduledForDelete) for some seconds before it disappears. With
+    # env_delete_lingering_reads set, this fake keeps reporting it for that
+    # many further list calls, then lets it go -- which is what real Azure
+    # did on 2026-08-17.
+    lingering = state.get("envs_lingering", {})
+    if name and name in lingering:
+        left = lingering[name] - 1
+        if left <= 0:
+            del lingering[name]
+            if name in state["envs"]:
+                state["envs"].remove(name)
+        else:
+            lingering[name] = left
+        state["envs_lingering"] = lingering
+        done("1" if name in state["envs"] else "0")
+    done("1" if name and name in state["envs"] else "0")
 if args[:3] == ["containerapp", "env", "create"]:
     state["envs"].append(opt("--name"))
     done("{}")
@@ -205,7 +222,11 @@ if args[:3] == ["containerapp", "env", "show"]:
 if args[:3] == ["containerapp", "env", "delete"]:
     name = opt("--name")
     if not state.get("env_delete_ineffective") and name in state.get("envs", []):
-        state["envs"].remove(name)
+        linger = state.get("env_delete_lingering_reads", 0)
+        if linger:
+            state.setdefault("envs_lingering", {})[name] = linger
+        else:
+            state["envs"].remove(name)
     done()
 
 # --- the app -----------------------------------------------------------------
@@ -1061,13 +1082,36 @@ def test_delete_app_readback_failure_aborts_before_env_delete(tmp_path: Path) ->
 
 
 def test_delete_env_readback_failure_aborts_before_workspace_delete(tmp_path: Path) -> None:
+    # Poll knobs shrunk to one immediate attempt: this environment never goes
+    # away, so the point of the test is the abort, not the waiting.
     h = deployed_harness(tmp_path, env_delete_ineffective=True)
-    result = h.run_delete()
+    result = h.run_delete(ENV_DELETE_POLL_ATTEMPTS="1", ENV_DELETE_POLL_INTERVAL="0")
     assert result.returncode != 0
     assert "still listed after delete" in result.stderr
     assert h.has("containerapp delete")
     assert not h.has("monitor log-analytics workspace delete")
     assert not h.has("identity delete")
+
+
+def test_delete_env_tolerates_an_environment_that_lingers_before_disappearing(
+    tmp_path: Path,
+) -> None:
+    # `az containerapp env delete` returns while the environment is still
+    # listed, in provisioningState ScheduledForDelete. Reading back once turns
+    # a working delete into a failed teardown -- on 2026-08-17 it stopped with
+    # the identity and its three role assignments still live, and the
+    # environment was gone 26 seconds later.
+    h = deployed_harness(tmp_path, env_delete_lingering_reads=3)
+    result = h.run_delete(ENV_DELETE_POLL_ATTEMPTS="10", ENV_DELETE_POLL_INTERVAL="0")
+    assert result.returncode == 0, result.stderr
+    assert "still listed after delete" not in result.stderr
+
+    # It waited rather than gave up, and then went on to finish the teardown --
+    # which is the whole point: the steps after this one are the ones that
+    # prevent orphaned role assignments.
+    assert h.has("monitor log-analytics workspace delete")
+    assert h.count("role assignment delete") == 3
+    assert h.has("identity delete")
 
 
 def test_delete_workspace_readback_failure_aborts_before_identity_steps(
