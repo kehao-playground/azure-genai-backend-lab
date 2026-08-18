@@ -1,0 +1,22 @@
+%% Publication source (zh-TW) for the Day 24 article figure.
+%% English semantic companion: aca-teardown-order.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    subgraph app["先拆會產生 shutdown 的東西"]
+        S1["1. 刪 Container App<br/>讀回確認消失"]
+        S2["2. 刪 environment<br/>讀回＝bounded poll，非單次快照<br/>（ScheduledForDelete 視窗實測 26 秒，2026-08-17）"]
+        S3["3. 刪 Log Analytics workspace<br/>（本 run 自己取的名字）"]
+    end
+    subgraph mi["再拆身份——順序就是契約"]
+        S4["4. 讀回 principal id<br/>（它跟 identity 一起死）"]
+        S5["5. 逐 scope 刪 role assignments<br/>ACR／Key Vault／Azure OpenAI"]
+        S6{"6. --all 讀回該 principal<br/>名下 assignments ＝ 0？"}
+        S7["7. 刪 identity<br/>讀回確認消失"]
+    end
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
+    S6 -->|"是"| S7
+    S6 -->|"否：fail-closed 中止——<br/>identity 還在，assignments<br/>還查得到、還救得回"| STOP["修好再重跑"]
+    S4 -.->|"跳過 4–6 直接刪 identity"| ORPHAN["orphan assignments：<br/>Identity not found<br/>principal id 已死，查無可查"]
+    style S6 fill:#fff3cd,stroke:#b26a00
+    style STOP fill:#d3f0d8,stroke:#2e7d32
+    style ORPHAN fill:#fde3e0,stroke:#c62828
