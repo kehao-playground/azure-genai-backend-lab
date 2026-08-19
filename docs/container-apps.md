@@ -631,7 +631,9 @@ resource or group, use `--all`"), and all three assignments here are at
 it the query returns `0` no matter what is actually assigned, and the
 entire step is vacuous: run the teardown with `AZ_ACR_NAME` unset, step 5
 warns and skips, a scope-blind step 6 reports zero remain, step 7 deletes
-the identity, and the `AcrPull` assignment is orphaned permanently. No
+the identity, and the `AcrPull` assignment is orphaned — no longer
+attributable to any identity you can name, cleanable only by the
+Unknown-type sweep. No
 behavioural test can catch a flag that only ever narrows what a query
 sees, which is why the regression that pins it asserts on the command's
 arguments.
