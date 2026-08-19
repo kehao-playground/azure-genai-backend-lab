@@ -219,6 +219,45 @@ def test_container_is_removed_on_a_failure_path(tmp_path: Path) -> None:
     assert any(call == f"rm -f {name}" for call in h.calls)
 
 
+# ---------------------------------------------------------------------------
+# Poll-knob validation: malformed or zero values fail closed before touching
+# docker at all, not via a `seq`-shaped loop that could run zero iterations
+# silently on a bad value (Day 21's shape) -- same require_count/
+# require_seconds pair infra/scripts/update-container-app.sh uses.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_attempts_knob_fails_before_touching_docker(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    for bad in ("0", "-5", "abc", "3.5"):
+        result = h.run(BOOT_SMOKE_ATTEMPTS=bad)
+        assert result.returncode != 0, bad
+        assert "BOOT_SMOKE_ATTEMPTS" in result.stderr, bad
+        assert "positive integer" in result.stderr, bad
+    assert h.calls == []
+
+
+def test_malformed_interval_knob_fails_before_touching_docker(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    for bad in ("-5", "abc", "3.5"):
+        result = h.run(BOOT_SMOKE_INTERVAL_SECONDS=bad)
+        assert result.returncode != 0, bad
+        assert "BOOT_SMOKE_INTERVAL_SECONDS" in result.stderr, bad
+        assert "non-negative integer" in result.stderr, bad
+    assert h.calls == []
+
+
+def test_zero_interval_is_valid_but_zero_attempts_is_not(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run(BOOT_SMOKE_INTERVAL_SECONDS="0")
+    assert result.returncode == 0, result.stderr
+
+    result = h.run(BOOT_SMOKE_ATTEMPTS="0")
+    assert result.returncode != 0
+    assert "BOOT_SMOKE_ATTEMPTS" in result.stderr
+    assert "positive integer" in result.stderr
+
+
 def test_default_container_name_is_unique_per_run(tmp_path: Path) -> None:
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"
