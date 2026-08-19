@@ -8,6 +8,11 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    # No OIDC token, no Azure access -- this job never touches Azure, so it
+    # never gets the ability to mint one. Declaring `permissions` at all
+    # zeroes every scope not listed; an empty map is how "none of them" is
+    # spelled.
+    permissions: {}
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -40,9 +45,33 @@ jobs:
         run: git diff --exit-code docs/audit/
       - name: Mermaid diagram syntax gate
         run: scripts/check_diagrams.sh
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        # Pinned by version and verified by checksum -- no new package manager,
+        # per D12: this is a tarball off GitHub Releases, the same way
+        # scripts/check_diagrams.sh pins mermaid-cli.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          chmod +x actionlint
+      - name: actionlint
+        # actionlint cannot catch the class of bug Day 24 shipped -- bugs
+        # that are only visible once the workflow actually runs against
+        # real Azure and GitHub state. What it does catch: a typo'd
+        # `needs.image.outputs.digest` reference, which GitHub Actions
+        # itself would otherwise evaluate to a silently empty string that
+        # flows straight into `--image` below.
+        run: ./actionlint -color
 
   site:
     runs-on: ubuntu-latest
+    # Never touches Azure either -- same reasoning as the python job above.
+    permissions: {}
     defaults:
       run:
         working-directory: site
@@ -58,12 +87,27 @@ jobs:
       - name: Build Astro site
         run: npm run build
 
-  docker:
+  image:
     runs-on: ubuntu-latest
+    # id-token: write is what lets azure/login mint an OIDC token below;
+    # contents: read has to be restated here even though it sounds like it
+    # should be implied -- declaring `permissions` at all zeroes every scope
+    # not listed, and actions/checkout needs it.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
-      - name: Docker build (gate only; Day 24 adds a manual push to ACR, Day 25 automates push and deploy here)
+
+      # Gate for every push and PR. On main, once DEPLOY_ENABLED is armed,
+      # this is also the image the steps below push to ACR and deploy --
+      # the bytes that pass boot smoke are the exact bytes that get deployed
+      # (pushed by digest below, never by a tag that could be reused).
+      - name: Docker build
         run: docker build -f docker/Dockerfile -t azgenai-lab:ci .
+
       - name: Docker boot smoke
         # A build that succeeds is not proof the image runs -- this milestone's worst bug
         # was exactly that (a module-relative default path that only breaks once the
@@ -76,3 +120,111 @@ jobs:
         # actually reports healthy, and a separate `docker exec` probe proves what
         # /health actually returns.
         run: scripts/boot_smoke.sh azgenai-lab:ci
+
+      # Everything below here touches Azure, so it is gated on both "this is
+      # main" and "the session's ephemeral Azure resources currently exist"
+      # (DEPLOY_ENABLED). Build and boot smoke above always run, including
+      # on pull requests -- that is the point of a gate. ACR and the build
+      # identity are ephemeral: after teardown, every push to main would
+      # otherwise fail here for a reason that has nothing to do with the
+      # code.
+      - name: Azure login (build identity)
+        if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_BUILD }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+        env:
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+        run: |
+          set -euo pipefail
+          # Deliberately NOT passing -g/--resource-group here, even though
+          # it looks like the tidier, more explicit choice. Without it, a
+          # failed control-plane lookup raises ResourceNotFound, which the
+          # CLI tolerates and falls back to <name>.azurecr.io plus a
+          # data-plane token exchange that the AcrPush role does cover. With
+          # -g, the CLI instead calls registries/read directly -- an action
+          # AcrPush does not grant -- and that failure is not on the
+          # tolerated path. Adding -g "for tidiness" would break the push.
+          az acr login --name "$AZURE_ACR_NAME"
+
+      - name: Tag and push
+        id: push
+        if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+        env:
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          IMAGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${AZURE_ACR_NAME}.azurecr.io/azgenai-lab:sha-${IMAGE_SHA}"
+          docker tag azgenai-lab:ci "$IMAGE"
+          docker push "$IMAGE"
+          # The point of this pipeline is that the bytes that passed the
+          # gates above are the bytes that get deployed. A tag can be
+          # repointed by a rerun; a digest cannot. The deploy job composes
+          # the full reference from this digest plus the ACR name it already
+          # has, so only the digest itself needs to cross the job boundary.
+          FULL_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          DIGEST="${FULL_DIGEST#*@}"
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "$FULL_DIGEST" ]; then
+            echo "Could not parse a digest out of docker inspect's RepoDigests[0]: '$FULL_DIGEST'" >&2
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [python, site, image]
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    # At most one deploy in flight, at most one more queued behind it (the
+    # default `queue: single` -- a newer pending run displaces an older one,
+    # never the other way around). cancel-in-progress stays false: a run
+    # cancelled between `az containerapp update` and its own verification
+    # steps would leave a revision nobody actually checked.
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Freshness guard
+        # Approval takes human time, and main does not wait for it. A run
+        # approved after main has moved on must not deploy the stale commit
+        # it started with -- and must not report success while doing
+        # nothing, either: a green no-op and a green deploy would look
+        # identical afterwards otherwise. See scripts/check_freshness.sh.
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: scripts/check_freshness.sh "$CURRENT_SHA" main
+
+      - name: Azure login (deploy identity)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_DEPLOY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        env:
+          AZ_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZ_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZ_ACA_APP_NAME: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIGEST" ]; then
+            echo "needs.image.outputs.digest is empty; refusing to deploy with an empty --image." >&2
+            exit 1
+          fi
+          infra/scripts/update-container-app.sh --image "${AZURE_ACR_NAME}.azurecr.io/azgenai-lab@${DIGEST}"
