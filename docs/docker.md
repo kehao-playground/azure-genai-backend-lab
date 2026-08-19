@@ -286,9 +286,10 @@ verify — and the full measured result are in
 
 That run also corrects a phrase this page's model leaned on: the
 `--timeout-graceful-shutdown` value is a **ceiling** on the request drain,
-not a delay that gets spent. Idle, the drain finished about a tenth of a
-second after the platform's stop event and lifespan shutdown began
-immediately. The ~20s figure measured below is what the ceiling looks like
+not a delay that gets spent. Idle, the app's `lifespan shutdown started`
+landed in the same second as the platform's earliest teardown events (two
+different clocks, so no duration can be read — but a 20-second wait is
+ruled out). The ~20s figure measured below is what the ceiling looks like
 when a held stream actually reaches it.
 
 Measured on this machine (Docker 29.4.0, 2026-08-12): an idle container
