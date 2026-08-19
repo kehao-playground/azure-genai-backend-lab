@@ -25,6 +25,27 @@ IMAGE="${1:?usage: scripts/boot_smoke.sh <image-ref>}"
 BOOT_SMOKE_ATTEMPTS="${BOOT_SMOKE_ATTEMPTS:-60}"
 BOOT_SMOKE_INTERVAL_SECONDS="${BOOT_SMOKE_INTERVAL_SECONDS:-2}"
 
+# Validated before anything is built or run, not left to fall through to a
+# `seq`/`for` loop that could run zero iterations silently on a malformed
+# value (Day 21's `seq` bug) -- same require_count/require_seconds pair
+# infra/scripts/update-container-app.sh uses for its own poll knobs.
+require_count() {
+  local name="$1" value="$2"
+  if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$name must be a positive integer; got '$value'." >&2
+    exit 1
+  fi
+}
+require_seconds() {
+  local name="$1" value="$2"
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$name must be a non-negative integer number of seconds; got '$value'." >&2
+    exit 1
+  fi
+}
+require_count BOOT_SMOKE_ATTEMPTS "$BOOT_SMOKE_ATTEMPTS"
+require_seconds BOOT_SMOKE_INTERVAL_SECONDS "$BOOT_SMOKE_INTERVAL_SECONDS"
+
 if [ -z "${BOOT_SMOKE_CONTAINER_NAME:-}" ]; then
   # Cryptographically unpredictable, not $RANDOM (seeded, guessable) and not
   # a timestamp -- two runs of this script on the same host must not pick
@@ -52,7 +73,7 @@ docker run -d --name "$BOOT_SMOKE_CONTAINER_NAME" "$IMAGE"
 # Docker reports unhealthy. The default 60 attempts at 2s (120s)
 # covers that with some room, not a generous margin.
 status=unknown
-for attempt in $(seq 1 "$BOOT_SMOKE_ATTEMPTS"); do
+for ((attempt = 1; attempt <= BOOT_SMOKE_ATTEMPTS; attempt++)); do
   if ! status="$(docker inspect --format '{{.State.Health.Status}}' "$BOOT_SMOKE_CONTAINER_NAME" 2>&1)"; then
     echo "docker inspect failed on attempt $attempt: $status" >&2
     status="inspect-error"
