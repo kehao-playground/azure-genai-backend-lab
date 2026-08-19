@@ -16,7 +16,7 @@ flowchart TB
     S1 --> S2 --> S3 --> S4 --> S5 --> S6
     S6 -->|"是"| S7
     S6 -->|"否：fail-closed 中止——<br/>identity 還在，assignments<br/>還查得到、還救得回"| STOP["修好再重跑"]
-    S4 -.->|"跳過 4–6 直接刪 identity"| ORPHAN["orphan assignments：<br/>Identity not found<br/>principal id 已死，查無可查"]
+    S3 -.->|"跳過 4–6 直接刪 identity"| ORPHAN["orphan assignments：<br/>Identity not found——沒留 principal id，<br/>清理退化成逐 scope 盤查<br/>Unknown 型 assignments"]
     style S6 fill:#fff3cd,stroke:#b26a00
     style STOP fill:#d3f0d8,stroke:#2e7d32
     style ORPHAN fill:#fde3e0,stroke:#c62828

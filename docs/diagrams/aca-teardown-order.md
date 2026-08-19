@@ -3,12 +3,13 @@
 `delete-container-app.sh` runs seven steps whose order is a contract, not a
 convenience, per [container-apps.md §9](../container-apps.md#9-teardown-ordering-is-a-contract-not-a-convenience):
 Azure does not delete a managed identity's role assignments when the identity
-is deleted, and the principal id — the only handle for finding those
-assignments — dies with the identity. So the principal id is read back before
-anything identity-related is touched, and a fail-closed `--all` read-back
-stands between deleting the assignments and deleting the identity. Aborting in
-the middle is worse than failing outright: it leaves the identity, its three
-assignments and the workspace all standing.
+is deleted, and the principal id — the handle that ties those assignments to
+*this* identity — dies with it (what remains afterwards is a per-scope sweep
+for `ObjectType: Unknown` assignments, no longer a lookup). So the principal
+id is read back before anything identity-related is touched, and a
+fail-closed `--all` read-back stands between deleting the assignments and
+deleting the identity. Aborting in the middle is worse than failing outright:
+it leaves the identity, its three assignments and the workspace all standing.
 
 This English diagram is the semantic companion to the article's published
 figure. The publication PNG is rendered from the localized source
@@ -33,7 +34,7 @@ flowchart TB
     S1 --> S2 --> S3 --> S4 --> S5 --> S6
     S6 -->|"yes"| S7
     S6 -->|"no: fail closed and stop —<br/>the identity still exists,<br/>so the assignments can still be queried and removed"| STOP["Fix, then rerun"]
-    S4 -.->|"skipping 4–6 and deleting the identity directly"| ORPHAN["Orphaned assignments:<br/>Identity not found,<br/>the principal id is gone — unrecoverable by lookup"]
+    S3 -.->|"skipping 4–6 and deleting the identity directly"| ORPHAN["Orphaned assignments:<br/>Identity not found — no saved principal id,<br/>cleanup falls back to sweeping each scope<br/>for Unknown-type assignments"]
     style S6 fill:#fff3cd,stroke:#b26a00
     style STOP fill:#d3f0d8,stroke:#2e7d32
     style ORPHAN fill:#fde3e0,stroke:#c62828

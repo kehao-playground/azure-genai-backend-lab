@@ -1,10 +1,14 @@
 # Deploying to Azure Container Apps (Day 24)
 
-Day 23 ended with an image that builds and boots. Day 24 puts that same
-image on a real runtime without scattering a single key: the app
-authenticates to Azure OpenAI with a managed identity, the Search admin
-key lives in Key Vault and is resolved by the platform, and the registry
-pull is identity-based too. The deployment is finished when a readiness
+Day 23 ended with an image that builds and boots. Day 24 puts that
+packaging on a real runtime: ACR rebuilds the image from the unchanged
+Dockerfile (§4), now carrying the managed-identity wiring and one new
+runtime dependency, and no key value travels in the app definition. Two
+paths are genuinely keyless — the app authenticates to Azure OpenAI with
+a managed identity, and the registry pull is identity-based. The Search
+data plane is still key-based: its admin key lives in Key Vault and the
+platform resolves it into the container, where the app sends it as an
+`api-key` header. The deployment is finished when a readiness
 gate proves the whole chain — public FQDN → Entra token → app → managed
 identity → Azure OpenAI — answers a real request, not when
 `az containerapp create` exits 0.
@@ -33,11 +37,14 @@ The series needs a container runtime that a solo engineer can stand up and
 tear down in an afternoon, on a US$20/month ceiling, without operating a
 cluster. Container Apps fits three of this project's standing constraints:
 
-- **It runs the Day 23 image, built from an unchanged Dockerfile.** Same
+- **It runs the Day 23 packaging, from an unchanged Dockerfile.** Same
   base, same non-root user, same `/health`, same `SAMPLE_DOCS_DIR`
-  mechanism; the deployment adds no build step of its own. What changes is
-  configuration — plus one new runtime dependency the keyless path pulls
-  in (`aiohttp`, the async transport `azure.identity.aio` needs).
+  mechanism; the deployment adds no build *stage* of its own. The image
+  itself is rebuilt for deployment (§4's `az acr build`), because the
+  keyless path pulls in one new runtime dependency (`aiohttp`, the async
+  transport `azure.identity.aio` needs) and the managed-identity wiring
+  in `src/`; so the bytes differ from Day 23's local image even though
+  the build graph does not.
 - **It has a documented shutdown contract.** SIGTERM, then SIGKILL when
   the termination grace expires, with the grace period settable per app
   ([Application lifecycle management](https://learn.microsoft.com/en-us/azure/container-apps/application-lifecycle-management),
@@ -58,10 +65,14 @@ reproducibility here is a shell script an operator runs by hand.
 ## 2. Topology: one identity, three roles
 
 A single **user-assigned** managed identity is the app's identity in every
-direction. User-assigned rather than system-assigned because its role
-assignments must exist *before* the app first runs, and a system-assigned
-principal does not exist until the app does — the ordering constraint
-Day 20 already settled
+direction. User-assigned rather than system-assigned because of ordering:
+a system-assigned principal does not exist until the app does, so its
+roles can only be granted *after* the workload may already have started
+once. A two-phase script (create app → read principal back → assign
+roles → restart) is perfectly possible — the cost is that extra phase and
+the window in which the app runs role-less. User-assigned lets every role
+assignment exist before the first start, which is the constraint Day 20
+already settled
 ([managed-identity.md §4](managed-identity.md#4-the-day-24-identity-plan-this-is-the-deployment-note)).
 
 | Consumer | Role | Scope | Who resolves it |
@@ -466,15 +477,22 @@ source says so, directly above the existence check (azure-cli 2.89.0,
 # Otherwise, it's based on current working directory.
 ```
 
-A relative `docker/Dockerfile` therefore worked only when the operator
-happened to stand in the repo root, and this script is invoked from
-`infra/scripts/`. An absolute path outside the context is safe:
+A relative `docker/Dockerfile` therefore works only when the caller's
+working directory happens to be the repo root — the script's own location
+guarantees nothing about that — and on the 2026-08-17 run it was not
+(stage 5 died with `Unable to find 'docker/Dockerfile'`). The fix is an
+absolute path, which is robust from any working directory and is safe
+even though it points outside the context:
 `_archive_utils.py` tars the source location and then *separately* opens the
 Dockerfile and adds it to the archive under a generated name.
 
 **`.dockerignore` prunes much less here than it does locally.** This
-repo's context uploaded as **41.081 MiB** (2026-08-17), against the 1.12MB
-that Day 23 measured a local build transferring from the same tree. Most of
+repo's context uploaded as **41.081 MiB** (2026-08-17). Day 23's final
+same-tree cold measurement of a local build was **671.22kB** (the 1.12MB
+sometimes quoted was the pre-fix reading; [docker.md](docker.md) records
+both). The two numbers come from different trees on different days, so
+read them as orders of magnitude, not a diff — the point is that the
+remote path uploads ~60× more than the local one prunes to. Most of
 the difference is a bug: in `_archive_utils.py`, `IgnoreRule.__init__`
 strips a rule's trailing slash *only* inside the `if rule.startswith('!')`
 branch. So an exclusion written `site/` compiles to the regex `^site/$`
@@ -490,15 +508,20 @@ The remaining difference is not a bug: local BuildKit prunes the context to
 the paths a `COPY` actually references, while `az acr build` tars the whole
 context first and prunes only by `.dockerignore`.
 
-Stage 6 exists because of a bill nobody would find. `az containerapp env
-create` will auto-provision a Log Analytics workspace when none is given,
-and deleting the environment does **not** delete that workspace — it is a
-separate `Microsoft.OperationalInsights/workspaces` resource with its own
-lifecycle. An auto-provisioned workspace is a silent recurring charge the
-teardown could never remove, because it was never told the name Azure
-chose. Creating it explicitly, under a per-run unique name the script
-prints, is what makes the teardown deterministic. Guessing the name would
-be the Day 21 mistake all over again.
+Stage 6 exists because of a bill nobody would go looking for. `az
+containerapp env create` auto-generates a Log Analytics workspace when
+none is given — the CLI reference's own first example is titled "Create an
+environment with an auto-generated Log Analytics workspace", and
+`--logs-destination` defaults to `log-analytics`
+([az containerapp env create](https://learn.microsoft.com/en-us/cli/azure/containerapp/env#az-containerapp-env-create),
+checked 2026-08, ms.date 2026-08-04). That workspace is a separate
+`Microsoft.OperationalInsights/workspaces` resource with its own
+lifecycle; nothing in the environment delete documents cascading to it,
+and this repo has not tested the auto-provision path — the script never
+takes it. It creates the workspace explicitly, under a per-run unique
+name it prints, so the teardown *owns* that lifecycle instead of having
+to reverse-engineer which workspace an omitted argument produced.
+Guessing at names would be the Day 21 mistake all over again.
 
 Stage 8 binds the app to that environment **in the YAML**, not on the
 command line. `az containerapp create --help` states that with `--yaml`,
@@ -583,12 +606,17 @@ resources, with nothing in the portal pointing back at them
 ([Managed identity best practice recommendations § Maintenance](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/managed-identity-best-practice-recommendations#maintenance)).
 Nobody notices, because nothing breaks.
 
-The principal id is the only handle Azure gives you for finding those
-assignments, and it dies with the identity. So step 4 reads it *before*
-anything identity-related is deleted, and step 6 refuses to continue if a
-single assignment remains: deleting the identity at that point converts a
-recoverable state (an identity that can still be re-queried) into a
-permanent one.
+The principal id dies with the identity, and with it the ability to read
+that id back *from the identity*. The same Maintenance page's remedy for
+already-orphaned assignments is enumeration: list assignments whose
+principal resolves to `ObjectType: Unknown` and remove them. That works,
+but it is a sweep, not a lookup — an Unknown-type assignment no longer
+says *which* deleted identity it belonged to. So step 4 reads the id
+*before* anything identity-related is deleted, and step 6 refuses to
+continue if a single assignment remains: deleting the identity at that
+point converts a precisely attributable state (an identity that can still
+be queried by id) into one that can only be cleaned up by scanning each
+scope for Unknowns.
 
 Step 6 deliberately queries **by assignee alone** — no `--scope`, no
 `--role` — and with `--all`. That is what catches a scope this run skipped
@@ -749,9 +777,13 @@ Day 23's local held-stream measurement is the closest available datum.
 **A correction to how the drain was described.** The marker table
 previously said uvicorn "enters lifespan shutdown only after
 `--timeout-graceful-shutdown` completes", which reads as a fixed 20-second
-wait. This run shows otherwise: the platform's stop events are at
-02:09:06.21 and `lifespan shutdown started` is at 02:09:06.351, about a
-tenth of a second later. The flag is a **ceiling** on the drain, not a
+wait. This run shows otherwise, within the clock discipline's limits: the
+KEDA scaler-stop events for the revision are logged at 02:09:06.21 (they
+are the platform's earliest teardown trace here, not an identified
+SIGTERM-delivery timestamp) and the app's `lifespan shutdown started` at
+02:09:06.351 — two different clocks, so no duration can be computed, but
+both land in the same second, which rules out a 20-second wait on an idle
+app. The flag is a **ceiling** on the drain, not a
 delay that is spent. Day 23's own local measurement is consistent — with a
 deliberately held SSE stream the drain *was* cut off at ~20s, because there
 the ceiling was reached.
