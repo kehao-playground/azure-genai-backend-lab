@@ -93,15 +93,17 @@
 #                       WARNING, never silently) only the item it names.
 # Optional env vars:
 #   GH_RUN_LIST_LIMIT - how many of the repo's most recent runs the drain
-#                        check inspects, default 1000. `gh run list` defaults
-#                        to 20 -- raised explicitly here so a busy repo does
-#                        not hide an in-flight run outside that window. `gh`
-#                        paginates internally to satisfy this limit; it is
-#                        still a bound, not literal pagination-to-exhaustion --
-#                        so step 3 also compares it against the repo's true
-#                        total run count FIRST and fails closed if that total
-#                        exceeds the cap, rather than trusting a count from a
-#                        window that might not have covered every run.
+#                        check inspects, default 1000; must be a positive
+#                        integer (validated before anything is mutated).
+#                        `gh run list` defaults to 20 -- raised explicitly
+#                        here so a busy repo does not hide an in-flight run
+#                        outside that window. `gh` paginates internally to
+#                        satisfy this limit; it is still a bound, not literal
+#                        pagination-to-exhaustion -- so step 3 also checks
+#                        whether the fetched window came back EXACTLY full
+#                        and fails closed on that (an unprovably-truncated
+#                        window), rather than trusting a non-terminal count
+#                        that might not have covered every run.
 #
 # Privileges needed: the same directory and role-assignment permissions
 # create-github-oidc.sh's header documents, plus `gh auth login` with
@@ -170,6 +172,16 @@ if [ -z "$GITHUB_REPO" ] || [ -z "$AZ_TENANT_ID" ] || [ -z "$AZ_SUBSCRIPTION_ID"
   echo "Record file '$OIDC_RECORD_FILE' is missing GITHUB_REPO, AZ_TENANT_ID or" >&2
   echo "AZ_SUBSCRIPTION_ID. Cannot safely identify anything to tear down from it." >&2
   echo "Fix the record file by hand, or tear the resources down manually." >&2
+  exit 1
+fi
+
+# Validated here, before any mutation, not where it is first used in step 3:
+# this project has shipped a knob that silently ran zero iterations on a
+# malformed value (Day 21's `seq` bug) -- a bad GH_RUN_LIST_LIMIT must fail
+# loudly up front, not fall through to a comparison that misbehaves quietly.
+GH_RUN_LIST_LIMIT="${GH_RUN_LIST_LIMIT:-1000}"
+if ! [[ "$GH_RUN_LIST_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GH_RUN_LIST_LIMIT must be a positive integer; got '$GH_RUN_LIST_LIMIT'." >&2
   exit 1
 fi
 
@@ -564,34 +576,45 @@ teardown_fic "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_FIC_ID)
 
 # === step 3: drain check =====================================================
 echo "== step 3: drain check (repo-scoped -- every run, not just this workflow) =="
-GH_RUN_LIST_LIMIT="${GH_RUN_LIST_LIMIT:-1000}"
+# GH_RUN_LIST_LIMIT was validated as a positive integer during preflight.
 
-# GH_RUN_LIST_LIMIT is a FETCH CAP, not a claim of exhaustive pagination. If
-# the repo has genuinely more total runs than this cap fetches, a
-# non-terminal run could be sitting entirely outside the window the count
-# query below inspects, and that query would read a false "0 found" --
-# draining silently on a truncated window is exactly the failure shape this
-# check exists to prevent. So the true total is read FIRST, cheaply, and
-# fails closed if it exceeds the cap: an unverifiable window aborts, it does
-# not proceed on an optimistic "probably fine".
-TOTAL_RUN_COUNT="$(gh api "repos/${GITHUB_REPO}/actions/runs" --jq '.total_count')"
-require_value "$TOTAL_RUN_COUNT" "the total workflow run count"
-if [ "$TOTAL_RUN_COUNT" -gt "$GH_RUN_LIST_LIMIT" ]; then
-  echo "The repo has $TOTAL_RUN_COUNT runs total, more than GH_RUN_LIST_LIMIT=$GH_RUN_LIST_LIMIT" >&2
-  echo "-- the drain check's window cannot be trusted to have seen every run. A" >&2
-  echo "non-terminal run outside that window would read as a false 'drained'." >&2
-  echo "Raise GH_RUN_LIST_LIMIT and re-run rather than proceed on an unverifiable window." >&2
+# ONE call answers two questions -- no second `gh run list` call, no second
+# endpoint. `--json status` is the only field requested (smaller response,
+# and its shape is what tells this call apart from the detail query a few
+# lines down). The jq program's comma operator prints TWO lines: the raw
+# window size (unfiltered `length`), then the non-terminal count within that
+# same window. `gh run list` defaults to 20 results -- GH_RUN_LIST_LIMIT
+# raises that explicitly, and `gh` paginates internally to satisfy it.
+#
+# GH_RUN_LIST_LIMIT is a FETCH CAP, not exhaustive pagination -- so the raw
+# window size is checked FIRST. If the window came back exactly full, an
+# older run (most plausibly one stuck `waiting` behind an unapproved
+# `production` environment, sitting underneath a pile of newer completed CI
+# runs) could exist entirely outside what was just fetched, and the
+# non-terminal count below would then be reading a possibly-truncated view,
+# not the whole repo. That is UNPROVABLE from this window alone, so an exactly
+# full window fails closed -- it does not proceed on an optimistic "probably
+# fine". (An earlier version of this check compared the repo's LIFETIME total
+# run count against GH_RUN_LIST_LIMIT -- a different, wrong quantity: any
+# repo whose all-time run count ever exceeded the cap would abort teardown
+# permanently, whether or not anything was in flight. Comparing the window's
+# own size against its own cap is the quantity that actually matters.)
+RUN_LIST_COUNTS="$(gh run list --repo "$GITHUB_REPO" --limit "$GH_RUN_LIST_LIMIT" \
+  --json status --jq 'length, ([.[] | select(.status != "completed")] | length)')"
+require_value "$RUN_LIST_COUNTS" "the workflow run drain-check counts"
+mapfile -t RUN_LIST_COUNT_LINES <<<"$RUN_LIST_COUNTS"
+RAW_WINDOW_COUNT="${RUN_LIST_COUNT_LINES[0]:-}"
+NON_TERMINAL_COUNT="${RUN_LIST_COUNT_LINES[1]:-}"
+require_value "$RAW_WINDOW_COUNT" "the workflow run drain-check window size"
+require_value "$NON_TERMINAL_COUNT" "the workflow run drain-check non-terminal count"
+
+if [ "$RAW_WINDOW_COUNT" -eq "$GH_RUN_LIST_LIMIT" ]; then
+  echo "gh run list returned exactly GH_RUN_LIST_LIMIT=$GH_RUN_LIST_LIMIT runs -- this window may be" >&2
+  echo "truncated, and an older non-terminal run could exist outside it. Cannot prove the repo is" >&2
+  echo "drained from a possibly-incomplete window. Raise GH_RUN_LIST_LIMIT and re-run." >&2
   exit 1
 fi
 
-# --json status is deliberately the ONLY field requested for the count query
-# below (smaller response, and it doubles as a clean way to tell this call
-# apart from the detail query a few lines down). `gh run list` defaults to 20
-# results -- GH_RUN_LIST_LIMIT raises that explicitly; `gh` paginates
-# internally to satisfy it.
-NON_TERMINAL_COUNT="$(gh run list --repo "$GITHUB_REPO" --limit "$GH_RUN_LIST_LIMIT" \
-  --json status --jq '[.[] | select(.status != "completed")] | length')"
-require_value "$NON_TERMINAL_COUNT" "the workflow run drain-check count"
 if [ "$NON_TERMINAL_COUNT" != "0" ]; then
   echo "Found $NON_TERMINAL_COUNT non-terminal run(s) in the repo (repo-scoped, not filtered by" >&2
   echo "workflow -- any workflow may declare environment: production). Aborting before any" >&2
@@ -601,7 +624,7 @@ if [ "$NON_TERMINAL_COUNT" != "0" ]; then
     --jq '.[] | select(.status != "completed") | "  - #\(.databaseId) \(.workflowName) (\(.headBranch)) status=\(.status) \(.url)"' >&2
   exit 1
 fi
-echo "  drain check clean: 0 non-terminal runs among the $GH_RUN_LIST_LIMIT most recent"
+echo "  drain check clean: 0 non-terminal runs among $RAW_WINDOW_COUNT total (window not truncated)"
 
 # === step 4: role assignments ================================================
 echo "== step 4: delete role assignments =="
