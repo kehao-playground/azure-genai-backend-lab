@@ -828,10 +828,15 @@ if args[:2] == ["auth", "status"]:
 
 if args[:2] == ["run", "list"]:
     jq_filter = opt("--jq")
-    runs = state.get("gh_runs", [])
+    limit_str = opt("--limit")
+    all_runs = state.get("gh_runs", [])
+    limit = int(limit_str) if limit_str else len(all_runs)
+    runs = all_runs[:limit]
     non_terminal = [r for r in runs if r.get("status") != "completed"]
-    if "length" in jq_filter:
-        done(str(len(non_terminal)))
+    if jq_filter.startswith("length,"):
+        # The comma-jq count query -- two lines: raw window size, then the
+        # non-terminal count within that same (possibly truncated) window.
+        done(f"{len(runs)}\\n{len(non_terminal)}")
     lines = [
         f"  - #{r['databaseId']} {r['workflowName']} ({r['headBranch']}) "
         f"status={r['status']} {r['url']}"
@@ -887,11 +892,6 @@ if args and args[0] == "api":
     if method == "GET" and path and path.startswith(variables_prefix):
         name = path[len(variables_prefix):]
         done(state.get("variables", {}).get(name, ""))
-
-    runs_path = f"repos/{state[\'github_repo\']}/actions/runs"
-    if method == "GET" and path == runs_path and jq_filter == ".total_count":
-        default_total = len(state.get("gh_runs", []))
-        done(str(state.get("total_run_count", default_total)))
 
     environments_path = f"repos/{state[\'github_repo\']}/environments"
     if method == "GET" and path == environments_path:
@@ -1102,30 +1102,63 @@ def test_drain_check_requests_more_than_the_default_20(tmp_path: Path) -> None:
         assert "--limit" in call
 
 
-def test_drain_check_fails_closed_when_total_run_count_exceeds_the_limit(tmp_path: Path) -> None:
-    # The repo has more total runs than GH_RUN_LIST_LIMIT would fetch -- the
-    # window cannot be trusted to have seen every run, so this must abort
-    # BEFORE even querying non-terminal status, not read a possibly-truncated
-    # "0 found" as "drained".
-    h = DeleteHarness(tmp_path, total_run_count=2001)
-    result = h.run(GH_RUN_LIST_LIMIT="2000")
+def _completed_runs(n: int) -> list[dict[str, object]]:
+    return [
+        {
+            "databaseId": i,
+            "workflowName": "CI",
+            "headBranch": "main",
+            "status": "completed",
+            "url": f"https://github.com/x/y/actions/runs/{i}",
+        }
+        for i in range(n)
+    ]
+
+
+def test_drain_check_fails_closed_when_the_run_list_window_is_exactly_full(
+    tmp_path: Path,
+) -> None:
+    # The fetched window came back with exactly GH_RUN_LIST_LIMIT entries --
+    # an older run could exist entirely outside it, so this window CANNOT
+    # prove the repo is drained, regardless of what's inside it (all three
+    # runs here are terminal). Must abort before the non-terminal count is
+    # even consulted, and before any further Azure deletion.
+    h = DeleteHarness(tmp_path, gh_runs=_completed_runs(3))
+    result = h.run(GH_RUN_LIST_LIMIT="3")
     assert result.returncode != 0
-    assert "2001" in result.stderr
-    assert "GH_RUN_LIST_LIMIT=2000" in result.stderr
-    assert "cannot be trusted" in result.stderr
+    assert "GH_RUN_LIST_LIMIT=3" in result.stderr
+    assert "may be" in result.stderr and "truncated" in result.stderr
+    assert "Cannot prove the repo is" in result.stderr
+    # Exactly one gh run list call -- the combined count query -- not the
+    # detail query too (that only fires once a non-terminal count is known
+    # from a window that was actually trusted).
+    run_list_calls = [c for c in h.calls if c.startswith("gh run list")]
+    assert len(run_list_calls) == 1
     assert h.has("ad app federated-credential delete")
-    assert not h.has("gh run list")
     assert not h.has("role assignment delete")
     assert not h.has("ad app delete")
     assert h.state["apps"] != {}
     assert h.state["role_assignments"] != []
 
 
-def test_drain_check_proceeds_when_total_run_count_is_within_the_limit(tmp_path: Path) -> None:
-    h = DeleteHarness(tmp_path, total_run_count=999)
-    result = h.run(GH_RUN_LIST_LIMIT="1000")
+def test_drain_check_proceeds_when_the_run_list_window_is_not_full(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path, gh_runs=_completed_runs(2))
+    result = h.run(GH_RUN_LIST_LIMIT="5")
     assert result.returncode == 0, result.stderr
     assert h.has("gh run list")
+
+
+def test_gh_run_list_limit_must_be_a_positive_integer(tmp_path: Path) -> None:
+    # Note: an EMPTY GH_RUN_LIST_LIMIT is not tested as a bad value here --
+    # bash's ${VAR:-default} treats "set but empty" the same as "unset" and
+    # falls back to 1000, so it is not actually a malformed-knob case.
+    h = DeleteHarness(tmp_path)
+    for bad in ("abc", "0", "-5", "3.5"):
+        result = h.run(GH_RUN_LIST_LIMIT=bad)
+        assert result.returncode != 0, bad
+        assert "GH_RUN_LIST_LIMIT" in result.stderr, bad
+    # Validated before any az/gh call -- not just before the drain check.
+    assert h.calls == []
 
 
 def test_non_terminal_run_aborts_before_role_assignment_or_app_deletion(tmp_path: Path) -> None:
