@@ -242,6 +242,35 @@ def test_snapshot_that_is_a_tag_is_echoed_verbatim_in_the_rollback_line(tmp_path
     assert "TAG reference, not a digest" in result.stderr
 
 
+def test_rollback_command_is_complete_enough_to_run_as_printed(tmp_path: Path) -> None:
+    # `az` reads neither AZ_SUBSCRIPTION_ID nor AZ_RESOURCE_GROUP -- those
+    # are this repo's own script conventions -- so the printed rollback
+    # command must carry --subscription and --resource-group as flags or it
+    # is not runnable pasted as-is. Pins completeness, not just that some
+    # expected words appear somewhere in stderr.
+    h = Harness(tmp_path, running_state="Failed")
+    result = h.run()
+    assert result.returncode != 0
+    rollback_lines = [
+        line for line in result.stderr.splitlines() if "az containerapp update" in line
+    ]
+    assert rollback_lines, result.stderr
+    rollback_command = " ".join(
+        result.stderr[result.stderr.index(rollback_lines[0]) :].splitlines()[:2]
+    )
+    assert "--subscription" in rollback_command
+    assert h.env["AZ_SUBSCRIPTION_ID"] in rollback_command
+    assert "--resource-group" in rollback_command
+    assert h.env["AZ_RESOURCE_GROUP"] in rollback_command
+    assert "--name" in rollback_command
+    assert h.env["AZ_ACA_APP_NAME"] in rollback_command
+    assert "--image" in rollback_command
+    # The rollback target is the step-1 snapshot (the image that was
+    # serving before this run's mutation), never the --image this run
+    # requested -- the harness default snapshot is TAG_IMAGE.
+    assert TAG_IMAGE in rollback_command
+
+
 def test_snapshot_that_is_a_digest_gets_no_tag_warning(tmp_path: Path) -> None:
     snapshot_digest = (
         "acrfaked25.azurecr.io/azgenai-lab@sha256:"
@@ -270,6 +299,28 @@ def test_empty_snapshot_read_back_aborts_before_any_mutation(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed: `az containerapp update` itself returns non-zero. The single
+# most likely real failure of this script, and the one whose handling (the
+# rollback hint) I1 found broken -- the FAKE_AZ hook existed before this
+# test did.
+# ---------------------------------------------------------------------------
+
+
+def test_update_call_failure_prints_the_rollback_line(tmp_path: Path) -> None:
+    h = Harness(tmp_path, update_fails=True)
+    result = h.run()
+    assert result.returncode != 0
+    assert "injected update failure" in result.stderr
+    assert "No automatic rollback" in result.stderr
+    assert f"--image {TAG_IMAGE}" in result.stderr
+    # A mutation was already requested (MUTATED=true is set before the `az`
+    # call), so the rollback hint fires even though the call itself failed --
+    # but nothing past step 2 ever ran.
+    assert not h.has("containerapp revision show")
+    assert not h.has("curl ")
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed: update reported success but the read-back disagrees.
 # ---------------------------------------------------------------------------
 
@@ -279,7 +330,7 @@ def test_update_succeeds_but_readback_shows_old_image_fails(tmp_path: Path) -> N
     # into served_image; injecting a stuck value simulates a read-back that
     # still reports the pre-update image even though the update call itself
     # returned 0.
-    h = Harness(tmp_path, stuck_served_image=True)
+    h = Harness(tmp_path)
     # Patch the fake az inline for this one test: served_image never changes.
     fake_az_stuck = FAKE_AZ.replace(
         'state["served_image"] = opt("--image")\n    done("{}")',
@@ -368,6 +419,19 @@ def test_health_never_resolves_within_the_attempt_budget(tmp_path: Path) -> None
     assert h.count("curl ") == 3  # HEALTH_POLL_ATTEMPTS
 
 
+def test_curl_transport_failure_is_treated_as_a_failed_probe_not_a_status(tmp_path: Path) -> None:
+    # curl exiting non-zero (a transport failure, not an HTTP status) must
+    # keep retrying rather than aborting the loop -- the `if HTTP_CODE=$(...)`
+    # form is set -e-exempt for exactly this. HTTP_CODE ends up unset/empty
+    # on a failed call, so the final message falls back to "none".
+    h = Harness(tmp_path, curl_fails=True)
+    result = h.run()
+    assert result.returncode != 0
+    assert "did not return the expected body" in result.stderr
+    assert "last status: none" in result.stderr
+    assert h.count("curl ") == 3  # HEALTH_POLL_ATTEMPTS
+
+
 def test_empty_fqdn_read_aborts_before_probing(tmp_path: Path) -> None:
     h = Harness(tmp_path, fqdn="")
     result = h.run()
@@ -426,6 +490,52 @@ def test_missing_required_env_vars_fail_before_touching_az(tmp_path: Path) -> No
         assert result.returncode != 0, missing
         assert missing in result.stderr, missing
     assert h.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Poll-knob validation: malformed or zero values fail closed before any `az`
+# call. This project has shipped the zero-iteration-silent-success shape
+# twice already (Day 21's `seq`, Day 24's `--all`) -- require_count/
+# require_seconds are the guard against a third; this pins that the guard
+# actually runs and actually blocks, not just that the loop later happens
+# to be a C-style `for ((...))` immune to it.
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_poll_attempt_knobs_fail_before_any_az_call(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    for name in ("ACA_REVISION_POLL_ATTEMPTS", "HEALTH_POLL_ATTEMPTS"):
+        for bad in ("0", "-5", "abc", "3.5"):
+            result = h.run(**{name: bad})
+            assert result.returncode != 0, (name, bad)
+            assert name in result.stderr, (name, bad)
+            assert "positive integer" in result.stderr, (name, bad)
+    assert h.calls == []
+
+
+def test_malformed_poll_interval_knobs_fail_before_any_az_call(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    for name in ("ACA_REVISION_POLL_INTERVAL", "HEALTH_POLL_INTERVAL"):
+        for bad in ("-5", "abc", "3.5"):
+            result = h.run(**{name: bad})
+            assert result.returncode != 0, (name, bad)
+            assert name in result.stderr, (name, bad)
+            assert "non-negative integer" in result.stderr, (name, bad)
+    assert h.calls == []
+
+
+def test_zero_interval_is_valid_but_zero_attempts_is_not(tmp_path: Path) -> None:
+    # Unlike the *_ATTEMPTS knobs (require_count, positive integers only),
+    # an interval of 0 is legitimate -- it is this harness's own default,
+    # and require_seconds accepts it.
+    h = Harness(tmp_path)
+    result = h.run(ACA_REVISION_POLL_INTERVAL="0", HEALTH_POLL_INTERVAL="0")
+    assert result.returncode == 0, result.stderr
+
+    result = h.run(ACA_REVISION_POLL_ATTEMPTS="0")
+    assert result.returncode != 0
+    assert "ACA_REVISION_POLL_ATTEMPTS" in result.stderr
+    assert "positive integer" in result.stderr
 
 
 def test_script_exists_and_is_executable() -> None:
