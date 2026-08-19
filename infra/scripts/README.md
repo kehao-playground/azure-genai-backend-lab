@@ -25,6 +25,7 @@
 | `delete-content-safety.sh` | Delete and purge that account from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
 | `run-content-safety-probe.sh` | Orchestrate create → Prompt Shields probe → delete/purge, EXIT-trap cleanup armed before create | working |
 | `create-github-oidc.sh` | Provision the two federated (secret-less) GitHub Actions identities (build: `AcrPush` on the registry; deploy: `Container Apps Contributor` on the app), the GitHub `production` environment (required reviewer + branch-restricted to `main`, read back and compared), repository variables, then arms `DEPLOY_ENABLED=true` last | working |
+| `delete-github-oidc.sh` | Tear that down from the record file `create-github-oidc.sh` wrote: `DEPLOY_ENABLED=false` first, delete both federated credentials, a repo-scoped drain check that aborts (never cancels) on any non-terminal run, delete role assignments then app registrations, delete the GitHub environment and repository variables — plus a read-only `--verify-teardown` mode that only removes the record file once nothing it names is still found | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 

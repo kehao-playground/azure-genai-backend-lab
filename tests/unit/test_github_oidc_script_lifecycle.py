@@ -641,3 +641,571 @@ def test_teardown_hint_printed_on_abort_after_partial_creation(tmp_path: Path) -
 def test_script_exists_and_is_executable() -> None:
     assert SCRIPT.is_file()
     assert os.access(SCRIPT, os.X_OK)
+
+
+# ---------------------------------------------------------------------------
+# infra/scripts/delete-github-oidc.sh
+#
+# D10's sequence: DEPLOY_ENABLED=false, delete both federated credentials,
+# drain check (repo-scoped, paginated, abort-not-cancel), delete role
+# assignments (--all read-back), delete app registrations (assignments
+# before principals), delete the GitHub environment and repository
+# variables, and a separate read-only --verify-teardown mode that only
+# removes the record file when nothing recorded is still found.
+#
+# The fakes below model a repository that already has everything
+# create-github-oidc.sh would have created (apps, federated credentials,
+# role assignments, the environment, the repository variables) plus a
+# configurable set of in-flight workflow runs, so delete-github-oidc.sh's
+# own read-backs are exercised against real state, not just call counting.
+# ---------------------------------------------------------------------------
+
+DELETE_SCRIPT = REPO_ROOT / "infra" / "scripts" / "delete-github-oidc.sh"
+
+BUILD_DISPLAY_NAME = "gh-oidc-build-azgenai-lab-abcd1234"
+DEPLOY_DISPLAY_NAME = "gh-oidc-deploy-azgenai-lab-efgh5678"
+BUILD_FIC_ID = "fic-build-1"
+DEPLOY_FIC_ID = "fic-deploy-1"
+BUILD_ASSIGNMENT_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleAssignments/aaaaaaaa-0000-0000-0000-000000000001"
+)
+DEPLOY_ASSIGNMENT_ID = (
+    f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/"
+    "roleAssignments/aaaaaaaa-0000-0000-0000-000000000002"
+)
+
+FAKE_AZ_DELETE = '''#!/usr/bin/env python3
+import json, os, re, sys
+
+state_path = os.environ["GH_OIDC_FAKE_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+
+args = sys.argv[1:]
+state.setdefault("calls", []).append(" ".join(args))
+
+def save():
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+
+def opt(name):
+    return args[args.index(name) + 1] if name in args else ""
+
+def done(out="", code=0):
+    save()
+    if out != "":
+        print(out)
+    sys.exit(code)
+
+def fail(msg="fake az: injected failure", code=1):
+    save()
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+apps = state.setdefault("apps", {})
+
+if args[:2] == ["account", "show"]:
+    done(state.get("active_tenant_id", ""))
+
+if args[:2] == ["account", "set"]:
+    done()
+
+if args[:3] == ["ad", "app", "list"]:
+    filt = opt("--filter")
+    query = opt("--query")
+    m = re.match(r"(appId|displayName) eq '([^']*)'", filt)
+    if not m:
+        fail(f"fake az: unparseable filter {filt!r}", 2)
+    field, value = m.group(1), m.group(2)
+    matches = []
+    for app_id, info in apps.items():
+        key = app_id if field == "appId" else info.get("display_name", "")
+        if key == value:
+            matches.append(app_id)
+    if query == "length([])":
+        done(str(len(matches)))
+    if query == "[0].appId":
+        done(matches[0] if matches else "")
+    fail(f"fake az: unhandled ad app list query {query!r}", 2)
+
+if args[:3] == ["ad", "app", "delete"]:
+    app_id = opt("--id")
+    if app_id in apps:
+        del apps[app_id]
+        done()
+    fail("fake az: app not found", 1)
+
+if args[:4] == ["ad", "app", "federated-credential", "delete"]:
+    app_id = opt("--id")
+    fic_id = opt("--federated-credential-id")
+    fics = apps.get(app_id, {}).get("fics", [])
+    if fic_id in fics:
+        fics.remove(fic_id)
+        done()
+    fail("fake az: federated credential not found", 1)
+
+if args[:4] == ["ad", "app", "federated-credential", "list"]:
+    app_id = opt("--id")
+    query = opt("--query")
+    if app_id not in apps:
+        fail("fake az: app not found (federated-credential list)", 1)
+    m = re.search(r"\\[\\?id=='([^']*)'\\]", query)
+    target = m.group(1) if m else None
+    fics = apps.get(app_id, {}).get("fics", [])
+    done(str(1 if target in fics else 0))
+
+if args[:3] == ["role", "assignment", "delete"]:
+    assignments = state.setdefault("role_assignments", [])
+    if "--ids" in args:
+        aid = opt("--ids")
+        state["role_assignments"] = [a for a in assignments if a["id"] != aid]
+        done()
+    pid = opt("--assignee-object-id")
+    role = opt("--role")
+    scope = opt("--scope")
+    state["role_assignments"] = [
+        a
+        for a in assignments
+        if not (a["principal_id"] == pid and a["role"] == role and a["scope"] == scope)
+    ]
+    done()
+
+if args[:3] == ["role", "assignment", "list"]:
+    pid = opt("--assignee-object-id")
+    role = opt("--role")
+    scope = opt("--scope")
+    assignments = state.get("role_assignments", [])
+    count = sum(
+        1
+        for a in assignments
+        if a["principal_id"] == pid and a["role"] == role and a["scope"] == scope
+    )
+    done(str(count))
+
+print(f"fake az: unhandled command: {' '.join(args)}", file=sys.stderr)
+done(code=2)
+'''
+
+FAKE_GH_DELETE = '''#!/usr/bin/env python3
+import json, os, re, sys
+
+state_path = os.environ["GH_OIDC_FAKE_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+
+args = sys.argv[1:]
+state.setdefault("calls", []).append("gh " + " ".join(args))
+
+def save():
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+
+def opt(name):
+    return args[args.index(name) + 1] if name in args else ""
+
+def done(out="", code=0):
+    save()
+    if out != "":
+        print(out)
+    sys.exit(code)
+
+def fail(msg="fake gh: injected failure", code=1):
+    save()
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+if args[:2] == ["auth", "status"]:
+    if state.get("gh_not_authenticated"):
+        fail("fake gh: not logged in")
+    done()
+
+if args[:2] == ["run", "list"]:
+    jq_filter = opt("--jq")
+    runs = state.get("gh_runs", [])
+    non_terminal = [r for r in runs if r.get("status") != "completed"]
+    if "length" in jq_filter:
+        done(str(len(non_terminal)))
+    lines = [
+        f"  - #{r['databaseId']} {r['workflowName']} ({r['headBranch']}) "
+        f"status={r['status']} {r['url']}"
+        for r in non_terminal
+    ]
+    done("\\n".join(lines))
+
+if args[:2] == ["variable", "set"]:
+    name = args[2]
+    body = opt("--body")
+    state.setdefault("variables", {})[name] = body
+    done()
+
+if args[:2] == ["variable", "delete"]:
+    name = args[2]
+    variables = state.setdefault("variables", {})
+    if name in variables:
+        del variables[name]
+        done()
+    fail("fake gh: variable not found", 1)
+
+if args[:2] == ["variable", "list"]:
+    jq_filter = opt("--jq")
+    m = re.search(r'index\\("([^"]*)"\\)', jq_filter)
+    if not m:
+        fail(f"fake gh: unparseable jq {jq_filter!r}", 2)
+    name = m.group(1)
+    present = name in state.get("variables", {})
+    done("true" if present else "false")
+
+if args and args[0] == "api":
+    rest = args[1:]
+    method = "GET"
+    jq_filter = None
+    path = None
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--method":
+            method = rest[i + 1]
+            i += 2
+        elif tok == "--jq":
+            jq_filter = rest[i + 1]
+            i += 2
+        elif not tok.startswith("-"):
+            if path is None:
+                path = tok
+            i += 1
+        else:
+            i += 1
+
+    variables_prefix = f"repos/{state[\'github_repo\']}/actions/variables/"
+    if method == "GET" and path and path.startswith(variables_prefix):
+        name = path[len(variables_prefix):]
+        done(state.get("variables", {}).get(name, ""))
+
+    environments_path = f"repos/{state[\'github_repo\']}/environments"
+    if method == "GET" and path == environments_path:
+        m = re.search(r\'index\\("([^"]*)"\\)\', jq_filter or "")
+        if not m:
+            fail(f"fake gh: unparseable environments jq {jq_filter!r}", 2)
+        name = m.group(1)
+        present = name in state.get("environments", [])
+        done("true" if present else "false")
+
+    if method == "DELETE" and path and path.startswith(f"{environments_path}/"):
+        name = path[len(environments_path) + 1:]
+        envs = state.setdefault("environments", [])
+        if name in envs:
+            envs.remove(name)
+        done()
+
+    print(f"fake gh: unhandled api call: {rest}", file=sys.stderr)
+    done(code=2)
+
+print(f"fake gh: unhandled command: {' '.join(args)}", file=sys.stderr)
+done(code=2)
+'''
+
+
+class DeleteHarness:
+    def __init__(
+        self,
+        tmp_path: Path,
+        record_overrides: dict[str, str] | None = None,
+        **overrides: object,
+    ) -> None:
+        state: dict[str, object] = {
+            "active_tenant_id": TENANT_ID,
+            "github_repo": GITHUB_REPO,
+            "apps": {
+                BUILD_APP_GUID: {"display_name": BUILD_DISPLAY_NAME, "fics": [BUILD_FIC_ID]},
+                DEPLOY_APP_GUID: {"display_name": DEPLOY_DISPLAY_NAME, "fics": [DEPLOY_FIC_ID]},
+            },
+            "role_assignments": [
+                {
+                    "id": BUILD_ASSIGNMENT_ID,
+                    "principal_id": BUILD_SP_GUID,
+                    "role": "AcrPush",
+                    "scope": ACR_ID,
+                },
+                {
+                    "id": DEPLOY_ASSIGNMENT_ID,
+                    "principal_id": DEPLOY_SP_GUID,
+                    "role": "Container Apps Contributor",
+                    "scope": ACA_APP_ID,
+                },
+            ],
+            "environments": ["production"],
+            "variables": {
+                "AZURE_TENANT_ID": TENANT_ID,
+                "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION_ID,
+                "AZURE_CLIENT_ID_BUILD": BUILD_APP_GUID,
+                "AZURE_CLIENT_ID_DEPLOY": DEPLOY_APP_GUID,
+                "AZURE_ACR_NAME": "acrfaked25",
+                "AZURE_RESOURCE_GROUP": "rg",
+                "AZURE_CONTAINER_APP_NAME": "aca-faked25",
+                "DEPLOY_ENABLED": "true",
+            },
+            "gh_runs": [],
+        }
+        state.update(overrides)
+        self.state_path = tmp_path / "state.json"
+        self.state_path.write_text(json.dumps(state))
+
+        fake_dir = tmp_path / "bin"
+        fake_dir.mkdir()
+        for name, body in (("az", FAKE_AZ_DELETE), ("gh", FAKE_GH_DELETE)):
+            path = fake_dir / name
+            path.write_text(body)
+            path.chmod(0o755)
+
+        self.record_file = tmp_path / "record.env"
+        record: dict[str, str] = {
+            "CREATED_AT": "2026-08-19T00:00:00Z",
+            "GITHUB_REPO": GITHUB_REPO,
+            "AZ_TENANT_ID": TENANT_ID,
+            "AZ_SUBSCRIPTION_ID": SUBSCRIPTION_ID,
+            "AZ_RESOURCE_GROUP": "rg",
+            "AZ_ACR_NAME": "acrfaked25",
+            "AZ_ACR_ID": ACR_ID,
+            "AZ_ACA_APP_NAME": "aca-faked25",
+            "AZ_ACA_APP_ID": ACA_APP_ID,
+            "GH_ENVIRONMENT_NAME": "production",
+            "GH_DEPLOY_BRANCH": "main",
+            "BUILD_APP_DISPLAY_NAME": BUILD_DISPLAY_NAME,
+            "DEPLOY_APP_DISPLAY_NAME": DEPLOY_DISPLAY_NAME,
+            "BUILD_APP_ID": BUILD_APP_GUID,
+            "BUILD_APP_OBJECT_ID": BUILD_OBJECT_GUID,
+            "BUILD_SP_ID": BUILD_SP_GUID,
+            "DEPLOY_APP_ID": DEPLOY_APP_GUID,
+            "DEPLOY_APP_OBJECT_ID": DEPLOY_OBJECT_GUID,
+            "DEPLOY_SP_ID": DEPLOY_SP_GUID,
+            "BUILD_FIC_ID": BUILD_FIC_ID,
+            "DEPLOY_FIC_ID": DEPLOY_FIC_ID,
+            "BUILD_ROLE_ASSIGNMENT_ID": BUILD_ASSIGNMENT_ID,
+            "DEPLOY_ROLE_ASSIGNMENT_ID": DEPLOY_ASSIGNMENT_ID,
+            "GH_ENVIRONMENT_CREATED": "true",
+            "GH_REQUIRED_REVIEWER_LOGIN": REVIEWER_LOGIN,
+            "GH_VARIABLES_WRITTEN": (
+                "AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID_BUILD "
+                "AZURE_CLIENT_ID_DEPLOY AZURE_ACR_NAME AZURE_RESOURCE_GROUP "
+                "AZURE_CONTAINER_APP_NAME"
+            ),
+            "DEPLOY_ENABLED_SET": "true",
+        }
+        if record_overrides:
+            record.update(record_overrides)
+        lines = [f"{k}={v}\n" for k, v in record.items() if v is not None]
+        self.record_file.write_text("".join(lines))
+
+        self.env = {
+            **os.environ,
+            "PATH": f"{fake_dir}:{os.environ['PATH']}",
+            "GH_OIDC_FAKE_STATE": str(self.state_path),
+            "OIDC_RECORD_FILE": str(self.record_file),
+        }
+
+    def run(self, *args: str, **extra_env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(DELETE_SCRIPT), *args],
+            env={**self.env, **extra_env},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    @property
+    def state(self) -> dict[str, object]:
+        return json.loads(self.state_path.read_text())  # type: ignore[no-any-return]
+
+    @property
+    def calls(self) -> list[str]:
+        return self.state.get("calls", [])  # type: ignore[return-value]
+
+    def first_index(self, prefix: str) -> int:
+        return next(i for i, call in enumerate(self.calls) if call.startswith(prefix))
+
+    def last_index(self, prefix: str) -> int:
+        return max(i for i, call in enumerate(self.calls) if call.startswith(prefix))
+
+    def has(self, prefix: str) -> bool:
+        return any(call.startswith(prefix) for call in self.calls)
+
+
+def test_delete_script_exists_and_is_executable() -> None:
+    assert DELETE_SCRIPT.is_file()
+    assert os.access(DELETE_SCRIPT, os.X_OK)
+
+
+def test_delete_happy_path_tears_everything_down(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    assert h.state["apps"] == {}
+    assert h.state["role_assignments"] == []
+    assert h.state["environments"] == []
+    assert h.state["variables"] == {}
+    # The record file is left in place by a plain teardown run -- only
+    # --verify-teardown removes it.
+    assert h.record_file.exists()
+
+    calls_before_verify = len(h.calls)
+    verify = h.run("--verify-teardown")
+    assert verify.returncode == 0, verify.stderr
+    assert "Removed" in verify.stdout
+    assert not h.record_file.exists()
+    # Read-only: none of the calls verify made were deletes.
+    verify_only_calls = h.calls[calls_before_verify:]
+    assert not any(
+        "federated-credential delete" in c
+        or "role assignment delete" in c
+        or "ad app delete" in c
+        or "gh variable delete" in c
+        or "DELETE repos" in c
+        for c in verify_only_calls
+    )
+
+
+def test_fic_deletion_precedes_drain_check(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert h.last_index("ad app federated-credential delete") < h.first_index("gh run list")
+
+
+def test_role_assignment_deletion_precedes_app_deletion(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert h.last_index("role assignment delete") < h.first_index("ad app delete")
+
+
+def test_drain_check_requests_more_than_the_default_20(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    run_list_calls = [c for c in h.calls if c.startswith("gh run list")]
+    assert run_list_calls
+    for call in run_list_calls:
+        assert "--limit 20" not in call
+        assert "--limit" in call
+
+
+def test_non_terminal_run_aborts_before_role_assignment_or_app_deletion(tmp_path: Path) -> None:
+    h = DeleteHarness(
+        tmp_path,
+        gh_runs=[
+            {
+                "databaseId": 42,
+                "workflowName": "CI",
+                "headBranch": "feature/x",
+                "status": "in_progress",
+                "url": "https://github.com/x/y/actions/runs/42",
+            }
+        ],
+    )
+    result = h.run()
+    assert result.returncode != 0
+    assert "non-terminal run" in result.stderr
+    assert "#42" in result.stderr
+    stderr_lower = result.stderr.lower()
+    assert "not cancelled" in stderr_lower or "nothing is cancelled" in stderr_lower
+    # FIC deletion (step 2) already ran -- it only blocks future token
+    # exchanges, so it is safe before the drain check. Role assignments and
+    # app registrations must NOT have been touched.
+    assert h.has("ad app federated-credential delete")
+    assert not h.has("role assignment delete")
+    assert not h.has("ad app delete")
+    assert h.state["apps"] != {}
+    assert h.state["role_assignments"] != []
+
+
+def test_incomplete_record_skips_with_warning_not_silently(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path, record_overrides={"BUILD_FIC_ID": ""})
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert "build federated credential not fully recorded" in result.stderr
+    # The build FIC was never targeted; the deploy one still was.
+    build_fic_deletes = [
+        c
+        for c in h.calls
+        if c.startswith("ad app federated-credential delete") and f"--id {BUILD_APP_GUID}" in c
+    ]
+    assert build_fic_deletes == []
+    assert h.has("ad app federated-credential delete")
+    # The rest of the teardown still completed.
+    assert h.state["environments"] == []
+
+
+def test_verify_teardown_nonempty_keeps_record_file(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert "STILL PRESENT" in result.stdout
+    assert h.record_file.exists()
+    # Read-only -- nothing was deleted.
+    assert h.state["apps"] != {}
+    assert h.state["role_assignments"] != []
+    assert h.state["environments"] != []
+    assert h.state["variables"] != {}
+
+
+def test_multiple_same_named_apps_aborts_without_deleting_either(tmp_path: Path) -> None:
+    duplicate_app_id = "99999999-9999-9999-9999-999999999999"
+    h = DeleteHarness(
+        tmp_path,
+        record_overrides={"BUILD_APP_ID": ""},
+        apps={
+            BUILD_APP_GUID: {"display_name": BUILD_DISPLAY_NAME, "fics": [BUILD_FIC_ID]},
+            duplicate_app_id: {"display_name": BUILD_DISPLAY_NAME, "fics": []},
+            DEPLOY_APP_GUID: {"display_name": DEPLOY_DISPLAY_NAME, "fics": [DEPLOY_FIC_ID]},
+        },
+    )
+    result = h.run()
+    assert result.returncode != 0
+    assert "Cannot tell which one is ours" in result.stderr
+    assert not h.has("ad app delete")
+    assert h.state["apps"][BUILD_APP_GUID] is not None
+    assert h.state["apps"][duplicate_app_id] is not None
+
+
+def test_missing_oidc_record_file_env_var(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    env = dict(h.env)
+    del env["OIDC_RECORD_FILE"]
+    result = subprocess.run(
+        ["bash", str(DELETE_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "OIDC_RECORD_FILE" in result.stderr
+
+
+def test_nonexistent_record_file_fails_closed(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    missing = tmp_path / "does-not-exist.env"
+    result = h.run(OIDC_RECORD_FILE=str(missing))
+    assert result.returncode != 0
+    assert "does not exist" in result.stderr
+    assert h.calls == []
+
+
+def test_verify_teardown_on_missing_record_file_is_a_clean_noop(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    missing = tmp_path / "does-not-exist.env"
+    result = h.run("--verify-teardown", OIDC_RECORD_FILE=str(missing))
+    assert result.returncode == 0, result.stderr
+    assert h.calls == []
+
+
+def test_incomplete_record_missing_required_fields_aborts_before_any_call(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path)
+    h.record_file.write_text("AZ_TENANT_ID=" + TENANT_ID + "\n")
+    result = h.run()
+    assert result.returncode != 0
+    assert "GITHUB_REPO" in result.stderr
+    assert h.calls == []
