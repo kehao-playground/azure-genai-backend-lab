@@ -25,7 +25,7 @@
 | `delete-content-safety.sh` | Delete and purge that account from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
 | `run-content-safety-probe.sh` | Orchestrate create → Prompt Shields probe → delete/purge, EXIT-trap cleanup armed before create | working |
 | `create-github-oidc.sh` | Provision the two federated (secret-less) GitHub Actions identities (build: `AcrPush` on the registry; deploy: `Container Apps Contributor` on the app), the GitHub `production` environment (required reviewer + branch-restricted to `main`, read back and compared), repository variables, then arms `DEPLOY_ENABLED=true` last | working |
-| `delete-github-oidc.sh` | Tear that down from the record file `create-github-oidc.sh` wrote: `DEPLOY_ENABLED=false` first, delete both federated credentials, a repo-scoped drain check that aborts (never cancels) on any non-terminal run, delete role assignments then app registrations, delete the GitHub environment and repository variables — plus a read-only `--verify-teardown` mode that only removes the record file once nothing it names is still found | working |
+| `delete-github-oidc.sh` | Tear that down from the record file `create-github-oidc.sh` wrote: `DEPLOY_ENABLED=false` first, delete both federated credentials, a repo-scoped drain check that aborts (never cancels) on any non-terminal run, delete role assignments then app registrations (best-effort purge from the Entra recycle bin), delete the GitHub environment and repository variables — plus a read-only `--verify-teardown` mode that distinguishes absent from soft-deleted and only removes the record file once nothing it names is still found | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
@@ -204,9 +204,14 @@ above.
 ```bash
 # 1. Bring up the deploy target first -- create-github-oidc.sh's role
 #    assignments are scoped to these two resources and refuse to proceed
-#    if either does not yet exist.
+#    if either does not yet exist. deploy-container-app.sh needs more than
+#    AZ_ACR_NAME on its own -- an existing AOAI account (AZ_OPENAI_NAME)
+#    and create-entra-app.sh's output (ENTRA_TENANT_ID, ENTRA_AUDIENCE,
+#    ENTRA_CLIENT_APP_ID, ENTRA_CLIENT_SECRET) -- so run this after the
+#    full Day 24 provisioning runbook in docs/container-apps.md §8, not on
+#    its own.
 infra/scripts/create-acr.sh                # prints AZ_ACR_NAME
-infra/scripts/deploy-container-app.sh       # prints AZ_ACA_APP_NAME's app id
+infra/scripts/deploy-container-app.sh       # prints AZ_ACA_APP_NAME, its URL, and more
 
 # 2. Provision the two federated identities, the GitHub environment, and
 #    arm the pipeline. Run once per session, after step 1.
@@ -227,9 +232,12 @@ infra/scripts/update-container-app.sh --image <acr>.azurecr.io/azgenai-lab@sha25
 #    separate manual step, just the one worth knowing how to run by hand
 #    for a manual re-point between pipeline runs.
 
-# 4. Tear down, in the order docs/container-apps.md's own runbook uses:
-#    the CI/CD identities first, while the ACR and app they hold
-#    assignments on still exist.
+# 4. Resolve any pending deployment approval and cancel any leftover
+#    negative-test run declaring `environment: production` first --
+#    delete-github-oidc.sh's drain check aborts (by design) on anything
+#    non-terminal. Then tear down, in the order docs/container-apps.md's
+#    own runbook uses: the CI/CD identities first, while the ACR and app
+#    they hold assignments on still exist.
 OIDC_RECORD_FILE=oidc-record.env infra/scripts/delete-github-oidc.sh
 # ... then the Container Apps teardown in container-apps.md §8.5
 ```

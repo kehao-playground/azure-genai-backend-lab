@@ -19,11 +19,14 @@ where the page publishes one.
 
 This pipeline has been built: `ci.yml` triggers `python`, `site` and `image`
 on every push and pull request against this repository, and `deploy` after
-approval on `main`. **None of it has run yet.** The branch carrying this
-workflow has never been pushed, so no job in this file has executed against
-real GitHub Actions or Azure state — not `python`'s gates, not `image`'s
-build-and-boot-smoke, and not `deploy`. Every claim below that depends on a
-live run is marked as open in
+approval on `main`. **No job in this file has run against Azure state, and
+`deploy` has never run at all.** That is the scope of what is still
+unverified — not whether `python`, `site` and `image`'s own gates execute on
+GitHub-hosted runners, which they are configured to do on every push and
+pull request the same as any workflow in any repository, and which this
+document does not need a live run to support. Every claim below that
+depends on a live run *against Azure*, or on the required-reviewer gate
+actually pausing `deploy`, is marked as open in
 [§11](#11-open-questions-settled-only-by-the-live-session), which also
 carries the specific mechanisms this leaves unverified.
 
@@ -171,10 +174,12 @@ named `main` — set by `create-github-oidc.sh` step 5, then **read back and
 compared**, because GitHub silently auto-creates an *unprotected*
 environment with no restriction at all the first time any workflow
 references a name that does not yet exist; the name existing proves
-nothing about whether it is gated). That policy is what stops a
-`workflow_dispatch` from a feature branch from ever reaching the point of
-requesting an `environment: production` token in the first place — it is
-enforced upstream of the subject, not encoded inside it. If that policy
+nothing about whether it is gated). That policy is what stops a run
+triggered from a feature branch — `ci.yml` only triggers on `push` and
+`pull_request`, but the same policy would equally stop a `workflow_dispatch`
+on any workflow this repository might add later — from ever reaching the
+point of requesting an `environment: production` token in the first place —
+it is enforced upstream of the subject, not encoded inside it. If that policy
 were ever removed or misconfigured back to "any branch," the deploy
 identity's federated credential would trust an `environment:production`
 token requested by a run from any branch, because nothing in the subject
@@ -185,9 +190,17 @@ string itself would object.
 | Layer | Mechanism | What it checks | Its limit |
 |---|---|---|---|
 | Gates | `needs: [python, site, image]` | Lint, types, tests, behave, three schema-drift checks, mermaid syntax, `actionlint`, the Astro build, and a build-plus-boot-smoke of the image all reported success | Only checks that these specific automated checks passed — a correctness bug none of them cover reaches `main` regardless; this is not a human having read the diff |
+| Job `if:` condition | `deploy`'s own `if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'` | Refuses to even queue the job — so no environment protection is evaluated at all — unless the run is on `main` and the pipeline is armed | A single boolean, evaluated once per job; §8 covers what it does and does not mean for a run already past that evaluation |
 | Required reviewer | GitHub environment protection (`reviewers: [...]`, `prevent_self_review: false`) | A human with write access approves before the `deploy` job's OIDC token can even be requested | Single-operator repo: the reviewer is whichever GitHub login `create-github-oidc.sh` was run under (`gh api user`), not necessarily the repository owner, and self-review is explicitly not prevented — see below |
 | Deployment branch policy | Environment setting, one custom policy named `main` | Only a run triggered from `main` can request a token whose claims match the deploy identity's subject | Enforced entirely at this layer — see §3. It says nothing about the *content* of that commit, only its ref |
 | Freshness guard | `scripts/check_freshness.sh`, first step of the `deploy` job | This run's commit is still `main`'s current HEAD, queried live from the GitHub API | Fails closed on any query failure or empty read, but it answers "is this commit still current," not "was it reviewed" — approval already happened by the time this check runs |
+| Federated subject | Deploy identity's federated credential, subject `repo:<owner>/<repo>:environment:production` (§3) | Entra will not exchange the OIDC token `azure/login@v2` presents for this identity's own token unless the claimed subject matches exactly | Carries no ref of its own (§3) — branch restriction is enforced entirely by the deployment branch policy layer above, not by anything in this string |
+
+The live session's negative tests (§11) produce evidence for two of these
+rows directly: the side-branch job that declares `environment: production`
+with no ref condition targets the deployment branch policy layer; the job
+that presents the deploy identity without declaring `environment:` at all
+targets the federated subject layer.
 
 The required-reviewer layer is the one most worth reading carefully rather
 than trusting the name. **Single-operator self-approval is not two-person
@@ -357,10 +370,21 @@ follow:
    service principal, and Azure evaluates role-assignment authorization
    against a *live* principal at request time: pulling that out from
    under a still-running job would break it immediately, unlike step 2's
-   forward-only credential deletion.
+   forward-only credential deletion. `az ad app delete` only moves a
+   registration into the directory's recycle bin for 30 days, still
+   holding its name, so this step also attempts a best-effort purge,
+   keyed on the object id `create-github-oidc.sh` records.
 6. Delete the GitHub environment and every repository variable this
    script wrote, including `DEPLOY_ENABLED` itself — read back after
    each deletion.
+
+**Before running this script, resolve every pending deployment approval and
+cancel any leftover run from a negative test that declares
+`environment: production`** (the live session's negative tests, §11, are
+exactly such a run) — step 3's drain check aborts on any non-terminal run
+by design, including one sitting `waiting` for a reviewer who never
+responds. That is the drain check working correctly, not a bug to route
+around.
 
 A separate, read-only `--verify-teardown` mode re-runs the same existence
 checks against everything the record file names, deletes nothing, and
@@ -369,8 +393,10 @@ confirmed absent; a field missing from the record file makes that one item
 *unverifiable*, never silently skipped.
 
 **There is no verified admission lock.** After step 3's drain check reads
-empty, nothing in this design stops a fresh `git push` to `main`, or a new
-`workflow_dispatch`, from starting a run before step 5 finishes — GitHub
+empty, nothing in this design stops a fresh `git push` to `main` — or a
+`workflow_dispatch` on any workflow this repository might add later, since
+`ci.yml` itself has no such trigger today — from starting a run before step
+5 finishes — GitHub
 Actions concurrency controls exist and this pipeline uses one (§1's
 `group: production`), but nothing wires it to the *teardown* process
 itself. For a single-operator repository, "do not push during teardown"
@@ -411,10 +437,7 @@ a future registry move to ABAC — per that same page's own migration table:
   pipeline's `image` job would need for `docker push` under `az acr login`.
 - `AcrPull` → `Container Registry Repository Reader` +
   `Container Registry Repository Catalog Lister` — the pair Container
-  Apps' own image pull would need. (`create-acr.sh`'s own header comment
-  names this second role `Container Registry Catalog Lister`, dropping
-  "Repository" — the Learn page's migration table gives the full name
-  above; this document uses the page's spelling.)
+  Apps' own image pull would need.
 - `az acr build` would additionally need `--source-acr-auth-id [caller]`
   on an ABAC-enabled registry. That flag matters to Day 24's
   `deploy-container-app.sh`, which builds server-side with `az acr build`
@@ -429,16 +452,18 @@ an ABAC-enabled registry.
 
 `ci.yml` defines `python`, `site` and `image` to trigger on every push and
 pull request against this repository, and `deploy` to run after approval on
-`main`. **None of it has executed.** The branch carrying this workflow has
-never been pushed (`git ls-remote --heads origin` shows no `day-25-cicd`),
-so no job in this file — not `python`'s lint/test gates, not `image`'s
-build-and-boot-smoke, and certainly not `deploy` — has run against real
-GitHub Actions or Azure state. Task 7's own report names the specific
-mechanisms this leaves unverified, folded into the list below: OIDC token
-minting via `azure/login@v2`, `az acr login`'s fallback behaviour, the
-environment's required-reviewer gate actually blocking a run, concurrency
-behaviour, and the digest round-trip through a real `docker push`. The
-following are open until a live run happens, and nothing above should be
+`main`. **No job in this file has run against Azure state, and `deploy` has
+never run at all** — that is what this section leaves open, not whether
+`python`, `site` and `image`'s own gates execute on GitHub-hosted runners
+(they are configured to, on every push and pull request, and §1 already
+states what they check; that is GitHub-hosted-runner and Docker state, not
+Azure or GitHub-environment-approval state). Task 7's own report names the
+specific mechanisms this leaves unverified, folded into the list below:
+OIDC token minting via `azure/login@v2`, `az acr login`'s fallback
+behaviour, the environment's required-reviewer gate actually blocking a
+run, concurrency behaviour, and the digest round-trip through a real
+`docker push`. The following are open until a live run against Azure
+happens, and nothing above should be
 read as resolving them in advance:
 
 - **Whether the OIDC token exchange itself succeeds end to end** — both
@@ -484,7 +509,7 @@ read as resolving them in advance:
   endpoints and field names, never checked against a live GitHub API
   response in this project.
 
-Task 12's live session is what answers these. Until then, treat every
+Task 10's live session is what answers these. Until then, treat every
 mechanism in this document as *specified by the code, and verified only by
 reading it*, not as *observed running against real GitHub Actions or Azure
 state*.
