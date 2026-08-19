@@ -8,11 +8,13 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
-    # No OIDC token, no Azure access -- this job never touches Azure, so it
-    # never gets the ability to mint one. Declaring `permissions` at all
-    # zeroes every scope not listed; an empty map is how "none of them" is
-    # spelled.
-    permissions: {}
+    # Read the repo and nothing else -- in particular no id-token, so this
+    # job can never mint an OIDC token and never gets Azure access.
+    # Declaring `permissions` at all zeroes every scope not listed;
+    # `contents: read` is what actions/checkout below needs, restated here
+    # rather than left to a default this repo does not rely on elsewhere.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -70,8 +72,10 @@ jobs:
 
   site:
     runs-on: ubuntu-latest
-    # Never touches Azure either -- same reasoning as the python job above.
-    permissions: {}
+    # Read the repo and nothing else -- same reasoning as the python job
+    # above: no id-token, so this job can never mint an OIDC token.
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: site
@@ -160,6 +164,10 @@ jobs:
           IMAGE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # This tag is a push artefact only -- it exists because `docker
+          # push` needs a reference to push by -- never a deploy target.
+          # The digest read back below is what crosses the job boundary and
+          # what `deploy` actually addresses; see the comment on that line.
           IMAGE="${AZURE_ACR_NAME}.azurecr.io/azgenai-lab:sha-${IMAGE_SHA}"
           docker tag azgenai-lab:ci "$IMAGE"
           docker push "$IMAGE"
@@ -168,6 +176,11 @@ jobs:
           # repointed by a rerun; a digest cannot. The deploy job composes
           # the full reference from this digest plus the ACR name it already
           # has, so only the digest itself needs to cross the job boundary.
+          # RepoDigests[0] (index 0, not filtered by repository): correct
+          # here because a freshly built, freshly pushed image on a fresh
+          # runner has exactly one repo digest -- pushed to exactly the one
+          # registry above. Would need filtering on $IMAGE's repository to
+          # stay correct if this image were ever pushed to more than one.
           FULL_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
           DIGEST="${FULL_DIGEST#*@}"
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "$FULL_DIGEST" ]; then
