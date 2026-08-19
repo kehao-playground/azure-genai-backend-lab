@@ -105,10 +105,20 @@
 #   AZ_ACA_APP_NAME     - existing container app (deploy-container-app.sh) --
 #                          the deploy identity's Container Apps Contributor scope
 # Optional env vars:
-#   GH_ENVIRONMENT_NAME        - defaults to production
+#   GH_ENVIRONMENT_NAME        - defaults to production. MUST MATCH ci.yml's
+#                                 own hardcoded `environment: production` --
+#                                 changing this here alone produces a deploy
+#                                 identity whose federated subject
+#                                 (repo:...:environment:<this value>) the
+#                                 workflow can never request a matching token
+#                                 for. A silent auth failure at the first
+#                                 push, not an error at configuration time.
 #   GH_DEPLOY_BRANCH           - defaults to main; the only branch allowed to
 #                                 deploy AND the branch named in the build
-#                                 identity's subject
+#                                 identity's subject. MUST MATCH ci.yml's own
+#                                 hardcoded `github.ref == 'refs/heads/main'`
+#                                 and `check_freshness.sh "$CURRENT_SHA" main`
+#                                 -- same failure mode as above if it drifts.
 #   GH_REQUIRED_REVIEWER_LOGIN - GitHub login required to approve a deployment;
 #                                 defaults to the currently authenticated
 #                                 `gh` user (this is a single-operator repo)
@@ -515,12 +525,12 @@ gh_var_set() {
   local name="$1" value="$2"
   gh variable set "$name" --repo "$GITHUB_REPO" --body "$value" >/dev/null
 }
-# `gh variable set` does not exist for reading a single value back with the
-# same confidence -- `gh variable list`'s exportable JSON fields are not
-# something this script asserts on without having run it live, so the
-# read-back below goes through the documented REST endpoint instead
-# (GET /repos/{owner}/{repo}/actions/variables/{name}), the same "use gh api
-# when unsure a subcommand covers it" rule step 5 already follows.
+# `gh variable get` does exist and could serve this read-back (checked
+# against the installed CLI: it supports the same --json/--jq contract this
+# needs). This script uses `gh api` against the documented REST endpoint
+# instead as a preference, not a necessity -- for consistency with step 5
+# above, which already reads every piece of GitHub state through `gh api`
+# rather than mixing subcommands and raw endpoints call by call.
 gh_var_get() {
   gh api "repos/${GITHUB_REPO}/actions/variables/${1}" --jq .value
 }
