@@ -56,8 +56,10 @@
 #   AZ_SUBSCRIPTION_ID   - target subscription (never rely on the default context)
 #   AZ_RESOURCE_GROUP    - existing resource group holding every resource below
 #   AZ_ACR_NAME          - existing registry (from create-acr.sh, which prints it)
-#   AZ_KEYVAULT_NAME     - existing key vault (create-keyvault.sh)
-#   AZ_SEARCH_NAME       - existing search service (create-search.sh)
+#   AZ_KEYVAULT_NAME     - existing key vault (create-keyvault.sh); required only
+#                          when AZ_SEARCH_MODE=real (the default) -- see below
+#   AZ_SEARCH_NAME       - existing search service (create-search.sh); required only
+#                          when AZ_SEARCH_MODE=real (the default) -- see below
 #   AZ_OPENAI_NAME       - existing Azure OpenAI account (create-openai.sh)
 #   ENTRA_TENANT_ID      - tenant of the API app registration (create-entra-app.sh)
 #   ENTRA_AUDIENCE       - the API application's client id, the `aud` the server validates
@@ -71,6 +73,19 @@
 #   AZ_ACA_ENV_NAME                   - defaults to acaenv-azgenai-lab
 #   AZ_ACA_APP_NAME                   - defaults to aca-azgenai-lab
 #   AZ_MI_NAME                        - defaults to mi-azgenai-lab
+#   AZ_SEARCH_MODE                    - real (default) or fake. fake drops every
+#                                        Search/Key Vault coupling this script would
+#                                        otherwise create: AZ_SEARCH_NAME and
+#                                        AZ_KEYVAULT_NAME are no longer required, the
+#                                        Search-key-into-Key-Vault stage and the Key
+#                                        Vault role assignment are both skipped, and
+#                                        the app is deployed with USE_FAKE_SEARCH=true
+#                                        and no secrets:/AZURE_SEARCH_ENDPOINT in its
+#                                        YAML. A value that is neither is a hard
+#                                        error, not a silent fall-through. Exists so a
+#                                        CI/CD demo session can stand up an app
+#                                        without paying for Search or Key Vault, which
+#                                        it has no other use for.
 #   IMAGE_TAG                         - defaults to day-24
 #   ENTRA_REQUIRED_SCOPE              - defaults to access_as_user (create-entra-app.sh's default)
 #   ENTRA_REQUIRED_APP_ROLE           - defaults to Api.Access (ditto)
@@ -97,8 +112,32 @@ set -euo pipefail
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID}"
 : "${AZ_RESOURCE_GROUP:?Set AZ_RESOURCE_GROUP}"
 : "${AZ_ACR_NAME:?Set AZ_ACR_NAME (create-acr.sh prints the generated name)}"
-: "${AZ_KEYVAULT_NAME:?Set AZ_KEYVAULT_NAME}"
-: "${AZ_SEARCH_NAME:?Set AZ_SEARCH_NAME}"
+
+# AZ_SEARCH_MODE=fake drops every Search/Key Vault coupling below: neither
+# name knob is required, the Search-key-into-Key-Vault stage and the Key
+# Vault role assignment are both skipped, and the app YAML carries no
+# secrets:/AZURE_SEARCH_ENDPOINT and USE_FAKE_SEARCH=true instead of false.
+# An unrecognised value is a hard error, not a silent fall-through to either
+# mode -- the same fail-closed discipline require_count/require_guid apply to
+# every other knob below.
+AZ_SEARCH_MODE="${AZ_SEARCH_MODE:-real}"
+case "$AZ_SEARCH_MODE" in
+  real | fake) ;;
+  *)
+    echo "AZ_SEARCH_MODE must be real or fake; got '$AZ_SEARCH_MODE'." >&2
+    exit 1
+    ;;
+esac
+if [ "$AZ_SEARCH_MODE" = "real" ]; then
+  : "${AZ_KEYVAULT_NAME:?Set AZ_KEYVAULT_NAME}"
+  : "${AZ_SEARCH_NAME:?Set AZ_SEARCH_NAME}"
+  USE_FAKE_SEARCH_VALUE="false"
+else
+  AZ_KEYVAULT_NAME="${AZ_KEYVAULT_NAME:-}"
+  AZ_SEARCH_NAME="${AZ_SEARCH_NAME:-}"
+  USE_FAKE_SEARCH_VALUE="true"
+fi
+
 : "${AZ_OPENAI_NAME:?Set AZ_OPENAI_NAME}"
 : "${ENTRA_TENANT_ID:?Set ENTRA_TENANT_ID (create-entra-app.sh prints it)}"
 : "${ENTRA_AUDIENCE:?Set ENTRA_AUDIENCE (the API application id)}"
@@ -149,7 +188,13 @@ ENTRA_REQUIRED_APP_ROLE="${ENTRA_REQUIRED_APP_ROLE:-Api.Access}"
 AZURE_OPENAI_ENDPOINT="${AZURE_OPENAI_ENDPOINT:-}"
 AZURE_OPENAI_DEPLOYMENT_NAME="${AZURE_OPENAI_DEPLOYMENT_NAME:-chat-mini}"
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT="${AZURE_OPENAI_EMBEDDING_DEPLOYMENT:-embed-small}"
-AZURE_SEARCH_ENDPOINT="${AZURE_SEARCH_ENDPOINT:-https://${AZ_SEARCH_NAME}.search.windows.net}"
+# Empty and left that way in fake mode: AZ_SEARCH_NAME may itself be unset
+# there, and this value is never referenced in the generated YAML when
+# AZ_SEARCH_MODE=fake (see stage 8).
+AZURE_SEARCH_ENDPOINT="${AZURE_SEARCH_ENDPOINT:-}"
+if [ "$AZ_SEARCH_MODE" = "real" ] && [ -z "$AZURE_SEARCH_ENDPOINT" ]; then
+  AZURE_SEARCH_ENDPOINT="https://${AZ_SEARCH_NAME}.search.windows.net"
+fi
 
 GATE_DEADLINE_SECONDS="${GATE_DEADLINE_SECONDS:-1200}"
 ACA_POLL_ATTEMPTS="${ACA_POLL_ATTEMPTS:-60}"
@@ -347,9 +392,11 @@ echo "== stage 3: role assignments =="
 ACR_ID=$(az acr show --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_ACR_NAME" --query id -o tsv)
 require_value "$ACR_ID" "the container registry resource id"
-KV_ID=$(az keyvault show --subscription "$AZ_SUBSCRIPTION_ID" \
-  --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_KEYVAULT_NAME" --query id -o tsv)
-require_value "$KV_ID" "the key vault resource id"
+if [ "$AZ_SEARCH_MODE" = "real" ]; then
+  KV_ID=$(az keyvault show --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_KEYVAULT_NAME" --query id -o tsv)
+  require_value "$KV_ID" "the key vault resource id"
+fi
 AOAI_ID=$(az cognitiveservices account show --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_OPENAI_NAME" --query id -o tsv)
 require_value "$AOAI_ID" "the Azure OpenAI account resource id"
@@ -410,11 +457,16 @@ assign_role() {
 }
 MUTATED=true
 assign_role "AcrPull" "$ACR_ID"
-assign_role "Key Vault Secrets User" "$KV_ID"
+if [ "$AZ_SEARCH_MODE" = "real" ]; then
+  assign_role "Key Vault Secrets User" "$KV_ID"
+fi
 assign_role "Cognitive Services OpenAI User" "$AOAI_ID"
 
 # === stage 4: Search admin key -> Key Vault ==================================
 echo "== stage 4: Search admin key -> Key Vault =="
+if [ "$AZ_SEARCH_MODE" != "real" ]; then
+  echo "  skipped (AZ_SEARCH_MODE=fake): no Search admin key to store, no Key Vault reference to build"
+else
 # Shell tracing prints an assignment together with its substituted value, so
 # `bash -x` (or SHELLOPTS=xtrace inherited from a parent) would put the admin
 # key in stderr. Tracing is suspended across this block and restored after it,
@@ -455,6 +507,7 @@ fi
 # rewriting this app's definition (docs/key-vault-config.md).
 KV_SECRET_URI="https://${AZ_KEYVAULT_NAME}.vault.azure.net/secrets/azure-search-admin-key"
 echo "  stored, referenced versionless at $KV_SECRET_URI"
+fi
 
 # === stage 5: image ==========================================================
 echo "== stage 5: build the image in ACR =="
@@ -624,11 +677,14 @@ echo "== stage 8: create the app =="
 
 APP_YAML="$(mktemp)"
 # The whole app definition in one file, so what is deployed can be read in one
-# place. Note the top-level `identity:` block: it is what ATTACHES the
-# user-assigned identity. The `identity:` fields under registries[] and
-# secrets[] are references to an already-attached identity, so without the top
-# block the image pull and the Key Vault reference both fail with an identity
-# that "does not exist" on an app that names it twice.
+# place -- written by several heredocs in sequence rather than one, so the
+# AZ_SEARCH_MODE=fake path can skip the secrets: block and the two
+# Search-specific env entries entirely instead of leaving them blank. Note the
+# top-level `identity:` block: it is what ATTACHES the user-assigned identity.
+# The `identity:` fields under registries[] and secrets[] are references to an
+# already-attached identity, so without the top block the image pull and the
+# Key Vault reference both fail with an identity that "does not exist" on an
+# app that names it twice.
 cat >"$APP_YAML" <<YAML
 identity:
   type: UserAssigned
@@ -667,10 +723,21 @@ properties:
     registries:
       - server: ${AZ_ACR_NAME}.azurecr.io
         identity: ${MI_ID}
+YAML
+
+# secrets: has no reason to exist when nothing references it: the only secret
+# this app ever needs is the Search admin key, and AZ_SEARCH_MODE=fake means
+# there is no such key.
+if [ "$AZ_SEARCH_MODE" = "real" ]; then
+  cat >>"$APP_YAML" <<YAML
     secrets:
       - name: search-admin-key
         keyVaultUrl: ${KV_SECRET_URI}
         identity: ${MI_ID}
+YAML
+fi
+
+cat >>"$APP_YAML" <<YAML
   template:
     terminationGracePeriodSeconds: 30
     containers:
@@ -694,7 +761,7 @@ properties:
           - name: USE_FAKE_LLM
             value: "false"
           - name: USE_FAKE_SEARCH
-            value: "false"
+            value: "${USE_FAKE_SEARCH_VALUE}"
           - name: USE_FAKE_EMBEDDINGS
             value: "false"
           - name: SAMPLE_DOCS_DIR
@@ -705,10 +772,21 @@ properties:
             value: "${AZURE_OPENAI_DEPLOYMENT_NAME}"
           - name: AZURE_OPENAI_EMBEDDING_DEPLOYMENT
             value: "${AZURE_OPENAI_EMBEDDING_DEPLOYMENT}"
+YAML
+
+# Same reasoning as the secrets: block above: an endpoint with nothing behind
+# it and a secretRef to a secret that was never created are both couplings
+# AZ_SEARCH_MODE=fake exists to drop, not to send empty.
+if [ "$AZ_SEARCH_MODE" = "real" ]; then
+  cat >>"$APP_YAML" <<YAML
           - name: AZURE_SEARCH_ENDPOINT
             value: "${AZURE_SEARCH_ENDPOINT}"
           - name: AZURE_SEARCH_ADMIN_KEY
             secretRef: search-admin-key
+YAML
+fi
+
+cat >>"$APP_YAML" <<YAML
         probes:
           - type: Startup
             httpGet: { path: /health, port: 8000 }

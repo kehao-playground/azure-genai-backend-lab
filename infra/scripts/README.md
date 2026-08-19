@@ -11,7 +11,7 @@
 | `teardown.sh` | Delete the demo resource group and everything in it | working |
 | `create-acr.sh` | Ephemeral Azure Container Registry (Basic SKU by default; per-run unique name) with provider pre-check | working |
 | `delete-acr.sh` | Delete that registry — synchronous, no soft-delete/purge step (unlike Key Vault / Content Safety) | working |
-| `deploy-container-app.sh` | Deploy to Azure Container Apps in eleven stages: managed identity, three role assignments, Search key → Key Vault, `az acr build`, Log Analytics workspace, environment, app, two-stage readiness gate | working |
+| `deploy-container-app.sh` | Deploy to Azure Container Apps in eleven stages: managed identity, three role assignments, Search key → Key Vault, `az acr build`, Log Analytics workspace, environment, app, two-stage readiness gate; `AZ_SEARCH_MODE=fake` (default `real`) skips every Search/Key Vault coupling for sessions that don't need either | working |
 | `delete-container-app.sh` | Tear that down in seven steps — app, environment, workspace, **role assignments before the identity** (see below) | working |
 | `configure-apim.sh` | APIM (Consumption tier) fronting Azure OpenAI v1 with managed-identity auth | working |
 | `delete-apim.sh` | Delete and purge the APIM instance + its role assignments | working |
