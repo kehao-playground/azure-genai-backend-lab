@@ -339,14 +339,21 @@ watching a rolling restart may see a burst of these. That code names the
   are not a trade-off here. The lab keeps both unpinned for readability and
   says so instead of pretending otherwise.
 - **Registry**: push to Azure Container Registry once a real runtime needs
-  to pull the image — Day 24 does exactly that, building in the registry
-  with `az acr build` and pulling with a managed identity rather than
-  registry credentials ([container-apps.md](container-apps.md)).
+  to pull the image. Two push paths exist now, both against the same
+  registry: Day 24's `deploy-container-app.sh` builds server-side with
+  `az acr build` and pulls with a managed identity rather than registry
+  credentials ([container-apps.md](container-apps.md)); Day 25's CI/CD
+  pipeline instead builds locally on the runner and does a plain `docker
+  push`, authenticated by a narrowly-scoped `AcrPush` OIDC identity
+  ([ci-cd.md](ci-cd.md)).
 - **Smaller bases** (distroless-style) drop the shell and package manager
   this image still carries. The lab keeps them for debuggability — a
   deliberate trade, not an oversight.
-- **Image scanning** (Docker Scout, Microsoft Defender for Cloud) belongs
-  in CI once images are published; the Day 23 gate proves the build, and
-  `scripts/boot_smoke.sh` (extracted from the inline CI step on Day 25)
-  boots the image and checks the declared `HEALTHCHECK` itself reports
-  `healthy` — it does not scan the image for vulnerabilities.
+- **Image scanning** (Docker Scout, Microsoft Defender for Cloud) is still
+  not part of this pipeline. Images are published now — Day 25's `image`
+  job builds this Dockerfile and pushes it to ACR by digest on every push
+  to `main` ([ci-cd.md](ci-cd.md)) — but nothing in that job scans the
+  result for vulnerabilities. What that job does check is boot: the Day
+  23 gate proves the build, and `scripts/boot_smoke.sh` (extracted from
+  the inline CI step on Day 25) boots the image and checks the declared
+  `HEALTHCHECK` itself reports `healthy`.

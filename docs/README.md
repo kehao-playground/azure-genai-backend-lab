@@ -9,6 +9,7 @@
 - [Audit Logging](audit-logging.md) — event taxonomy, presence rules, never-log list, exactly-once and delivery, consuming the log
 - [Docker](docker.md) — multi-stage build, non-root runtime, health check, graceful shutdown, environment variables
 - [Container Apps](container-apps.md) — the Day 24 deployment: ingress, revisions, scaling, Key Vault references, the readiness gate, teardown ordering
+- [CI/CD Pipeline](ci-cd.md) — the Day 25 GitHub Actions workflow: two OIDC identities, subject binding, environment approval, digest-pinned deploy, teardown
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)

@@ -191,3 +191,63 @@ traced back to anything.
 Both scripts follow the same fail-closed rule as everything else here: an
 `az ... -o tsv` read that returns empty output aborts, and is never read
 as "absent", "zero" or "not yet".
+
+## CI/CD (Day 25)
+
+The full pipeline design — the workflow shape, why two identities, subject
+binding, the layered controls, digest-not-tag, repository variables versus
+secrets, `DEPLOY_ENABLED` — is documented in
+[docs/ci-cd.md](../../docs/ci-cd.md). What belongs here is the runbook
+order: which script runs when, relative to the Container Apps scripts
+above.
+
+```bash
+# 1. Bring up the deploy target first -- create-github-oidc.sh's role
+#    assignments are scoped to these two resources and refuse to proceed
+#    if either does not yet exist.
+infra/scripts/create-acr.sh                # prints AZ_ACR_NAME
+infra/scripts/deploy-container-app.sh       # prints AZ_ACA_APP_NAME's app id
+
+# 2. Provision the two federated identities, the GitHub environment, and
+#    arm the pipeline. Run once per session, after step 1.
+export OIDC_RECORD_FILE=oidc-record.env
+export GITHUB_REPO=<owner>/<repo>
+export AZ_TENANT_ID=<tenant-guid> AZ_SUBSCRIPTION_ID=<subscription-guid>
+export AZ_RESOURCE_GROUP=rg-azgenai-lab
+export AZ_ACR_NAME=<printed by create-acr.sh>
+export AZ_ACA_APP_NAME=<printed by deploy-container-app.sh>
+infra/scripts/create-github-oidc.sh
+#    -> prints both client ids and confirms DEPLOY_ENABLED=true
+
+# 3. Push to main. ci.yml's `image` job builds and pushes by digest;
+#    `deploy` waits for the required reviewer's approval, then runs:
+infra/scripts/update-container-app.sh --image <acr>.azurecr.io/azgenai-lab@sha256:...
+#    -- this is the same script the pipeline itself invokes; it is not a
+#    separate manual step, just the one worth knowing how to run by hand
+#    for a manual re-point between pipeline runs.
+
+# 4. Tear down, in the order docs/container-apps.md's own runbook uses:
+#    the CI/CD identities first, while the ACR and app they hold
+#    assignments on still exist.
+OIDC_RECORD_FILE=oidc-record.env infra/scripts/delete-github-oidc.sh
+# ... then the Container Apps teardown in container-apps.md §8.5
+```
+
+`create-github-oidc.sh` writes every identifier `delete-github-oidc.sh`
+needs into `OIDC_RECORD_FILE`, appended the moment each object exists —
+unlike the Entra and Content Safety scripts above, which recover by
+printing ids and teardown commands rather than by writing a file, this
+script provisions six-plus objects across two systems (Entra app
+registrations, federated credentials, role assignments, a GitHub
+environment, repository variables) and needs a durable list rather than a
+terminal scrollback to reverse any of it. It refuses to overwrite an
+existing record file, for the same reason: that file is the only list of
+what a previous run created.
+
+`AZ_SEARCH_MODE=fake` (default `real`) on `deploy-container-app.sh` is
+worth calling out here specifically because it changes what step 1 above
+needs: with `AZ_SEARCH_MODE=fake`, no Key Vault coupling happens and no
+`AZ_KEYVAULT_NAME` is required, but `create-github-oidc.sh` in step 2 still
+only ever grants the deploy identity `Container Apps Contributor` on the
+app — the Search/Key Vault mode does not change which roles the CI/CD
+identities hold.
