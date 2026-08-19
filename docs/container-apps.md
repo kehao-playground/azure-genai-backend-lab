@@ -27,7 +27,9 @@ Companion documents: [docker.md](docker.md) (the image),
 user-assigned, and what a role assignment actually grants),
 [key-vault-config.md](key-vault-config.md) (the secret inventory and
 rotation semantics), [entra-id-auth.md](entra-id-auth.md) (the caller-side
-401/403 contract this deployment turns on).
+401/403 contract this deployment turns on), [ci-cd.md](ci-cd.md) (the Day
+25 pipeline that runs this same deploy step, automated, behind two OIDC
+identities and an approval gate).
 
 ---
 
@@ -58,9 +60,12 @@ cluster. Container Apps fits three of this project's standing constraints:
   zero — see §5 — but the option is what makes a lab-sized deployment
   affordable outside a measurement window.
 
-What this deployment is not: it is not Bicep (Day 26), it is not a CI/CD
-pipeline (Day 25), and it does not put the app behind APIM. The unit of
-reproducibility here is a shell script an operator runs by hand.
+What this deployment is not: it is not Bicep (Day 26), and it does not put
+the app behind APIM. It is not itself the CI/CD pipeline
+([ci-cd.md](ci-cd.md), Day 25) either — that pipeline calls the same
+`update-container-app.sh` script this page documents, from behind two OIDC
+identities and an approval gate, but the eleven-stage first deployment
+below remains a shell script an operator runs by hand.
 
 ## 2. Topology: one identity, three roles
 
@@ -556,9 +561,19 @@ silently dropped) if the gate itself never reached 200.
 
 ### 8.5 Tear down, in this order
 
-Still from the repository root, still with §8.1's exports in the shell:
+Still from the repository root, still with §8.1's exports in the shell. If
+the [CI/CD pipeline](ci-cd.md) was ever armed for this session
+(`create-github-oidc.sh`), tear that down **first**, while both the
+registry and the app it holds role assignments on still exist — its own
+teardown, `delete-github-oidc.sh`, reads its role-assignment scopes back
+from the ACR and the app themselves, and doing that before either is gone
+is the clean order ([ci-cd.md §9](ci-cd.md#9-teardown-runbook-its-ordering-contract-and-no-admission-lock)
+has the six-step contract inside that script):
 
 ```bash
+OIDC_RECORD_FILE=<path printed by create-github-oidc.sh> \
+  infra/scripts/delete-github-oidc.sh
+
 AZ_ACA_APP_NAME=aca-azgenai-lab AZ_ACA_ENV_NAME=acaenv-azgenai-lab \
 AZ_MI_NAME=mi-azgenai-lab AZ_LAW_NAME=<printed by the deploy script> \
   infra/scripts/delete-container-app.sh
@@ -570,7 +585,7 @@ ENTRA_API_APP_ID=<api-app-id> ENTRA_CLIENT_APP_ID=<client-app-id> \
   infra/scripts/delete-entra-app.sh
 ```
 
-The first command is the one the deploy script prints for you, with the
+The second command is the one the deploy script prints for you, with the
 run's real values filled in — including the generated `AZ_LAW_NAME`, which
 has no default to fall back on — both on success and on any failure that
 already mutated something. It names every scope knob
@@ -865,4 +880,7 @@ subscription's budget alert is a delayed notification, not a cap.
   Key Vault reference in §7 a genuine consumer instead of a demonstration.
 - **Nothing here is production IaC.** These are shell scripts an operator
   runs by hand, with per-run unique names and no state file. Bicep is
-  Day 26; an automated pipeline is Day 25.
+  Day 26; an automated pipeline is [Day 25](ci-cd.md), which deploys by
+  calling `update-container-app.sh` — the same script §8.3 does not itself
+  invoke, since the first deployment for a session goes through
+  `deploy-container-app.sh` instead.
