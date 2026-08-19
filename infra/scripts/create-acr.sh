@@ -29,8 +29,8 @@
 # AcrPush role, so pinning `rbac` keeps that assignment meaningful. Migrating
 # to ABAC (not done in this series) would require: AcrPush -> Container
 # Registry Repository Writer; AcrPull -> Container Registry Repository
-# Reader + Container Registry Catalog Lister; and `az acr build` would need
-# `--source-acr-auth-id [caller]` on an ABAC registry.
+# Reader + Container Registry Repository Catalog Lister; and `az acr build`
+# would need `--source-acr-auth-id [caller]` on an ABAC registry.
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID}"
