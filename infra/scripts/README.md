@@ -24,6 +24,7 @@
 | `create-content-safety.sh` | Ephemeral Content Safety account (F0; conditional S0 fallback on allowlisted error code) with provider pre-check | working |
 | `delete-content-safety.sh` | Delete and purge that account from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
 | `run-content-safety-probe.sh` | Orchestrate create → Prompt Shields probe → delete/purge, EXIT-trap cleanup armed before create | working |
+| `create-github-oidc.sh` | Provision the two federated (secret-less) GitHub Actions identities (build: `AcrPush` on the registry; deploy: `Container Apps Contributor` on the app), the GitHub `production` environment (required reviewer + branch-restricted to `main`, read back and compared), repository variables, then arms `DEPLOY_ENABLED=true` last | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
