@@ -40,7 +40,12 @@
 #      role-assignment authorization against a live principal at request
 #      time -- pulling that out from under a still-running job would break it
 #      immediately, unlike step 2's federated credentials, which only gate
-#      future token exchanges.
+#      future token exchanges. `az ad app delete` only moves a registration
+#      into the directory's recycle bin for 30 days, still holding its name;
+#      this step also attempts a best-effort purge (ported from
+#      delete-entra-app.sh, keyed on the object id create-github-oidc.sh
+#      already records) and reports which of the two outcomes it got, the
+#      same two-branch message delete-entra-app.sh prints.
 #   6. delete the GitHub environment and the repository variables (including
 #      DEPLOY_ENABLED itself, not just flipping it to false), read every
 #      deletion back.
@@ -60,7 +65,11 @@
 # A field missing from the record file makes that one item UNVERIFIABLE, not
 # silently skipped -- an unverifiable item keeps the record file, same as a
 # resource still found live. Run it any time after the main teardown (or
-# stand-alone, to confirm a prior run actually finished).
+# stand-alone, to confirm a prior run actually finished). For the two app
+# registrations, "confirmed absent" also checks the directory's deletedItems
+# endpoint by object id -- `az ad app list` alone cannot see a soft-deleted
+# app, so without that check this mode would report a registration "gone"
+# while it is still recoverable and still holding its name.
 #
 # The record file is parsed by hand, one `KEY=VALUE` line at a time -- it is
 # deliberately NEVER `source`d. GH_VARIABLES_WRITTEN's value is a
@@ -221,6 +230,22 @@ app_count_by_name() {
 app_id_by_name() {
   az ad app list --filter "displayName eq '$1'" --query "[0].appId" -o tsv
 }
+app_deleted_item_present() {
+  # `az ad app list` never sees a soft-deleted app -- once app_count_by_id
+  # reads 0, this is the only way to tell "purged / never existed" apart
+  # from "in the recycle bin, still recoverable, still holding its name"
+  # (I3). GET on the object id: 200 if it is still there, non-zero
+  # otherwise. This is a best-effort existence probe, never a mutation, so
+  # unlike every other helper here it treats its own failure as "false"
+  # rather than propagating it -- the same discipline the purge below uses.
+  if az rest --method GET \
+      --uri "https://graph.microsoft.com/v1.0/directory/deletedItems/$1" \
+      --query id -o tsv >/dev/null 2>&1; then
+    echo true
+  else
+    echo false
+  fi
+}
 fic_count() {
   # Unlike app_count_by_id, this DOES require the app itself to resolve --
   # `--id` on federated-credential list/show/delete triggers an app lookup as
@@ -323,7 +348,7 @@ teardown_role_assignment() {
 }
 
 teardown_app() {
-  local label="$1" recorded_id="$2" display_name="$3"
+  local label="$1" recorded_id="$2" display_name="$3" recorded_object_id="$4"
   local app_id="$recorded_id"
   if [ -z "$app_id" ]; then
     if [ -z "$display_name" ]; then
@@ -359,6 +384,19 @@ teardown_app() {
     echo "  $label app registration already gone -- nothing to do"
     return 0
   fi
+
+  # Resolved BEFORE the delete, not after: once the app is gone,
+  # `az ad app list` (which app_count_by_id and the display-name fallback
+  # above both use) can no longer resolve its object id, and the purge
+  # below needs it. Prefer the recorded value -- it is exactly the dead
+  # field create-github-oidc.sh already writes -- and only fall back to a
+  # lookup when it is missing (an older record file, or the display-name
+  # path above).
+  local object_id="$recorded_object_id"
+  if [ -z "$object_id" ]; then
+    object_id="$(az ad app list --filter "appId eq '$app_id'" --query "[0].id" -o tsv)"
+  fi
+
   az ad app delete --id "$app_id"
   local after
   after="$(app_count_by_id "$app_id")"
@@ -368,6 +406,23 @@ teardown_app() {
     exit 1
   fi
   echo "  $label app registration ($app_id) deleted -- its service principal and any remaining federated credentials go with it"
+
+  # `az ad app delete` only moves the registration into the directory's
+  # recycle bin for 30 days, still holding its name. Purge is best effort --
+  # it needs a permission the deletion itself does not, so a failure here is
+  # reported, not fatal -- ported from delete-entra-app.sh, same two-branch
+  # message.
+  if [ -n "$object_id" ]; then
+    if az rest --method DELETE \
+        --uri "https://graph.microsoft.com/v1.0/directory/deletedItems/${object_id}" \
+        --output none 2>/dev/null; then
+      echo "  $label: purged from deleted items."
+    else
+      echo "  $label: still in 'Deleted applications' -- auto-purges after 30 days."
+    fi
+  else
+    echo "  $label: could not resolve an object id to purge -- still in 'Deleted applications', auto-purges after 30 days."
+  fi
 }
 
 teardown_environment() {
@@ -469,7 +524,7 @@ if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
   check_role_assignment "deploy" "$(record_get DEPLOY_SP_ID)" "Container Apps Contributor" "$(record_get AZ_ACA_APP_ID)"
 
   check_app() {
-    local label="$1" recorded_id="$2" display_name="$3"
+    local label="$1" recorded_id="$2" display_name="$3" recorded_object_id="$4"
     local app_id="$recorded_id"
     if [ -z "$app_id" ]; then
       if [ -z "$display_name" ]; then
@@ -498,12 +553,27 @@ if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
     if [ "$count2" != "0" ]; then
       echo "  STILL PRESENT: $label app registration ($app_id)"
       REMAINING=$((REMAINING + 1))
-    else
+      return
+    fi
+    # `az ad app list` cannot see a soft-deleted app -- count2==0 alone
+    # cannot tell "purged / never existed" apart from "in the recycle bin
+    # for 30 days, still recoverable, still holding its name" (I3). Check
+    # the directory's deletedItems endpoint by object id when one is known.
+    if [ -n "$recorded_object_id" ]; then
+      local deleted_present
+      deleted_present="$(app_deleted_item_present "$recorded_object_id")"
+      if [ "$deleted_present" = "true" ]; then
+        echo "  STILL PRESENT (soft-deleted, recoverable for 30 days): $label app registration ($app_id)"
+        REMAINING=$((REMAINING + 1))
+        return
+      fi
       echo "  gone: $label app registration"
+    else
+      echo "  gone: $label app registration (soft-delete state not checked -- object id not recorded)"
     fi
   }
-  check_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)"
-  check_app "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_APP_DISPLAY_NAME)"
+  check_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)" "$(record_get BUILD_APP_OBJECT_ID)"
+  check_app "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_APP_DISPLAY_NAME)" "$(record_get DEPLOY_APP_OBJECT_ID)"
 
   ENV_NAME="$(record_get GH_ENVIRONMENT_NAME)"
   if [ -z "$ENV_NAME" ]; then
@@ -635,8 +705,8 @@ teardown_role_assignment "deploy" "$(record_get DEPLOY_ROLE_ASSIGNMENT_ID)" \
 
 # === step 5: app registrations (assignments already gone -- see step 4) =====
 echo "== step 5: delete the app registrations =="
-teardown_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)"
-teardown_app "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_APP_DISPLAY_NAME)"
+teardown_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)" "$(record_get BUILD_APP_OBJECT_ID)"
+teardown_app "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_APP_DISPLAY_NAME)" "$(record_get DEPLOY_APP_OBJECT_ID)"
 
 # === step 6: GitHub environment and repository variables ====================
 echo "== step 6: delete the GitHub environment and repository variables =="

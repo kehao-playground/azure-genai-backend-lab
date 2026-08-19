@@ -727,14 +727,43 @@ if args[:3] == ["ad", "app", "list"]:
         done(str(len(matches)))
     if query == "[0].appId":
         done(matches[0] if matches else "")
+    if query == "[0].id":
+        done(apps[matches[0]].get("object_id", "") if matches else "")
     fail(f"fake az: unhandled ad app list query {query!r}", 2)
 
 if args[:3] == ["ad", "app", "delete"]:
     app_id = opt("--id")
     if app_id in apps:
-        del apps[app_id]
+        info = apps.pop(app_id)
+        object_id = info.get("object_id")
+        if object_id:
+            # `az ad app delete` only soft-deletes -- move it into the
+            # recycle bin state rather than erasing it, so a subsequent
+            # `az rest` purge (or --verify-teardown's presence check) has
+            # something real to act on.
+            state.setdefault("deleted_items", {})[object_id] = info
         done()
     fail("fake az: app not found", 1)
+
+if args[:1] == ["rest"]:
+    method = opt("--method")
+    uri = opt("--uri")
+    prefix = "https://graph.microsoft.com/v1.0/directory/deletedItems/"
+    if uri.startswith(prefix):
+        object_id = uri[len(prefix):]
+        deleted_items = state.setdefault("deleted_items", {})
+        if method == "GET":
+            if object_id in deleted_items:
+                done(object_id)
+            fail("fake az: deleted item not found", 3)
+        if method == "DELETE":
+            if state.get("purge_fails"):
+                fail("fake az: injected purge failure", 1)
+            if object_id in deleted_items:
+                del deleted_items[object_id]
+                done()
+            fail("fake az: deleted item not found", 3)
+    fail(f"fake az: unhandled rest uri {uri!r}", 2)
 
 if args[:4] == ["ad", "app", "federated-credential", "delete"]:
     app_id = opt("--id")
@@ -928,9 +957,18 @@ class DeleteHarness:
             "active_tenant_id": TENANT_ID,
             "github_repo": GITHUB_REPO,
             "apps": {
-                BUILD_APP_GUID: {"display_name": BUILD_DISPLAY_NAME, "fics": [BUILD_FIC_ID]},
-                DEPLOY_APP_GUID: {"display_name": DEPLOY_DISPLAY_NAME, "fics": [DEPLOY_FIC_ID]},
+                BUILD_APP_GUID: {
+                    "display_name": BUILD_DISPLAY_NAME,
+                    "fics": [BUILD_FIC_ID],
+                    "object_id": BUILD_OBJECT_GUID,
+                },
+                DEPLOY_APP_GUID: {
+                    "display_name": DEPLOY_DISPLAY_NAME,
+                    "fics": [DEPLOY_FIC_ID],
+                    "object_id": DEPLOY_OBJECT_GUID,
+                },
             },
+            "deleted_items": {},
             "role_assignments": [
                 {
                     "id": BUILD_ASSIGNMENT_ID,
@@ -1056,6 +1094,11 @@ def test_delete_happy_path_tears_everything_down(tmp_path: Path) -> None:
     assert h.state["role_assignments"] == []
     assert h.state["environments"] == []
     assert h.state["variables"] == {}
+    # Both app registrations were also purged from the recycle bin (I3),
+    # keyed on the object id create-github-oidc.sh recorded.
+    assert h.state["deleted_items"] == {}
+    assert "build: purged from deleted items." in result.stdout
+    assert "deploy: purged from deleted items." in result.stdout
     # The record file is left in place by a plain teardown run -- only
     # --verify-teardown removes it.
     assert h.record_file.exists()
@@ -1075,6 +1118,44 @@ def test_delete_happy_path_tears_everything_down(tmp_path: Path) -> None:
         or "DELETE repos" in c
         for c in verify_only_calls
     )
+
+
+def test_purge_failure_falls_back_to_the_30_day_message_but_is_not_fatal(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path, purge_fails=True)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    # The app registrations themselves are still gone -- only the purge,
+    # a permission the deletion itself does not need, failed.
+    assert h.state["apps"] == {}
+    assert "build: still in 'Deleted applications' -- auto-purges after 30 days." in result.stdout
+    assert "deploy: still in 'Deleted applications' -- auto-purges after 30 days." in result.stdout
+    # Still soft-deleted -- the injected failure means the purge never
+    # actually removed them from the recycle bin.
+    assert set(h.state["deleted_items"]) == {BUILD_OBJECT_GUID, DEPLOY_OBJECT_GUID}
+
+
+def test_verify_teardown_reports_a_soft_deleted_app_as_still_present(tmp_path: Path) -> None:
+    # The app registration itself is gone (az ad app list sees nothing), but
+    # it is still sitting in the recycle bin -- --verify-teardown must not
+    # report "gone" for something a Graph deletedItems read still finds.
+    h = DeleteHarness(
+        tmp_path,
+        apps={},
+        deleted_items={
+            BUILD_OBJECT_GUID: {"display_name": BUILD_DISPLAY_NAME},
+            DEPLOY_OBJECT_GUID: {"display_name": DEPLOY_DISPLAY_NAME},
+        },
+        role_assignments=[],
+        environments=[],
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert "STILL PRESENT (soft-deleted" in result.stdout
+    assert result.stdout.count("STILL PRESENT (soft-deleted") == 2
+    assert h.record_file.exists()
+    # Read-only: the soft-deleted items are still there afterwards.
+    assert set(h.state["deleted_items"]) == {BUILD_OBJECT_GUID, DEPLOY_OBJECT_GUID}
 
 
 def test_fic_deletion_precedes_drain_check(tmp_path: Path) -> None:
