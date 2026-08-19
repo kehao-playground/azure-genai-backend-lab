@@ -131,8 +131,16 @@ on_exit() {
     echo "" >&2
     echo "update-container-app.sh failed (exit $status) after requesting the image change." >&2
     echo "No automatic rollback is performed. To roll back manually:" >&2
-    echo "  AZ_SUBSCRIPTION_ID=$AZ_SUBSCRIPTION_ID AZ_RESOURCE_GROUP=$AZ_RESOURCE_GROUP \\" >&2
-    echo "    az containerapp update --name $AZ_ACA_APP_NAME --image $SNAPSHOT_IMAGE" >&2
+    # `az` reads none of AZ_SUBSCRIPTION_ID / AZ_RESOURCE_GROUP -- those are
+    # this repo's own script-level conventions, not az env fallbacks (az
+    # configure --defaults group=... is the only alternative az itself
+    # documents). The printed line must therefore carry --subscription and
+    # --resource-group as flags, or it fails with a missing-argument error
+    # exactly when an operator is under pressure and least likely to debug
+    # the recovery instruction itself -- the same shape as Day 24's teardown
+    # printer that omitted two knobs.
+    echo "  az containerapp update --subscription $AZ_SUBSCRIPTION_ID --resource-group $AZ_RESOURCE_GROUP \\" >&2
+    echo "    --name $AZ_ACA_APP_NAME --image $SNAPSHOT_IMAGE" >&2
     case "$SNAPSHOT_IMAGE" in
       *@sha256:*) ;;
       *)
@@ -195,14 +203,14 @@ REVISION_NAME=$(az containerapp show \
 require_value "$REVISION_NAME" "the latest revision name"
 
 # Which field authoritatively reports "the new revision failed to start" is
-# an open question in this project (待查核 8), settled by a live Azure
-# session that has not happened yet (Task 12). Implemented against the
+# an open question this project has not settled, resolved only by a live
+# Azure session that has not happened yet (Task 10). Implemented against the
 # revision's own properties.runningState: it is the most specific field
 # `az containerapp revision show` exposes for whether the container is
 # actually running, more specific than the app-level
 # properties.provisioningState (which reflects ARM-level resource
 # provisioning and would not obviously reflect a container that provisioned
-# fine but crashed on startup). Task 9's docs record what Task 12 actually
+# fine but crashed on startup). Task 8's docs record what Task 10 actually
 # observes; this comment is not a claim that runningState is correct.
 RUNNING_STATE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
