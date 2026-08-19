@@ -20,6 +20,17 @@
 #                       chars); defaults to acrazgenai + 8 hex characters from
 #                       python3's secrets module, freshly generated each run
 #   AZ_ACR_SKU        - defaults to Basic
+#
+# Role assignment mode is pinned to rbac (see the `az acr create` call
+# below). Microsoft has announced ABAC-enabled registries, on which the
+# classic AcrPush/AcrPull/AcrDelete roles are not honored; `rbac` is the CLI
+# default today, but that default is Microsoft's to change, not ours to
+# assume. This series' CI federated identity is assigned the classic
+# AcrPush role, so pinning `rbac` keeps that assignment meaningful. Migrating
+# to ABAC (not done in this series) would require: AcrPush -> Container
+# Registry Repository Writer; AcrPull -> Container Registry Repository
+# Reader + Container Registry Catalog Lister; and `az acr build` would need
+# `--source-acr-auth-id [caller]` on an ABAC registry.
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID}"
@@ -70,11 +81,14 @@ else
   fi' EXIT
 
   echo "Creating container registry '$AZ_ACR_NAME' in resource group '$AZ_RESOURCE_GROUP' (SKU $AZ_ACR_SKU)"
+  # --role-assignment-mode rbac is explicit, not the CLI default we happen
+  # to inherit: see the header comment for why this can't be left implicit.
   az acr create \
     --subscription "$AZ_SUBSCRIPTION_ID" \
     --resource-group "$AZ_RESOURCE_GROUP" \
     --name "$AZ_ACR_NAME" \
-    --sku "$AZ_ACR_SKU" >/dev/null
+    --sku "$AZ_ACR_SKU" \
+    --role-assignment-mode rbac >/dev/null
 fi
 
 echo

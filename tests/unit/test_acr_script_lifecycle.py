@@ -178,6 +178,21 @@ def test_create_skips_when_registry_already_exists(tmp_path: Path) -> None:
     assert not any(call.startswith("acr create") for call in h.calls)
 
 
+def test_create_pins_rbac_role_assignment_mode(tmp_path: Path) -> None:
+    # ABAC-enabled registries do not honor the classic AcrPush role our CI
+    # federated identity is assigned. The CLI defaults to rbac today, but
+    # that default is Microsoft's to change; pinning it explicitly means a
+    # future default flip can't silently break the push step without this
+    # test going red first.
+    h = Harness(tmp_path, provider_state="Registered", registries=[])
+    result = h.run(
+        "create-acr.sh", AZ_RESOURCE_GROUP="rg", AZ_ACR_NAME="acrfaked24"
+    )
+    assert result.returncode == 0, result.stderr
+    create_call = next(call for call in h.calls if call.startswith("acr create"))
+    assert "--role-assignment-mode rbac" in create_call
+
+
 def test_delete_of_absent_registry_is_a_noop_success(tmp_path: Path) -> None:
     h = Harness(tmp_path, provider_state="Registered", registries=[])
     result = h.run(
