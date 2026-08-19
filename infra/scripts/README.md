@@ -219,8 +219,9 @@ export AZ_ACA_APP_NAME=<printed by deploy-container-app.sh>
 infra/scripts/create-github-oidc.sh
 #    -> prints both client ids and confirms DEPLOY_ENABLED=true
 
-# 3. Push to main. ci.yml's `image` job builds and pushes by digest;
-#    `deploy` waits for the required reviewer's approval, then runs:
+# 3. Push to main. ci.yml's `image` job builds and pushes by tag, then
+#    reads the digest back; `deploy` waits for the required reviewer's
+#    approval, then runs:
 infra/scripts/update-container-app.sh --image <acr>.azurecr.io/azgenai-lab@sha256:...
 #    -- this is the same script the pipeline itself invokes; it is not a
 #    separate manual step, just the one worth knowing how to run by hand

@@ -13,11 +13,19 @@ its own teardown contract), [managed-identity.md](managed-identity.md) (the
 one existing measurement of Azure AD role-assignment propagation this
 pipeline inherits but has not itself repeated).
 
-This pipeline has been built, and its `python`, `site` and `image` jobs run
-on every push and pull request against this repository. What it has **not**
-yet done is complete a live run through the `deploy` job against real Azure
-and GitHub state. Every claim below that depends on that is marked as open
-in [§11](#11-open-questions-settled-only-by-the-live-session).
+Microsoft Learn pages cited below were checked 2026-08-19 unless a
+different date is given; each citation carries the page's own `ms.date`
+where the page publishes one.
+
+This pipeline has been built: `ci.yml` triggers `python`, `site` and `image`
+on every push and pull request against this repository, and `deploy` after
+approval on `main`. **None of it has run yet.** The branch carrying this
+workflow has never been pushed, so no job in this file has executed against
+real GitHub Actions or Azure state — not `python`'s gates, not `image`'s
+build-and-boot-smoke, and not `deploy`. Every claim below that depends on a
+live run is marked as open in
+[§11](#11-open-questions-settled-only-by-the-live-session), which also
+carries the specific mechanisms this leaves unverified.
 
 ---
 
@@ -38,10 +46,11 @@ runs `scripts/boot_smoke.sh` against it — the same two-assertion boot smoke
 (HEALTHCHECK reports `healthy`, a separate `docker exec` proves what
 `/health` actually returns) that used to live as an inline step in a job
 named `docker`; Day 25 extracted it into its own script and renamed that job
-`image`, because it now does more than build. All three of those jobs run on
-every push and every pull request, including from a branch that will never
-touch Azure — that is the point of a gate: the correctness bar does not
-depend on `DEPLOY_ENABLED` or on which branch triggered the run.
+`image`, because it now does more than build. All three of those jobs are
+configured to trigger on every push and every pull request, including from
+a branch that will never touch Azure — that is the point of a gate: the
+correctness bar does not depend on `DEPLOY_ENABLED` or on which branch
+triggered the run.
 
 `deploy` is declared with `needs: [python, site, image]`, and that is the
 entire coordination mechanism. There is no separate "all green" status
@@ -86,8 +95,8 @@ resource, not the resource group and not the subscription: a wider scope
 would let either identity touch everything else that group holds, which is
 exactly the blast radius two narrow identities exist to avoid.
 
-**The residual this buys is real, and it is not a corner case — it happens
-on every ordinary push to `main`.** The `image` job's Azure-touching steps
+**The residual this buys is real, and it is not a corner case — by design,
+it happens on every ordinary push to `main`.** The `image` job's Azure-touching steps
 (`az acr login`, tag, push) are gated only on `github.ref == 'refs/heads/main'
 && vars.DEPLOY_ENABLED == 'true'`, with no approval requirement at all —
 approval belongs to the `deploy` job, three jobs downstream. So the build
@@ -188,9 +197,11 @@ single-operator repository and the alternative (leaving the default,
 implicitly) would obscure a decision this project's own discipline says to
 write down. The required reviewer's identity is also not fixed to "the
 repo owner" by anything in the code — `GH_REQUIRED_REVIEWER_LOGIN`
-defaults to whichever account `gh auth status` reports at the moment
-`create-github-oidc.sh` runs, which happens to be the same person in this
-project but is not guaranteed to be by the mechanism itself.
+defaults to whichever account `gh api user --jq .login` reports at the
+moment `create-github-oidc.sh` runs (a separate, earlier `gh auth status`
+check only confirms *some* account is logged in; it is never queried for
+the login value itself). That default happens to be the same person in
+this project but is not guaranteed to be by the mechanism itself.
 
 ## 5. Digest, not tag
 
@@ -251,9 +262,12 @@ subscription id, the ACR name, the resource group, the container app name,
 and `DEPLOY_ENABLED` itself — is a **repository variable**
 (`gh variable set`), not a secret (`gh secret set`). This is a deliberate,
 recorded deviation from Microsoft's own OIDC guidance, which states
-plainly, of these same kinds of identifiers: *"For security reasons, we
+plainly, of these same `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
+`AZURE_SUBSCRIPTION_ID`-shaped identifiers: *"For security reasons, we
 recommend using GitHub Secrets rather than passing values directly to the
-workflow."*
+workflow."* ([Authenticate to Azure from GitHub Actions by OpenID Connect
+§ Create GitHub secrets](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect#create-github-secrets),
+ms.date 2024-07-01, checked 2026-08-19.)
 
 The reasoning for deviating: the actual credential in this design is the
 federated-identity trust relationship itself — the subject match checked
@@ -382,19 +396,25 @@ no longer resolves. The full runbook, in order, is documented in
 `create-acr.sh` passes `--role-assignment-mode rbac` **explicitly**, even
 though `rbac` also happens to be the CLI's current default. That default
 is Microsoft's to change, not this project's to assume — Microsoft has
-announced ABAC-enabled registries, on which the classic `AcrPush` /
-`AcrPull` / `AcrDelete` roles this series assigns are not honoured at all.
-Pinning `rbac` is what keeps the build identity's `AcrPush` grant (§2)
-meaningful.
+documented an ABAC-enabled registry mode (`rbac-abac`), on which the
+classic `AcrPush` / `AcrPull` / `AcrDelete` roles this series assigns are
+not honoured at all, and states its intent to make that mode the default
+in the future
+([Azure ABAC repository permissions in Azure Container Registry](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-rbac-abac-repository-permissions),
+ms.date 2025-12-11, checked 2026-08-19). Pinning `rbac` is what keeps the
+build identity's `AcrPush` grant (§2) meaningful today.
 
 The migration this project has **documented but not implemented**, should
-a future registry move to ABAC:
+a future registry move to ABAC — per that same page's own migration table:
 
 - `AcrPush` → `Container Registry Repository Writer` — the role this
   pipeline's `image` job would need for `docker push` under `az acr login`.
 - `AcrPull` → `Container Registry Repository Reader` +
-  `Container Registry Catalog Lister` — the pair Container Apps' own image
-  pull would need.
+  `Container Registry Repository Catalog Lister` — the pair Container
+  Apps' own image pull would need. (`create-acr.sh`'s own header comment
+  names this second role `Container Registry Catalog Lister`, dropping
+  "Repository" — the Learn page's migration table gives the full name
+  above; this document uses the page's spelling.)
 - `az acr build` would additionally need `--source-acr-auth-id [caller]`
   on an ABAC-enabled registry. That flag matters to Day 24's
   `deploy-container-app.sh`, which builds server-side with `az acr build`
@@ -407,14 +427,32 @@ an ABAC-enabled registry.
 
 ## 11. Open questions, settled only by the live session
 
-This pipeline's `python`, `site` and `image` jobs run on every push and
-pull request against this repository and have been exercised repeatedly
-that way. Its `deploy` job — the OIDC exchanges, the role assignments in
-practice rather than on paper, the environment approval flow, and
-`update-container-app.sh` running against a real revision — has not yet
-completed a live run. The following are open until it does, and nothing
-above should be read as resolving them in advance:
+`ci.yml` defines `python`, `site` and `image` to trigger on every push and
+pull request against this repository, and `deploy` to run after approval on
+`main`. **None of it has executed.** The branch carrying this workflow has
+never been pushed (`git ls-remote --heads origin` shows no `day-25-cicd`),
+so no job in this file — not `python`'s lint/test gates, not `image`'s
+build-and-boot-smoke, and certainly not `deploy` — has run against real
+GitHub Actions or Azure state. Task 7's own report names the specific
+mechanisms this leaves unverified, folded into the list below: OIDC token
+minting via `azure/login@v2`, `az acr login`'s fallback behaviour, the
+environment's required-reviewer gate actually blocking a run, concurrency
+behaviour, and the digest round-trip through a real `docker push`. The
+following are open until a live run happens, and nothing above should be
+read as resolving them in advance:
 
+- **Whether the OIDC token exchange itself succeeds end to end** — both
+  identities' federated credentials, `azure/login@v2` minting a token
+  against each subject, and Entra accepting it. Every mechanism in §2 and
+  §3 is a description of the configuration as written, not of an observed
+  exchange.
+- **Whether the required-reviewer gate actually pauses the `deploy` job**
+  as configured, and whether the deployment-branch policy actually blocks
+  a non-`main` run from reaching it — both are GitHub-side settings this
+  document describes from `create-github-oidc.sh`'s own read-back logic,
+  not from watching a run be paused or blocked.
+- **Whether the `concurrency` group behaves as specified** under a real
+  queued run (§1) — untested, since no two runs have ever competed for it.
 - **Role-assignment propagation timing for this pipeline.** The only
   measurement anywhere in this project is Day 20's **14 minutes 44
   seconds**, against Microsoft's documented "up to 5 minutes"
@@ -447,5 +485,6 @@ above should be read as resolving them in advance:
   response in this project.
 
 Task 12's live session is what answers these. Until then, treat every
-mechanism in this document as *designed and gated by this repository's own
-tests*, not as *observed working end to end*.
+mechanism in this document as *specified by the code, and verified only by
+reading it*, not as *observed running against real GitHub Actions or Azure
+state*.

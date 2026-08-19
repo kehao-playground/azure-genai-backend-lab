@@ -343,17 +343,20 @@ watching a rolling restart may see a burst of these. That code names the
   registry: Day 24's `deploy-container-app.sh` builds server-side with
   `az acr build` and pulls with a managed identity rather than registry
   credentials ([container-apps.md](container-apps.md)); Day 25's CI/CD
-  pipeline instead builds locally on the runner and does a plain `docker
-  push`, authenticated by a narrowly-scoped `AcrPush` OIDC identity
-  ([ci-cd.md](ci-cd.md)).
+  pipeline instead builds locally on the runner and pushes by tag with
+  plain `docker push`, authenticated by a narrowly-scoped `AcrPush` OIDC
+  identity — a separate `deploy` job is what addresses the image by digest
+  ([ci-cd.md § Digest, not tag](ci-cd.md#5-digest-not-tag)).
 - **Smaller bases** (distroless-style) drop the shell and package manager
   this image still carries. The lab keeps them for debuggability — a
   deliberate trade, not an oversight.
 - **Image scanning** (Docker Scout, Microsoft Defender for Cloud) is still
-  not part of this pipeline. Images are published now — Day 25's `image`
-  job builds this Dockerfile and pushes it to ACR by digest on every push
-  to `main` ([ci-cd.md](ci-cd.md)) — but nothing in that job scans the
-  result for vulnerabilities. What that job does check is boot: the Day
-  23 gate proves the build, and `scripts/boot_smoke.sh` (extracted from
-  the inline CI step on Day 25) boots the image and checks the declared
+  not part of this pipeline. Day 25's `image` job is designed to build this
+  Dockerfile and push it to ACR on every push to `main`
+  ([ci-cd.md](ci-cd.md)) — that pipeline has not yet run against real
+  GitHub Actions, so "published" here describes what it is built to do, not
+  a history of images it has produced — but nothing in that job scans
+  whatever it pushes for vulnerabilities. What that job does check is boot:
+  the Day 23 gate proves the build, and `scripts/boot_smoke.sh` (extracted
+  from the inline CI step on Day 25) boots the image and checks the declared
   `HEALTHCHECK` itself reports `healthy`.
