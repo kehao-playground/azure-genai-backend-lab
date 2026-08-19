@@ -772,6 +772,12 @@ if args[:3] == ["role", "assignment", "delete"]:
     done()
 
 if args[:3] == ["role", "assignment", "list"]:
+    if "--all" not in args:
+        # Mirrors the exact Day 24 bug: without --all, resource-scoped
+        # assignments never show up, no matter what was actually created.
+        # Same guard as FAKE_AZ's create-side handler -- role_assignment_count()
+        # in delete-github-oidc.sh must pass --all at every call site.
+        done("0")
     pid = opt("--assignee-object-id")
     role = opt("--role")
     scope = opt("--scope")
@@ -881,6 +887,11 @@ if args and args[0] == "api":
     if method == "GET" and path and path.startswith(variables_prefix):
         name = path[len(variables_prefix):]
         done(state.get("variables", {}).get(name, ""))
+
+    runs_path = f"repos/{state[\'github_repo\']}/actions/runs"
+    if method == "GET" and path == runs_path and jq_filter == ".total_count":
+        default_total = len(state.get("gh_runs", []))
+        done(str(state.get("total_run_count", default_total)))
 
     environments_path = f"repos/{state[\'github_repo\']}/environments"
     if method == "GET" and path == environments_path:
@@ -1089,6 +1100,32 @@ def test_drain_check_requests_more_than_the_default_20(tmp_path: Path) -> None:
     for call in run_list_calls:
         assert "--limit 20" not in call
         assert "--limit" in call
+
+
+def test_drain_check_fails_closed_when_total_run_count_exceeds_the_limit(tmp_path: Path) -> None:
+    # The repo has more total runs than GH_RUN_LIST_LIMIT would fetch -- the
+    # window cannot be trusted to have seen every run, so this must abort
+    # BEFORE even querying non-terminal status, not read a possibly-truncated
+    # "0 found" as "drained".
+    h = DeleteHarness(tmp_path, total_run_count=2001)
+    result = h.run(GH_RUN_LIST_LIMIT="2000")
+    assert result.returncode != 0
+    assert "2001" in result.stderr
+    assert "GH_RUN_LIST_LIMIT=2000" in result.stderr
+    assert "cannot be trusted" in result.stderr
+    assert h.has("ad app federated-credential delete")
+    assert not h.has("gh run list")
+    assert not h.has("role assignment delete")
+    assert not h.has("ad app delete")
+    assert h.state["apps"] != {}
+    assert h.state["role_assignments"] != []
+
+
+def test_drain_check_proceeds_when_total_run_count_is_within_the_limit(tmp_path: Path) -> None:
+    h = DeleteHarness(tmp_path, total_run_count=999)
+    result = h.run(GH_RUN_LIST_LIMIT="1000")
+    assert result.returncode == 0, result.stderr
+    assert h.has("gh run list")
 
 
 def test_non_terminal_run_aborts_before_role_assignment_or_app_deletion(tmp_path: Path) -> None:

@@ -97,9 +97,11 @@
 #                        to 20 -- raised explicitly here so a busy repo does
 #                        not hide an in-flight run outside that window. `gh`
 #                        paginates internally to satisfy this limit; it is
-#                        still a bound, not literal pagination-to-exhaustion,
-#                        and an extraordinarily busy repo could in principle
-#                        still hide something past it.
+#                        still a bound, not literal pagination-to-exhaustion --
+#                        so step 3 also compares it against the repo's true
+#                        total run count FIRST and fails closed if that total
+#                        exceeds the cap, rather than trusting a count from a
+#                        window that might not have covered every run.
 #
 # Privileges needed: the same directory and role-assignment permissions
 # create-github-oidc.sh's header documents, plus `gh auth login` with
@@ -563,6 +565,25 @@ teardown_fic "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_FIC_ID)
 # === step 3: drain check =====================================================
 echo "== step 3: drain check (repo-scoped -- every run, not just this workflow) =="
 GH_RUN_LIST_LIMIT="${GH_RUN_LIST_LIMIT:-1000}"
+
+# GH_RUN_LIST_LIMIT is a FETCH CAP, not a claim of exhaustive pagination. If
+# the repo has genuinely more total runs than this cap fetches, a
+# non-terminal run could be sitting entirely outside the window the count
+# query below inspects, and that query would read a false "0 found" --
+# draining silently on a truncated window is exactly the failure shape this
+# check exists to prevent. So the true total is read FIRST, cheaply, and
+# fails closed if it exceeds the cap: an unverifiable window aborts, it does
+# not proceed on an optimistic "probably fine".
+TOTAL_RUN_COUNT="$(gh api "repos/${GITHUB_REPO}/actions/runs" --jq '.total_count')"
+require_value "$TOTAL_RUN_COUNT" "the total workflow run count"
+if [ "$TOTAL_RUN_COUNT" -gt "$GH_RUN_LIST_LIMIT" ]; then
+  echo "The repo has $TOTAL_RUN_COUNT runs total, more than GH_RUN_LIST_LIMIT=$GH_RUN_LIST_LIMIT" >&2
+  echo "-- the drain check's window cannot be trusted to have seen every run. A" >&2
+  echo "non-terminal run outside that window would read as a false 'drained'." >&2
+  echo "Raise GH_RUN_LIST_LIMIT and re-run rather than proceed on an unverifiable window." >&2
+  exit 1
+fi
+
 # --json status is deliberately the ONLY field requested for the count query
 # below (smaller response, and it doubles as a clean way to tell this call
 # apart from the detail query a few lines down). `gh run list` defaults to 20
