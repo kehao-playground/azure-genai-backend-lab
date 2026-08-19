@@ -880,16 +880,311 @@ def test_the_app_yaml_heredoc_contains_no_command_substitution(tmp_path: Path) -
     #
     # $(...) is included for the same reason, and neither has any legitimate
     # use in this block: every value it needs is already in a shell variable.
+    #
+    # APP_YAML is assembled from several heredocs in sequence (one per
+    # AZ_SEARCH_MODE=fake-skippable section), all sharing the delimiter
+    # "YAML" -- so every <<YAML/YAML pair in the script is scanned, not just
+    # the first, or the sections added for fake mode would go unchecked.
     script = (SCRIPTS_DIR / "deploy-container-app.sh").read_text().splitlines()
-    start = next(i for i, line in enumerate(script) if line.endswith("<<YAML"))
-    end = next(i for i, line in enumerate(script) if i > start and line == "YAML")
-    body = script[start + 1 : end]
-    offenders = [
-        f"{start + 2 + n}: {line}"
-        for n, line in enumerate(body)
-        if "`" in line or "$(" in line
-    ]
+    starts = [i for i, line in enumerate(script) if line.endswith("<<YAML")]
+    assert starts, "expected at least one <<YAML heredoc"
+    offenders = []
+    for start in starts:
+        end = next(i for i, line in enumerate(script) if i > start and line == "YAML")
+        body = script[start + 1 : end]
+        offenders.extend(
+            f"{start + 2 + n}: {line}"
+            for n, line in enumerate(body)
+            if "`" in line or "$(" in line
+        )
     assert not offenders, offenders
+
+
+# ---------------------------------------------------------------------------
+# 7b. AZ_SEARCH_MODE=fake drops five Search/Key Vault couplings; AZ_SEARCH_MODE
+# =real (the default) must not change so much as a byte of what this script
+# already produced. The five pieces below are transcribed verbatim from the
+# heredoc as it existed BEFORE AZ_SEARCH_MODE was introduced (commit 1fad6f0,
+# infra/scripts/deploy-container-app.sh lines 632-726) -- not re-derived from
+# the current, split-into-several-heredocs script -- so a real-mode test built
+# from them proves byte-identity against the pre-switch contract, not just
+# internal self-consistency.
+# ---------------------------------------------------------------------------
+
+YAML_PART_A = """identity:
+  type: UserAssigned
+  userAssignedIdentities:
+    "${MI_ID}": {}
+properties:
+  # The binding to the environment, stated in the file rather than left to
+  # the --environment flag on the create call below, which is documented to
+  # ignore "all other parameters".
+  #
+  # No backticks anywhere in this heredoc. The delimiter is deliberately
+  # unquoted so the variables above expand -- which also means backticks in
+  # here are command substitutions, not punctuation. A prose backtick pair
+  # around a flag name in this very comment used to run that flag as a
+  # command: "line 632: --yaml: command not found".
+  environmentId: ${ENV_ID}
+  configuration:
+    activeRevisionsMode: single
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: auto
+      # Stated explicitly because omitting it does not mean "do not send it".
+      # The containerapp extension deserializes this YAML into its SDK model
+      # and serializes the WHOLE model back out, so every field left out here
+      # is transmitted as an explicit JSON null -- 84 of them in this app's
+      # PUT body. The API version the extension targets (2025-10-02-preview)
+      # rejects null for this non-nullable boolean, and says so from the
+      # server's own parse context rather than ours:
+      #   The JSON value could not be converted to System.Boolean.
+      #   Path: $ | LineNumber: 0 | BytePositionInLine: 4
+      # Position 4 is the end of the four characters of "null"; Path $ is the
+      # root of that value, not of the document, which is why the message
+      # names no field. allowInsecure is the only boolean among those nulls.
+      allowInsecure: false
+    registries:
+      - server: ${AZ_ACR_NAME}.azurecr.io
+        identity: ${MI_ID}
+"""
+
+YAML_PART_B_SECRETS = """    secrets:
+      - name: search-admin-key
+        keyVaultUrl: ${KV_SECRET_URI}
+        identity: ${MI_ID}
+"""
+
+YAML_PART_C1 = """  template:
+    terminationGracePeriodSeconds: 30
+    containers:
+      - image: ${AZ_ACR_NAME}.azurecr.io/azgenai-lab:${IMAGE_TAG}
+        name: azgenai-lab
+        env:
+          - name: AZURE_OPENAI_AUTH
+            value: "entra"
+          - name: AZURE_CLIENT_ID
+            value: "${MI_CLIENT_ID}"
+          - name: AUTH_MODE
+            value: "entra"
+          - name: ENTRA_TENANT_ID
+            value: "${ENTRA_TENANT_ID}"
+          - name: ENTRA_AUDIENCE
+            value: "${ENTRA_AUDIENCE}"
+          - name: ENTRA_REQUIRED_SCOPE
+            value: "${ENTRA_REQUIRED_SCOPE}"
+          - name: ENTRA_REQUIRED_APP_ROLE
+            value: "${ENTRA_REQUIRED_APP_ROLE}"
+          - name: USE_FAKE_LLM
+            value: "false"
+          - name: USE_FAKE_SEARCH
+            value: "false"
+          - name: USE_FAKE_EMBEDDINGS
+            value: "false"
+          - name: SAMPLE_DOCS_DIR
+            value: "/app/data/sample-docs"
+          - name: AZURE_OPENAI_ENDPOINT
+            value: "${AZURE_OPENAI_ENDPOINT}"
+          - name: AZURE_OPENAI_DEPLOYMENT_NAME
+            value: "${AZURE_OPENAI_DEPLOYMENT_NAME}"
+          - name: AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+            value: "${AZURE_OPENAI_EMBEDDING_DEPLOYMENT}"
+"""
+
+YAML_PART_D_SEARCH_ENV = """          - name: AZURE_SEARCH_ENDPOINT
+            value: "${AZURE_SEARCH_ENDPOINT}"
+          - name: AZURE_SEARCH_ADMIN_KEY
+            secretRef: search-admin-key
+"""
+
+YAML_PART_E = """        probes:
+          - type: Startup
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          - type: Liveness
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          - type: Readiness
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+"""
+
+
+def render_yaml(template: str, mapping: dict[str, str]) -> str:
+    result = template
+    for key, value in mapping.items():
+        result = result.replace(f"${{{key}}}", value)
+    return result
+
+
+def with_use_fake_search(part_c1: str, value: str) -> str:
+    old = '          - name: USE_FAKE_SEARCH\n            value: "false"\n'
+    new = f'          - name: USE_FAKE_SEARCH\n            value: "{value}"\n'
+    assert old in part_c1
+    return part_c1.replace(old, new, 1)
+
+
+def yaml_var_map(h: "Harness") -> dict[str, str]:
+    # Pulled from the harness's own env/state rather than retyped, so this map
+    # cannot drift from what the fake `az` calls actually returned. The two
+    # ENTRA_REQUIRED_* values are the script's own defaults (not set by the
+    # harness env), documented in its "Optional env vars" header.
+    return {
+        "MI_ID": MI_RESOURCE_ID,
+        "ENV_ID": ENV_ID,
+        "AZ_ACR_NAME": h.env["AZ_ACR_NAME"],
+        "IMAGE_TAG": "day-24",
+        "MI_CLIENT_ID": MI_CLIENT_ID,
+        "ENTRA_TENANT_ID": h.env["ENTRA_TENANT_ID"],
+        "ENTRA_AUDIENCE": h.env["ENTRA_AUDIENCE"],
+        "ENTRA_REQUIRED_SCOPE": "access_as_user",
+        "ENTRA_REQUIRED_APP_ROLE": "Api.Access",
+        "AZURE_OPENAI_ENDPOINT": h.state["aoai_reads"]["properties.endpoint"],  # type: ignore[index]
+        "AZURE_OPENAI_DEPLOYMENT_NAME": "chat-mini",
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": "embed-small",
+        "KV_SECRET_URI": f"https://{h.env['AZ_KEYVAULT_NAME']}.vault.azure.net/secrets/azure-search-admin-key",
+        "AZURE_SEARCH_ENDPOINT": f"https://{h.env['AZ_SEARCH_NAME']}.search.windows.net",
+    }
+
+
+def run_with_env(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(SCRIPTS_DIR / "deploy-container-app.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_real_mode_yaml_is_byte_identical_to_the_pre_switch_contract(
+    tmp_path: Path,
+) -> None:
+    """AZ_SEARCH_MODE unset (the default) and AZ_SEARCH_MODE=real must both
+    produce exactly what this script produced before AZ_SEARCH_MODE existed --
+    the whole safety property this task promises, since real mode is shared
+    with earlier days' runbooks.
+    """
+    implicit_dir = tmp_path / "implicit"
+    implicit_dir.mkdir()
+    h_implicit = Harness(implicit_dir)
+    result_implicit = h_implicit.run()
+    assert result_implicit.returncode == 0, result_implicit.stderr
+
+    expected = render_yaml(
+        YAML_PART_A + YAML_PART_B_SECRETS + YAML_PART_C1 + YAML_PART_D_SEARCH_ENV + YAML_PART_E,
+        yaml_var_map(h_implicit),
+    )
+    assert h_implicit.state["app_yaml"] == expected
+
+    explicit_dir = tmp_path / "explicit"
+    explicit_dir.mkdir()
+    h_explicit = Harness(explicit_dir)
+    result_explicit = h_explicit.run(AZ_SEARCH_MODE="real")
+    assert result_explicit.returncode == 0, result_explicit.stderr
+    assert h_explicit.state["app_yaml"] == expected
+
+
+def test_fake_mode_drops_all_five_search_keyvault_couplings(tmp_path: Path) -> None:
+    """The five couplings AZ_SEARCH_MODE=fake exists to drop, checked
+    together: (1) AZ_SEARCH_NAME not required, (2) AZ_KEYVAULT_NAME not
+    required, (3) no Search-key-into-Key-Vault stage, (4) no secrets: block /
+    AZURE_SEARCH_ENDPOINT / secretRef in the app YAML and USE_FAKE_SEARCH
+    flips to true, (5) no Key Vault role assignment.
+    """
+    h = Harness(tmp_path)
+    env = dict(h.env)
+    del env["AZ_KEYVAULT_NAME"]
+    del env["AZ_SEARCH_NAME"]
+    env["AZ_SEARCH_MODE"] = "fake"
+    result = run_with_env(env)
+    assert result.returncode == 0, result.stderr  # (1) and (2): neither required
+
+    # (3): the whole stage is skipped, not silently -- no Search admin key
+    # read, no secret written.
+    assert "skipped (AZ_SEARCH_MODE=fake)" in result.stdout
+    assert not h.has("search admin-key show")
+    assert not h.has("keyvault secret set")
+
+    # (5): the identity is only ever granted two roles, and Key Vault is never
+    # even looked up.
+    assert not h.has("keyvault show")
+    assert h.count("role assignment create") == 2
+    assert sorted(h.state["roles"]) == sorted(  # type: ignore[arg-type]
+        ["AcrPull", "Cognitive Services OpenAI User"]
+    )
+
+    # (4): byte-identity, the same discipline as the real-mode test above --
+    # everything Search-shaped drops out and nothing else moves.
+    expected = render_yaml(
+        YAML_PART_A + with_use_fake_search(YAML_PART_C1, "true") + YAML_PART_E,
+        yaml_var_map(h),
+    )
+    assert h.state["app_yaml"] == expected
+    yaml_text = h.state["app_yaml"]
+    assert isinstance(yaml_text, str)
+    assert "secrets:" not in yaml_text
+    assert "keyVaultUrl" not in yaml_text
+    assert "AZURE_SEARCH_ENDPOINT" not in yaml_text
+    assert "AZURE_SEARCH_ADMIN_KEY" not in yaml_text
+    assert "secretRef" not in yaml_text
+
+
+def test_fake_mode_only_touches_the_five_search_keyvault_couplings(tmp_path: Path) -> None:
+    """Everything unrelated to Search/Key Vault -- identity, ACR pull, ingress,
+    Log Analytics, the AOAI configuration -- still has to be there in fake
+    mode. Belt-and-braces alongside the byte-identity check above.
+    """
+    h = Harness(tmp_path)
+    env = dict(h.env)
+    del env["AZ_KEYVAULT_NAME"]
+    del env["AZ_SEARCH_NAME"]
+    env["AZ_SEARCH_MODE"] = "fake"
+    result = run_with_env(env)
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert isinstance(yaml_text, str)
+    assert "identity:" in yaml_text
+    assert "type: UserAssigned" in yaml_text
+    assert f'"{MI_RESOURCE_ID}": {{}}' in yaml_text
+    assert "terminationGracePeriodSeconds: 30" in yaml_text
+    for probe in ("type: Startup", "type: Liveness", "type: Readiness"):
+        assert probe in yaml_text
+    for name in (
+        "AZURE_OPENAI_AUTH",
+        "AZURE_CLIENT_ID",
+        "AUTH_MODE",
+        "ENTRA_TENANT_ID",
+        "ENTRA_AUDIENCE",
+        "ENTRA_REQUIRED_SCOPE",
+        "ENTRA_REQUIRED_APP_ROLE",
+        "USE_FAKE_LLM",
+        "USE_FAKE_EMBEDDINGS",
+        "SAMPLE_DOCS_DIR",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
+    ):
+        assert f"- name: {name}\n" in yaml_text, name
+    assert h.has("monitor log-analytics workspace create")
+    assert h.has("containerapp env create")
+
+
+def test_invalid_search_mode_fails_before_any_azure_call(tmp_path: Path) -> None:
+    """Not real, not fake: a hard error, never a silent fall-through to
+    either mode.
+    """
+    h = Harness(tmp_path)
+    result = h.run(AZ_SEARCH_MODE="mock")
+    assert result.returncode != 0
+    assert "AZ_SEARCH_MODE" in result.stderr
+    assert not h.has("account set")
 
 
 # ---------------------------------------------------------------------------
