@@ -10,7 +10,7 @@ D12 names four order contracts as the ones that matter for the `gh`-side
 lifecycle (the other scripts already cover az-only patterns):
 
   1. an environment-protection read-back mismatch aborts before repository
-     variables or DEPLOY_ENABLED are ever written
+     secrets or DEPLOY_ENABLED are ever written
   2. DEPLOY_ENABLED=true is the LAST mutation the script makes
   3. any read-back that comes back empty aborts with nothing further attempted
   4. the two identities get distinct subjects, and their role-assignment
@@ -151,7 +151,7 @@ done(code=2)
 '''
 
 FAKE_GH = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 
 state_path = os.environ["GH_OIDC_FAKE_STATE"]
 with open(state_path) as f:
@@ -283,6 +283,43 @@ if args[:2] == ["variable", "set"]:
     state.setdefault("variables", {})[name] = body
     done()
 
+if args[:2] == ["secret", "set"]:
+    # Models what `gh secret set` actually does: it writes a value that can
+    # never be read back through `gh` again. The fake still records the
+    # value in state["secrets"] -- that is this TEST fixture's own window
+    # into what was sent, not something the real `gh` or this script's own
+    # presence read-back can see.
+    name = args[2]
+    i = 3
+    body = ""
+    while i < len(args):
+        if args[i] == "--body":
+            body = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    state.setdefault("secrets", {})[name] = body
+    done()
+
+if args[:2] == ["secret", "list"]:
+    jq_filter = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--jq":
+            jq_filter = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    m = re.search(r'index\\("([^"]*)"\\)', jq_filter or "")
+    if not m:
+        fail(f"fake gh: unparseable jq {jq_filter!r}", 2)
+    name = m.group(1)
+    overrides = state.get("secret_presence_overrides", {})
+    if name in overrides:
+        done(overrides[name])
+    present = name in state.get("secrets", {})
+    done("true" if present else "false")
+
 print(f"fake gh: unhandled command: {' '.join(args)}", file=sys.stderr)
 done(code=2)
 '''
@@ -393,9 +430,25 @@ def test_happy_path_creates_and_arms(tmp_path: Path) -> None:
     assert rec["DEPLOY_FIC_ID"] == "fic-deploy-1"
     assert rec["GITHUB_REPO"] == GITHUB_REPO
     assert rec["DEPLOY_ENABLED_SET"] == "true"
+    assert rec["GH_SECRETS_WRITTEN"] == (
+        "AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID_BUILD "
+        "AZURE_CLIENT_ID_DEPLOY AZURE_ACR_NAME AZURE_RESOURCE_GROUP "
+        "AZURE_CONTAINER_APP_NAME"
+    )
+    # DEPLOY_ENABLED is the one repository VARIABLE this script writes.
     assert h.state["variables"]["DEPLOY_ENABLED"] == "true"
-    assert h.state["variables"]["AZURE_CLIENT_ID_BUILD"] == BUILD_APP_GUID
-    assert h.state["variables"]["AZURE_CLIENT_ID_DEPLOY"] == DEPLOY_APP_GUID
+    assert "AZURE_TENANT_ID" not in h.state.get("variables", {})
+    # The seven identifiers are repository SECRETS -- present under their
+    # names in the fake's own bookkeeping. The real `gh` could never let this
+    # script (or this test) read the value back; this fixture can, only
+    # because it is modelling what was sent, not what `gh` would return.
+    assert h.state["secrets"]["AZURE_CLIENT_ID_BUILD"] == BUILD_APP_GUID
+    assert h.state["secrets"]["AZURE_CLIENT_ID_DEPLOY"] == DEPLOY_APP_GUID
+    assert h.state["secrets"]["AZURE_TENANT_ID"] == TENANT_ID
+    assert h.state["secrets"]["AZURE_SUBSCRIPTION_ID"] == SUBSCRIPTION_ID
+    assert h.state["secrets"]["AZURE_ACR_NAME"] == "acrfaked25"
+    assert h.state["secrets"]["AZURE_RESOURCE_GROUP"] == "rg"
+    assert h.state["secrets"]["AZURE_CONTAINER_APP_NAME"] == "aca-faked25"
 
 
 def test_step_ordering_is_pinned(tmp_path: Path) -> None:
@@ -425,7 +478,11 @@ def test_step_ordering_is_pinned(tmp_path: Path) -> None:
     # Read-backs (plain "gh api repos/.../environments/production" with no
     # --method, i.e. GET) happen after both writes.
     assert h.last_index(branch_policy_post) < h.first_index(env_get)
-    assert h.last_index(branch_policy_get) < h.first_index("gh variable set")
+    assert h.last_index(branch_policy_get) < h.first_index("gh secret set")
+    # DEPLOY_ENABLED (the one repository variable) is armed only after every
+    # identifier secret has been set -- see test_deploy_enabled_is_the_last_mutation
+    # for the full last-mutation contract.
+    assert h.last_index("gh secret set") < h.first_index("gh variable set DEPLOY_ENABLED")
 
 
 def test_two_identities_created_with_distinct_subjects_and_scopes(tmp_path: Path) -> None:
@@ -460,7 +517,7 @@ def test_two_identities_created_with_distinct_subjects_and_scopes(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-def test_environment_branch_policy_mismatch_aborts_before_variables(tmp_path: Path) -> None:
+def test_environment_branch_policy_mismatch_aborts_before_secrets(tmp_path: Path) -> None:
     # Simulates GitHub silently serving the pre-protection (auto-created,
     # unprotected) state back on read: the PUT reported success, but what
     # comes back on GET disagrees.
@@ -469,23 +526,26 @@ def test_environment_branch_policy_mismatch_aborts_before_variables(tmp_path: Pa
     assert result.returncode != 0
     assert "custom_branch_policies=false" in result.stderr
     assert "not a gate" in result.stderr
+    assert not h.has("gh secret set")
     assert not h.has("gh variable set")
 
 
-def test_environment_reviewer_mismatch_aborts_before_variables(tmp_path: Path) -> None:
+def test_environment_reviewer_mismatch_aborts_before_secrets(tmp_path: Path) -> None:
     h = Harness(tmp_path, reviewer_ids_override="9999999")
     result = h.run()
     assert result.returncode != 0
     assert "required reviewers" in result.stderr
     assert "9999999" in result.stderr
+    assert not h.has("gh secret set")
     assert not h.has("gh variable set")
 
 
-def test_branch_policy_list_mismatch_aborts_before_variables(tmp_path: Path) -> None:
+def test_branch_policy_list_mismatch_aborts_before_secrets(tmp_path: Path) -> None:
     h = Harness(tmp_path, branch_policies_readback_override="some-other-branch")
     result = h.run()
     assert result.returncode != 0
     assert "deployment branch policies" in result.stderr
+    assert not h.has("gh secret set")
     assert not h.has("gh variable set")
 
 
@@ -508,21 +568,26 @@ def test_deploy_enabled_is_the_last_mutation(tmp_path: Path) -> None:
             call.startswith("ad ")
             or call.startswith("role assignment create")
             or call.startswith("gh api --method")
-            or (call.startswith("gh variable set") and "DEPLOY_ENABLED" not in call)
+            or call.startswith("gh secret set")
         )
     ]
     assert other_mutating_calls, "sanity: there should be earlier mutations to compare against"
     assert deploy_enabled_set_index > max(other_mutating_calls)
 
 
-def test_variable_readback_mismatch_never_reaches_deploy_enabled(tmp_path: Path) -> None:
+def test_secret_presence_readback_failure_never_reaches_deploy_enabled(tmp_path: Path) -> None:
+    # There is no value to corrupt for a secret's read-back -- `gh` never
+    # returns one (see gh_secret_present's own comment in the script). The
+    # only failure this presence check can catch is the secret not showing
+    # up under its name at all, e.g. the write silently did not take.
     h = Harness(
         tmp_path,
-        variable_readback_overrides={"AZURE_CLIENT_ID_BUILD": "wrong-value"},
+        secret_presence_overrides={"AZURE_CLIENT_ID_BUILD": "false"},
     )
     result = h.run()
     assert result.returncode != 0
     assert "AZURE_CLIENT_ID_BUILD" in result.stderr
+    assert "was not found" in result.stderr
     assert not h.has("gh variable set DEPLOY_ENABLED")
 
 
@@ -555,6 +620,7 @@ def test_role_assignment_not_listed_aborts_before_github(tmp_path: Path) -> None
     assert "is not listed" in result.stderr
     assert not h.has("gh api")
     assert not h.has("gh variable")
+    assert not h.has("gh secret")
 
 
 def test_empty_environment_readback_aborts(tmp_path: Path) -> None:
@@ -562,6 +628,7 @@ def test_empty_environment_readback_aborts(tmp_path: Path) -> None:
     result = h.run()
     assert result.returncode != 0
     assert "empty output" in result.stderr
+    assert not h.has("gh secret set")
     assert not h.has("gh variable set")
 
 
@@ -907,6 +974,29 @@ if args[:2] == ["variable", "list"]:
     present = name in state.get("variables", {})
     done("true" if present else "false")
 
+if args[:2] == ["secret", "set"]:
+    name = args[2]
+    body = opt("--body")
+    state.setdefault("secrets", {})[name] = body
+    done()
+
+if args[:2] == ["secret", "delete"]:
+    name = args[2]
+    secrets = state.setdefault("secrets", {})
+    if name in secrets:
+        del secrets[name]
+        done()
+    fail("fake gh: secret not found", 1)
+
+if args[:2] == ["secret", "list"]:
+    jq_filter = opt("--jq")
+    m = re.search(r'index\\("([^"]*)"\\)', jq_filter)
+    if not m:
+        fail(f"fake gh: unparseable jq {jq_filter!r}", 2)
+    name = m.group(1)
+    present = name in state.get("secrets", {})
+    done("true" if present else "false")
+
 if args and args[0] == "api":
     rest = args[1:]
     method = "GET"
@@ -995,7 +1085,7 @@ class DeleteHarness:
                 },
             ],
             "environments": ["production"],
-            "variables": {
+            "secrets": {
                 "AZURE_TENANT_ID": TENANT_ID,
                 "AZURE_SUBSCRIPTION_ID": SUBSCRIPTION_ID,
                 "AZURE_CLIENT_ID_BUILD": BUILD_APP_GUID,
@@ -1003,6 +1093,8 @@ class DeleteHarness:
                 "AZURE_ACR_NAME": "acrfaked25",
                 "AZURE_RESOURCE_GROUP": "rg",
                 "AZURE_CONTAINER_APP_NAME": "aca-faked25",
+            },
+            "variables": {
                 "DEPLOY_ENABLED": "true",
             },
             "gh_runs": [],
@@ -1045,7 +1137,7 @@ class DeleteHarness:
             "DEPLOY_ROLE_ASSIGNMENT_ID": DEPLOY_ASSIGNMENT_ID,
             "GH_ENVIRONMENT_CREATED": "true",
             "GH_REQUIRED_REVIEWER_LOGIN": REVIEWER_LOGIN,
-            "GH_VARIABLES_WRITTEN": (
+            "GH_SECRETS_WRITTEN": (
                 "AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_CLIENT_ID_BUILD "
                 "AZURE_CLIENT_ID_DEPLOY AZURE_ACR_NAME AZURE_RESOURCE_GROUP "
                 "AZURE_CONTAINER_APP_NAME"
@@ -1104,6 +1196,7 @@ def test_delete_happy_path_tears_everything_down(tmp_path: Path) -> None:
     assert h.state["apps"] == {}
     assert h.state["role_assignments"] == []
     assert h.state["environments"] == []
+    assert h.state["secrets"] == {}
     assert h.state["variables"] == {}
     # Both app registrations were also purged from the recycle bin (I3),
     # keyed on the object id create-github-oidc.sh recorded.
@@ -1126,6 +1219,7 @@ def test_delete_happy_path_tears_everything_down(tmp_path: Path) -> None:
         or "role assignment delete" in c
         or "ad app delete" in c
         or "gh variable delete" in c
+        or "gh secret delete" in c
         or "DELETE repos" in c
         for c in verify_only_calls
     )
@@ -1158,6 +1252,7 @@ def test_verify_teardown_reports_a_soft_deleted_app_as_still_present(tmp_path: P
         },
         role_assignments=[],
         environments=[],
+        secrets={},
         variables={},
     )
     result = h.run("--verify-teardown")
@@ -1188,6 +1283,7 @@ def test_verify_teardown_is_unverifiable_when_object_id_is_missing(tmp_path: Pat
         deleted_items={},
         role_assignments=[],
         environments=[],
+        secrets={},
         variables={},
     )
     result = h.run("--verify-teardown")
@@ -1212,6 +1308,7 @@ def test_verify_teardown_is_unverifiable_when_the_deleted_items_probe_fails(
         deleted_item_probe_fails=True,
         role_assignments=[],
         environments=[],
+        secrets={},
         variables={},
     )
     result = h.run("--verify-teardown")
@@ -1246,6 +1343,7 @@ def test_verify_teardown_is_unverifiable_on_the_display_name_fallback_when_objec
         deleted_items={},
         role_assignments=[],
         environments=[],
+        secrets={},
         variables={},
     )
     result = h.run("--verify-teardown")
@@ -1397,6 +1495,7 @@ def test_verify_teardown_nonempty_keeps_record_file(tmp_path: Path) -> None:
     assert h.state["apps"] != {}
     assert h.state["role_assignments"] != []
     assert h.state["environments"] != []
+    assert h.state["secrets"] != {}
     assert h.state["variables"] != {}
 
 

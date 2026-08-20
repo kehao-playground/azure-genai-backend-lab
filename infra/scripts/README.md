@@ -24,8 +24,8 @@
 | `create-content-safety.sh` | Ephemeral Content Safety account (F0; conditional S0 fallback on allowlisted error code) with provider pre-check | working |
 | `delete-content-safety.sh` | Delete and purge that account from any state (live / soft-deleted / absent), bounded waits, final absence assertion | working |
 | `run-content-safety-probe.sh` | Orchestrate create → Prompt Shields probe → delete/purge, EXIT-trap cleanup armed before create | working |
-| `create-github-oidc.sh` | Provision the two federated (secret-less) GitHub Actions identities (build: `AcrPush` on the registry; deploy: `Container Apps Contributor` on the app), the GitHub `production` environment (required reviewer + branch-restricted to `main`, read back and compared), repository variables, then arms `DEPLOY_ENABLED=true` last | working |
-| `delete-github-oidc.sh` | Tear that down from the record file `create-github-oidc.sh` wrote: `DEPLOY_ENABLED=false` first, delete both federated credentials, a repo-scoped drain check that aborts (never cancels) on any non-terminal run, delete role assignments then app registrations (best-effort purge from the Entra recycle bin), delete the GitHub environment and repository variables — plus a read-only `--verify-teardown` mode that distinguishes absent from soft-deleted and only removes the record file once nothing it names is still found | working |
+| `create-github-oidc.sh` | Provision the two federated (secret-less) GitHub Actions identities (build: `AcrPush` on the registry; deploy: `Container Apps Contributor` on the app), the GitHub `production` environment (required reviewer + branch-restricted to `main`, read back and compared), seven identifier repository secrets (presence-only read-back — a secret's value cannot be read back) plus the `DEPLOY_ENABLED` repository variable, then arms `DEPLOY_ENABLED=true` last | working |
+| `delete-github-oidc.sh` | Tear that down from the record file `create-github-oidc.sh` wrote: `DEPLOY_ENABLED=false` first, delete both federated credentials, a repo-scoped drain check that aborts (never cancels) on any non-terminal run, delete role assignments then app registrations (best-effort purge from the Entra recycle bin), delete the GitHub environment, the seven identifier repository secrets and the `DEPLOY_ENABLED` repository variable — plus a read-only `--verify-teardown` mode that distinguishes absent from soft-deleted and only removes the record file once nothing it names is still found | working |
 
 All scripts read configuration from environment variables, fail fast, and never hardcode subscription IDs or secrets.
 
@@ -195,8 +195,8 @@ as "absent", "zero" or "not yet".
 ## CI/CD (Day 25)
 
 The full pipeline design — the workflow shape, why two identities, subject
-binding, the layered controls, digest-not-tag, repository variables versus
-secrets, `DEPLOY_ENABLED` — is documented in
+binding, the layered controls, digest-not-tag, repository secrets versus
+the one variable, `DEPLOY_ENABLED` — is documented in
 [docs/ci-cd.md](../../docs/ci-cd.md). What belongs here is the runbook
 order: which script runs when, relative to the Container Apps scripts
 above.
@@ -248,8 +248,9 @@ unlike the Entra and Content Safety scripts above, which recover by
 printing ids and teardown commands rather than by writing a file, this
 script provisions six-plus objects across two systems (Entra app
 registrations, federated credentials, role assignments, a GitHub
-environment, repository variables) and needs a durable list rather than a
-terminal scrollback to reverse any of it. It refuses to overwrite an
+environment, repository secrets and a repository variable) and needs a
+durable list rather than a terminal scrollback to reverse any of it. It
+refuses to overwrite an
 existing record file, for the same reason: that file is the only list of
 what a previous run created.
 

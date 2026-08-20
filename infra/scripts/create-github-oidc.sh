@@ -36,23 +36,41 @@
 #      references a name that does not exist yet -- "the environment named
 #      production exists" proves nothing about whether it is actually
 #      gated.
-#   6. write the GitHub repository variables the workflow reads, then read
-#      each one back
+#   6. write the seven identifier repository secrets the workflow reads,
+#      then read back that each one is PRESENT (a secret's value cannot be
+#      read back -- see step 6's own comment for what that costs)
 #   7. only after 5 and 6 have both verified clean: arm the pipeline by
-#      setting DEPLOY_ENABLED=true. This is deliberately the LAST mutation
-#      this script makes -- if anything earlier failed, the pipeline must
-#      never be armed.
+#      setting the DEPLOY_ENABLED repository VARIABLE to true. This is
+#      deliberately the LAST mutation this script makes -- if anything
+#      earlier failed, the pipeline must never be armed.
 #
-# These are repository VARIABLES (`gh variable set`, not `gh secret set`) on
-# purpose, following this project's own decision (docs/ci-cd.md, D9): the
-# credential is the federated-identity trust relationship itself, and it does
-# not live in the repo. Client ids, tenant/subscription ids and resource
-# names are not secrets -- putting them in `secrets` would only obscure them
-# in logs, not protect anything, at the cost of every debugging session
-# reading `***`. This is a KNOWING DEVIATION from Microsoft's own OIDC
-# tutorial, which puts these same three identifiers in secrets "for security
-# reasons" -- the reasoning for the deviation belongs in docs/ci-cd.md, not
-# silently done here.
+# The seven identifiers below (tenant id, subscription id, both client ids,
+# ACR name, resource group, container app name) are written as repository
+# SECRETS (`gh secret set`), not variables. DEPLOY_ENABLED is the one
+# exception -- it stays a VARIABLE (`gh variable set`), for a reason that has
+# nothing to do with secrecy: `ci.yml` reads it in job-level `if:`
+# conditions, and the `secrets` context is documented as unusable there
+# ("Secrets cannot be directly referenced in `if:` conditionals" -- GitHub
+# Docs, Using secrets in GitHub Actions, checked 2026-08-19).
+#
+# The classification argument has not changed and this project still makes
+# it: the actual credential is the federated-identity trust relationship
+# itself, checked at token-exchange time, and it does not live in this repo
+# at all. A client id or a tenant id, on its own, grants nothing without a
+# matching token and that trust relationship -- so none of these seven
+# values are secrets in the OIDC threat model. docs/ci-cd.md still argues
+# that, and still means it.
+#
+# What changed is the EXPOSURE SURFACE, not the classification. This repo is
+# public, and its Actions run logs are permanently readable and indexed --
+# `gh variable set` values are never masked in a log line that references
+# them, `gh secret set` values are. This project already masks subscription
+# ids, tenant ids, endpoints and resource names in every screenshot and
+# every evidence file it publishes elsewhere in this series. Publishing the
+# identical values through a workflow log while masking them in a
+# screenshot would be incoherent -- same value, same threat model,
+# different handling, because where it becomes visible changed. docs/ci-cd.md
+# §7 records the reasoning and the cost in full.
 #
 # Two identities, not one, because the alternative (one identity, subject
 # bound to the environment, holding both AcrPush and the deploy role) forces
@@ -129,7 +147,8 @@
 # and on the container app (e.g. Owner or User Access Administrator at a
 # scope covering both), directory permission to create app registrations and
 # service principals, and `gh auth login` with `repo` scope plus permission
-# to manage this repository's environments and Actions variables.
+# to manage this repository's environments, Actions secrets and Actions
+# variables.
 set -euo pipefail
 
 while [[ $# -gt 0 ]]; do
@@ -518,24 +537,37 @@ if [ "$BRANCH_POLICIES" != "$GH_DEPLOY_BRANCH" ]; then
 fi
 echo "  verified: required reviewer=$REVIEWER_LOGIN, deployment branch policy=$GH_DEPLOY_BRANCH only"
 
-# === step 6: repository variables ============================================
-echo "== step 6: repository variables =="
+# === step 6: repository secrets ==============================================
+echo "== step 6: repository secrets =="
 
+gh_secret_set() {
+  local name="$1" value="$2"
+  gh secret set "$name" --repo "$GITHUB_REPO" --body "$value" >/dev/null
+}
 gh_var_set() {
   local name="$1" value="$2"
   gh variable set "$name" --repo "$GITHUB_REPO" --body "$value" >/dev/null
 }
-# `gh variable get` does exist and could serve this read-back (checked
-# against the installed CLI: it supports the same --json/--jq contract this
-# needs). This script uses `gh api` against the documented REST endpoint
-# instead as a preference, not a necessity -- for consistency with step 5
-# above, which already reads every piece of GitHub state through `gh api`
-# rather than mixing subcommands and raw endpoints call by call.
+# `gh variable get` (and the REST endpoint behind it) returns the value that
+# was set -- that is what step 7's DEPLOY_ENABLED read-back below still
+# relies on. There is no equivalent for secrets: `gh secret list` and
+# `repos/{owner}/{repo}/actions/secrets/{name}` both return name and
+# timestamps only, never the value, by GitHub's own design -- once a secret
+# is set, nothing (not even this operator, not even `gh`) can read it back.
+# So this presence check is genuinely weaker than the variable read-back it
+# replaces: it confirms the secret EXISTS under this name, not that its
+# value is what this script just sent. That gap is not closed anywhere in
+# this project -- docs/ci-cd.md §7 states it as a cost of this design, not
+# an oversight.
+gh_secret_present() {
+  gh secret list --repo "$GITHUB_REPO" --json name \
+    --jq "([.[].name] | index(\"$1\")) != null"
+}
 gh_var_get() {
   gh api "repos/${GITHUB_REPO}/actions/variables/${1}" --jq .value
 }
 
-declare -a VAR_NAMES=(
+declare -a SECRET_NAMES=(
   AZURE_TENANT_ID
   AZURE_SUBSCRIPTION_ID
   AZURE_CLIENT_ID_BUILD
@@ -544,7 +576,7 @@ declare -a VAR_NAMES=(
   AZURE_RESOURCE_GROUP
   AZURE_CONTAINER_APP_NAME
 )
-declare -a VAR_VALUES=(
+declare -a SECRET_VALUES=(
   "$AZ_TENANT_ID"
   "$AZ_SUBSCRIPTION_ID"
   "$BUILD_APP_ID"
@@ -553,30 +585,37 @@ declare -a VAR_VALUES=(
   "$AZ_RESOURCE_GROUP"
   "$AZ_ACA_APP_NAME"
 )
-for i in "${!VAR_NAMES[@]}"; do
-  gh_var_set "${VAR_NAMES[$i]}" "${VAR_VALUES[$i]}"
-  echo "  set ${VAR_NAMES[$i]}"
+for i in "${!SECRET_NAMES[@]}"; do
+  gh_secret_set "${SECRET_NAMES[$i]}" "${SECRET_VALUES[$i]}"
+  echo "  set ${SECRET_NAMES[$i]}"
 done
-record GH_VARIABLES_WRITTEN "${VAR_NAMES[*]}"
+record GH_SECRETS_WRITTEN "${SECRET_NAMES[*]}"
 
-# Read every one back rather than trusting the write's exit code -- the same
-# fail-closed discipline this whole directory uses for `az`.
-for i in "${!VAR_NAMES[@]}"; do
-  name="${VAR_NAMES[$i]}"
-  expected="${VAR_VALUES[$i]}"
-  actual="$(gh_var_get "$name")"
-  require_value "$actual" "the $name variable read-back"
-  if [ "$actual" != "$expected" ]; then
-    echo "Repository variable $name read back as '$actual', expected '$expected'. Aborting." >&2
+# PRESENCE only, not a value comparison -- see gh_secret_present above for
+# why a value read-back is not possible here at all. This is the fail-closed
+# discipline this whole directory uses for `az` and `gh variable`, narrowed
+# to the one thing a secret's own design still lets it check.
+for i in "${!SECRET_NAMES[@]}"; do
+  name="${SECRET_NAMES[$i]}"
+  present="$(gh_secret_present "$name")"
+  require_value "$present" "the $name secret presence read-back"
+  if [ "$present" != "true" ]; then
+    echo "Repository secret $name was not found after being set. Aborting." >&2
     exit 1
   fi
 done
-echo "  all ${#VAR_NAMES[@]} variables verified"
+echo "  all ${#SECRET_NAMES[@]} secrets confirmed present (values NOT verifiable -- gh cannot read a secret back)"
 
 # === step 7: arm the pipeline ================================================
 echo "== step 7: arm the pipeline (DEPLOY_ENABLED) =="
+# DEPLOY_ENABLED is a repository VARIABLE, not a secret, unlike the seven
+# identifiers step 6 just wrote -- see the header comment for why (`ci.yml`
+# reads it in job-level `if:` conditions, and GitHub documents the `secrets`
+# context as unusable there). That also means its read-back, unlike step 6's,
+# really does confirm the value.
+#
 # Deliberately the LAST mutation this script makes. Only reached after step
-# 5's environment protection and step 6's variables have both read back
+# 5's environment protection and step 6's secrets have both read back
 # clean -- if anything earlier had failed, execution would already have
 # aborted and DEPLOY_ENABLED would never be set.
 gh_var_set DEPLOY_ENABLED "true"
@@ -598,6 +637,11 @@ Created and armed.
                    Container Apps Contributor on $AZ_ACA_APP_NAME
   environment:     $GH_ENVIRONMENT_NAME (reviewer $REVIEWER_LOGIN, branch $GH_DEPLOY_BRANCH only)
   record file:     $OIDC_RECORD_FILE
+
+Step 6 confirmed all seven identifier secrets exist under their expected
+names -- it could not confirm their values, because gh has no command that
+reads a secret's value back once set. If a value written above is wrong,
+the first symptom will be at the first workflow run that reads it, not here.
 
 Persistence was verified at the control-plane only (step 4) -- role
 propagation is not, and this project has measured it take up to ~15 minutes

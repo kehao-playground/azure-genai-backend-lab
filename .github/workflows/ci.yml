@@ -136,14 +136,14 @@ jobs:
         if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
         uses: azure/login@v2
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID_BUILD }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID_BUILD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: ACR login
         if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
         env:
-          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          AZURE_ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
         run: |
           set -euo pipefail
           # Deliberately NOT passing -g/--resource-group here, even though
@@ -160,7 +160,7 @@ jobs:
         id: push
         if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
         env:
-          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          AZURE_ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
           IMAGE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -223,16 +223,16 @@ jobs:
       - name: Azure login (deploy identity)
         uses: azure/login@v2
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID_DEPLOY }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID_DEPLOY }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Deploy
         env:
-          AZ_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          AZ_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-          AZ_ACA_APP_NAME: ${{ vars.AZURE_CONTAINER_APP_NAME }}
-          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+          AZ_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZ_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZ_ACA_APP_NAME: ${{ secrets.AZURE_CONTAINER_APP_NAME }}
+          AZURE_ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
           DIGEST: ${{ needs.image.outputs.digest }}
         run: |
           set -euo pipefail
