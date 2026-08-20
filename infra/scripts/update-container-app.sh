@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Point an existing Container App at a new image and refuse to report success
-# unless the app is actually serving it. This is the script the CI/CD deploy
+# unless three mechanical facts hold afterwards (see step 3/4 below). Note
+# what is NOT among them: this script cannot establish which revision is
+# actually serving traffic. This is the script the CI/CD deploy
 # job runs -- deploy-container-app.sh creates the app once; every deploy after
 # that goes through here.
 #
@@ -11,8 +13,12 @@
 # normalization, no appending ":latest".
 #
 # Four steps, in order:
-#   1. Pre-mutation snapshot -- read the image the active revision is running
-#      NOW, exactly as Azure stores it. The first deployment (by
+#   1. Pre-mutation snapshot -- read the app's CURRENT TEMPLATE image,
+#      exactly as Azure stores it. This is the desired-state field, not
+#      proof of what any revision is serving: if an earlier deploy left a
+#      failed new revision while the previous one kept serving, the template
+#      already holds that failed image. It is a rollback candidate, nothing
+#      stronger. The first deployment (by
 #      deploy-container-app.sh) writes a TAG (azgenai-lab:${IMAGE_TAG}), so
 #      this snapshot is sometimes a tag and sometimes a digest. It is stored
 #      and echoed verbatim, never assumed to be one or the other.
@@ -44,10 +50,12 @@
 # does include that action -- the claim here is that this script does not
 # touch them, not that it cannot.
 #
-# The app runs in single-revision mode: `properties.latestRevisionName` names
-# the one revision this update produced, and there is no other active
-# revision to reconcile against. A multi-revision app would need a different
-# approach.
+# The app runs in single-revision mode, so `properties.latestRevisionName`
+# names the revision this update produced. That is not the same as knowing it
+# is the one answering traffic: what happens to the previous revision when a
+# new one fails to start has never been observed here (docs/ci-cd.md section
+# 11, open item 14), so this script does not claim the two coincide. A
+# multi-revision app would need a different approach again.
 #
 # Usage: update-container-app.sh --image <ref>
 #
@@ -184,8 +192,8 @@ SNAPSHOT_IMAGE=$(az containerapp show \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --name "$AZ_ACA_APP_NAME" \
   --query "properties.template.containers[0].image" -o tsv)
-require_value "$SNAPSHOT_IMAGE" "the currently deployed image reference"
-echo "  currently serving: $SNAPSHOT_IMAGE"
+require_value "$SNAPSHOT_IMAGE" "the app's current template image reference"
+echo "  prior template image (rollback candidate): $SNAPSHOT_IMAGE"
 
 # === step 2: update ==========================================================
 echo "== step 2: update the image =="
@@ -325,7 +333,13 @@ echo "  /health returned the expected body"
 
 cat <<SUMMARY
 
-Updated and verified.
+Update requested and read back. Verified, precisely:
+  - the app template now reports the requested image
+  - the latest revision reported no known failure state
+  - /health returned the exact expected body
+Not verified: which revision served that /health response. Under single
+revision mode with an image-pull failure, that is an open question -- see
+docs/ci-cd.md section 11.
   app:   $AZ_ACA_APP_NAME
   url:   $BASE_URL
   image: $IMAGE

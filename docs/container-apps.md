@@ -27,8 +27,9 @@ Companion documents: [docker.md](docker.md) (the image),
 user-assigned, and what a role assignment actually grants),
 [key-vault-config.md](key-vault-config.md) (the secret inventory and
 rotation semantics), [entra-id-auth.md](entra-id-auth.md) (the caller-side
-401/403 contract this deployment turns on), [ci-cd.md](ci-cd.md) (the Day
-25 pipeline that runs this same deploy step, automated, behind two OIDC
+401/403 contract this deployment turns on), [ci-cd.md](ci-cd.md) (the Day 25
+pipeline, which does **not** automate the eleven stages below — it automates
+the image updates that come *after* this target exists, behind two OIDC
 identities and an approval gate).
 
 ---
