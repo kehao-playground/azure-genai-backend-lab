@@ -368,7 +368,7 @@ def test_revision_failed_state_fails_the_update(tmp_path: Path) -> None:
 
 
 def test_revision_stuck_processing_fails_after_bounded_polling(tmp_path: Path) -> None:
-    # "Processing" is the one value in the pinned CLI extension's own
+    # "Processing" is the one value in the installed CLI extension's own
     # RevisionRunningState enum that means still-provisioning -- the only
     # state this poll keeps waiting through.
     h = Harness(tmp_path, running_state="Processing")
@@ -392,7 +392,7 @@ def test_revision_resolves_to_non_failure_state_after_transient_polls(tmp_path: 
 # ---------------------------------------------------------------------------
 # Regression: 2026-08-20, japaneast. A live deploy of a healthy,
 # single-replica revision reported runningState "RunningAtMaxScale", a value
-# the pinned containerapp CLI extension's own RevisionRunningState enum
+# the installed containerapp CLI extension's own RevisionRunningState enum
 # (azext_containerapp/_sdk_enums.py) does not contain -- confirmed by reading
 # that file at its installed path before writing this fix. An allow-list of
 # "success" strings is unsound against a vocabulary the service's own SDK
