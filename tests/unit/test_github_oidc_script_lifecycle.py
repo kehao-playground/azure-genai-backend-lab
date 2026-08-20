@@ -137,12 +137,27 @@ if args[:3] == ["role", "assignment", "create"]:
     done(f"assignment-{role.replace(' ', '-').lower()}")
 
 if args[:3] == ["role", "assignment", "list"]:
+    # Mirrors the real CLI (azure-cli 2.89.0's list_role_assignments):
+    # --all and a scope (--scope, or --resource-group/-g) are mutually
+    # exclusive, rejected with a CLIError before any query runs -- verified
+    # live 2026-08-20:
+    #   $ az role assignment list --all --scope <resource id>
+    #   ERROR: group or scope are not required when --all is used
+    #   (exit 1)
+    # A live session on 2026-08-20 hit exactly this at
+    # verify_role_assignment_listed() in create-github-oidc.sh; the old
+    # version of this fake accepted the combination and stayed green
+    # against a command the real CLI refuses.
+    has_scope = "--scope" in args or "--resource-group" in args or "-g" in args
+    if "--all" in args and has_scope:
+        fail("ERROR: group or scope are not required when --all is used")
     role = opt("--role")
     if role in state.get("role_assignment_listback_zero_for", []):
         done("0")
-    if "--all" not in args:
-        # Mirrors the exact Day 24 bug: without --all, resource-scoped
-        # assignments never show up, no matter what was actually created.
+    if not has_scope and "--all" not in args:
+        # Bare default (no --scope, no --all) is subscription-scope only --
+        # every assignment this script creates is resource-scoped, so this
+        # is the Day 24 shape: silently vacuous, not an error.
         done("0")
     done("1")
 
@@ -512,6 +527,26 @@ def test_two_identities_created_with_distinct_subjects_and_scopes(tmp_path: Path
     assert by_role["Container Apps Contributor"]["principal_id"] == DEPLOY_SP_GUID
 
 
+def test_verify_role_assignment_readback_never_combines_all_with_scope(tmp_path: Path) -> None:
+    """Regression for the 2026-08-20 live-session bug: `az role assignment
+    list` rejects `--all` and `--scope` together ("group or scope are not
+    required when --all is used", exit 1) -- verified against the real CLI.
+    Step 4's read-back must always name an exact scope and never add --all
+    to it; the fake now rejects the combination too (see FAKE_AZ's
+    role-assignment-list handler), so this asserts the same thing at two
+    layers: the exact call shape, and that the run still succeeds against a
+    fake that would fail it if reintroduced.
+    """
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    role_list_calls = [c for c in h.calls if c.startswith("role assignment list")]
+    assert len(role_list_calls) == 2, role_list_calls
+    for call in role_list_calls:
+        assert "--scope" in call, call
+        assert "--all" not in call, call
+
+
 # ---------------------------------------------------------------------------
 # Order contract 1: environment protection read-back mismatch aborts.
 # ---------------------------------------------------------------------------
@@ -715,7 +750,7 @@ def test_script_exists_and_is_executable() -> None:
 #
 # D10's sequence: DEPLOY_ENABLED=false, delete both federated credentials,
 # drain check (repo-scoped, paginated, abort-not-cancel), delete role
-# assignments (--all read-back), delete app registrations (assignments
+# assignments (exact-scope read-back), delete app registrations (assignments
 # before principals), delete the GitHub environment and repository
 # variables, and a separate read-only --verify-teardown mode that only
 # removes the record file when nothing recorded is still found.
@@ -879,11 +914,25 @@ if args[:3] == ["role", "assignment", "delete"]:
     done()
 
 if args[:3] == ["role", "assignment", "list"]:
-    if "--all" not in args:
-        # Mirrors the exact Day 24 bug: without --all, resource-scoped
-        # assignments never show up, no matter what was actually created.
-        # Same guard as FAKE_AZ's create-side handler -- role_assignment_count()
-        # in delete-github-oidc.sh must pass --all at every call site.
+    # Mirrors the real CLI (azure-cli 2.89.0's list_role_assignments):
+    # --all and a scope (--scope, or --resource-group/-g) are mutually
+    # exclusive, rejected with a CLIError before any query runs -- verified
+    # live 2026-08-20:
+    #   $ az role assignment list --all --scope <resource id>
+    #   ERROR: group or scope are not required when --all is used
+    #   (exit 1)
+    # A live session on 2026-08-20 hit exactly this at
+    # role_assignment_count() in delete-github-oidc.sh -- teardown aborted
+    # AFTER deleting both federated credentials, leaving role assignments
+    # and app registrations live. The old version of this fake accepted the
+    # combination and stayed green against a command the real CLI refuses.
+    has_scope = "--scope" in args or "--resource-group" in args or "-g" in args
+    if "--all" in args and has_scope:
+        fail("ERROR: group or scope are not required when --all is used")
+    if not has_scope and "--all" not in args:
+        # Bare default (no --scope, no --all) is subscription-scope only --
+        # every assignment this script deletes is resource-scoped, so this
+        # is the Day 24 shape: silently vacuous, not an error.
         done("0")
     pid = opt("--assignee-object-id")
     role = opt("--role")
@@ -1366,6 +1415,38 @@ def test_role_assignment_deletion_precedes_app_deletion(tmp_path: Path) -> None:
     result = h.run()
     assert result.returncode == 0, result.stderr
     assert h.last_index("role assignment delete") < h.first_index("ad app delete")
+
+
+def test_teardown_role_assignment_readback_never_combines_all_with_scope(tmp_path: Path) -> None:
+    """Regression for the 2026-08-20 live-session bug: `az role assignment
+    list` rejects `--all` and `--scope` together ("group or scope are not
+    required when --all is used", exit 1) -- verified against the real CLI.
+    role_assignment_count() always names an exact scope and must never add
+    --all to it; the fake now rejects the combination too (see
+    FAKE_AZ_DELETE's role-assignment-list handler), which would abort
+    teardown AFTER federated credentials are already gone if --all were
+    reintroduced (step 4's own comment). Checked in both the plain teardown
+    path and --verify-teardown, since role_assignment_count() backs both.
+    """
+    h = DeleteHarness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    role_list_calls = [c for c in h.calls if c.startswith("role assignment list")]
+    assert role_list_calls, "sanity: teardown must read role assignments back"
+    for call in role_list_calls:
+        assert "--scope" in call, call
+        assert "--all" not in call, call
+
+    calls_before_verify = len(h.calls)
+    verify = h.run("--verify-teardown")
+    assert verify.returncode == 0, verify.stderr
+    verify_role_list_calls = [
+        c for c in h.calls[calls_before_verify:] if c.startswith("role assignment list")
+    ]
+    assert verify_role_list_calls, "sanity: --verify-teardown must read role assignments back"
+    for call in verify_role_list_calls:
+        assert "--scope" in call, call
+        assert "--all" not in call, call
 
 
 def test_drain_check_requests_more_than_the_default_20(tmp_path: Path) -> None:

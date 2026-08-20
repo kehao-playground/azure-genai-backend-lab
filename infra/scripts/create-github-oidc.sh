@@ -22,8 +22,10 @@
 #   3. two role assignments (AcrPush on the ACR; Container Apps Contributor
 #      on the one app) -- id appended
 #   4. persistence verification: read the assignments back with
-#      `az role assignment list --all`. This proves the CONTROL-PLANE OBJECT
-#      EXISTS. It does not prove the permission is effective --
+#      `az role assignment list --scope <the resource id>` (no `--all` --
+#      the two are mutually exclusive once a scope is named; see step 4's
+#      own comment). This proves the CONTROL-PLANE OBJECT EXISTS. It does
+#      not prove the permission is effective --
 #      docs/managed-identity.md:89-94 measured 14 minutes 44 seconds of
 #      propagation on Day 20, against Microsoft's documented "up to 5". No
 #      `sleep` is added here to wait for it: an unmeasured wait is not a
@@ -436,11 +438,28 @@ assign_role "deploy" "$DEPLOY_SP_ID" "Container Apps Contributor" "$ACA_APP_ID" 
 # === step 4: persistence verification ========================================
 echo "== step 4: persistence verification (control-plane only) =="
 
-# --all is LOAD-BEARING, not noise -- Day 24's most severe finding was
-# exactly this: `az role assignment list` documents its own default as
-# subscription-scope only, so without --all this query returns 0
-# unconditionally for every assignment here (both are resource-scoped) and
-# this whole verification step is vacuous.
+# NO --all here -- this read-back names an exact resource scope, and `az
+# role assignment list --help` is explicit that the two are mutually
+# exclusive: "group or scope are not required when --all is used", enforced
+# as a hard CLIError by azure-cli's own list_role_assignments, not a
+# warning. `--all` is the fix for the OPPOSITE situation -- a caller with
+# no scope to give, who would otherwise silently get the subscription-only
+# default (Day 24's most severe finding, and still the right call at the
+# assignee-wide read-backs in delete-container-app.sh and
+# delete-github-oidc.sh's own drain-to-zero check). Here a scope is always
+# given, so `--all` is not missing coverage, it is a rejected combination;
+# a live run on 2026-08-20 hit exactly that error and aborted step 4 after
+# step 3 had already created six Azure objects.
+#
+# `--scope` alone is not weaker: azure-cli's own `_search_role_assignments`
+# does not default to including inherited assignments (`include_inherited`
+# defaults to False, wired to the absent `--include-inherited` flag), so
+# without that flag it filters to `ra.scope.lower() == scope.lower()` --
+# exact-scope matches only, nothing inherited from the resource group or
+# subscription above it. Combined with `--assignee-object-id` and `--role`
+# (both still passed below), this cannot be satisfied by an assignment this
+# run did not create: it would need the same principal, the same role, AND
+# this exact resource id, at a scope no parent-scope grant can satisfy.
 #
 # What this DOES prove: the control-plane object is listed. What it does NOT
 # prove: that the permission is effective. docs/managed-identity.md:89-94
@@ -456,7 +475,6 @@ verify_role_assignment_listed() {
   count="$(az role assignment list \
     --subscription "$AZ_SUBSCRIPTION_ID" \
     --assignee-object-id "$principal_id" \
-    --all \
     --fill-principal-name false \
     --role "$role" \
     --scope "$scope" \
