@@ -15,13 +15,27 @@ does github-slugger's own regex delete it? The answer set is emitted as ranges.
 The vendored file is data produced by running the thing we are imitating, not
 by interpreting it.
 
-Requires node and network (it installs the pinned package into a temp dir).
-Run it only when deliberately moving to a new github-slugger version, and
-commit the regenerated table together with the version bump recorded below.
+**This script always needs node and the network**: `generate()` runs
+`npm install` unconditionally, including under `--check`. Run it when
+deliberately moving to a new github-slugger version, and commit the
+regenerated table with the version bump recorded below.
+
+What each check can and cannot prove, because an earlier version of this
+docstring got this wrong and claimed `--check` was an offline CI guard:
+
+* `--check` (online, manual) regenerates from upstream and diffs. It is the
+  **only** check here that can prove the committed table still matches
+  github-slugger. CI does not run it, and cannot: there is no network
+  contract for it, and an empty npm cache against an unreachable registry
+  simply hangs.
+* The offline guard is `tests/unit/test_check_doc_anchors.py`, which pins
+  this file's sha256 and runs a 40-case differential frozen beside it. That
+  proves the table has not drifted **since the corpus was frozen against
+  it** -- it does not prove upstream fidelity, because both files live in
+  this repository and a determined edit could update both together. Only the
+  online `--check` closes that.
 
 Usage: scripts/vendor_github_slugger.py [--version 2.0.0] [--check]
-       --check regenerates into memory and diffs against the committed table,
-       which is how CI could detect a hand-edited table without network.
 """
 
 from __future__ import annotations
@@ -106,7 +120,11 @@ REMOVED_RANGES: tuple[tuple[int, int], ...] = (
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", default="2.0.0")
-    ap.add_argument("--check", action="store_true")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="regenerate from upstream and diff (requires network; not a CI guard)",
+    )
     args = ap.parse_args()
 
     ranges, digests = generate(args.version)

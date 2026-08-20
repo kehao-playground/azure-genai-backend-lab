@@ -57,7 +57,11 @@ jobs:
         # by running github-slugger itself (scripts/vendor_github_slugger.py).
         # Both halves were hand-rolled once and both were wrong; the emoji case
         # made an ordinary heading fail open. No network here -- the table and
-        # its differential corpus are committed.
+        # its differential corpus are committed. The table's own integrity is
+        # guarded offline by a pinned sha256 in tests/unit/test_check_doc_anchors.py;
+        # proving it still matches UPSTREAM needs
+        # `scripts/vendor_github_slugger.py --check`, which needs the network
+        # and is deliberately not run here.
         run: uv run python scripts/check_doc_anchors.py
       - name: Install actionlint
         env:
