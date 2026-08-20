@@ -28,9 +28,10 @@
 #      role assignments or app registrations. Nothing is ever cancelled here
 #      -- deciding to kill someone else's in-flight run is not this script's
 #      call, only a human's.
-#   4. delete both role assignments, read back zero remaining (`--all` is
-#      load-bearing -- see role_assignment_count below, same Day 24 trap
-#      delete-container-app.sh's step 6 already documents).
+#   4. delete both role assignments, read back zero remaining at each one's
+#      exact scope -- no `--all` here, see role_assignment_count below for
+#      why (it is load-bearing at a DIFFERENT read-back, the assignee-wide
+#      one delete-container-app.sh's step 6 documents, not this one).
 #   5. delete the app registrations -- ASSIGNMENTS BEFORE PRINCIPALS, or the
 #      assignments become "Identity not found" orphans with no principal left
 #      to look them up by (Day 24's most severe finding, in a different
@@ -293,15 +294,30 @@ fic_count() {
     --query "length([?id=='$2'])" -o tsv
 }
 role_assignment_count() {
-  # --all is LOAD-BEARING, not noise -- same Day 24 trap
-  # delete-container-app.sh's step 6 documents at length: `az role assignment
-  # list` documents its own default as subscription-scope only. Every
-  # assignment create-github-oidc.sh grants is resource-scoped (the ACR, the
-  # container app), so without --all this returns 0 unconditionally and every
-  # check built on it -- the existence check, the post-delete confirmation,
-  # and --verify-teardown -- is vacuous.
+  # Every call to this helper passes an exact resource scope (the ACR, the
+  # container app) -- so NO --all here. `az role assignment list --help` is
+  # explicit that the two are mutually exclusive: "group or scope are not
+  # required when --all is used", enforced as a hard CLIError by azure-cli's
+  # own list_role_assignments, not a warning. A live run on 2026-08-20 hit
+  # exactly that error at this call site and aborted teardown AFTER already
+  # deleting both federated credentials, leaving role assignments and app
+  # registrations live.
+  #
+  # This is not the same trap delete-container-app.sh's step 6 documents.
+  # That check is assignee-wide with no scope to give it, so it genuinely
+  # needs --all to escape the subscription-only default (Day 24's most
+  # severe finding) -- and it still does; see that script. Here a scope is
+  # always given, so `--scope` alone is the whole query, and it is not
+  # weaker: azure-cli's `_search_role_assignments` does not include
+  # inherited assignments unless `--include-inherited` is passed (which it
+  # never is here), so it filters to `ra.scope.lower() == scope.lower()` --
+  # exact-scope matches only, nothing inherited from the resource group or
+  # subscription above it. Combined with `--assignee-object-id` and
+  # `--role` (both still passed below), this cannot be satisfied by an
+  # assignment this project did not create: it would need the same
+  # principal, the same role, AND this exact resource id.
   az role assignment list --subscription "$AZ_SUBSCRIPTION_ID" \
-    --assignee-object-id "$1" --all --fill-principal-name false \
+    --assignee-object-id "$1" --fill-principal-name false \
     --role "$2" --scope "$3" --query "length([])" -o tsv
 }
 env_present() {
@@ -388,10 +404,10 @@ teardown_role_assignment() {
   after="$(role_assignment_count "$sp_id" "$role" "$scope")"
   require_value "$after" "the $label role assignment post-delete count"
   if [ "$after" != "0" ]; then
-    echo "$label role assignment still listed at $scope after delete (checked with --all)." >&2
+    echo "$label role assignment still listed at $scope after delete." >&2
     exit 1
   fi
-  echo "  $label role assignment deleted -- confirmed zero remain (--all)"
+  echo "  $label role assignment deleted -- confirmed zero remain at $scope"
 }
 
 teardown_app() {
