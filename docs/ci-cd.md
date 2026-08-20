@@ -1,11 +1,20 @@
 # CI/CD Pipeline (Day 25)
 
 Day 24 was a script an operator runs by hand, once, in a terminal that
-already trusts them. Day 25 puts the same deploy step behind a GitHub
-Actions workflow that anyone reading the repository can watch run, with two
-identities that hold no long-lived secret, one human approval gate, and a
-digest — not a tag — carrying the exact bytes from build through to the
-running app.
+already trusts them — eleven stages that **create** the target: the registry,
+the identity, its role assignments, the app itself. Day 25 does not move that
+script into CI. What it moves is the part that runs on every code change
+*after* the target exists: build, gates, a human approval, and pointing the
+existing app at a new image (`update-container-app.sh --image …@sha256:…`).
+Provisioning stays a prerequisite — `create-acr.sh`,
+`deploy-container-app.sh` and `create-github-oidc.sh` must all have run
+before this workflow has anything to update.
+
+What that half gains by moving is what the rest of this document is about:
+anyone reading the repository can watch it run, two identities hold no
+long-lived Azure credential, one human approval gate sits in front of the
+deploy, and a digest — not a tag — carries the exact bytes from build through
+to the running app.
 
 Companion documents: [docker.md](docker.md) (the image this pipeline
 builds), [container-apps.md](container-apps.md) (the deployment target and
@@ -29,13 +38,17 @@ That run also produced the two live bugs recorded in
 evidence file it points to.
 
 What remains genuinely unverified is now a short list, not a blanket
-disclaimer: `concurrency` behaviour under two competing runs, single-revision
-behaviour when a revision fails to start, and role-assignment propagation
-timing for these two service principals. Those three, and nothing broader,
-are what [§11](#11-what-the-live-session-settled-and-what-is-still-open)
-leaves open. Claims elsewhere in this document that were written before that
-run and phrased as "not yet observed" have been reconciled against it; where
-a mechanism is described from the code rather than from an observation, the
+disclaimer. Three gaps belong to the pipeline **as it runs today**:
+`concurrency` behaviour under two competing runs, single-revision behaviour
+when a revision fails to start, and role-assignment propagation timing for
+these two service principals. A fourth item is open in a different sense —
+the ABAC registry mode of §10 has never been enabled here, so its migration
+path is untested rather than unobserved; it is not a gap in the running
+pipeline. Those three plus that one are the whole of what
+[§11](#11-what-the-live-session-settled-and-what-is-still-open) leaves open.
+Claims elsewhere in this document that were written before that run and
+phrased as "not yet observed" have been reconciled against it; where a
+mechanism is described from the code rather than from an observation, the
 sentence says so locally.
 
 ---
@@ -620,7 +633,8 @@ choice was right — it is still the most specific signal
 not. A healthy, correctly-deployed revision reported `RunningAtMaxScale`, and
 a second deployment in the same session reported `Activating`; neither value
 appears in the `RevisionRunningState` enum shipped by the containerapp CLI
-extension installed at the time (`azext_containerapp/_sdk_enums.py`, which
+extension installed on that machine (its version during the session was not
+preserved; see the evidence file) (`azext_containerapp/_sdk_enums.py`, which
 lists only `Running`/`Processing`/`Stopped`/`Degraded`/`Failed`/`Unknown`).
 Two observations against that installed enum are enough to establish that it
 could not be used as a complete success allow-list, which is why the poll is
@@ -628,14 +642,20 @@ now failure-shaped: it aborts on the enum's named failure states, keeps
 waiting through `Processing`, and treats every other value — including
 vocabulary this project has not seen — as not evidence of failure. It does
 not establish what the service's full vocabulary is, nor that any particular
-new value will appear next. What proves a deployment actually succeeded is
-therefore not the poll: it is the combination the script performs around it —
-the pre-mutation snapshot, the read-back that the app now carries the exact
-requested digest, the revision reading active/provisioned, and step 4's
-exact-body `/health` probe. See the comment above the poll in
-`infra/scripts/update-container-app.sh` for the full account.
+new value will appear next. What stands in for success is therefore not the
+poll but the two checks around it: the step-3 read-back that the app's
+template now carries the exact requested image, and step 4's exact-body
+`/health` probe — together with the absence of a known failure state at the
+poll. **That is the whole list.** The script queries no other revision field:
+there is no `active` and no `provisioningState` read-back in it, and the
+step-1 pre-mutation snapshot is rollback data, not a success gate. See the
+comment above the poll in `infra/scripts/update-container-app.sh`.
 
 ### Still open
+
+Three of these are gaps in the pipeline as it runs today; the fourth (ABAC)
+is a mode this series has never enabled, listed here so the two kinds are not
+confused with each other.
 
 - **`concurrency` behaviour under two competing runs** (§1) — untested; no
   two runs ever competed for the `production` group, and in particular

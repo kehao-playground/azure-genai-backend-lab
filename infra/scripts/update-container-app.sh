@@ -17,10 +17,21 @@
 #      this snapshot is sometimes a tag and sometimes a digest. It is stored
 #      and echoed verbatim, never assumed to be one or the other.
 #   2. `az containerapp update --image <ref>`.
-#   3. Fail-closed read-backs: the app reports the requested image, and the
-#      new revision reaches a terminal successful running state.
+#   3. Fail-closed read-backs: the app's template reports the requested image,
+#      and the latest revision's runningState is watched as a FAILURE
+#      DETECTOR -- a known failure state aborts, "Processing" keeps waiting,
+#      and any other value (including vocabulary this project has not seen)
+#      is treated as "not evidence of failure", never as proof of success.
+#      This script does NOT read `active` or `provisioningState`; the only
+#      revision field it queries is runningState.
 #   4. Data-plane smoke: /health, polled with a bounded deadline, must return
 #      the exact body.
+#
+# So "success" here means: the control plane accepted the requested image and
+# echoes it back, nothing reported a known failure state, and the app answers
+# /health with the exact expected body. The step-1 snapshot is rollback data,
+# not part of that determination. See docs/ci-cd.md section 11 for the gap
+# this leaves under single revision mode (open item 14).
 #
 # There is NO automatic rollback. On any failure after step 2, this script
 # prints the manual rollback command built from the step-1 snapshot -- and if
@@ -222,7 +233,7 @@ require_value "$REVISION_NAME" "the latest revision name"
 # that a healthy, correctly-deployed single-replica revision reported
 # runningState "RunningAtMaxScale", not "Running"; a second deployment in the
 # same session reported "Activating". Neither string appears in the SDK enum
-# shipped by the containerapp CLI extension in use during that session
+# shipped by the containerapp CLI extension installed on that machine
 # (azext_containerapp/_sdk_enums.py, RevisionRunningState, which lists only
 # Running / Processing / Stopped / Degraded / Failed / Unknown). Consulting
 # that enum before writing this check would have produced the exact same bug:
@@ -238,10 +249,13 @@ require_value "$REVISION_NAME" "the latest revision name"
 # under way), and treats every other value -- Running, RunningAtMaxScale,
 # Stopped, Unknown, and whatever undocumented string Azure returns next --
 # as not evidence of failure. It does not treat that as proof of success
-# either. What stands in for success is the combination this script performs
-# around the poll: the read-back that the app now carries the exact requested
-# digest, the revision reading active/provisioned, and step 4's exact-body
-# /health probe. One caveat that combination does not close: this app runs in
+# either. What stands in for success is the rest of what this script actually
+# checks: the step-3 read-back that the app's template now carries the exact
+# requested image, and step 4's exact-body /health probe. Those two, plus the
+# absence of a known failure state here, are the whole of it -- there is no
+# `active` or `provisioningState` read-back in this script, and describing one
+# would be describing code that does not exist. One caveat this does not
+# close: this app runs in
 # single revision mode, and it has never been observed here what happens when
 # a new revision fails to start -- whether /health would then be answered by
 # the previous revision, returning the expected body for the wrong reason.
