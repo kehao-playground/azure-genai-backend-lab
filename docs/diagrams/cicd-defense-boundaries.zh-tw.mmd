@@ -14,7 +14,7 @@ flowchart TD
     E -.- eN["擋不住：<br/>核准前 image 已進 ACR<br/>單人自我核准 ≠ 雙人覆核"]
     F -.- fN["答的是「還新鮮嗎」<br/>不是「review 過了嗎」"]
     O -.- oN["subject 不帶 ref<br/>限 main＝job if ＋ branch policy 兩層"]
-    D -.- dN["runningState＝失敗偵測器<br/>成功靠 image 讀回＋/health（image-pull 失敗未測）"]
+    D -.- dN["runningState＝失敗偵測器<br/>成功靠 image 讀回＋/health<br/>（image-pull 失敗未測）"]
 
     style H fill:#d3f0d8,stroke:#2e7d32
     style gN fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
