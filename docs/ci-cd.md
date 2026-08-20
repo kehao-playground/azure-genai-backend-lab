@@ -300,8 +300,9 @@ just passed, and never read back from anything a later run could have
 overwritten.
 
 `update-container-app.sh` was written with this ambiguity already in mind
-on the read side: its pre-mutation snapshot of the currently-deployed
-image is stored and echoed *verbatim*, "sometimes a tag and sometimes a
+on the read side: its pre-mutation snapshot of the app's current *template*
+image — the desired-state field, not proof of what a revision is serving — is
+stored and echoed *verbatim*, "sometimes a tag and sometimes a
 digest," because the very first deployment (`deploy-container-app.sh`, Day
 24) writes a tag and only a later run through this pipeline writes a
 digest. An immutable-tag fallback — deploying by `sha-<commit-sha>`

@@ -64,7 +64,7 @@ if args[:2] == ["account", "set"]:
 if args[:2] == ["containerapp", "show"]:
     field = query_value().strip('"')
     if field == "properties.template.containers[0].image":
-        done(state.get("served_image", ""))
+        done(state.get("template_image", ""))
     if field == "properties.latestRevisionName":
         done(state.get("revision_name", ""))
     if field == "properties.configuration.ingress.fqdn":
@@ -75,7 +75,7 @@ if args[:2] == ["containerapp", "update"]:
     if state.get("update_fails"):
         print("ERROR: injected update failure", file=sys.stderr)
         done(code=1)
-    state["served_image"] = opt("--image")
+    state["template_image"] = opt("--image")
     done("{}")
 
 if args[:3] == ["containerapp", "revision", "show"]:
@@ -122,7 +122,7 @@ print(code, end="")
 class Harness:
     def __init__(self, tmp_path: Path, **overrides: object) -> None:
         state: dict[str, object] = {
-            "served_image": TAG_IMAGE,
+            "template_image": TAG_IMAGE,
             "revision_name": "aca-faked25--abc123",
             "running_state": "Running",
             "fqdn": "aca-faked25.japaneast.azurecontainerapps.io",
@@ -234,10 +234,10 @@ def test_image_reaches_az_unmodified_including_digest_form(tmp_path: Path) -> No
 
 
 def test_snapshot_that_is_a_tag_is_echoed_verbatim_in_the_rollback_line(tmp_path: Path) -> None:
-    h = Harness(tmp_path, served_image=TAG_IMAGE, running_state="Failed")
+    h = Harness(tmp_path, template_image=TAG_IMAGE, running_state="Failed")
     result = h.run()
     assert result.returncode != 0
-    assert f"currently serving: {TAG_IMAGE}" in result.stdout
+    assert f"prior template image (rollback candidate): {TAG_IMAGE}" in result.stdout
     assert f"--image {TAG_IMAGE}" in result.stderr
     assert "TAG reference, not a digest" in result.stderr
 
@@ -276,7 +276,7 @@ def test_snapshot_that_is_a_digest_gets_no_tag_warning(tmp_path: Path) -> None:
         "acrfaked25.azurecr.io/azgenai-lab@sha256:"
         "2222222222222222222222222222222222222222222222222222222222222222"
     )
-    h = Harness(tmp_path, served_image=snapshot_digest, running_state="Failed")
+    h = Harness(tmp_path, template_image=snapshot_digest, running_state="Failed")
     result = h.run()
     assert result.returncode != 0
     assert f"--image {snapshot_digest}" in result.stderr
@@ -289,7 +289,7 @@ def test_snapshot_that_is_a_digest_gets_no_tag_warning(tmp_path: Path) -> None:
 
 
 def test_empty_snapshot_read_back_aborts_before_any_mutation(tmp_path: Path) -> None:
-    h = Harness(tmp_path, served_image="")
+    h = Harness(tmp_path, template_image="")
     result = h.run()
     assert result.returncode != 0
     assert "empty output" in result.stderr
@@ -327,13 +327,14 @@ def test_update_call_failure_prints_the_rollback_line(tmp_path: Path) -> None:
 
 def test_update_succeeds_but_readback_shows_old_image_fails(tmp_path: Path) -> None:
     # The fake az's "containerapp update" handler normally records --image
-    # into served_image; injecting a stuck value simulates a read-back that
+    # into template_image (the app TEMPLATE field, not serving truth);
+    # injecting a stuck value simulates a read-back that
     # still reports the pre-update image even though the update call itself
     # returned 0.
     h = Harness(tmp_path)
-    # Patch the fake az inline for this one test: served_image never changes.
+    # Patch the fake az inline for this one test: template_image never changes.
     fake_az_stuck = FAKE_AZ.replace(
-        'state["served_image"] = opt("--image")\n    done("{}")',
+        'state["template_image"] = opt("--image")\n    done("{}")',
         'done("{}")',
     )
     (tmp_path / "bin" / "az").write_text(fake_az_stuck)
@@ -351,7 +352,9 @@ def test_update_succeeds_but_readback_shows_old_image_fails(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed: the new revision never reaches Running.
+# Fail-closed: the revision poll reports a known failure state, or stays
+# "Processing" past the budget. It is a failure detector -- reaching "Running"
+# specifically is not what success depends on.
 # ---------------------------------------------------------------------------
 
 

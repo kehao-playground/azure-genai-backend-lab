@@ -47,6 +47,12 @@ jobs:
         run: git diff --exit-code docs/audit/
       - name: Mermaid diagram syntax gate
         run: scripts/check_diagrams.sh
+      - name: Doc anchor gate
+        # A heading rename in one file silently breaks `#…` links in others.
+        # That shipped twice in the Day 25 review topic before this gate
+        # existed: the manual sweep's scope was the file being retitled, and
+        # a cross-file reference is exactly what such a sweep cannot see.
+        run: python3 scripts/check_doc_anchors.py
       - name: Install actionlint
         env:
           ACTIONLINT_VERSION: "1.7.12"
