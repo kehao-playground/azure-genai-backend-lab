@@ -1499,6 +1499,59 @@ def test_verify_teardown_nonempty_keeps_record_file(tmp_path: Path) -> None:
     assert h.state["variables"] != {}
 
 
+def test_verify_teardown_reports_secrets_still_present(tmp_path: Path) -> None:
+    # Isolates the --verify-teardown secrets block: everything else this
+    # mode checks is cleared to "gone" (or, for DEPLOY_ENABLED, absent), so
+    # the seven identifier secrets -- left at DeleteHarness's default -- are
+    # the only thing left to report. This pins the block that
+    # test_verify_teardown_nonempty_keeps_record_file's bare
+    # "STILL PRESENT" in stdout does not: deleting the entire secrets block
+    # from --verify-teardown (delete-github-oidc.sh) makes this mode print
+    # "Nothing remains", delete the record file, and exit 0 while all seven
+    # secrets are still on the repository -- and that test alone stays
+    # green, because the app registrations satisfy its assertion on their
+    # own.
+    h = DeleteHarness(
+        tmp_path,
+        apps={},
+        deleted_items={},
+        role_assignments=[],
+        environments=[],
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert "STILL PRESENT: repository secret AZURE_TENANT_ID" in result.stdout
+    assert result.stdout.count("STILL PRESENT: repository secret") == 7
+    assert "7 resource(s) still present, 0 item(s) could not be checked." in result.stderr
+    assert h.record_file.exists()
+
+
+def test_verify_teardown_is_unverifiable_when_secrets_written_is_missing(tmp_path: Path) -> None:
+    # The other way a secret can be UNVERIFIABLE: the record field naming
+    # which secrets were written is itself missing, not a probe failure (a
+    # secret has no soft-delete state to probe -- see the script's own
+    # comment). Isolated the same way as the app-registration UNVERIFIABLE
+    # tests above.
+    h = DeleteHarness(
+        tmp_path,
+        record_overrides={"GH_SECRETS_WRITTEN": ""},
+        apps={},
+        deleted_items={},
+        role_assignments=[],
+        environments=[],
+        secrets={},
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert (
+        "UNVERIFIABLE: the identifier repository secrets (GH_SECRETS_WRITTEN not recorded)"
+        in result.stdout
+    )
+    assert h.record_file.exists()
+
+
 def test_multiple_same_named_apps_aborts_without_deleting_either(tmp_path: Path) -> None:
     duplicate_app_id = "99999999-9999-9999-9999-999999999999"
     h = DeleteHarness(
