@@ -258,6 +258,30 @@ commit" no longer provably means "the same bytes," only "very likely the
 same bytes, unless this exact run was re-triggered." This pipeline does
 not take that trade.
 
+**Stripping to the bare digest is also what keeps this job output from
+disappearing, now that the ACR name is a secret (§7).** GitHub's runner
+masks a job output by comparing its evaluated string against a
+secret-masked copy of itself and, on any difference, drops the output
+entirely rather than passing through `***` — `context.Warning($"Skip
+output '{output.Key}' since it may contain secret.")` immediately followed
+by `continue`, in `FinalizeJob`
+([`src/Runner.Worker/JobExtension.cs`](https://github.com/actions/runner/blob/main/src/Runner.Worker/JobExtension.cs),
+checked 2026-08-20). The full digest string
+(`<acr-name>.azurecr.io/azgenai-lab@sha256:…`) would trip that check, since
+it contains the now-secret ACR name; `DIGEST="${FULL_DIGEST#*@}"` above
+removes exactly that prefix before the value ever reaches
+`echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"`, so `sha256:` plus 64 hex
+characters is what actually crosses the job boundary — content the masker
+has nothing to match. This strip predates the secrets migration and was
+written for the reproducibility reason above; that it also keeps this
+particular output alive is a side effect of that design, not something the
+migration itself reasoned about. Had this pipeline instead published the
+full `<acr-name>.azurecr.io/...@sha256:...` reference as a job output, the
+masker would silently empty it, and `deploy`'s own `[ -z "$DIGEST" ]`
+guard would then refuse to deploy — a loud, fail-closed failure, not a
+silent one, but one this design avoids entirely by never putting the
+secret-shaped substring in an output in the first place.
+
 ## 6. Why no `--platform`
 
 Day 24's `az acr build --platform linux/amd64` existed because the
@@ -274,14 +298,25 @@ Every identifier this workflow reads — both client ids, the tenant id, the
 subscription id, the ACR name, the resource group and the container app
 name — is a **repository secret** (`gh secret set`). `DEPLOY_ENABLED` is the
 one exception, and it stays a **repository variable** (`gh variable set`),
-for a reason that has nothing to do with secrecy: `ci.yml` reads it in
-job-level `if:` conditions (§1, §4), and GitHub documents the `secrets`
-context as unusable there — *"Secrets cannot be directly referenced in
-`if:` conditionals. Instead, consider setting secrets as job-level
-environment variables, then referencing the environment variables to
-conditionally run steps in the job."* ([Using secrets in GitHub Actions §
-Using secrets in a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets),
-checked 2026-08-19.) `DEPLOY_ENABLED` is not itself a secret-shaped value —
+for a reason that has nothing to do with secrecy: `ci.yml` reads it in four
+`if:`s (§1, §4) — one job-level (`deploy`'s own top-level `if`) and three
+step-level (the `image` job's Azure-touching steps) — and GitHub documents
+the `secrets` context as unusable in `if:` conditionals generally:
+*"Secrets cannot be directly referenced in `if:` conditionals. Instead,
+consider setting secrets as job-level environment variables, then
+referencing the environment variables to conditionally run steps in the
+job."* ([Using secrets in GitHub Actions § Using secrets in a
+workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets),
+checked 2026-08-19.) That suggested workaround would actually cover the
+three step-level reads — the `env` context is available in
+`jobs.<job_id>.steps.if` — but not the one job-level read: `jobs.<job_id>.if`
+only has `github`, `needs`, `vars` and `inputs` in scope, no `env` and no
+`secrets` ([Contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts),
+checked 2026-08-20). So the job-level `if:` on `deploy` is the one read
+that actually forces `DEPLOY_ENABLED` to stay a variable; the three
+step-level reads are along for the ride, kept on the same variable for one
+consistent name rather than split across two mechanisms. `DEPLOY_ENABLED`
+is not itself a secret-shaped value —
 it is a boolean gate — so this is not a workaround forced on a value that
 belongs in `secrets`; it is the one identifier here that was never a
 candidate for `secrets` in the first place, now placed correctly next to
@@ -308,9 +343,17 @@ makes it.**
 
 **What changed is the exposure surface, not the classification.** This
 repository is public, and Actions run logs for a public repository are
-themselves publicly readable and indexed, by anyone, without a GitHub
-account — repository *variables*, unlike secrets, are never masked in a
-log line that references them. Independently of this pipeline, this
+readable by anyone, without a GitHub account, for as long as GitHub
+retains them — 90 days by default, configurable 1–90 days for a public
+repository ([Managing GitHub Actions settings for a
+repository](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository),
+checked 2026-08-20). "90 days" bounds what GitHub stores, not what a
+reader keeps: whatever anyone reads inside that window is copyable and
+outside this project's control **from then on, permanently** — the
+permanence is a property of what got read, not of the storage window —
+and this project has no way to know who read what before a run's logs
+expire. Repository *variables*, unlike secrets, are never masked in a log
+line that references them. Independently of this pipeline, this
 project's own discipline already masks subscription ids, tenant ids,
 endpoints and resource names in every screenshot and every evidence file it
 publishes; that discipline exists precisely because these values are the
@@ -324,8 +367,10 @@ threat model consistently across every surface this project controls, not
 a reversal of the classification argument above. Both things are true at
 once: these values are not secrets in the OIDC threat model, and this
 project masks them anyway, because *where* a value becomes visible is a
-fact about this repository (public, permanently, indexed), not a fact this
-document is willing to leave to which command happened to write the value.
+fact about this repository (public, readable by anyone without an account
+for the retention window, and anything read there is out of this
+project's control for good), not a fact this document is willing to leave
+to which command happened to write the value.
 
 **The cost, stated plainly rather than left implicit:** `gh` has no command
 that reads a secret's value back once set — `gh secret list` and the REST
@@ -352,14 +397,15 @@ ephemeral by this series' own standing rule: created for a session,
 deleted at the end of it. A workflow that always tries to push an image
 and update an app would fail on every push to `main` between sessions, for
 a reason that has nothing to do with the code. `DEPLOY_ENABLED`, a
-repository variable read in two `if:` conditions in `ci.yml` (the `image`
-job's Azure-touching steps, and the `deploy` job's own top-level `if`), is
-what lets the workflow tell those two situations apart. `create-github-oidc.sh`
-sets it to `true` as its deliberately *last* mutation — reached only after
-every earlier verification (role-assignment read-backs, the environment
-read-back, the repository-variable read-backs) has already come back
-clean — and `delete-github-oidc.sh` sets it to `false` as its deliberately
-*first* mutation.
+repository variable read in one job-level `if:` (`deploy`'s own top-level
+`if`) plus three step-level `if:`s in the `image` job's Azure-touching
+steps, is what lets the workflow tell those two situations apart.
+`create-github-oidc.sh` sets it to `true` as its deliberately *last*
+mutation — reached only after every earlier verification (role-assignment
+read-backs, the environment read-back, the seven identifier secrets'
+presence read-backs — §7's own value-verification limit, not repeated
+here) has already come back clean — and `delete-github-oidc.sh` sets it to
+`false` as its deliberately *first* mutation.
 
 **It is not "the pipeline is stopped."** It is one variable, read once, at
 the point GitHub Actions evaluates that `if:` string for a given job. A

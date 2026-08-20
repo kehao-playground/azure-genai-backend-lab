@@ -48,10 +48,16 @@
 # ACR name, resource group, container app name) are written as repository
 # SECRETS (`gh secret set`), not variables. DEPLOY_ENABLED is the one
 # exception -- it stays a VARIABLE (`gh variable set`), for a reason that has
-# nothing to do with secrecy: `ci.yml` reads it in job-level `if:`
-# conditions, and the `secrets` context is documented as unusable there
-# ("Secrets cannot be directly referenced in `if:` conditionals" -- GitHub
-# Docs, Using secrets in GitHub Actions, checked 2026-08-19).
+# nothing to do with secrecy: `ci.yml` reads it in one JOB-LEVEL `if:`
+# (`deploy`'s own top-level `if`) plus three step-level `if:`s (the `image`
+# job's Azure-touching steps). The `secrets` context is documented as
+# unusable in `if:` conditionals generally ("Secrets cannot be directly
+# referenced in `if:` conditionals" -- GitHub Docs, Using secrets in GitHub
+# Actions, checked 2026-08-19), but the job-level read is the one that
+# actually forces this: `jobs.<job_id>.if` has only `github`, `needs`,
+# `vars` and `inputs` in scope -- no `env`, so not even GitHub's own
+# suggested env-var workaround reaches it (Contexts reference, checked
+# 2026-08-20). Full reasoning in docs/ci-cd.md §7.
 #
 # The classification argument has not changed and this project still makes
 # it: the actual credential is the federated-identity trust relationship
@@ -62,15 +68,22 @@
 # that, and still means it.
 #
 # What changed is the EXPOSURE SURFACE, not the classification. This repo is
-# public, and its Actions run logs are permanently readable and indexed --
-# `gh variable set` values are never masked in a log line that references
-# them, `gh secret set` values are. This project already masks subscription
-# ids, tenant ids, endpoints and resource names in every screenshot and
-# every evidence file it publishes elsewhere in this series. Publishing the
-# identical values through a workflow log while masking them in a
-# screenshot would be incoherent -- same value, same threat model,
-# different handling, because where it becomes visible changed. docs/ci-cd.md
-# §7 records the reasoning and the cost in full.
+# public, and its Actions run logs are readable by anyone, without a GitHub
+# account, for as long as GitHub retains them -- 90 days by default,
+# configurable 1-90 days for a public repo (GitHub Docs, Managing GitHub
+# Actions settings for a repository, checked 2026-08-20). Whatever anyone
+# reads inside that window is copyable and outside this project's control
+# from then on, permanently -- the permanence is a property of what a
+# reader keeps, not of what GitHub stores, and this project has no way to
+# know who read what before a log expires. `gh variable set` values are
+# never masked in a log line that references them, `gh secret set` values
+# are. This project already masks subscription ids, tenant ids, endpoints
+# and resource names in every screenshot and every evidence file it
+# publishes elsewhere in this series. Publishing the identical values
+# through a workflow log while masking them in a screenshot would be
+# incoherent -- same value, same threat model, different handling, because
+# where it becomes visible changed. docs/ci-cd.md §7 records the reasoning
+# and the cost in full.
 #
 # Two identities, not one, because the alternative (one identity, subject
 # bound to the environment, holding both AcrPush and the deploy role) forces
