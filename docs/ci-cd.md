@@ -268,41 +268,81 @@ is itself amd64. `docker build -f docker/Dockerfile -t azgenai-lab:ci .`
 therefore builds natively for the architecture Container Apps expects,
 with no cross-platform emulation and no `--platform` flag to get wrong.
 
-## 7. Repository variables, not secrets
+## 7. Repository secrets, and the one variable that stays a variable
 
 Every identifier this workflow reads — both client ids, the tenant id, the
-subscription id, the ACR name, the resource group, the container app name,
-and `DEPLOY_ENABLED` itself — is a **repository variable**
-(`gh variable set`), not a secret (`gh secret set`). This is a deliberate,
-recorded deviation from Microsoft's own OIDC guidance, which states
-plainly, of these same `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
-`AZURE_SUBSCRIPTION_ID`-shaped identifiers: *"For security reasons, we
-recommend using GitHub Secrets rather than passing values directly to the
-workflow."* ([Authenticate to Azure from GitHub Actions by OpenID Connect
-§ Create GitHub secrets](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect#create-github-secrets),
-ms.date 2024-07-01, checked 2026-08-19.)
+subscription id, the ACR name, the resource group and the container app
+name — is a **repository secret** (`gh secret set`). `DEPLOY_ENABLED` is the
+one exception, and it stays a **repository variable** (`gh variable set`),
+for a reason that has nothing to do with secrecy: `ci.yml` reads it in
+job-level `if:` conditions (§1, §4), and GitHub documents the `secrets`
+context as unusable there — *"Secrets cannot be directly referenced in
+`if:` conditionals. Instead, consider setting secrets as job-level
+environment variables, then referencing the environment variables to
+conditionally run steps in the job."* ([Using secrets in GitHub Actions §
+Using secrets in a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets),
+checked 2026-08-19.) `DEPLOY_ENABLED` is not itself a secret-shaped value —
+it is a boolean gate — so this is not a workaround forced on a value that
+belongs in `secrets`; it is the one identifier here that was never a
+candidate for `secrets` in the first place, now placed correctly next to
+the constraint that would have broken it if it were.
 
-The reasoning for deviating: the actual credential in this design is the
-federated-identity trust relationship itself — the subject match checked
-at token-exchange time — and that relationship does not live in the repo
-at all; it lives in Entra. A client id, a tenant id, a subscription id, an
-ACR name and a resource-group name are not, on their own, secrets that
-grant access to anything. Putting them in `secrets` would not protect
-anything real; it would only mask them as `***` in every log line that
-references them, at the cost of every future debugging session having to
-guess what a redacted value was.
+**This project changed its mind about the other seven.** An earlier version
+of this pipeline put all eight of these in repository variables, arguing —
+correctly, and the argument still holds — that Microsoft's own OIDC
+tutorial's reason for putting them in secrets does not survive contact with
+what a secret actually protects: *"For security reasons, we recommend using
+GitHub Secrets rather than passing values directly to the workflow."*
+([Authenticate to Azure from GitHub Actions by OpenID Connect § Create
+GitHub secrets](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect#create-github-secrets),
+ms.date 2024-07-01, checked 2026-08-19.) The actual credential in this
+design is the federated-identity trust relationship itself — the subject
+match checked at token-exchange time (§2, §3) — and that relationship does
+not live in this repository at all; it lives in Entra. A client id, a
+tenant id, a subscription id, an ACR name and a resource-group name are
+not, on their own, secrets that grant access to anything: knowing
+`AZURE_CLIENT_ID_DEPLOY` without also holding a token whose subject matches
+`repo:<owner>/<repo>:environment:production` gets an attacker nothing.
+**That classification argument has not changed, and this document still
+makes it.**
 
-The cost is stated here rather than left implicit, because this project's
-own discipline treats an unstated trade-off as worse than an admitted one.
-This repository is public. Repository *variables*, unlike secrets, are not
-masked in workflow run logs — and Actions run logs for a public repository
-are themselves publicly readable, by anyone, without a GitHub account.
-Every one of these identifiers — the subscription id, the tenant id, the
-ACR name, the resource group name, the container app name, both client
-ids — appears in plaintext in this repository's public run history the
-moment a workflow that references it runs. That is the concrete price of
-the deviation, and it is why the values in this document's own examples
-are placeholders rather than the project's real ones.
+**What changed is the exposure surface, not the classification.** This
+repository is public, and Actions run logs for a public repository are
+themselves publicly readable and indexed, by anyone, without a GitHub
+account — repository *variables*, unlike secrets, are never masked in a
+log line that references them. Independently of this pipeline, this
+project's own discipline already masks subscription ids, tenant ids,
+endpoints and resource names in every screenshot and every evidence file it
+publishes; that discipline exists precisely because these values are the
+project's own, and the project has chosen not to publish them even though
+none of them is, on its own, a credential. Publishing the identical values
+through a workflow log while masking them in a screenshot would be
+incoherent — the same value, under the same threat model, handled two
+different ways depending on which surface happened to carry it. Moving
+these seven identifiers into `secrets` is what makes the handling match the
+threat model consistently across every surface this project controls, not
+a reversal of the classification argument above. Both things are true at
+once: these values are not secrets in the OIDC threat model, and this
+project masks them anyway, because *where* a value becomes visible is a
+fact about this repository (public, permanently, indexed), not a fact this
+document is willing to leave to which command happened to write the value.
+
+**The cost, stated plainly rather than left implicit:** `gh` has no command
+that reads a secret's value back once set — `gh secret list` and the REST
+endpoint behind it return a name and timestamps only, never a value, by
+GitHub's own design. `create-github-oidc.sh`'s previous read-back discipline
+for these seven values — write, then read the value back, then compare it
+against what was just sent — is not reproducible for secrets and is not
+faked here. Step 6 of that script now confirms only that each secret
+**exists** under its expected name; it cannot confirm that its **value**
+is the one the script just sent. If a value is wrong at write time — a
+stale `$AZ_ACR_NAME`, a typo carried in from the caller's environment — the
+first symptom is a failure at the first workflow run that reads it, not
+here. This is a real weakening of this branch's read-back discipline
+relative to the repository-variable design it replaces, not a gap this
+document is silently carrying forward: `DEPLOY_ENABLED`, the one value that
+stayed a variable, keeps the full write-then-compare read-back exactly as
+before (§8), because nothing about that value's own verifiability changed.
 
 ## 8. `DEPLOY_ENABLED` and the ephemeral-resources tension
 
@@ -374,9 +414,13 @@ follow:
    registration into the directory's recycle bin for 30 days, still
    holding its name, so this step also attempts a best-effort purge,
    keyed on the object id `create-github-oidc.sh` records.
-6. Delete the GitHub environment and every repository variable this
-   script wrote, including `DEPLOY_ENABLED` itself — read back after
-   each deletion.
+6. Delete the GitHub environment, every repository secret this script
+   wrote (the seven identifiers, §7), and `DEPLOY_ENABLED` itself, the one
+   repository variable — read back after each deletion. For the secrets,
+   the read-back can only prove presence/absence, the same limit §7 states
+   for creation; that is a complete check for what deletion needs, since a
+   secret has no ambiguous soft-delete state the way an app registration
+   does (step 5 above).
 
 **Before running this script, resolve every pending deployment approval and
 cancel any leftover run from a negative test that declares

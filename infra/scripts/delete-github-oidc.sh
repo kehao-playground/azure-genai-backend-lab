@@ -46,9 +46,10 @@
 #      delete-entra-app.sh, keyed on the object id create-github-oidc.sh
 #      already records) and reports which of the two outcomes it got, the
 #      same two-branch message delete-entra-app.sh prints.
-#   6. delete the GitHub environment and the repository variables (including
-#      DEPLOY_ENABLED itself, not just flipping it to false), read every
-#      deletion back.
+#   6. delete the GitHub environment, the seven identifier repository
+#      SECRETS create-github-oidc.sh wrote, and the DEPLOY_ENABLED
+#      repository VARIABLE itself (not just flipping it to false), read
+#      every deletion back.
 #
 # THERE IS NO VERIFIED ADMISSION LOCK. After step 3's drain check reads
 # empty, nothing stops a new `git push` to main or a new workflow_dispatch
@@ -75,22 +76,33 @@
 # being able to check is never evidence of absence, and this is the one
 # mode that can delete the only record of what was created.
 #
+# The seven identifier secrets do not have a soft-delete ambiguity the way
+# an app registration does -- `gh secret list` either names a secret or it
+# does not, with nothing in between. So for those, and for DEPLOY_ENABLED,
+# "checkable" only fails the same way every other UNVERIFIABLE case here
+# does: the record field naming which secrets were written is itself
+# missing. Presence/absence is all teardown needs to prove for a secret;
+# it was never able to prove the VALUE at creation time either (see
+# create-github-oidc.sh step 6), so nothing is lost here that create-time
+# verification already had.
+#
 # The record file is parsed by hand, one `KEY=VALUE` line at a time -- it is
-# deliberately NEVER `source`d. GH_VARIABLES_WRITTEN's value is a
-# space-separated list of variable names (e.g. "AZURE_TENANT_ID
+# deliberately NEVER `source`d. GH_SECRETS_WRITTEN's value is a
+# space-separated list of secret names (e.g. "AZURE_TENANT_ID
 # AZURE_SUBSCRIPTION_ID ..."); `source`ing that line would hand bash
-# `GH_VARIABLES_WRITTEN=AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ...` as a
+# `GH_SECRETS_WRITTEN=AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID ...` as a
 # command line, setting the env var to only the first token and then trying
 # to EXECUTE the remaining tokens as a command. Splitting on the first `=`
 # per line sidesteps that entirely.
 #
-# GH_VARIABLES_WRITTEN and DEPLOY_ENABLED_SET are tracked separately in the
-# record file (create-github-oidc.sh writes DEPLOY_ENABLED as its own final
-# mutation, after the seven variables GH_VARIABLES_WRITTEN names) -- so
-# DEPLOY_ENABLED is torn down here unconditionally in step 6, not gated on
-# whichever of those two fields happens to be present. Step 1 above already
-# guarantees the variable exists by the time step 6 runs, regardless of what
-# the record file says about it.
+# GH_SECRETS_WRITTEN and DEPLOY_ENABLED_SET are tracked separately in the
+# record file (create-github-oidc.sh writes DEPLOY_ENABLED, the one
+# repository VARIABLE, as its own final mutation, after the seven secrets
+# GH_SECRETS_WRITTEN names) -- so DEPLOY_ENABLED is torn down here
+# unconditionally in step 6, not gated on whichever of those two fields
+# happens to be present. Step 1 above already guarantees the variable
+# exists by the time step 6 runs, regardless of what the record file says
+# about it.
 #
 # The record file does not carry the federated credentials' NAMES, only their
 # ids -- `az ad app federated-credential delete`/`list` both accept an id, so
@@ -120,8 +132,8 @@
 #
 # Privileges needed: the same directory and role-assignment permissions
 # create-github-oidc.sh's header documents, plus `gh auth login` with
-# permission to delete repository variables/environments and read workflow
-# runs across the repo.
+# permission to delete repository secrets/variables/environments and read
+# workflow runs across the repo.
 set -euo pipefail
 
 VERIFY_TEARDOWN=0
@@ -301,6 +313,15 @@ env_present() {
 }
 variable_present() {
   gh variable list --repo "$GITHUB_REPO" --json name \
+    --jq "([.[].name] | index(\"$1\")) != null"
+}
+secret_present() {
+  # `gh secret list` returns name and timestamps only, never a value -- that
+  # is exactly the limit create-github-oidc.sh's own step 6 documents. It is
+  # still enough for teardown: presence/absence is unambiguous for a secret
+  # (no soft-delete state the way an app registration has), so this is a
+  # complete check for what deletion needs to prove, not a weakened one.
+  gh secret list --repo "$GITHUB_REPO" --json name \
     --jq "([.[].name] | index(\"$1\")) != null"
 }
 
@@ -495,6 +516,26 @@ teardown_variable() {
   echo "  deleted $name"
 }
 
+teardown_secret() {
+  local name="$1"
+  local present
+  present="$(secret_present "$name")"
+  require_value "$present" "the $name secret listing read-back"
+  if [ "$present" = "false" ]; then
+    echo "  secret $name already gone -- nothing to do"
+    return 0
+  fi
+  gh secret delete "$name" --repo "$GITHUB_REPO" >/dev/null
+  local after
+  after="$(secret_present "$name")"
+  require_value "$after" "the $name secret post-delete read-back"
+  if [ "$after" != "false" ]; then
+    echo "Repository secret $name still listed after delete." >&2
+    exit 1
+  fi
+  echo "  deleted $name"
+}
+
 # === --verify-teardown: read-only, never deletes an Azure/GitHub resource ==
 
 if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
@@ -651,20 +692,20 @@ if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
     fi
   fi
 
-  VARS_WRITTEN="$(record_get GH_VARIABLES_WRITTEN)"
-  if [ -z "$VARS_WRITTEN" ]; then
-    echo "  UNVERIFIABLE: the identifier repository variables (GH_VARIABLES_WRITTEN not recorded)"
+  SECRETS_WRITTEN="$(record_get GH_SECRETS_WRITTEN)"
+  if [ -z "$SECRETS_WRITTEN" ]; then
+    echo "  UNVERIFIABLE: the identifier repository secrets (GH_SECRETS_WRITTEN not recorded)"
     UNVERIFIABLE=$((UNVERIFIABLE + 1))
   else
-    read -ra VAR_NAMES_TO_CHECK <<<"$VARS_WRITTEN"
-    for name in "${VAR_NAMES_TO_CHECK[@]}"; do
-      PRESENT="$(variable_present "$name")"
-      require_value "$PRESENT" "the $name variable listing read-back"
+    read -ra SECRET_NAMES_TO_CHECK <<<"$SECRETS_WRITTEN"
+    for name in "${SECRET_NAMES_TO_CHECK[@]}"; do
+      PRESENT="$(secret_present "$name")"
+      require_value "$PRESENT" "the $name secret listing read-back"
       if [ "$PRESENT" = "true" ]; then
-        echo "  STILL PRESENT: repository variable $name"
+        echo "  STILL PRESENT: repository secret $name"
         REMAINING=$((REMAINING + 1))
       else
-        echo "  gone: repository variable $name"
+        echo "  gone: repository secret $name"
       fi
     done
   fi
@@ -769,23 +810,24 @@ echo "== step 5: delete the app registrations =="
 teardown_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)" "$(record_get BUILD_APP_OBJECT_ID)"
 teardown_app "deploy" "$(record_get DEPLOY_APP_ID)" "$(record_get DEPLOY_APP_DISPLAY_NAME)" "$(record_get DEPLOY_APP_OBJECT_ID)"
 
-# === step 6: GitHub environment and repository variables ====================
-echo "== step 6: delete the GitHub environment and repository variables =="
+# === step 6: GitHub environment, repository secrets and DEPLOY_ENABLED ======
+echo "== step 6: delete the GitHub environment, repository secrets and DEPLOY_ENABLED =="
 teardown_environment "$(record_get GH_ENVIRONMENT_NAME)"
 
-VARS_WRITTEN="$(record_get GH_VARIABLES_WRITTEN)"
-if [ -z "$VARS_WRITTEN" ]; then
-  echo "WARNING: GH_VARIABLES_WRITTEN not recorded -- skipping cleanup of the identifier" >&2
-  echo "  variables (AZURE_TENANT_ID etc). DEPLOY_ENABLED is still handled below." >&2
+SECRETS_WRITTEN="$(record_get GH_SECRETS_WRITTEN)"
+if [ -z "$SECRETS_WRITTEN" ]; then
+  echo "WARNING: GH_SECRETS_WRITTEN not recorded -- skipping cleanup of the identifier" >&2
+  echo "  secrets (AZURE_TENANT_ID etc). DEPLOY_ENABLED is still handled below." >&2
 else
-  read -ra VAR_NAMES_TO_DELETE <<<"$VARS_WRITTEN"
-  for name in "${VAR_NAMES_TO_DELETE[@]}"; do
-    teardown_variable "$name"
+  read -ra SECRET_NAMES_TO_DELETE <<<"$SECRETS_WRITTEN"
+  for name in "${SECRET_NAMES_TO_DELETE[@]}"; do
+    teardown_secret "$name"
   done
 fi
-# DEPLOY_ENABLED is tracked separately from GH_VARIABLES_WRITTEN -- see header
-# -- and step 1 above guarantees it exists by the time this runs, regardless
-# of what the record file says, so it is attempted unconditionally.
+# DEPLOY_ENABLED is the one repository VARIABLE this pair of scripts writes,
+# tracked separately from GH_SECRETS_WRITTEN -- see header -- and step 1
+# above guarantees it exists by the time this runs, regardless of what the
+# record file says, so it is attempted unconditionally.
 teardown_variable "DEPLOY_ENABLED"
 
 echo
