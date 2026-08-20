@@ -622,10 +622,8 @@ echo "  all ${#SECRET_NAMES[@]} secrets confirmed present (values NOT verifiable
 # === step 7: arm the pipeline ================================================
 echo "== step 7: arm the pipeline (DEPLOY_ENABLED) =="
 # DEPLOY_ENABLED is a repository VARIABLE, not a secret, unlike the seven
-# identifiers step 6 just wrote -- see the header comment for why (`ci.yml`
-# reads it in job-level `if:` conditions, and GitHub documents the `secrets`
-# context as unusable there). That also means its read-back, unlike step 6's,
-# really does confirm the value.
+# identifiers step 6 just wrote -- see the header comment for why. That also
+# means its read-back, unlike step 6's, really does confirm the value.
 #
 # Deliberately the LAST mutation this script makes. Only reached after step
 # 5's environment protection and step 6's secrets have both read back
