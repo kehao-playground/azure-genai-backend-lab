@@ -265,9 +265,10 @@ def test_rollback_command_is_complete_enough_to_run_as_printed(tmp_path: Path) -
     assert "--name" in rollback_command
     assert h.env["AZ_ACA_APP_NAME"] in rollback_command
     assert "--image" in rollback_command
-    # The rollback target is the step-1 snapshot (the image that was
-    # serving before this run's mutation), never the --image this run
-    # requested -- the harness default snapshot is TAG_IMAGE.
+    # The rollback target is the step-1 snapshot -- the app's TEMPLATE image
+    # as it stood before this run's mutation, which is a rollback candidate
+    # and not proof of what any revision was serving -- never the --image this
+    # run requested. The harness default snapshot is TAG_IMAGE.
     assert TAG_IMAGE in rollback_command
 
 
