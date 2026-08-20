@@ -69,7 +69,11 @@
 # registrations, "confirmed absent" also checks the directory's deletedItems
 # endpoint by object id -- `az ad app list` alone cannot see a soft-deleted
 # app, so without that check this mode would report a registration "gone"
-# while it is still recoverable and still holding its name.
+# while it is still recoverable and still holding its name. The same rule
+# governs that check itself: no object id to probe with, or a probe that
+# fails for any reason other than a confirmed 404, is UNVERIFIABLE. Not
+# being able to check is never evidence of absence, and this is the one
+# mode that can delete the only record of what was created.
 #
 # The record file is parsed by hand, one `KEY=VALUE` line at a time -- it is
 # deliberately NEVER `source`d. GH_VARIABLES_WRITTEN's value is a
@@ -234,16 +238,38 @@ app_deleted_item_present() {
   # `az ad app list` never sees a soft-deleted app -- once app_count_by_id
   # reads 0, this is the only way to tell "purged / never existed" apart
   # from "in the recycle bin, still recoverable, still holding its name"
-  # (I3). GET on the object id: 200 if it is still there, non-zero
-  # otherwise. This is a best-effort existence probe, never a mutation, so
-  # unlike every other helper here it treats its own failure as "false"
-  # rather than propagating it -- the same discipline the purge below uses.
-  if az rest --method GET \
+  # (I3). GET on the object id: 200 if it is still there.
+  #
+  # A non-2xx response is NOT automatically "absent" -- a failed *probe*
+  # (network error, a 403 on a tenant that will not let this operator read
+  # deletedItems, a malformed id) must not be folded into the same verdict
+  # as a genuinely confirmed absence, because the caller (--verify-teardown)
+  # uses this to decide whether to delete the only record of what this run
+  # created. So exactly one failure shape is read as a confirmed "false" --
+  # a 404 -- and everything else comes back "unknown".
+  #
+  # Recognising that 404 means matching az's own error text, because
+  # `az rest` surfaces no status code any other way. The shape comes from
+  # azure-cli's source, not from a live capture: `send_raw_request`
+  # (azure/cli/core/util.py, azure-cli 2.89.0) does
+  # `reason = r.reason; if r.text: reason += '({})'.format(r.text)` and
+  # raises that, so a Graph 404 reaches stderr as
+  # `Not Found({"error":{"code":"Request_ResourceNotFound",...}})`. Both
+  # halves are matched: the HTTP reason phrase and Graph's own error code.
+  #
+  # THIS MATCH IS FAIL-CLOSED BY CONSTRUCTION. If either text ever changes,
+  # a real 404 stops matching and falls into "unknown" -- which makes the
+  # item UNVERIFIABLE and KEEPS the record file. The failure mode of a
+  # stale pattern here is an over-cautious verdict, never a false "gone".
+  local err
+  if err="$(az rest --method GET \
       --uri "https://graph.microsoft.com/v1.0/directory/deletedItems/$1" \
-      --query id -o tsv >/dev/null 2>&1; then
+      --query id -o tsv 2>&1 >/dev/null)"; then
     echo true
-  else
+  elif [[ "$err" == *"Request_ResourceNotFound"* || "$err" == *"ERROR: Not Found("* ]]; then
     echo false
+  else
+    echo unknown
   fi
 }
 fic_count() {
@@ -536,7 +562,30 @@ if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
       count="$(app_count_by_name "$display_name")"
       require_value "$count" "the $label display-name lookup count"
       if [ "$count" = "0" ]; then
-        echo "  gone: $label app registration (by name '$display_name')"
+        # `az ad app list` cannot see a soft-deleted app, so this 0 is
+        # exactly what a soft-deleted registration produces too -- same
+        # discipline as the app_id path below: check deletedItems before
+        # calling it gone.
+        if [ -n "$recorded_object_id" ]; then
+          local deleted_present_by_name
+          deleted_present_by_name="$(app_deleted_item_present "$recorded_object_id")"
+          case "$deleted_present_by_name" in
+            true)
+              echo "  STILL PRESENT (soft-deleted, recoverable for 30 days): $label app registration (by name '$display_name')"
+              REMAINING=$((REMAINING + 1))
+              ;;
+            false)
+              echo "  gone: $label app registration (by name '$display_name')"
+              ;;
+            *)
+              echo "  UNVERIFIABLE: $label app registration (by name '$display_name'; the deletedItems check failed, cannot confirm absence)"
+              UNVERIFIABLE=$((UNVERIFIABLE + 1))
+              ;;
+          esac
+        else
+          echo "  UNVERIFIABLE: $label app registration (by name '$display_name'; no object id recorded, cannot check soft-delete state)"
+          UNVERIFIABLE=$((UNVERIFIABLE + 1))
+        fi
         return
       fi
       if [ "$count" != "1" ]; then
@@ -559,17 +608,29 @@ if [ "$VERIFY_TEARDOWN" -eq 1 ]; then
     # cannot tell "purged / never existed" apart from "in the recycle bin
     # for 30 days, still recoverable, still holding its name" (I3). Check
     # the directory's deletedItems endpoint by object id when one is known.
+    # A "cannot check" outcome is UNVERIFIABLE, never "gone" -- the same
+    # rule this script's own header states for a missing record field, and
+    # --verify-teardown only removes the record file when nothing is left
+    # UNVERIFIABLE either.
     if [ -n "$recorded_object_id" ]; then
       local deleted_present
       deleted_present="$(app_deleted_item_present "$recorded_object_id")"
-      if [ "$deleted_present" = "true" ]; then
-        echo "  STILL PRESENT (soft-deleted, recoverable for 30 days): $label app registration ($app_id)"
-        REMAINING=$((REMAINING + 1))
-        return
-      fi
-      echo "  gone: $label app registration"
+      case "$deleted_present" in
+        true)
+          echo "  STILL PRESENT (soft-deleted, recoverable for 30 days): $label app registration ($app_id)"
+          REMAINING=$((REMAINING + 1))
+          ;;
+        false)
+          echo "  gone: $label app registration"
+          ;;
+        *)
+          echo "  UNVERIFIABLE: $label app registration ($app_id; the deletedItems check failed, cannot confirm absence)"
+          UNVERIFIABLE=$((UNVERIFIABLE + 1))
+          ;;
+      esac
     else
-      echo "  gone: $label app registration (soft-delete state not checked -- object id not recorded)"
+      echo "  UNVERIFIABLE: $label app registration (soft-delete state not checked -- object id not recorded)"
+      UNVERIFIABLE=$((UNVERIFIABLE + 1))
     fi
   }
   check_app "build" "$(record_get BUILD_APP_ID)" "$(record_get BUILD_APP_DISPLAY_NAME)" "$(record_get BUILD_APP_OBJECT_ID)"

@@ -753,9 +753,20 @@ if args[:1] == ["rest"]:
         object_id = uri[len(prefix):]
         deleted_items = state.setdefault("deleted_items", {})
         if method == "GET":
+            if state.get("deleted_item_probe_fails"):
+                # A non-404 failure -- e.g. a 403 on a tenant that will not
+                # let this operator read deletedItems -- must NOT look like
+                # a confirmed absence to the real script's classifier.
+                fail("ERROR: Authorization_RequestDenied(Insufficient privileges)", 1)
             if object_id in deleted_items:
                 done(object_id)
-            fail("fake az: deleted item not found", 3)
+            # The 404 text az itself would produce: send_raw_request
+            # (azure/cli/core/util.py) appends the response body to the HTTP
+            # reason phrase. This fake reproduces that shape so the script's
+            # classifier is exercised against it; it is not evidence about a
+            # real tenant, and the script treats any UNRECOGNISED text as
+            # "unknown" precisely so a drift here cannot become a false "gone".
+            fail('ERROR: Not Found({"error":{"code":"Request_ResourceNotFound"}})', 1)
         if method == "DELETE":
             if state.get("purge_fails"):
                 fail("fake az: injected purge failure", 1)
@@ -1156,6 +1167,93 @@ def test_verify_teardown_reports_a_soft_deleted_app_as_still_present(tmp_path: P
     assert h.record_file.exists()
     # Read-only: the soft-deleted items are still there afterwards.
     assert set(h.state["deleted_items"]) == {BUILD_OBJECT_GUID, DEPLOY_OBJECT_GUID}
+
+
+# ---------------------------------------------------------------------------
+# --verify-teardown must never report "gone" for something it could not
+# actually check -- a "cannot check" outcome is UNVERIFIABLE, and an
+# UNVERIFIABLE item keeps the record file, per the script's own header rule.
+# Three paths in check_app can hit "cannot check": no object id was
+# recorded, the same on the display-name fallback, and the deletedItems
+# probe itself failing (not a 404 -- something else, e.g. a permissions
+# gap). One test per path.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_teardown_is_unverifiable_when_object_id_is_missing(tmp_path: Path) -> None:
+    h = DeleteHarness(
+        tmp_path,
+        record_overrides={"BUILD_APP_OBJECT_ID": ""},
+        apps={},
+        deleted_items={},
+        role_assignments=[],
+        environments=[],
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert (
+        "UNVERIFIABLE: build app registration (soft-delete state not checked -- "
+        "object id not recorded)" in result.stdout
+    )
+    assert h.record_file.exists()
+
+
+def test_verify_teardown_is_unverifiable_when_the_deleted_items_probe_fails(
+    tmp_path: Path,
+) -> None:
+    # A non-404 failure (e.g. a 403 on a tenant that will not let this
+    # operator read deletedItems) must not be folded into "gone" the way a
+    # confirmed absence is.
+    h = DeleteHarness(
+        tmp_path,
+        apps={},
+        deleted_items={},
+        deleted_item_probe_fails=True,
+        role_assignments=[],
+        environments=[],
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert "UNVERIFIABLE: build app registration" in result.stdout
+    assert "the deletedItems check failed, cannot confirm absence" in result.stdout
+    assert "UNVERIFIABLE: deploy app registration" in result.stdout
+    assert h.record_file.exists()
+    # Read-only despite the failed probe.
+    assert h.state["apps"] == {}
+
+
+def test_verify_teardown_is_unverifiable_on_the_display_name_fallback_when_object_id_is_missing(
+    tmp_path: Path,
+) -> None:
+    # The truncated-record-file case the display-name fallback exists to
+    # serve: BUILD_APP_ID is gone AND there is no object id to fall back
+    # on. az ad app list cannot see a soft-deleted app, so a name lookup
+    # returning 0 here is exactly what a soft-deleted registration
+    # produces -- it must not be reported as "gone" on that basis alone.
+    #
+    # Unlike the other two paths, record-file survival alone cannot pin this
+    # one: a record file with no BUILD_APP_ID also makes check_fic's build
+    # arm UNVERIFIABLE, and that increment keeps the file on its own. So the
+    # UNVERIFIABLE TOTAL is asserted too -- 2 (the federated credential and
+    # this app registration), not 1. Drop this guard and the total falls to
+    # 1 while everything else stays identical.
+    h = DeleteHarness(
+        tmp_path,
+        record_overrides={"BUILD_APP_ID": "", "BUILD_APP_OBJECT_ID": ""},
+        apps={},
+        deleted_items={},
+        role_assignments=[],
+        environments=[],
+        variables={},
+    )
+    result = h.run("--verify-teardown")
+    assert result.returncode != 0
+    assert f"UNVERIFIABLE: build app registration (by name '{BUILD_DISPLAY_NAME}'" in result.stdout
+    assert "no object id recorded, cannot check soft-delete state" in result.stdout
+    assert "0 resource(s) still present, 2 item(s) could not be checked." in result.stderr
+    assert h.record_file.exists()
 
 
 def test_fic_deletion_precedes_drain_check(tmp_path: Path) -> None:
