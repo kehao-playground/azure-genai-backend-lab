@@ -1,0 +1,193 @@
+{
+ "_source": "github-slugger 2.0.0 (regex.js sha256 3bcbb3836a4e76f0f343c34d223ddd9eac83cc73a4e2c7a1118ef0829bc9129b)",
+ "_generated_by": "the reference implementation itself; see scripts/vendor_github_slugger.py",
+ "_note": "Frozen so the differential test runs offline. Regenerate alongside the vendored table when the pinned slugger version moves.",
+ "cases": [
+  [
+   "Emoji 🚀 test",
+   "emoji--test"
+  ],
+  [
+   "Family 👩‍👩‍👧‍👦 emoji",
+   "family--emoji"
+  ],
+  [
+   "A & B",
+   "a--b"
+  ],
+  [
+   "A &amp; B",
+   "a-amp-b"
+  ],
+  [
+   "Exactly-once & delivery",
+   "exactly-once--delivery"
+  ],
+  [
+   "中文段落",
+   "中文段落"
+  ],
+  [
+   "日本語の見出し",
+   "日本語の見出し"
+  ],
+  [
+   "한국어 제목",
+   "한국어-제목"
+  ],
+  [
+   "Ελληνικά",
+   "ελληνικά"
+  ],
+  [
+   "Русский заголовок",
+   "русский-заголовок"
+  ],
+  [
+   "Foo",
+   "foo"
+  ],
+  [
+   "foo",
+   "foo"
+  ],
+  [
+   "FOO",
+   "foo"
+  ],
+  [
+   "keep_the_underscores",
+   "keep_the_underscores"
+  ],
+  [
+   "trailing-hyphen-",
+   "trailing-hyphen-"
+  ],
+  [
+   "- leading dash",
+   "--leading-dash"
+  ],
+  [
+   "3.1 G1 — the fences were forgeable (fixed)",
+   "31-g1--the-fences-were-forgeable-fixed"
+  ],
+  [
+   "11. What the live session settled, and what is still open",
+   "11-what-the-live-session-settled-and-what-is-still-open"
+  ],
+  [
+   "needs is the gate",
+   "needs-is-the-gate"
+  ],
+  [
+   "Bold heading",
+   "bold-heading"
+  ],
+  [
+   "emphasis and underscore emphasis",
+   "emphasis-and-underscore-emphasis"
+  ],
+  [
+   "linked heading",
+   "linked-heading"
+  ],
+  [
+   "a  b",
+   "a--b"
+  ],
+  [
+   "a b",
+   "a-b"
+  ],
+  [
+   "  padded  ",
+   "--padded--"
+  ],
+  [
+   "symbols ±§¶ here",
+   "symbols--here"
+  ],
+  [
+   "math ∑ ∫ ∞",
+   "math---"
+  ],
+  [
+   "arrows → ← ⇒",
+   "arrows---"
+  ],
+  [
+   "box ▲ ● ◆",
+   "box---"
+  ],
+  [
+   "tilde~and|pipe",
+   "tildeandpipe"
+  ],
+  [
+   "question? and: colon",
+   "question-and-colon"
+  ],
+  [
+   "slash/and\\\\backslash",
+   "slashandbackslash"
+  ],
+  [
+   "quote\"double\" and ’curly’",
+   "quotedouble-and-curly"
+  ],
+  [
+   "ﬀ ligature",
+   "ﬀ-ligature"
+  ],
+  [
+   "ß sharp s",
+   "ß-sharp-s"
+  ],
+  [
+   "İ dotted I",
+   "i̇-dotted-i"
+  ],
+  [
+   "ǅ titlecase",
+   "ǆ-titlecase"
+  ],
+  [
+   "１２３ fullwidth",
+   "１２３-fullwidth"
+  ],
+  [
+   "Ⅻ roman numeral",
+   "ⅻ-roman-numeral"
+  ],
+  [
+   "½ fraction",
+   "-fraction"
+  ]
+ ],
+ "sequence": [
+  [
+   "Foo",
+   "foo"
+  ],
+  [
+   "Foo-1",
+   "foo-1"
+  ],
+  [
+   "Foo",
+   "foo-2"
+  ],
+  [
+   "Notes",
+   "notes"
+  ],
+  [
+   "Notes",
+   "notes-1"
+  ],
+  [
+   "Notes",
+   "notes-2"
+  ]
+ ]
+}
