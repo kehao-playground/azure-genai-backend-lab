@@ -52,7 +52,13 @@ jobs:
         # That shipped twice in the Day 25 review topic before this gate
         # existed: the manual sweep's scope was the file being retitled, and
         # a cross-file reference is exactly what such a sweep cannot see.
-        run: python3 scripts/check_doc_anchors.py
+        #
+        # Structure comes from markdown-it-py and slugs from a table generated
+        # by running github-slugger itself (scripts/vendor_github_slugger.py).
+        # Both halves were hand-rolled once and both were wrong; the emoji case
+        # made an ordinary heading fail open. No network here -- the table and
+        # its differential corpus are committed.
+        run: uv run python scripts/check_doc_anchors.py
       - name: Install actionlint
         env:
           ACTIONLINT_VERSION: "1.7.12"

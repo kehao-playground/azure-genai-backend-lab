@@ -32,6 +32,12 @@ dev = [
   "mypy>=1.10.0",
   "types-PyYAML>=6.0.0",
   "httpx2>=2.5.0",
+  # CommonMark parser for scripts/check_doc_anchors.py. Two hand-rolled
+  # markdown parsers in that gate shipped a combined thirteen defects --
+  # phantom headings inside fenced code and HTML comments, fence-legality
+  # errors, entity and escape handling. Structure parsing is a solved problem
+  # and this repo should not be re-solving it.
+  "markdown-it-py>=3.0.0",
 ]
 
 [build-system]
