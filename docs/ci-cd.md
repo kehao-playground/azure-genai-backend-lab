@@ -17,18 +17,26 @@ Microsoft Learn pages cited below were checked 2026-08-19 unless a
 different date is given; each citation carries the page's own `ms.date`
 where the page publishes one.
 
-This pipeline has been built: `ci.yml` triggers `python`, `site` and `image`
-on every push and pull request against this repository, and `deploy` after
-approval on `main`. **No job in this file has run against Azure state, and
-`deploy` has never run at all.** That is the scope of what is still
-unverified — not whether `python`, `site` and `image`'s own gates execute on
-GitHub-hosted runners, which they are configured to do on every push and
-pull request the same as any workflow in any repository, and which this
-document does not need a live run to support. Every claim below that
-depends on a live run *against Azure*, or on the required-reviewer gate
-actually pausing `deploy`, is marked as open in
-[§11](#11-open-questions-settled-only-by-the-live-session), which also
-carries the specific mechanisms this leaves unverified.
+This pipeline has been built and run. `ci.yml` triggers `python`, `site` and
+`image` on every push to `main` and on every pull request, and `deploy` after
+approval on `main`. **On 2026-08-20 the whole pipeline ran end to end against
+real Azure and GitHub state** (japaneast): both OIDC token exchanges
+succeeded, an image was pushed to a live registry, the required-reviewer gate
+paused `deploy` until a human approved, and `az containerapp update` deployed
+by digest to a live container app that then served the exact `/health` body.
+That run also produced the two live bugs recorded in
+[§11](#11-what-the-live-session-settled-and-what-is-still-open) and the
+evidence file it points to.
+
+What remains genuinely unverified is now a short list, not a blanket
+disclaimer: `concurrency` behaviour under two competing runs, single-revision
+behaviour when a revision fails to start, and role-assignment propagation
+timing for these two service principals. Those three, and nothing broader,
+are what [§11](#11-what-the-live-session-settled-and-what-is-still-open)
+leaves open. Claims elsewhere in this document that were written before that
+run and phrased as "not yet observed" have been reconciled against it; where
+a mechanism is described from the code rather than from an observation, the
+sentence says so locally.
 
 ---
 
@@ -49,11 +57,14 @@ runs `scripts/boot_smoke.sh` against it — the same two-assertion boot smoke
 (HEALTHCHECK reports `healthy`, a separate `docker exec` proves what
 `/health` actually returns) that used to live as an inline step in a job
 named `docker`; Day 25 extracted it into its own script and renamed that job
-`image`, because it now does more than build. All three of those jobs are
-configured to trigger on every push and every pull request, including from
-a branch that will never touch Azure — that is the point of a gate: the
-correctness bar does not depend on `DEPLOY_ENABLED` or on which branch
-triggered the run.
+`image`, because it now does more than build. This workflow's triggers are
+`pull_request:` and `push:` restricted to `branches: [main]`, so all three of
+those jobs run on every push to `main` and on every pull request — including a
+pull request from a branch that will never touch Azure, which is the point of a
+gate: the correctness bar does not depend on `DEPLOY_ENABLED` or on which branch
+opened the pull request. A push to a side branch with no pull request open
+triggers nothing at all; that is a property of these triggers, not a gap the
+gates cover.
 
 `deploy` is declared with `needs: [python, site, image]`, and that is the
 entire coordination mechanism. There is no separate "all green" status
@@ -76,7 +87,9 @@ from under itself by a second push.
 checksum — no new package manager, same discipline
 [docker.md](docker.md) uses for the `uv` image) cannot catch the class of
 bug Day 24 shipped: bugs only visible once the workflow actually runs
-against real Azure and GitHub state. What it does catch is narrower and
+against real Azure and GitHub state — a class this pipeline then shipped two
+more of, both caught by the 2026-08-20 run and neither reachable by any
+static check (§11). What it does catch is narrower and
 still worth having — a typo'd `needs.image.outputs.digest` reference, which
 GitHub Actions itself would otherwise evaluate to a silently empty string
 that flows straight into the `deploy` job's `--image` argument.
@@ -98,13 +111,19 @@ resource, not the resource group and not the subscription: a wider scope
 would let either identity touch everything else that group holds, which is
 exactly the blast radius two narrow identities exist to avoid.
 
-**The residual this buys is real, and it is not a corner case — by design,
-it happens on every ordinary push to `main`.** The `image` job's Azure-touching steps
+**The residual this buys is real, and it is not a corner case — by design, an
+ordinary armed push to `main` reaches it with no approval anywhere in
+front.** The `image` job's Azure-touching steps
 (`az acr login`, tag, push) are gated only on `github.ref == 'refs/heads/main'
 && vars.DEPLOY_ENABLED == 'true'`, with no approval requirement at all —
-approval belongs to the `deploy` job, three jobs downstream. So the build
-identity's `AcrPush` grant is exercised, and an image really is pushed to
-the registry, before any human has approved anything. What that write is
+approval belongs to the `deploy` job, three jobs downstream. So on a run where
+the pipeline is armed, the ref is `main`, and the build, boot smoke, ACR login
+and push all succeed, the build identity's `AcrPush` grant is exercised and an
+image really is pushed to the registry before any human has approved anything.
+Those conditions are what make the write routine rather than exceptional, and
+not one of them is an approval — which is the whole point. A run that is
+unarmed, on another ref, or that fails anywhere ahead of the push writes
+nothing at all. What that write is
 *not* is dangerous on its own: nothing runs an image that no `--image`
 argument names, so a pushed-but-never-approved image just sits in the
 registry as a tag-and-digest pair until the next `delete-acr.sh`. But
@@ -141,9 +160,12 @@ tolerates and falls back to `<name>.azurecr.io` plus a data-plane token
 exchange — the path `AcrPush` actually covers. With `-g`, the CLI instead
 calls `registries/read` directly, an action `AcrPush` does not grant, and
 that failure is not on the tolerated fallback path. Adding `-g` "for
-tidiness" would break the push. What the CLI actually prints in that
-failure path, under a real `AcrPush`-only identity, has not been observed
-in this project — see [§11](#11-open-questions-settled-only-by-the-live-session).
+tidiness" would break the push. What the CLI prints while taking that
+fallback path was observed on 2026-08-20 under a real `AcrPush`-only
+identity: `Login Succeeded`, and nothing else — no warning, no note that a
+control-plane lookup failed. The fallback is invisible in the log, which is
+why the warning above has to live in a comment in `ci.yml` instead
+([§11](#11-what-the-live-session-settled-and-what-is-still-open)).
 
 ## 3. Subject binding: what it stops, and what it does not
 
@@ -167,19 +189,31 @@ Reading it as "this subject *is* the branch restriction" is the most
 likely misreading a reader of this pipeline would take away, and it would
 be wrong.
 
-**"Only `main` deploys" is enforced entirely by a separate, GitHub-side
-setting**: the `production` environment's deployment-branch policy
+**"Only `main` deploys" is enforced by two independent layers, neither of
+them the subject string.** The first is this workflow's own job-level
+condition, `if: github.ref == 'refs/heads/main' && …` on the `deploy` job
+(§4): a run on any other ref never even queues the job, so no environment
+protection is evaluated at all. The second is a GitHub-side setting that does
+not depend on this workflow being written correctly: the `production`
+environment's deployment-branch policy
 (`custom_branch_policies: true`, `protected_branches: false`, one policy
 named `main` — set by `create-github-oidc.sh` step 5, then **read back and
 compared**, because GitHub silently auto-creates an *unprotected*
 environment with no restriction at all the first time any workflow
 references a name that does not yet exist; the name existing proves
-nothing about whether it is gated). That policy is what stops a run
-triggered from a feature branch — `ci.yml` only triggers on `push` and
-`pull_request`, but the same policy would equally stop a `workflow_dispatch`
-on any workflow this repository might add later — from ever reaching the
-point of requesting an `environment: production` token in the first place —
-it is enforced upstream of the subject, not encoded inside it. If that policy
+nothing about whether it is gated).
+
+The second layer is the one worth understanding, precisely because it holds
+where the first does not: it stops a run whose workflow declares
+`environment: production` with **no ref condition at all** — a workflow whose
+job-level `if` was never written, was removed, or is a `workflow_dispatch`
+entry point this repository might add later — from ever reaching the point of
+requesting an `environment: production` token. That is exactly the shape the
+live session's negative test A used, and why that test needed a separate
+throwaway workflow rather than `ci.yml`: under `ci.yml`'s own job-level `if`,
+a side-branch run is skipped before the branch policy is ever consulted, so
+the layer under test would never be reached. Both layers are enforced upstream
+of the subject, not encoded inside it. If that policy
 were ever removed or misconfigured back to "any branch," the deploy
 identity's federated credential would trust an `environment:production`
 token requested by a run from any branch, because nothing in the subject
@@ -192,15 +226,16 @@ string itself would object.
 | Gates | `needs: [python, site, image]` | Lint, types, tests, behave, three schema-drift checks, mermaid syntax, `actionlint`, the Astro build, and a build-plus-boot-smoke of the image all reported success | Only checks that these specific automated checks passed — a correctness bug none of them cover reaches `main` regardless; this is not a human having read the diff |
 | Job `if:` condition | `deploy`'s own `if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'` | Refuses to even queue the job — so no environment protection is evaluated at all — unless the run is on `main` and the pipeline is armed | A single boolean, evaluated once per job; §8 covers what it does and does not mean for a run already past that evaluation |
 | Required reviewer | GitHub environment protection (`reviewers: [...]`, `prevent_self_review: false`) | A human with write access approves before the `deploy` job's OIDC token can even be requested | Single-operator repo: the reviewer is whichever GitHub login `create-github-oidc.sh` was run under (`gh api user`), not necessarily the repository owner, and self-review is explicitly not prevented — see below |
-| Deployment branch policy | Environment setting, one custom policy named `main` | Only a run triggered from `main` can request a token whose claims match the deploy identity's subject | Enforced entirely at this layer — see §3. It says nothing about the *content* of that commit, only its ref |
-| Freshness guard | `scripts/check_freshness.sh`, first step of the `deploy` job | This run's commit is still `main`'s current HEAD, queried live from the GitHub API | Fails closed on any query failure or empty read, but it answers "is this commit still current," not "was it reviewed" — approval already happened by the time this check runs |
-| Federated subject | Deploy identity's federated credential, subject `repo:<owner>/<repo>:environment:production` (§3) | Entra will not exchange the OIDC token `azure/login@v2` presents for this identity's own token unless the claimed subject matches exactly | Carries no ref of its own (§3) — branch restriction is enforced entirely by the deployment branch policy layer above, not by anything in this string |
+| Deployment branch policy | Environment setting, one custom policy named `main` | Only a run triggered from `main` can request a token whose claims match the deploy identity's subject | The second of the two layers that enforce "only `main` deploys" (the job `if:` row above is the first), and the one that survives a workflow which omits the ref condition — see §3. It says nothing about the *content* of that commit, only its ref |
+| Freshness guard | `scripts/check_freshness.sh` — the `deploy` job's first check, immediately after `actions/checkout` and before any Azure login | This run's commit is still `main`'s current HEAD, queried live from the GitHub API | Fails closed on any query failure or empty read, but it answers "is this commit still current," not "was it reviewed" — approval already happened by the time this check runs |
+| Federated subject | Deploy identity's federated credential, subject `repo:<owner>/<repo>:environment:production` (§3) | Entra will not exchange the OIDC token `azure/login@v2` presents for this identity's own token unless the claimed subject matches exactly | Carries no ref of its own (§3) — branch restriction comes from the job `if:` and deployment-branch-policy layers above, not from anything in this string |
 
-The live session's negative tests (§11) produce evidence for two of these
-rows directly: the side-branch job that declares `environment: production`
-with no ref condition targets the deployment branch policy layer; the job
-that presents the deploy identity without declaring `environment:` at all
-targets the federated subject layer.
+The live session's negative tests (§11) produced evidence for two of these
+rows directly: the side-branch job that declared `environment: production`
+with no ref condition targeted the deployment branch policy layer, and was
+refused by it; the job that presented the deploy identity without declaring
+`environment:` at all targeted the federated subject layer, and was refused
+at the Entra token exchange.
 
 The required-reviewer layer is the one most worth reading carefully rather
 than trusting the name. **Single-operator self-approval is not two-person
@@ -239,7 +274,13 @@ guaranteed bit-for-bit reproducible run to run, given base-image and
 package-index drift — and re-push under that identical tag, silently
 overwriting the object the first run's boot smoke actually verified. Any
 later deploy addressing the image by that tag would then be serving bytes
-nobody's gate ever checked, with no error anywhere to say so. Digest
+that no longer belong to the run whose gates and whose approval were the
+reason to deploy at all — with no error anywhere to say so. The re-pushed
+bytes are not ungated: the re-run's own `image` job builds and boot-smokes
+before it can push, so whatever a tag now resolves to has passed *some* run's
+gate. What tag addressing cannot do is prove *which* run's — and the
+approval a human gave was given for one specific run's artefact, not for
+whatever later occupies the same name. Digest
 addressing makes that structurally impossible, because the digest handed
 to `deploy` is computed fresh, in the very same job run whose boot smoke
 just passed, and never read back from anything a later run could have
@@ -541,86 +582,97 @@ a future registry move to ABAC — per that same page's own migration table:
 Neither path has been exercised: this series has never created or tested
 an ABAC-enabled registry.
 
-## 11. Open questions, settled only by the live session
+## 11. What the live session settled, and what is still open
 
-`ci.yml` defines `python`, `site` and `image` to trigger on every push and
-pull request against this repository, and `deploy` to run after approval on
-`main`. **No job in this file has run against Azure state, and `deploy` has
-never run at all** — that is what this section leaves open, not whether
-`python`, `site` and `image`'s own gates execute on GitHub-hosted runners
-(they are configured to, on every push and pull request, and §1 already
-states what they check; that is GitHub-hosted-runner and Docker state, not
-Azure or GitHub-environment-approval state). Task 7's own report names the
-specific mechanisms this leaves unverified, folded into the list below:
-OIDC token minting via `azure/login@v2`, `az acr login`'s fallback
-behaviour, the environment's required-reviewer gate actually blocking a
-run, concurrency behaviour, and the digest round-trip through a real
-`docker push`. The following are open until a live run against Azure
-happens, and nothing above should be
-read as resolving them in advance:
+The live session ran on **2026-08-20, japaneast**, against real Azure and real
+GitHub state, and its redacted record is
+`reviews/evidence/day25/2026-08-20-cicd-live-session.md` in the planning
+repository. It is what turned this section from a list of open questions into
+a settled/open split. Everything in the settled column below is an
+**observation from that one session on that date**, not a general guarantee
+about GitHub, Entra or Azure; single-session scoping is the standing rule in
+this series, and it applies to these rows as much as to any measurement.
 
-- **Whether the OIDC token exchange itself succeeds end to end** — both
-  identities' federated credentials, `azure/login@v2` minting a token
-  against each subject, and Entra accepting it. Every mechanism in §2 and
-  §3 is a description of the configuration as written, not of an observed
-  exchange.
-- **Whether the required-reviewer gate actually pauses the `deploy` job**
-  as configured, and whether the deployment-branch policy actually blocks
-  a non-`main` run from reaching it — both are GitHub-side settings this
-  document describes from `create-github-oidc.sh`'s own read-back logic,
-  not from watching a run be paused or blocked.
-- **Whether the `concurrency` group behaves as specified** under a real
-  queued run (§1) — untested, since no two runs have ever competed for it.
-- **Role-assignment propagation timing for this pipeline.** The only
-  measurement anywhere in this project is Day 20's **14 minutes 44
-  seconds**, against Microsoft's documented "up to 5 minutes"
-  ([managed-identity.md §2](managed-identity.md#2-keyless-azure-openai-on-this-projects-own-client-shape)).
-  That number describes a *different* identity type (a managed identity
-  reaching the Azure OpenAI data plane) under Day 20's own conditions —
-  cite it here as prior art for how far "up to 5 minutes" has already
-  been shown wrong, not as a prediction for these two app-registration
-  service principals reaching the ACR and Container Apps control planes.
-- ~~Whether `Container Apps Contributor`'s coverage of
-  `containerApps/*/write` extends to the bare `containerApps/write`
-  action `az containerapp update --image` needs.~~ **Settled (observed
-  2026-08-20, japaneast): yes.** `az containerapp update --image <digest>`
-  under the deploy identity's `Container Apps Contributor` role assignment
-  was accepted, and the app read back the requested image.
-- ~~Whether ARM/ACA accepts a digest-form `--image`~~. **Settled (observed
-  2026-08-20, japaneast): yes.** The update above landed with a
-  `@sha256:...` reference, and the app is running one.
-  How a single-revision-mode app behaves when the revision it produces
-  actually fails to start remains open — this run's revision came up
-  healthy. What the same run did settle is narrower: which field
-  authoritatively reports the revision's state.
-  `update-container-app.sh` polls `properties.runningState`, and this run
-  settled that the field choice itself was right — it is still the most
-  specific signal `az containerapp revision show` exposes — but not the
-  vocabulary assumed for it. The healthy, correctly-deployed revision
-  reported runningState `RunningAtMaxScale`, a value outside even the
-  pinned containerapp CLI extension's own `RevisionRunningState` SDK enum
-  (`azext_containerapp/_sdk_enums.py` lists only
-  `Running`/`Processing`/`Stopped`/`Degraded`/`Failed`/`Unknown`). The poll
-  is now failure-shaped rather than success-shaped because of this: it
-  aborts fast on the enum's two named failure states, keeps waiting only
-  through `Processing`, and treats every other value — including
-  vocabulary this project has not seen yet — as not evidence of failure,
-  leaving step 4's exact-body `/health` probe as the actual proof the app
-  is serving. See the comment above the poll in
-  `infra/scripts/update-container-app.sh` for the full account.
-- ~~What `az acr login` prints under an identity that holds only
-  `AcrPush`~~ (no `registries/read`). **Settled (observed 2026-08-20,
-  japaneast): `Login Succeeded`, with no warning at all** — the fallback
-  path §2 documents was exercised against a real `AcrPush`-only identity
-  and produced output indistinguishable from a login backed by broader
-  registry permissions.
-- **The GitHub REST response shapes the environment-protection read-back
-  depends on** (`create-github-oidc.sh` step 5's field-by-field
-  comparison against `deployment_branch_policy` and
-  `protection_rules[].reviewers`) — implemented against the documented
-  endpoints and field names, never checked against a live GitHub API
-  response in this project.
+### Settled by that run
 
-Task 10's live session is what answers these. Until then, treat every
-mechanism in this document as *specified by the code, and verified only by
-reading it*, not as *observed running against real Azure state*.
+| Question | Observed |
+|---|---|
+| Does the OIDC token exchange succeed end to end, for both identities? | Yes. `azure/login@v2` obtained an Azure token for the build identity in `image` and for the deploy identity in `deploy`; Entra accepted both subjects. |
+| Does the required-reviewer gate actually pause `deploy`? | Yes. An unapproved `deploy` job sat at `status: waiting`, `conclusion: null`, `steps: []` — no step had run, yet `started_at` was already populated — and `pending_deployments` reported `current_user_can_approve: true` for the same account that opened and merged the PR. Single-operator self-approval, with an API field to prove it. |
+| Does the deployment-branch policy block a non-`main` run? | Yes, and automatically. A throwaway workflow on a side branch declaring `environment: production` went `waiting` → `failure` with `steps: []`, annotated `Branch "…" is not allowed to deploy to production due to environment protection rules`. Its `pending_deployments` was **empty**: nothing was ever routed to a human. |
+| What happens if a job presents the deploy identity without declaring `environment:`? | GitHub mints a **ref**-form subject; Entra refuses that assertion with `AADSTS700213: No matching federated identity record found`. The refusal happens at the token exchange — the workflow holds a GitHub OIDC assertion but never obtains an Azure access token, so no Azure authorization is even attempted. |
+| Does `Microsoft.App/containerApps/*/write` cover the bare `containerApps/write` that `az containerapp update --image` needs? | Yes. The update was accepted under `Container Apps Contributor` alone, and the app read back the requested image. |
+| Does ARM/ACA accept a digest-form `--image`? | Yes. The update landed with a `@sha256:…` reference and the app ran it. |
+| What does `az acr login` print under an `AcrPush`-only identity? | `Login Succeeded`, with no warning at all (§2). The control-plane fallback leaves no trace in the log. |
+| Does the digest round-trip through a real `docker push` work? | Yes. `docker inspect`'s `RepoDigests[0]` was parsed, stripped to a bare `sha256:…`, crossed the job boundary intact under secret masking, and was what `deploy` addressed. |
+| Do the GitHub REST response shapes the environment read-back depends on match what the API returns? | Yes. `create-github-oidc.sh` step 5's field-by-field comparison against `deployment_branch_policy` and `protection_rules[].reviewers` executed against the live API and passed. |
+
+Two live bugs also came out of that run and are fixed in the code this
+document describes: `az role assignment list` rejects `--all` together with
+`--scope` (the flag is for the case where no scope is named), and the
+revision poll's success allow-list was unsound — see the next row and
+`update-container-app.sh`.
+
+**The `runningState` vocabulary, and why the poll is failure-shaped.**
+`update-container-app.sh` polls `properties.runningState`, and the field
+choice was right — it is still the most specific signal
+`az containerapp revision show` exposes. The *vocabulary* assumed for it was
+not. A healthy, correctly-deployed revision reported `RunningAtMaxScale`, and
+a second deployment in the same session reported `Activating`; neither value
+appears in the `RevisionRunningState` enum shipped by the containerapp CLI
+extension installed at the time (`azext_containerapp/_sdk_enums.py`, which
+lists only `Running`/`Processing`/`Stopped`/`Degraded`/`Failed`/`Unknown`).
+Two observations against that installed enum are enough to establish that it
+could not be used as a complete success allow-list, which is why the poll is
+now failure-shaped: it aborts on the enum's named failure states, keeps
+waiting through `Processing`, and treats every other value — including
+vocabulary this project has not seen — as not evidence of failure. It does
+not establish what the service's full vocabulary is, nor that any particular
+new value will appear next. What proves a deployment actually succeeded is
+therefore not the poll: it is the combination the script performs around it —
+the pre-mutation snapshot, the read-back that the app now carries the exact
+requested digest, the revision reading active/provisioned, and step 4's
+exact-body `/health` probe. See the comment above the poll in
+`infra/scripts/update-container-app.sh` for the full account.
+
+### Still open
+
+- **`concurrency` behaviour under two competing runs** (§1) — untested; no
+  two runs ever competed for the `production` group, and in particular
+  whether a run waiting on approval counts as the queued `pending` slot was
+  not exercised.
+- **Single-revision behaviour when a revision fails to start.** This
+  session's revisions both came up healthy. Because the app runs in single
+  revision mode, this leaves a specific gap worth naming: it has not been
+  observed whether a new revision that fails to pull its image would be
+  caught by the checks above, or whether the previous revision would keep
+  serving `/health` while the new one fails — which would make the probe
+  return the expected body for the wrong reason. The digest read-back is a
+  control-plane check and would still report what was requested. This is the
+  one place where "the deployment succeeded" rests on an untested
+  assumption.
+- **Role-assignment propagation timing for this pipeline** — **not measured
+  this run.** The first workflow run authenticated and pushed without an
+  authorization failure, which is a single non-failure, not a measurement.
+  The only propagation figure anywhere in this project remains Day 20's
+  **14 minutes 44 seconds** against Microsoft's documented "up to 5 minutes"
+  ([managed-identity.md §2](managed-identity.md#2-keyless-azure-openai-on-this-projects-own-client-shape)),
+  and that number describes a *different* identity type (a managed identity
+  reaching the Azure OpenAI data plane) under Day 20's own conditions — prior
+  art for how far "up to 5 minutes" has been shown wrong, not a prediction
+  for these two app-registration service principals.
+- **The ABAC migration path** (§10) — neither `rbac-abac` registry mode nor
+  the replacement roles have ever been created or tested in this series.
+
+### One recorded, not fixed
+
+`az containerapp env delete`'s completion signal failed for the second time,
+in a second distinct way: Day 24 saw the command return while the environment
+was still listed (`ScheduledForDelete`); this session saw the CLI's own
+long-poll `GET` raise a client-side `ReadTimeout` (with `read timeout=None`)
+while the server had in fact accepted the delete. Teardown aborted at step 2
+and never reached the workspace, the role assignments or the identity. No
+script change was made: what covers it today is an operator re-running the
+script, which is idempotent. Recorded here because teardown order is a
+contract, and an abort partway through it leaves more behind than an outright
+failure would.

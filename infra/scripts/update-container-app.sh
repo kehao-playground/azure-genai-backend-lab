@@ -220,18 +220,16 @@ require_value "$REVISION_NAME" "the latest revision name"
 # provisioning and would not obviously reflect a container that provisioned
 # fine but crashed on startup). What the live session actually observed is
 # that a healthy, correctly-deployed single-replica revision reported
-# runningState "RunningAtMaxScale", not "Running" -- because its replica
-# count equals its max, which is the normal case for this lab's
-# configuration, not an edge case. That value is not a documented typo: the
-# pinned containerapp CLI extension's own SDK enum
-# (azext_containerapp/_sdk_enums.py, RevisionRunningState) lists only
-# Running / Processing / Stopped / Degraded / Failed / Unknown --
-# "RunningAtMaxScale" is outside even the extension's own published
-# vocabulary. Consulting that enum before writing this check would have
-# produced the exact same bug: the service returns values its own SDK does
-# not enumerate, so an allow-list of "success" strings is unsound here --
-# the next unlisted healthy value fails the same way an allow-list did on
-# 2026-08-20.
+# runningState "RunningAtMaxScale", not "Running"; a second deployment in the
+# same session reported "Activating". Neither string appears in the SDK enum
+# shipped by the containerapp CLI extension in use during that session
+# (azext_containerapp/_sdk_enums.py, RevisionRunningState, which lists only
+# Running / Processing / Stopped / Degraded / Failed / Unknown). Consulting
+# that enum before writing this check would have produced the exact same bug:
+# the service returned values its own installed SDK does not enumerate, twice,
+# so an allow-list of "success" strings cannot be grounded in it. That is what
+# these two observations establish -- not what the service's full vocabulary
+# is, and not that any particular further value will appear.
 #
 # The check is therefore failure-shaped, not success-shaped: it fails fast
 # on the two states this project has evidence are terminal failures
@@ -240,8 +238,14 @@ require_value "$REVISION_NAME" "the latest revision name"
 # under way), and treats every other value -- Running, RunningAtMaxScale,
 # Stopped, Unknown, and whatever undocumented string Azure returns next --
 # as not evidence of failure. It does not treat that as proof of success
-# either: step 4's exact-body /health probe is what proves the app is
-# actually serving, not this poll.
+# either. What stands in for success is the combination this script performs
+# around the poll: the read-back that the app now carries the exact requested
+# digest, the revision reading active/provisioned, and step 4's exact-body
+# /health probe. One caveat that combination does not close: this app runs in
+# single revision mode, and it has never been observed here what happens when
+# a new revision fails to start -- whether /health would then be answered by
+# the previous revision, returning the expected body for the wrong reason.
+# See docs/ci-cd.md section 11 ("Still open").
 RUNNING_STATE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
   RUNNING_STATE=$(az containerapp revision show \
