@@ -511,5 +511,4 @@ read as resolving them in advance:
 
 Task 10's live session is what answers these. Until then, treat every
 mechanism in this document as *specified by the code, and verified only by
-reading it*, not as *observed running against real GitHub Actions or Azure
-state*.
+reading it*, not as *observed running against real Azure state*.
