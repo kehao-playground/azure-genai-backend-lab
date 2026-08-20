@@ -353,8 +353,8 @@ watching a rolling restart may see a burst of these. That code names the
 - **Image scanning** (Docker Scout, Microsoft Defender for Cloud) is still
   not part of this pipeline. Day 25's `image` job is designed to build this
   Dockerfile and push it to ACR on every push to `main`
-  ([ci-cd.md](ci-cd.md)) — that pipeline has not yet run against real
-  GitHub Actions, so "published" here describes what it is built to do, not
+  ([ci-cd.md](ci-cd.md)) — that pipeline has never pushed an image to ACR,
+  so "published" here describes what it is built to do, not
   a history of images it has produced — but nothing in that job scans
   whatever it pushes for vulnerabilities. What that job does check is boot:
   the Day 23 gate proves the build, and `scripts/boot_smoke.sh` (extracted
