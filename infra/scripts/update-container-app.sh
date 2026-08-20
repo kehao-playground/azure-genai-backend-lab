@@ -47,8 +47,16 @@
 #
 # Optional env vars:
 #   ACA_REVISION_POLL_ATTEMPTS / ACA_REVISION_POLL_INTERVAL
-#       Bounds on waiting for the new revision's runningState to reach a
-#       terminal value. Default 30 attempts * 10s = up to 5 minutes.
+#       Bounds on waiting out a revision stuck reporting "Processing" -- the
+#       one runningState value this project treats as still-provisioning.
+#       Every other value (a known failure, or anything else, including
+#       vocabulary this project has not seen yet) ends the wait on its
+#       first read, so a healthy deploy no longer burns this budget; it now
+#       bounds only a revision that is genuinely still starting up. Default
+#       kept at 30 attempts * 10s = up to 5 minutes unchanged from before
+#       this project had a live measurement of how long "Processing" is
+#       ever legitimately expected to last -- shrinking it without that
+#       measurement would trade one guess for another.
 #   HEALTH_POLL_ATTEMPTS / HEALTH_POLL_INTERVAL
 #       Bounds on the /health probe. The ingress needs a moment after a
 #       revision swaps, so this is a wait with a deadline, not a single
@@ -202,16 +210,38 @@ REVISION_NAME=$(az containerapp show \
   --query "properties.latestRevisionName" -o tsv)
 require_value "$REVISION_NAME" "the latest revision name"
 
-# Which field authoritatively reports "the new revision failed to start" is
-# an open question this project has not settled, resolved only by a live
-# Azure session that has not happened yet (Task 10). Implemented against the
-# revision's own properties.runningState: it is the most specific field
+# Which field authoritatively reports "the new revision failed to start" was
+# an open question this project had not settled, resolved by the Task 10
+# live session (2026-08-20, japaneast). It settled the field choice, not the
+# vocabulary: properties.runningState is still the most specific field
 # `az containerapp revision show` exposes for whether the container is
 # actually running, more specific than the app-level
 # properties.provisioningState (which reflects ARM-level resource
 # provisioning and would not obviously reflect a container that provisioned
-# fine but crashed on startup). Task 8's docs record what Task 10 actually
-# observes; this comment is not a claim that runningState is correct.
+# fine but crashed on startup). What the live session actually observed is
+# that a healthy, correctly-deployed single-replica revision reported
+# runningState "RunningAtMaxScale", not "Running" -- because its replica
+# count equals its max, which is the normal case for this lab's
+# configuration, not an edge case. That value is not a documented typo: the
+# pinned containerapp CLI extension's own SDK enum
+# (azext_containerapp/_sdk_enums.py, RevisionRunningState) lists only
+# Running / Processing / Stopped / Degraded / Failed / Unknown --
+# "RunningAtMaxScale" is outside even the extension's own published
+# vocabulary. Consulting that enum before writing this check would have
+# produced the exact same bug: the service returns values its own SDK does
+# not enumerate, so an allow-list of "success" strings is unsound here --
+# the next unlisted healthy value fails the same way an allow-list did on
+# 2026-08-20.
+#
+# The check is therefore failure-shaped, not success-shaped: it fails fast
+# on the two states this project has evidence are terminal failures
+# (Failed, Degraded -- no point burning the poll budget on those), keeps
+# waiting only through "Processing" (the one state named for still being
+# under way), and treats every other value -- Running, RunningAtMaxScale,
+# Stopped, Unknown, and whatever undocumented string Azure returns next --
+# as not evidence of failure. It does not treat that as proof of success
+# either: step 4's exact-body /health probe is what proves the app is
+# actually serving, not this poll.
 RUNNING_STATE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
   RUNNING_STATE=$(az containerapp revision show \
@@ -221,21 +251,22 @@ for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
     --revision "$REVISION_NAME" \
     --query "properties.runningState" -o tsv)
   require_value "$RUNNING_STATE" "the new revision running state"
-  if [ "$RUNNING_STATE" = "Running" ]; then
-    break
-  fi
   if [ "$RUNNING_STATE" = "Failed" ] || [ "$RUNNING_STATE" = "Degraded" ]; then
+    echo "Revision '$REVISION_NAME' runningState is '$RUNNING_STATE'; aborting." >&2
+    exit 1
+  fi
+  if [ "$RUNNING_STATE" != "Processing" ]; then
     break
   fi
   if ((ATTEMPT < ACA_REVISION_POLL_ATTEMPTS)); then
     sleep "$ACA_REVISION_POLL_INTERVAL"
   fi
 done
-if [ "$RUNNING_STATE" != "Running" ]; then
-  echo "Revision '$REVISION_NAME' runningState is '$RUNNING_STATE' after $ACA_REVISION_POLL_ATTEMPTS attempts." >&2
+if [ "$RUNNING_STATE" = "Processing" ]; then
+  echo "Revision '$REVISION_NAME' runningState is still 'Processing' after $ACA_REVISION_POLL_ATTEMPTS attempts; aborting." >&2
   exit 1
 fi
-echo "  revision '$REVISION_NAME' is Running"
+echo "  revision '$REVISION_NAME' reports runningState '$RUNNING_STATE' (not a known failure state; /health decides next)"
 
 # === step 4: data-plane smoke ================================================
 echo "== step 4: /health smoke =="

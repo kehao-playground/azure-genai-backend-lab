@@ -192,7 +192,7 @@ def test_happy_path_updates_and_verifies(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert f"requesting: {DIGEST_IMAGE}" in result.stdout
     assert "app reports the requested image" in result.stdout
-    assert "is Running" in result.stdout
+    assert "reports runningState 'Running'" in result.stdout
     assert "/health returned the expected body" in result.stdout
     assert h.state["fqdn"] in result.stdout
     assert DIGEST_IMAGE in result.stdout
@@ -367,20 +367,73 @@ def test_revision_failed_state_fails_the_update(tmp_path: Path) -> None:
     assert h.count("containerapp revision show") == 1
 
 
-def test_revision_stuck_provisioning_fails_after_bounded_polling(tmp_path: Path) -> None:
-    h = Harness(tmp_path, running_state="Provisioning")
+def test_revision_stuck_processing_fails_after_bounded_polling(tmp_path: Path) -> None:
+    # "Processing" is the one value in the pinned CLI extension's own
+    # RevisionRunningState enum that means still-provisioning -- the only
+    # state this poll keeps waiting through.
+    h = Harness(tmp_path, running_state="Processing")
     result = h.run()
     assert result.returncode != 0
-    assert "runningState is 'Provisioning'" in result.stderr
+    assert "runningState is still 'Processing'" in result.stderr
     assert h.count("containerapp revision show") == 3  # ACA_REVISION_POLL_ATTEMPTS
     assert not h.has("curl ")
 
 
-def test_revision_becomes_running_after_transient_polls(tmp_path: Path) -> None:
-    h = Harness(tmp_path, running_states=["Provisioning", "Provisioning", "Running"])
+def test_revision_resolves_to_non_failure_state_after_transient_polls(tmp_path: Path) -> None:
+    # The revision spends two polls "Processing" before settling on
+    # "RunningAtMaxScale" -- not "Running" -- which must still be accepted
+    # once polling stops finding "Processing".
+    h = Harness(tmp_path, running_states=["Processing", "Processing", "RunningAtMaxScale"])
     result = h.run()
     assert result.returncode == 0, result.stderr
     assert h.count("containerapp revision show") == 3
+
+
+# ---------------------------------------------------------------------------
+# Regression: 2026-08-20, japaneast. A live deploy of a healthy,
+# single-replica revision reported runningState "RunningAtMaxScale", a value
+# the pinned containerapp CLI extension's own RevisionRunningState enum
+# (azext_containerapp/_sdk_enums.py) does not contain -- confirmed by reading
+# that file at its installed path before writing this fix. An allow-list of
+# "success" strings is unsound against a vocabulary the service's own SDK
+# does not fully enumerate, so these tests pin the failure-shaped
+# replacement: only Failed/Degraded abort, only Processing keeps waiting,
+# and everything else -- including values this project has never seen --
+# is accepted without polling further.
+# ---------------------------------------------------------------------------
+
+
+def test_revision_running_at_max_scale_succeeds_immediately(tmp_path: Path) -> None:
+    h = Harness(tmp_path, running_state="RunningAtMaxScale")
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert "reports runningState 'RunningAtMaxScale'" in result.stdout
+    # Not an allow-list entry for this one string: the very first read ends
+    # the wait, exactly as it would for "Running" or any other non-failure,
+    # non-Processing value.
+    assert h.count("containerapp revision show") == 1
+
+
+def test_revision_unrecognized_future_state_is_not_evidence_of_failure(tmp_path: Path) -> None:
+    # A value this project has never seen and did not special-case must
+    # still be accepted -- the fix is "anything but a known failure or
+    # Processing", not a second allow-list entry alongside "Running".
+    h = Harness(tmp_path, running_state="SomeFutureStateThisTestInvented")
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert h.count("containerapp revision show") == 1
+
+
+def test_revision_degraded_state_fails_the_update_without_burning_the_budget(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path, running_state="Degraded")
+    result = h.run()
+    assert result.returncode != 0
+    assert "runningState is 'Degraded'" in result.stderr
+    assert "No automatic rollback" in result.stderr
+    assert not h.has("curl ")
+    assert h.count("containerapp revision show") == 1
 
 
 def test_empty_revision_name_read_aborts_before_polling(tmp_path: Path) -> None:

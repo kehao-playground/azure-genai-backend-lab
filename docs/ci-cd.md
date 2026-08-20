@@ -580,21 +580,40 @@ read as resolving them in advance:
   cite it here as prior art for how far "up to 5 minutes" has already
   been shown wrong, not as a prediction for these two app-registration
   service principals reaching the ACR and Container Apps control planes.
-- **Whether `Container Apps Contributor`'s coverage of
+- ~~Whether `Container Apps Contributor`'s coverage of
   `containerApps/*/write` extends to the bare `containerApps/write`
-  action `az containerapp update --image` needs.** Not verified against a
-  live call.
-- **Whether ARM/ACA accepts a digest-form `--image`**, and how a
-  single-revision-mode app behaves when the revision it produces fails to
-  start. `update-container-app.sh` polls the new revision's
-  `properties.runningState` as the most specific field `az containerapp
-  revision show` exposes for this, but which field authoritatively
-  reports a failed start is, in the script's own words, "an open question
-  in this project" — this document does not settle it either.
-- **What `az acr login` prints under an identity that holds only
-  `AcrPush`** (no `registries/read`) — the fallback path §2 documents has
-  never been exercised against a real `AcrPush`-only identity in this
-  project.
+  action `az containerapp update --image` needs.~~ **Settled (observed
+  2026-08-20, japaneast): yes.** `az containerapp update --image <digest>`
+  under the deploy identity's `Container Apps Contributor` role assignment
+  was accepted, and the app read back the requested image.
+- ~~Whether ARM/ACA accepts a digest-form `--image`~~. **Settled (observed
+  2026-08-20, japaneast): yes.** The update above landed with a
+  `@sha256:...` reference, and the app is running one.
+  How a single-revision-mode app behaves when the revision it produces
+  actually fails to start remains open — this run's revision came up
+  healthy. What the same run did settle is narrower: which field
+  authoritatively reports the revision's state.
+  `update-container-app.sh` polls `properties.runningState`, and this run
+  settled that the field choice itself was right — it is still the most
+  specific signal `az containerapp revision show` exposes — but not the
+  vocabulary assumed for it. The healthy, correctly-deployed revision
+  reported runningState `RunningAtMaxScale`, a value outside even the
+  pinned containerapp CLI extension's own `RevisionRunningState` SDK enum
+  (`azext_containerapp/_sdk_enums.py` lists only
+  `Running`/`Processing`/`Stopped`/`Degraded`/`Failed`/`Unknown`). The poll
+  is now failure-shaped rather than success-shaped because of this: it
+  aborts fast on the enum's two named failure states, keeps waiting only
+  through `Processing`, and treats every other value — including
+  vocabulary this project has not seen yet — as not evidence of failure,
+  leaving step 4's exact-body `/health` probe as the actual proof the app
+  is serving. See the comment above the poll in
+  `infra/scripts/update-container-app.sh` for the full account.
+- ~~What `az acr login` prints under an identity that holds only
+  `AcrPush`~~ (no `registries/read`). **Settled (observed 2026-08-20,
+  japaneast): `Login Succeeded`, with no warning at all** — the fallback
+  path §2 documents was exercised against a real `AcrPush`-only identity
+  and produced output indistinguishable from a login backed by broader
+  registry permissions.
 - **The GitHub REST response shapes the environment-protection read-back
   depends on** (`create-github-oidc.sh` step 5's field-by-field
   comparison against `deployment_branch_policy` and
