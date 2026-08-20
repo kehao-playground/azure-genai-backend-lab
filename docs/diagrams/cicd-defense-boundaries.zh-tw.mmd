@@ -8,13 +8,13 @@ flowchart TD
     E -->|"人按下核准"| F["freshness guard<br/>github.sha 仍是 main HEAD？"]
     F --> O["OIDC token 交換<br/>subject＝environment:production"]
     O --> D["az containerapp update<br/>--image ＠digest"]
-    D --> H["/health 精確 body＝部署完成"]
+    D --> H["/health 精確 body<br/>＝部署完成"]
 
     G -.- gN["證明不了：有人讀過 diff<br/>上限＝fake CLI 的保真度"]
-    E -.- eN["擋不住：核准前 image 已進 ACR<br/>單人自我核准 ≠ 雙人覆核"]
+    E -.- eN["擋不住：<br/>核准前 image 已進 ACR<br/>單人自我核准 ≠ 雙人覆核"]
     F -.- fN["答的是「還新鮮嗎」<br/>不是「review 過了嗎」"]
     O -.- oN["subject 不帶 ref<br/>分支限制在 branch policy"]
-    D -.- dN["runningState 只當失敗偵測器<br/>成功由 /health 判定"]
+    D -.- dN["runningState＝失敗偵測器<br/>成功由 /health 判定"]
 
     style H fill:#d3f0d8,stroke:#2e7d32
     style gN fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
