@@ -265,22 +265,25 @@ secret-masked copy of itself and, on any difference, drops the output
 entirely rather than passing through `***` — `context.Warning($"Skip
 output '{output.Key}' since it may contain secret.")` immediately followed
 by `continue`, in `FinalizeJob`
-([`src/Runner.Worker/JobExtension.cs`](https://github.com/actions/runner/blob/main/src/Runner.Worker/JobExtension.cs),
+([`src/Runner.Worker/JobExtension.cs`](https://github.com/actions/runner/blob/258d6c857db3519913f7deb6004b60172f8043ae/src/Runner.Worker/JobExtension.cs),
 checked 2026-08-20). The full digest string
 (`<acr-name>.azurecr.io/azgenai-lab@sha256:…`) would trip that check, since
 it contains the now-secret ACR name; `DIGEST="${FULL_DIGEST#*@}"` above
 removes exactly that prefix before the value ever reaches
 `echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"`, so `sha256:` plus 64 hex
-characters is what actually crosses the job boundary — content the masker
-has nothing to match. This strip predates the secrets migration and was
+characters is what actually crosses the job boundary — content none of
+these seven values can occur inside: every one of them either contains a
+`-`, which a digest never does, or — for the ACR name, the only
+alphanumeric-only one — would have to be composed entirely of hex
+characters. This strip predates the secrets migration and was
 written for the reproducibility reason above; that it also keeps this
 particular output alive is a side effect of that design, not something the
 migration itself reasoned about. Had this pipeline instead published the
 full `<acr-name>.azurecr.io/...@sha256:...` reference as a job output, the
-masker would silently empty it, and `deploy`'s own `[ -z "$DIGEST" ]`
-guard would then refuse to deploy — a loud, fail-closed failure, not a
-silent one, but one this design avoids entirely by never putting the
-secret-shaped substring in an output in the first place.
+masker would empty it — that warning in the `image` job's log being the
+only clue on that side — and `deploy`'s own `[ -z "$DIGEST" ]` guard would
+then refuse to deploy, a failure this design avoids entirely by never
+putting the secret-shaped substring in an output in the first place.
 
 ## 6. Why no `--platform`
 
