@@ -1,0 +1,19 @@
+%% Publication source (zh-TW) for the Day 26 article figure.
+%% English semantic companion: infra-ownership-axes.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TD
+    S["一個 infra 物件"] --> A1{"軸一：provisioning ownership<br/>(a) 型別可宣告？<br/>(b) 在意的屬性不經<br/>resource function／secret 產出？<br/>(c) 變更可預覽<br/>（what-if）？"}
+    A1 -->|"任一不成立"| K1["建立與更新留在腳本"]
+    A1 -->|"三條全成立"| B["建立與更新交給 Bicep<br/>拆除仍留腳本<br/>（main.bicep：AOAI 帳號＋兩個 deployment）"]
+    B --> A2{"軸二：full lifecycle ownership<br/>前置：對該型別實測過 deployment stack<br/>(d) actionOnUnmanage<br/>表達得了它的拆除？<br/>(e) ownership 可追蹤？"}
+    A2 -->|"未實測，或任一不成立"| K2["teardown 留在腳本<br/>（本 lab 今天：全部物件）"]
+    A2 -->|"實測過＋兩條成立"| C["生命週期整包交給 deployment stack<br/>（本 lab 今天：0 個）"]
+
+    K1 -.- n1["例：Entra client secret、<br/>Search index schema、GitHub"]
+    A1 -.- n2["Graph 物件過得了 (a)<br/>卻沒有 what-if——卡在 (c)"]
+    A2 -.- n3["預設 actionOnUnmanage＝detach：<br/>猜錯＝以為拆了的資源繼續計費"]
+
+    style B fill:#d3f0d8,stroke:#2e7d32
+    style n1 fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
+    style n2 fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
+    style n3 fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4
