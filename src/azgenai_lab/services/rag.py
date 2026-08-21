@@ -34,6 +34,7 @@ from azgenai_lab.core.audit import (
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.correlation import correlation_id_var
 from azgenai_lab.core.errors import ContextLengthExceededError, UpstreamError, upstream_outcome
+from azgenai_lab.core.telemetry import stage_span
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal
@@ -321,7 +322,12 @@ class RagService:
         retrieved: SearchResult | None = None
         included: list[SearchHit] = []
         try:
-            retrieved = await self._retriever.retrieve(question, principal)
+            # The three stage spans wrap the work Day 14 already timed and
+            # logged; they are the same boundaries, not a second clock. The
+            # embeddings and search spans nest under this one because the
+            # retriever raises them inside this context.
+            with stage_span("rag.retrieval"):
+                retrieved = await self._retriever.retrieve(question, principal)
             if not retrieved.hits:
                 _log_rag_stage(question, retrieved.hits, context="", dropped_source_count=0)
                 # No provider call happens on this path (structural
@@ -345,14 +351,15 @@ class RagService:
                     status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None
                 )
             current_stage = "assemble_context"
-            nonce = self._nonce_factory()
-            included, dropped_source_count = _select_within_budget(
-                question,
-                retrieved.hits,
-                instructions_bytes=self._instructions_bytes,
-                nonce=nonce,
-            )
-            user_message = render_user_message(question, included, nonce=nonce)
+            with stage_span("rag.assemble_context"):
+                nonce = self._nonce_factory()
+                included, dropped_source_count = _select_within_budget(
+                    question,
+                    retrieved.hits,
+                    instructions_bytes=self._instructions_bytes,
+                    nonce=nonce,
+                )
+                user_message = render_user_message(question, included, nonce=nonce)
             _log_rag_stage(
                 question,
                 included,
@@ -363,7 +370,8 @@ class RagService:
             current_stage = "generation"
             generation_started = time.perf_counter()
             try:
-                result = await self._chat_service.complete([item])
+                with stage_span("rag.generation"):
+                    result = await self._chat_service.complete([item])
             except Exception as exc:
                 duration_ms = (time.perf_counter() - generation_started) * 1000
                 # Redaction: neither question text nor chunk content is
