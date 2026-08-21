@@ -46,9 +46,38 @@ def step_upstream_recovers(context) -> None:  # type: ignore[no-untyped-def]
     app.dependency_overrides.pop(get_conversation_service, None)
 
 
+@given('the caller sends the correlation id "{value}"')
+def step_caller_correlation_id(context, value: str) -> None:  # type: ignore[no-untyped-def]
+    context.sent_correlation_id = value
+
+
 @when("I submit the request to the chat endpoint")
 def step_submit_chat_request(context) -> None:  # type: ignore[no-untyped-def]
-    context.response = context.client.post("/api/v1/chat", json=context.payload)
+    headers = {}
+    sent = getattr(context, "sent_correlation_id", None)
+    if sent is not None:
+        headers["X-Correlation-Id"] = sent
+    context.response = context.client.post(
+        "/api/v1/chat", json=context.payload, headers=headers
+    )
+
+
+@then("the echoed correlation id should differ from the one sent")
+def step_echoed_correlation_differs(context) -> None:  # type: ignore[no-untyped-def]
+    # Day 27: an unusable value is replaced rather than refused. The request
+    # still succeeds -- the error contract did not change -- but the id the
+    # caller gets back is the backend's own.
+    assert context.response is not None
+    echoed = context.response.headers["X-Correlation-Id"]
+    assert echoed != context.sent_correlation_id
+    assert context.response.json()["correlation_id"] == echoed
+
+
+@then('the echoed correlation id should be "{value}"')
+def step_echoed_correlation_equals(context, value: str) -> None:  # type: ignore[no-untyped-def]
+    assert context.response is not None
+    assert context.response.headers["X-Correlation-Id"] == value
+    assert context.response.json()["correlation_id"] == value
 
 
 class TruncatingChatService:

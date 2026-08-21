@@ -256,11 +256,10 @@ def create_app() -> FastAPI:
     async def root() -> dict[str, str]:
         return {"service": settings.app_name, "docs": "/docs", "health": "/health"}
 
-    # Last, after every middleware and router: Starlette's add_middleware
-    # inserts at position 0, so whatever registers last runs outermost.
-    # Instrumenting earlier would leave correlation_id_middleware outside the
-    # OpenTelemetry middleware, running before any server span exists -- and
-    # the correlation id it stamps would land on nothing, silently.
+    # Placed here because this is where the app is fully built, not because
+    # the position is load-bearing: instrument_app replaces
+    # build_middleware_stack rather than adding middleware, so its span wraps
+    # every user middleware whenever it is called (see instrument_fastapi_app).
     if telemetry_installed:
         instrument_fastapi_app(app)
 

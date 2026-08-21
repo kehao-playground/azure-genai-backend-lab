@@ -63,6 +63,12 @@ CONTROLLED_ENV: dict[str, str] = {
 # data, and this milestone is about the lifecycle of one LLM request.
 HEALTH_EXCLUDED_URLS = r"^https?://[^/]+/health$"
 
+# The join key across every telemetry surface. Application Insights has its
+# own identifier (operation_Id, the W3C trace id) and it is not this one: that
+# one describes the tree, this one is the contract Day 5 published and every
+# error envelope since has carried. Queries join on this.
+ATTR_CORRELATION_ID = "correlation_id"
+
 _installed = False
 
 
@@ -164,11 +170,16 @@ def instrument_fastapi_app(app: FastAPI) -> None:
     automatic path is disabled outright rather than left on in the hope that it
     misses.
 
-    Call this *after* every middleware and router is registered. Starlette's
-    ``add_middleware`` inserts at position 0, so whatever is added last runs
-    outermost: instrument earlier and `correlation_id_middleware` ends up
-    outside the OpenTelemetry middleware, where there is no server span yet for
-    it to stamp the correlation id onto.
+    Call order relative to middleware registration does not matter, which is
+    worth stating because it is not obvious: `instrument_app` does not go
+    through ``add_middleware`` at all. It replaces ``app.build_middleware_stack``
+    with a wrapper that builds the user's stack and then wraps
+    ``OpenTelemetryMiddleware`` around the outside of it
+    (opentelemetry/instrumentation/fastapi/__init__.py:355-395), and that
+    method runs lazily on startup. The server span therefore always encloses
+    every user middleware, including `correlation_id_middleware`, however early
+    or late this is called. Verified by moving the call before the middleware
+    registration and watching the correlation-id span assertion stay green.
     """
     if not _installed:
         # Guarded here as well as at the call site: tools/index_corpus.py is a

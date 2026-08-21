@@ -27,3 +27,18 @@ Feature: Chat API contract
     Then the response status code should be 200
     And the response JSON should report status "incomplete" with reason "max_output_tokens"
     And the response JSON should contain a non-empty "message"
+
+  Scenario: An unusable correlation id is replaced, not rejected
+    Given a valid chat request
+    And the caller sends the correlation id "has space"
+    When I submit the request to the chat endpoint
+    Then the response status code should be 200
+    And the echoed correlation id should differ from the one sent
+    And the response JSON should contain a "correlation_id"
+
+  Scenario: A usable correlation id is echoed back unchanged
+    Given a valid chat request
+    And the caller sends the correlation id "caller-supplied-42"
+    When I submit the request to the chat endpoint
+    Then the response status code should be 200
+    And the echoed correlation id should be "caller-supplied-42"
