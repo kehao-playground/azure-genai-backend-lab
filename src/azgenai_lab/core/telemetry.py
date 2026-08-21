@@ -20,17 +20,24 @@ being ingested and billed twice.
 
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
 from agent_framework.observability import enable_instrumentation
 from azure.monitor.opentelemetry import configure_azure_monitor
 from fastapi import FastAPI
+from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.correlation import ATTR_CORRELATION_ID, correlation_id_var
+from azgenai_lab.models.chat import TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +70,37 @@ CONTROLLED_ENV: dict[str, str] = {
 # data, and this milestone is about the lifecycle of one LLM request.
 HEALTH_EXCLUDED_URLS = r"^https?://[^/]+/health$"
 
-# The join key across every telemetry surface. Application Insights has its
-# own identifier (operation_Id, the W3C trace id) and it is not this one: that
-# one describes the tree, this one is the contract Day 5 published and every
-# error envelope since has carried. Queries join on this.
-ATTR_CORRELATION_ID = "correlation_id"
+# Own namespace, closed value set, low cardinality on purpose. This one is a
+# metric-shaped dimension even though it lives on a span, and a free-form
+# upstream status string here is how dimension explosions start. The error code
+# is read off UpstreamError rather than mapped again: Day 22 already closed
+# that set in the type, and a second copy of it would drift.
+ATTR_OUTCOME = "azgenai.outcome"
+ATTR_ERROR_CODE = "azgenai.error.code"
+OUTCOME_SUCCESS = "success"
+OUTCOME_REJECTED = "rejected"
+OUTCOME_ERROR = "error"
+
+# Time to first chunk, in seconds, measured from request issuance -- the
+# semantic convention's own definition
+# (opentelemetry/semconv/_incubating/attributes/gen_ai_attributes.py:271),
+# which is why the owning span starts before the request goes out rather than
+# when the adapter hands back a stream. Imported rather than spelled out so an
+# upstream rename fails at import instead of silently emitting a dead key; it
+# lives under `_incubating`, so that is a real possibility.
+ATTR_TTFB = gen_ai_attributes.GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK
+# Re-exported from the same place as the rest so callers have one import for
+# the vocabulary, and an upstream rename surfaces here rather than in five
+# adapters.
+ATTR_FINISH_REASONS = gen_ai_attributes.GEN_AI_RESPONSE_FINISH_REASONS
+
+# What a fake adapter reports as its deployment. The span name has to be
+# decided before the call, so it cannot be read off the result -- and Day 22
+# set the precedent of a "fake" sentinel rather than a blank or a lie
+# (provider_call_attempted records that the adapter boundary was reached, not
+# that Azure was).
+FAKE_DEPLOYMENT = "fake"
+FAKE_EMBEDDING_DEPLOYMENT = "fake-embeddings"
 
 _installed = False
 
@@ -211,3 +244,73 @@ def instrumented_httpx_client(**kwargs: Any) -> httpx.AsyncClient:
     if _installed:
         HTTPXClientInstrumentor.instrument_client(client)
     return client
+
+
+@contextmanager
+def llm_span(deployment: str, *, operation: str = "chat") -> Iterator[Span]:
+    """A semantic span over one model call.
+
+    Named ``{operation} {deployment}`` to match what agent-framework emits on
+    the /agent path, so a reader comparing the two trees is comparing like with
+    like. There are genuinely two producers of this span -- the framework's on
+    /agent, ours on /chat and /rag, because those go through the openai SDK
+    directly -- and their looking alike is a decision, not a coincidence.
+    """
+    with trace.get_tracer("azgenai_lab").start_as_current_span(
+        f"{operation} {deployment}",
+        kind=SpanKind.CLIENT,
+        # Both off, deliberately. record_exception defaults to True and writes
+        # the exception's own message into a span event -- upstream detail,
+        # verbatim, straight past the never-log rules Day 15/19/21/22 built up.
+        # Status is set explicitly by set_outcome instead. agent-framework's
+        # get_function_span turns the same two off for the same reason.
+        record_exception=False,
+        set_status_on_exception=False,
+        attributes={
+            gen_ai_attributes.GEN_AI_OPERATION_NAME: operation,
+            gen_ai_attributes.GEN_AI_PROVIDER_NAME: "azure.ai.openai",
+            gen_ai_attributes.GEN_AI_REQUEST_MODEL: deployment,
+        },
+    ) as span:
+        correlation_id = correlation_id_var.get()
+        if correlation_id is not None:
+            span.set_attribute(ATTR_CORRELATION_ID, correlation_id)
+        yield span
+
+
+@contextmanager
+def stage_span(name: str) -> Iterator[Span]:
+    """An application-owned span over one pipeline stage."""
+    with trace.get_tracer("azgenai_lab").start_as_current_span(
+        name,
+        kind=SpanKind.INTERNAL,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        correlation_id = correlation_id_var.get()
+        if correlation_id is not None:
+            span.set_attribute(ATTR_CORRELATION_ID, correlation_id)
+        yield span
+
+
+def set_usage_attributes(span: Span, usage: TokenUsage | None) -> None:
+    """Record provider-reported tokens. Absent usage leaves the keys absent.
+
+    Writing 0 for an unknown would turn "we do not know" into "it cost
+    nothing", and Day 9 already disclosed that a failed or disconnected call
+    may have incurred billable processing upstream while reporting no usage at
+    all.
+    """
+    if usage is None:
+        return
+    span.set_attribute(gen_ai_attributes.GEN_AI_USAGE_INPUT_TOKENS, usage.input_tokens)
+    span.set_attribute(gen_ai_attributes.GEN_AI_USAGE_OUTPUT_TOKENS, usage.output_tokens)
+
+
+def set_outcome(span: Span, outcome: str, error_code: str | None = None) -> None:
+    span.set_attribute(ATTR_OUTCOME, outcome)
+    if error_code is not None:
+        span.set_attribute(ATTR_ERROR_CODE, error_code)
+    if outcome == OUTCOME_ERROR:
+        # The classification, never the upstream's own message.
+        span.set_status(Status(StatusCode.ERROR, error_code or OUTCOME_ERROR))

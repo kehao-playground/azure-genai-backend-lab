@@ -38,8 +38,17 @@ from azgenai_lab.core.errors import (
     UpstreamServiceError,
     UpstreamThrottledError,
     UpstreamTimeoutError,
+    upstream_outcome,
 )
-from azgenai_lab.core.telemetry import instrumented_httpx_client
+from azgenai_lab.core.telemetry import (
+    ATTR_FINISH_REASONS,
+    FAKE_DEPLOYMENT,
+    OUTCOME_SUCCESS,
+    instrumented_httpx_client,
+    llm_span,
+    set_outcome,
+    set_usage_attributes,
+)
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts.loader import PromptTemplate
@@ -484,6 +493,72 @@ class AzureOpenAIChatService:
             await self._credential_aclose()
 
 
+class TracingChatService:
+    """Wraps any ``ChatService`` in one semantic span per model call.
+
+    A decorator at the composition point rather than code inside each adapter,
+    which is the decision Day 27 had to make and is worth recording. The
+    adapters are not the only implementations of this protocol: the test suite
+    substitutes the same narrow ``complete``/``open_stream``/``aclose`` shape
+    (``tests/unit/audit_helpers.py``'s RaisingChatService, and others), and an
+    adapter-internal span would leave every one of those paths -- which is to
+    say every failure path under test -- producing no span at all. Wrapping the
+    protocol covers real, fake and stand-in alike.
+
+    The deployment name is fixed at construction because a span has to be named
+    before the call it measures, so it cannot be read off the result. For fake
+    adapters that name is the ``"fake"`` sentinel, matching the ``model_version``
+    the fake already reports and the precedent Day 22 set with
+    ``provider_call_attempted``: the field records that the adapter boundary was
+    reached, not that Azure was.
+
+    ``open_stream`` deliberately passes straight through here. A streaming call's
+    span outlives the method that starts it -- it has to stay open across the
+    body iteration -- so it needs an owner rather than a context manager, which
+    is a separate piece of machinery.
+    """
+
+    def __init__(self, inner: ChatService, deployment: str) -> None:
+        self._inner = inner
+        self._deployment = deployment
+
+    @property
+    def inner(self) -> ChatService:
+        """The wrapped adapter. Exposed so composition tests can still say
+        which adapter was selected rather than only that something was."""
+        return self._inner
+
+    async def complete(self, items: Sequence[ReplayItem]) -> ChatResult:
+        with llm_span(self._deployment) as span:
+            try:
+                result = await self._inner.complete(items)
+            except UpstreamError as exc:
+                # upstream_outcome, not a hardcoded "error": a 4xx is this
+                # caller's request being rejected and a 5xx is a failure that
+                # was not their fault. Day 22's audit outcome field already
+                # makes that split, and a second copy of the rule here would
+                # be a second thing to keep in sync.
+                set_outcome(span, upstream_outcome(exc), exc.code)
+                raise
+            set_usage_attributes(span, result.usage)
+            span.set_attribute(
+                ATTR_FINISH_REASONS,
+                # Day 6's incomplete_reason is the same fact under this repo's
+                # own name; the convention wants a list.
+                [result.incomplete_reason or result.status],
+            )
+            set_outcome(span, OUTCOME_SUCCESS)
+            return result
+
+    async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
+        # `async def` to match the protocol: Day 6 made this an eager await so
+        # a pre-stream failure raises before the StreamingResponse exists.
+        return await self._inner.open_stream(items)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatService:
     """Composition point: fake vs. real. The prompt instance is loaded once by
     the caller (fail-fast on a malformed template, same as before) and shared
@@ -492,7 +567,7 @@ def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatSer
     describe the prompt this adapter actually holds.
     """
     if settings.use_fake_llm:
-        return FakeChatService(prompt=prompt)
+        return TracingChatService(FakeChatService(prompt=prompt), FAKE_DEPLOYMENT)
     if not (settings.azure_openai_endpoint and settings.azure_openai_deployment_name):
         raise ValueError(
             "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT_NAME"
@@ -508,10 +583,13 @@ def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatSer
         # the only way the upstream call appears as a dependency at all.
         http_client=instrumented_httpx_client(timeout=settings.llm_timeout_seconds),
     )
-    return AzureOpenAIChatService(
-        client,
+    return TracingChatService(
+        AzureOpenAIChatService(
+            client,
+            settings.azure_openai_deployment_name,
+            prompt,
+            max_output_tokens=settings.llm_max_output_tokens,
+            credential_aclose=auth.aclose,
+        ),
         settings.azure_openai_deployment_name,
-        prompt,
-        max_output_tokens=settings.llm_max_output_tokens,
-        credential_aclose=auth.aclose,
     )
