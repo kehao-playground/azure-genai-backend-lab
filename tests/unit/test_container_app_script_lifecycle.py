@@ -1555,3 +1555,66 @@ def test_delete_script_exists_and_is_executable() -> None:
     path = SCRIPTS_DIR / "delete-container-app.sh"
     assert path.is_file()
     assert os.access(path, os.X_OK)
+
+
+# --- Day 27: Key Vault need is two independent questions --------------------
+#
+# The whole Key Vault coupling used to hang off AZ_SEARCH_MODE alone: the vault
+# lookup, the "Key Vault Secrets User" assignment, the secrets: block. That
+# made "fake Search plus telemetry" deploy with no vault at all -- and a
+# tracing session is exactly the run that wants fake Search and a connection
+# string. Four states, because three of them were previously unreachable.
+
+_APPI_SECRET_URI = (
+    "https://kv-fake.vault.azure.net/secrets/applicationinsights-connection-string/abc123"
+)
+
+
+def test_fake_search_with_telemetry_still_wires_key_vault(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run(AZ_SEARCH_MODE="fake", AZ_APPINSIGHTS_SECRET_URI=_APPI_SECRET_URI)
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert "secrets:" in yaml_text
+    assert "applicationinsights-connection-string" in yaml_text
+    assert "APPLICATIONINSIGHTS_CONNECTION_STRING" in yaml_text
+    # No Search key anywhere: fake Search still has nothing to store.
+    assert "search-admin-key" not in yaml_text
+    # And the identity is still granted read access, or the reference above
+    # resolves to nothing at runtime.
+    assert any("Key Vault Secrets User" in call for call in h.calls)
+
+
+def test_fake_search_without_telemetry_touches_no_key_vault(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run(AZ_SEARCH_MODE="fake")
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert "secrets:" not in yaml_text
+    assert "APPLICATIONINSIGHTS_CONNECTION_STRING" not in yaml_text
+    assert not any("Key Vault Secrets User" in call for call in h.calls)
+
+
+def test_real_search_with_telemetry_wires_both_secrets(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run(AZ_APPINSIGHTS_SECRET_URI=_APPI_SECRET_URI)
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    # One secrets: block, two entries under it -- not two blocks, which is what
+    # a naive second heredoc would have produced.
+    assert yaml_text.count("secrets:") == 1
+    assert "search-admin-key" in yaml_text
+    assert "applicationinsights-connection-string" in yaml_text
+
+
+def test_real_search_without_telemetry_is_unchanged(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+    yaml_text = h.state["app_yaml"]
+    assert "search-admin-key" in yaml_text
+    assert "applicationinsights-connection-string" not in yaml_text

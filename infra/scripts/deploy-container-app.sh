@@ -56,8 +56,9 @@
 #   AZ_SUBSCRIPTION_ID   - target subscription (never rely on the default context)
 #   AZ_RESOURCE_GROUP    - existing resource group holding every resource below
 #   AZ_ACR_NAME          - existing registry (from create-acr.sh, which prints it)
-#   AZ_KEYVAULT_NAME     - existing key vault (create-keyvault.sh); required only
-#                          when AZ_SEARCH_MODE=real (the default) -- see below
+#   AZ_KEYVAULT_NAME     - existing key vault (create-keyvault.sh); required
+#                          when AZ_SEARCH_MODE=real (the default) OR when
+#                          AZ_APPINSIGHTS_SECRET_URI is set -- see below
 #   AZ_SEARCH_NAME       - existing search service (create-search.sh); required only
 #                          when AZ_SEARCH_MODE=real (the default) -- see below
 #   AZ_OPENAI_NAME       - existing Azure OpenAI account (create-openai.sh)
@@ -73,6 +74,11 @@
 #   AZ_ACA_ENV_NAME                   - defaults to acaenv-azgenai-lab
 #   AZ_ACA_APP_NAME                   - defaults to aca-azgenai-lab
 #   AZ_MI_NAME                        - defaults to mi-azgenai-lab
+#   AZ_APPINSIGHTS_SECRET_URI         - Key Vault secret id holding the
+#                                        Application Insights connection string
+#                                        (printed by create-app-insights.sh).
+#                                        Unset deploys with telemetry off, the
+#                                        same default the code has.
 #   AZ_SEARCH_MODE                    - real (default) or fake. fake drops every
 #                                        Search/Key Vault coupling this script would
 #                                        otherwise create: AZ_SEARCH_NAME and
@@ -128,6 +134,16 @@ case "$AZ_SEARCH_MODE" in
     exit 1
     ;;
 esac
+# Day 27. Key Vault is needed when EITHER the Search admin key or the
+# Application Insights connection string has to reach the app -- two
+# independent reasons, and gating the whole coupling on AZ_SEARCH_MODE alone
+# meant "fake Search plus telemetry" silently deployed with no vault, no role
+# assignment and no secrets: block. That combination is exactly the one a
+# tracing session runs.
+NEEDS_KEYVAULT=false
+if [ "$AZ_SEARCH_MODE" = "real" ]; then NEEDS_KEYVAULT=true; fi
+if [ -n "${AZ_APPINSIGHTS_SECRET_URI:-}" ]; then NEEDS_KEYVAULT=true; fi
+
 if [ "$AZ_SEARCH_MODE" = "real" ]; then
   : "${AZ_KEYVAULT_NAME:?Set AZ_KEYVAULT_NAME}"
   : "${AZ_SEARCH_NAME:?Set AZ_SEARCH_NAME}"
@@ -392,7 +408,7 @@ echo "== stage 3: role assignments =="
 ACR_ID=$(az acr show --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_ACR_NAME" --query id -o tsv)
 require_value "$ACR_ID" "the container registry resource id"
-if [ "$AZ_SEARCH_MODE" = "real" ]; then
+if [ "$NEEDS_KEYVAULT" = true ]; then
   KV_ID=$(az keyvault show --subscription "$AZ_SUBSCRIPTION_ID" \
     --resource-group "$AZ_RESOURCE_GROUP" --name "$AZ_KEYVAULT_NAME" --query id -o tsv)
   require_value "$KV_ID" "the key vault resource id"
@@ -457,7 +473,10 @@ assign_role() {
 }
 MUTATED=true
 assign_role "AcrPull" "$ACR_ID"
-if [ "$AZ_SEARCH_MODE" = "real" ]; then
+if [ "$NEEDS_KEYVAULT" = true ]; then
+  # Read-only on the data plane, and read is all the app ever does: both
+  # secrets are written by the provisioning scripts, never by the app or by
+  # this deploy.
   assign_role "Key Vault Secrets User" "$KV_ID"
 fi
 assign_role "Cognitive Services OpenAI User" "$AOAI_ID"
@@ -725,16 +744,26 @@ properties:
         identity: ${MI_ID}
 YAML
 
-# secrets: has no reason to exist when nothing references it: the only secret
-# this app ever needs is the Search admin key, and AZ_SEARCH_MODE=fake means
-# there is no such key.
-if [ "$AZ_SEARCH_MODE" = "real" ]; then
+# secrets: has no reason to exist when nothing references it, and which
+# secrets exist is now two independent questions rather than one.
+if [ "$NEEDS_KEYVAULT" = true ]; then
   cat >>"$APP_YAML" <<YAML
     secrets:
+YAML
+  if [ "$AZ_SEARCH_MODE" = "real" ]; then
+    cat >>"$APP_YAML" <<YAML
       - name: search-admin-key
         keyVaultUrl: ${KV_SECRET_URI}
         identity: ${MI_ID}
 YAML
+  fi
+  if [ -n "${AZ_APPINSIGHTS_SECRET_URI:-}" ]; then
+    cat >>"$APP_YAML" <<YAML
+      - name: applicationinsights-connection-string
+        keyVaultUrl: ${AZ_APPINSIGHTS_SECRET_URI}
+        identity: ${MI_ID}
+YAML
+  fi
 fi
 
 cat >>"$APP_YAML" <<YAML
@@ -783,6 +812,16 @@ if [ "$AZ_SEARCH_MODE" = "real" ]; then
             value: "${AZURE_SEARCH_ENDPOINT}"
           - name: AZURE_SEARCH_ADMIN_KEY
             secretRef: search-admin-key
+YAML
+fi
+
+# Day 27. Absent means telemetry stays off in the deployed app -- which is the
+# same default the code has, so an operator who does not want tracing does
+# nothing rather than remembering to unset something.
+if [ -n "${AZ_APPINSIGHTS_SECRET_URI:-}" ]; then
+  cat >>"$APP_YAML" <<YAML
+          - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+            secretRef: applicationinsights-connection-string
 YAML
 fi
 
