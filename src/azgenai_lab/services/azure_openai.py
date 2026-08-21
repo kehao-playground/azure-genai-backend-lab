@@ -20,7 +20,7 @@ only on the :class:`ChatService` protocol.
 """
 
 import logging
-from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -43,11 +43,14 @@ from azgenai_lab.core.errors import (
 from azgenai_lab.core.telemetry import (
     ATTR_FINISH_REASONS,
     FAKE_DEPLOYMENT,
+    OUTCOME_ERROR,
     OUTCOME_SUCCESS,
+    OwnedLlmSpan,
     instrumented_httpx_client,
     llm_span,
     set_outcome,
     set_usage_attributes,
+    start_owned_llm_span,
 )
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
@@ -493,6 +496,66 @@ class AzureOpenAIChatService:
             await self._credential_aclose()
 
 
+async def _traced_stream(
+    events: AsyncIterator[ChatStreamEvent], owned: OwnedLlmSpan
+) -> AsyncGenerator[ChatStreamEvent]:
+    """Carry the owned span across the body iteration and close it on any exit.
+
+    `finally` rather than a happy-path close: consumer close, task
+    cancellation, upstream EOF and an exception all have to end the span, and
+    only one of those is the normal one.
+    """
+    try:
+        async for event in events:
+            owned.record_first_chunk()
+            if isinstance(event, StreamDone):
+                # The terminal carries what the span most needs: provider-
+                # reported usage, and whether the model actually finished.
+                owned.record_terminal(
+                    event.usage,
+                    OUTCOME_SUCCESS,
+                )
+            yield event
+    finally:
+        # No terminal seen means the stream ended without one -- EOF, a
+        # disconnect before the model finished, or a cancellation. aclose()
+        # records that as an error rather than inferring success from silence.
+        await owned.aclose()
+
+
+class _TracedStream:
+    """An async iterator, not a bare generator, so the span closes even if the
+    stream is never iterated.
+
+    Measured rather than assumed: an async generator that has never been
+    started does not run its ``finally`` on ``aclose()`` -- there is no
+    suspended frame to throw ``GeneratorExit`` into -- so a generator-only
+    design leaks the span in exactly the case where nothing ever consumed the
+    stream. Two tests pin that: one closes before the first iteration, one
+    never iterates at all.
+
+    Both closes are called on the way out. ``OwnedLlmSpan.aclose`` is
+    idempotent precisely so this is safe: whichever path got there first keeps
+    its recorded outcome.
+    """
+
+    def __init__(self, events: AsyncIterator[ChatStreamEvent], owned: OwnedLlmSpan) -> None:
+        self._inner: AsyncGenerator[ChatStreamEvent] = _traced_stream(events, owned)
+        self._owned = owned
+
+    def __aiter__(self) -> AsyncIterator[ChatStreamEvent]:
+        return self
+
+    async def __anext__(self) -> ChatStreamEvent:
+        return await self._inner.__anext__()
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+        # Idempotent, and the only close that runs when the generator above
+        # was never started.
+        await self._owned.aclose()
+
+
 class TracingChatService:
     """Wraps any ``ChatService`` in one semantic span per model call.
 
@@ -551,9 +614,36 @@ class TracingChatService:
             return result
 
     async def open_stream(self, items: Sequence[ReplayItem]) -> AsyncIterator[ChatStreamEvent]:
-        # `async def` to match the protocol: Day 6 made this an eager await so
-        # a pre-stream failure raises before the StreamingResponse exists.
-        return await self._inner.open_stream(items)
+        """Open the stream under a span this method does not close.
+
+        `async def` to match the protocol: Day 6 made this an eager await so a
+        pre-stream failure raises before the StreamingResponse exists. That
+        two-phase boundary is why the span is closed in two places here --
+        before the iterator exists, this method owns the failure; after it,
+        the wrapper generator does.
+
+        The owner stays inside this decorator rather than being returned
+        alongside the iterator. Threading it out would change the protocol, the
+        conversation service, the endpoint, and every test double implementing
+        the same shape -- for a value only this layer ever reads.
+        """
+        owned = start_owned_llm_span(self._deployment)
+        try:
+            events = await self._inner.open_stream(items)
+        except UpstreamError as exc:
+            # Pre-stream: no byte has reached the client, so this is still an
+            # ordinary HTTP failure and no StreamingResponse will ever exist
+            # to close the span for us.
+            owned.record_terminal(None, upstream_outcome(exc), exc.code)
+            await owned.aclose()
+            raise
+        except BaseException:
+            owned.record_terminal(None, OUTCOME_ERROR, "upstream_error")
+            await owned.aclose()
+            raise
+        return _TracedStream(events, owned)
+
+
 
     async def aclose(self) -> None:
         await self._inner.aclose()

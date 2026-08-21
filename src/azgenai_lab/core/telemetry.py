@@ -20,6 +20,7 @@ being ingested and billed twice.
 
 import logging
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -314,3 +315,80 @@ def set_outcome(span: Span, outcome: str, error_code: str | None = None) -> None
     if outcome == OUTCOME_ERROR:
         # The classification, never the upstream's own message.
         span.set_status(Status(StatusCode.ERROR, error_code or OUTCOME_ERROR))
+
+
+class OwnedLlmSpan:
+    """Owns one LLM span across a streaming response's whole life.
+
+    A streaming call's span cannot be a context manager: it opens before the
+    request goes out and has to stay open across the body iteration, which
+    happens after the function that started it has returned. So it gets an
+    owner instead.
+
+    The correlation id is captured at construction rather than read at close.
+    `correlation_id_var` is reset when `call_next` returns -- which is *before*
+    the body iterates -- and `core/correlation.py` says so in its own comment.
+
+    ``aclose`` is idempotent because two paths legitimately reach it: the
+    terminal-event path, which knows usage and status, and the exit path, which
+    only knows the stream is over. Whichever runs first wins; the second must
+    not overwrite what the first recorded.
+    """
+
+    def __init__(self, span: Span, correlation_id: str | None) -> None:
+        self._span = span
+        self._closed = False
+        self._outcome: str | None = None
+        self._first_chunk_at: float | None = None
+        self._started = time.perf_counter()
+        if correlation_id is not None:
+            span.set_attribute(ATTR_CORRELATION_ID, correlation_id)
+
+    def record_first_chunk(self) -> None:
+        """Stamp time to first chunk, once. Measured from construction, which
+        is before the request is issued -- the semantic convention defines it
+        that way, and starting the clock when the adapter hands back a stream
+        would systematically under-report it."""
+        if self._first_chunk_at is None:
+            self._first_chunk_at = time.perf_counter()
+            self._span.set_attribute(ATTR_TTFB, self._first_chunk_at - self._started)
+
+    def record_terminal(
+        self, usage: "TokenUsage | None", outcome: str, error_code: str | None = None
+    ) -> None:
+        if self._closed or self._outcome is not None:
+            return
+        self._outcome = outcome
+        set_usage_attributes(self._span, usage)
+        set_outcome(self._span, outcome, error_code)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # self._outcome, not a read-back of the span's attributes: Span is an
+        # abstract API with no attribute getter in its contract, and the SDK's
+        # .attributes is an implementation detail an owner should not reach
+        # into. The owner already knows what it wrote.
+        if self._outcome is None:
+            # Reached the exit path with no terminal event: neither a clean
+            # finish nor a recorded failure. Say that, rather than inferring
+            # one from silence.
+            set_outcome(self._span, OUTCOME_ERROR, "upstream_error")
+        self._span.end()
+
+
+def start_owned_llm_span(deployment: str, *, operation: str = "chat") -> OwnedLlmSpan:
+    """Open a semantic span that outlives this call. Caller owns closing it."""
+    span = trace.get_tracer("azgenai_lab").start_span(
+        f"{operation} {deployment}",
+        kind=SpanKind.CLIENT,
+        record_exception=False,
+        set_status_on_exception=False,
+        attributes={
+            gen_ai_attributes.GEN_AI_OPERATION_NAME: operation,
+            gen_ai_attributes.GEN_AI_PROVIDER_NAME: "azure.ai.openai",
+            gen_ai_attributes.GEN_AI_REQUEST_MODEL: deployment,
+        },
+    )
+    return OwnedLlmSpan(span, correlation_id_var.get())
