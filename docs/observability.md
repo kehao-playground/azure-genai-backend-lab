@@ -68,7 +68,18 @@ Two details in that call:
 `/health` is excluded because Container Apps runs startup, liveness and
 readiness probes against it, liveness every 10 seconds
 ([container-apps.md](container-apps.md)). At 100% sampling those would dominate
-the data.
+the data. Deployed, the container's own access log shows two `GET /health`
+every ten seconds while `AppRequests` holds none of them — the exclusion is
+what makes the difference, not an absence of traffic.
+
+**`/` is deliberately not excluded**, though it is also unauthenticated and
+also gets hit. The line is who generates the traffic: the platform's probes are
+high-frequency traffic you configured and already know the answer to, while a
+request to `/` came from outside and is the kind of thing telemetry exists to
+show you. The volumes are not comparable: probes arrive at twelve
+a minute, every minute, forever, while one deployed session saw three
+unsolicited requests to `/` in total. Note that telemetry will not tell you
+*who* sent them: the exporter reports `ClientIP` as `0.0.0.0` by default.
 
 One thing that is **not** load-bearing, stated because the opposite is a
 reasonable guess: the call's position relative to middleware registration does
@@ -108,6 +119,25 @@ on which of those is true.
 **On `/agent`, `N` and `M` are not 1.** One tool round is already two model
 calls. That the model-call count, not the tool count, is what grows is the Day
 16/17 point about where an agent's cost actually goes.
+
+### A span that only appears once deployed
+
+Running under a managed identity adds a child nobody wrote:
+
+```
+GET /msi/token                       CLIENT   ← azure_sdk (the distro's, not ours)
+   target: localhost:12356
+```
+
+It is the identity's token fetch, and it comes from the distro's `azure_sdk`
+instrumentation — not from the per-client httpx wiring, which only covers the
+six clients this application builds. Locally there is no identity endpoint, so
+this span cannot appear; the first time it showed was in Container Apps.
+
+Worth knowing because of what it costs: measured at **2.68 s for the first
+fetch**, then **6–8 ms** once the credential has a cached token. A cold start
+therefore carries a multi-second dependency that has nothing to do with the
+model, and it is attributed to whichever request happens to trigger it.
 
 ### Two producers of the same span
 
@@ -366,9 +396,16 @@ to look for is `Transmission succeeded: Item received: N. Items accepted: N`.
   rename them; a test will catch it, but the tree in this document is not
   something this codebase fully controls.
 - The one-server-span-per-request test proves that of **the shipped
-  composition**, which disables automatic instrumentation. It does not prove
-  what automatic and manual instrumentation do together — that combination is
-  never run.
+  composition**, which disables the **FastAPI** automatic instrumentation. It
+  does not prove what automatic and manual FastAPI instrumentation do together
+  — that combination is never run.
+- Disabling FastAPI's is not disabling automatic instrumentation. The distro's
+  supported set is `azure_sdk`, `django`, `fastapi`, `flask`, `psycopg2`,
+  `requests`, `urllib`, `urllib3`
+  (`azure/monitor/opentelemetry/_constants.py:74-83`); one name is turned off
+  and the rest stay on. Three of them are simply not installed here, but
+  `azure_sdk` is, and it emits spans this document does not design — see the
+  token fetch below.
 - Content-free telemetry is enforced by attribute **name**. A caller-controlled
   value copied into a well-named field would not be caught by it; that is why
   the correlation header is bounded before it is stamped anywhere.
