@@ -435,3 +435,29 @@ does not control and does not assume.
   without the audit schema ever depending on the error hierarchy back. This keeps the audit
   module usable from anywhere in the codebase without pulling in the whole error taxonomy,
   and is a boundary future changes should preserve rather than route around.
+
+
+## Why the audit trail is not in Application Insights (Day 27)
+
+Day 27 adds distributed tracing and deliberately leaves this log where it is.
+`OTEL_LOGS_EXPORTER` is set to `none`, so no Python log record — audit line or
+diagnostic — is exported to Application Insights.
+
+Three reasons, in order of weight:
+
+1. **Ownership stays simple.** Everything this page says about the trail is
+   still true word for word: it is a JSON line on a process log stream, not a
+   durable or tamper-evident sink, and retention belongs to the hosting log
+   pipeline. Exporting it would have created a second store with a different
+   retention story and made "where is the audit trail" a two-part answer.
+2. **Container Apps already collects stderr** into Log Analytics. Exporting the
+   same lines through the OpenTelemetry pipeline would ingest and bill them
+   twice.
+3. **The trail and the trace answer different questions.** The audit event
+   records what was committed; the span records what happened and how long it
+   took. `correlation_id` joins them.
+
+The cost is a real one and worth stating plainly: clicking into a span in
+Application Insights will not show you that request's log lines. Cross to Log
+Analytics and join on `correlation_id`. See
+[observability.md](observability.md#what-is-not-exported).

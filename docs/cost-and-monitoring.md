@@ -1,6 +1,6 @@
 # Cost and Monitoring
 
-Day 9 makes token cost a backend contract instead of a monthly surprise. Day 27 extends this with Application Insights.
+Day 9 makes token cost a backend contract instead of a monthly surprise. Day 27 puts the same numbers on distributed traces — see [observability.md](observability.md).
 
 ## Metering over estimation
 
@@ -30,6 +30,6 @@ The budget is a post-paid ledger: provider-reported usage accumulates atomically
 
 - A failed turn (upstream error, discarded `content_filter` text, disconnect) may have incurred billable processing upstream but never enters the ledger — turn-commit semantics (Day 7) win over accounting completeness. The same paths produce no `llm usage` log line either (there is no usage-bearing terminal to read): a missing line is not zero cost, and reconciliation belongs to Cost Management.
 - The ledger is per conversation, not per user — still, and now by choice rather than by necessity. Day 19 put a verified identity on every protected request (`Principal.user_id`, from `X-User-Id` or the token's `oid`), so per-user and per-feature quotas are technically possible; they are deliberately not implemented. A per-user quota needs a durable per-identity counter with its own retention, reset and cross-instance-consistency story, and that is a different piece of machinery from the per-conversation ledger, not a wider version of it. See [entra-id-auth.md](entra-id-auth.md).
-- Log lines are attribution, not metrics: aggregation (spend per day, per prompt version) is a Cost Management / Application Insights job (Day 27), not grep's.
+- Log lines are attribution, not metrics: aggregation (spend per day, per prompt version) is a Cost Management / Application Insights job, not grep's. Day 27 carries `gen_ai.usage.*` on the model-call span, which makes per-request cost queryable — but note what it deliberately does not do: usage attributes are **absent** on failed and disconnected calls rather than zero, for the same reason the `llm usage` line is missing there. See [observability.md](observability.md#attributes).
 
 The subscription-level backstop is an Azure Cost Management budget alert — a **delayed detection/notification mechanism, not a spending cap**: per Microsoft's documentation, crossing a budget threshold triggers notifications only; resources are not stopped and consumption continues, and cost data itself lags hours behind usage. Application guardrails bound the burn rate; the budget alert tells you (late) that something got past them. An actual automated stop would require an action-group automation with its own failure modes — out of scope here.
