@@ -70,7 +70,9 @@ readiness probes against it, liveness every 10 seconds
 ([container-apps.md](container-apps.md)). At 100% sampling those would dominate
 the data. Deployed, the container's own access log shows two `GET /health`
 every ten seconds while `AppRequests` holds none of them — the exclusion is
-what makes the difference, not an absence of traffic.
+what makes the difference, not an absence of traffic. In one 34-minute session
+181 of the container's last 200 log lines were health probes, against zero rows
+in telemetry.
 
 **`/` is deliberately not excluded**, though it is also unauthenticated and
 also gets hit. The line is who generates the traffic: the platform's probes are
