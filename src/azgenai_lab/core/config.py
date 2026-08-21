@@ -113,6 +113,20 @@ class Settings(BaseSettings):
     # ephemeral sessions cheap to configure. Never logged, never returned.
     azure_search_admin_key: SecretStr | None = None
 
+    # Day 27. Absent is the default posture: no connection string means no
+    # provider, no patched client and no environment mutation, which is what
+    # CI, local runs and every USE_FAKE_* path rely on. The string carries an
+    # instrumentation key, so it is a secret by the same rule as the others
+    # above -- never logged, never returned.
+    applicationinsights_connection_string: SecretStr | None = None
+    # Explicit, because the distro's own default is a rate-limited sampler at
+    # 5 traces/second. A reader following the article with one request in
+    # flight would otherwise not find it, and would have no way to tell that
+    # from a broken pipeline.
+    telemetry_sampling_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Becomes cloud_RoleName in Application Insights.
+    otel_service_name: str = "azgenai-lab"
+
     use_fake_llm: bool = Field(default=True)
     use_fake_search: bool = Field(default=True)
     use_fake_embeddings: bool = Field(default=True)
