@@ -44,7 +44,9 @@ stays in the scripts. A resource qualifies when:
 1. a Bicep type can express it,
 2. the properties you care about are not resource functions (`listKeys`,
    `listSecrets`) or generated secrets, and
-3. changes can be previewed — `what-if` covers the resource type.
+3. changes can be previewed — `what-if` supports the resource type.
+   Documented coverage is the bar; a live `what-if` run raises the evidence
+   from documentation to observation but is not the entry condition.
 
 **Axis 2 — full lifecycle ownership.** Teardown moves too, via deployment
 stacks. Axis 1 plus:
@@ -65,7 +67,7 @@ all. It can. It just cannot hand over the ending.
 | Budget alert, resource group | conditions met (types + docs only; no live probe run) | not verified |
 | Managed identity, role assignments | conditions met (types + docs only) | **not verified** — see below |
 | Key Vault, Content Safety, APIM | conditions met | inferred no: each needs a purge |
-| Entra app / SP / federated credential | conditions met via the Graph Bicep extension (docs only, never exercised here) | **no** — deployment stacks do not support Graph resources |
+| Entra app / SP / federated credential | **not met** — condition (a) holds via the Graph Bicep extension (docs only, never exercised here), but `what-if` does not support Graph resources, so (c) fails; declaring them buys creation without preview | **no** — deployment stacks do not support Graph resources |
 | Client secrets, search index schema, GitHub environment and secrets | **no** — generated secrets, a data-plane schema, and a non-Azure API | no |
 
 Axis 2 has no ✅ anywhere in this table, and the honest reason is not that
@@ -101,9 +103,12 @@ not become declarative at any point on this roadmap:
   that is not.
 - **The search index schema**, which is a data-plane object.
 - **The GitHub side** — environments, secrets, variables. Not ARM at all.
-- **Every fail-closed read-back.** The scripts check what they just did and
-  stop on an empty answer. That is not provisioning cost; it is the cost of
-  noticing when something did not happen.
+- **The fail-closed read-backs that guard what the scripts still own.** A
+  conversion does retire some read-backs — the create/update verification for
+  a resource that moves into a template is absorbed by ARM's own deployment
+  outcome. What stays is every read-back around purges, ordering and
+  cross-system steps: the cost of noticing when something did not happen, in
+  exactly the operations that never become declarative.
 
 ## Deliberately not in CI
 
@@ -123,9 +128,15 @@ Trigger conditions, not dates:
    role assignments: a dedicated resource group, per-run unique names, a
    least-privilege role, a resource-id inventory taken before and after, and a
    cleanup path for failure. It closes those two rows and nothing else — no
-   extrapolation to purge-bearing resources or to Graph.
-2. **Budget and resource group to axis 1**, if a live `what-if` behaves the way
-   the types suggest.
+   extrapolation to purge-bearing resources or to Graph. The probe should also
+   run the deployment-stack-specific `what-if` Microsoft published on
+   2026-08-14 as a pre-mutation check — noting that the stacks known-issues
+   page still said stack `what-if` was unavailable on the same date (checked
+   2026-08): record the conflict, do not silently trust either page.
+2. **Budget and resource group to axis 1.** Their conditions already hold —
+   types exist and `what-if` coverage is documented — so crossing is a matter
+   of writing the declaration. A live `what-if` would upgrade the evidence
+   from documentation to observation; it is not the entry condition.
 3. **Reassess when a resource stops being ephemeral.** The whole shape of this
    decision comes from resources that exist for the length of a test session
    under a US$20/month ceiling. For a team whose resources are permanently on,

@@ -30,22 +30,32 @@ inventory built on create-verbs sees it at all. Scale and capability are
 different measurements; the first table is the scale, and the next one is the
 capability.
 
-What the other five thousand lines do: fail-closed read-back after nearly every
-mutation (an empty answer aborts), ordering contracts (role assignments before
-the identity, federated credentials before the app registration), per-run unique
-naming (a cleanup step that identifies its resources by a fixed name will
-happily purge a concurrent run's), three different soft-delete purge semantics,
-and recovery paths for half-finished state.
-`delete-github-oidc.sh` is 852 lines — 167 longer than the script that creates
-what it destroys.
+What most of the other five thousand lines do: fail-closed read-back after
+nearly every mutation (an empty answer aborts), ordering contracts (role
+assignments before the identity, federated credentials before the app
+registration), per-run unique naming (a cleanup step that identifies its
+resources by a fixed name will happily purge a concurrent run's), three
+different soft-delete purge semantics, and recovery paths for half-finished
+state. `delete-github-oidc.sh` is 852 lines — 167 longer than the script that
+creates what it destroys.
 
-None of that disappears by adopting Bicep. It is the cost of tearing down
-cleanly and of noticing when something did not happen, not the cost of standing
-things up.
+Those categories do not disappear automatically by adopting Bicep. The
+provisioning commands and their create-side read-backs are the part a template
+does absorb — [`main.bicep`](../infra/bicep/main.bicep) already carries
+`create-openai.sh`'s provisioning shape — but purge, ordering, secret
+generation and the verification around them are the cost of tearing down
+cleanly and of noticing when something did not happen, not the cost of
+standing things up.
 
 ## What is declarable, and what is not
 
-Two separate columns, because they answer two separate questions.
+Two separate columns, because they answer two separate questions. The last
+column keeps two kinds of value apart: an **evidence grade** for the stack
+verdict — *inferred no* (reasoned from documented `actionOnUnmanage`
+behaviour), *documented no* (official limitation), *not verified* (no grounds
+either way), or *n/a* (a stack has no jurisdiction: not ARM, or not state) —
+and a **dependency**, written *follows &lt;parent&gt;*, meaning the row's
+lifecycle rides on its parent and the stack verdict is the parent's.
 
 | Object | Plane | Declarable | Secret output | Teardown needs | Teardown via stack? |
 |---|---|---|---|---|---|
@@ -58,18 +68,18 @@ Two separate columns, because they answer two separate questions.
 | Container registry | ARM | yes | — (OIDC) | delete | not verified |
 | Log Analytics workspace | ARM | yes | — | delete — **and it gets created implicitly if you do not declare it** | not verified |
 | Container Apps environment + app | ARM | yes | — | delete | not verified |
-| Container app image update (by digest) | ARM | yes | — | with the app | with the app |
+| Container app image update (by digest) | ARM | yes | — | with the app | follows the app |
 | Key Vault | ARM | yes | — | delete + **purge** | inferred no |
-| Key Vault secret and its value | ARM child | yes | yes | with the vault | with the vault |
+| Key Vault secret and its value | ARM child | yes | yes | with the vault | **documented no** — stacks cannot delete Key Vault secrets; removal needs detach handling (see below) |
 | Content Safety account | ARM | yes | account key | delete + **purge** (48h name lock) | inferred no |
 | APIM service | ARM | yes | — | delete + purge | inferred no |
-| APIM API + policy XML | ARM child | yes (`loadTextContent()`) | — | with APIM | with APIM |
-| APIM `demo-client` subscription | ARM child | yes | yes (`listSecrets`) | with APIM | with APIM |
-| Entra app / SP / federated credential / app role / grant | Graph | yes (Graph extension) | — | delete + recycle bin purge | **no** |
-| Entra client secret | Graph | **no** | yes | with the app | no |
-| Search index schema | **data plane** | no | — | with the service | no |
-| Container image build | build action | no | — | with the registry | no |
-| GitHub environment / secrets / variable | GitHub API | **no** | yes | manual | no |
+| APIM API + policy XML | ARM child | yes (`loadTextContent()`) | — | with APIM | follows APIM |
+| APIM `demo-client` subscription | ARM child | yes | yes (`listSecrets`) | with APIM | follows APIM |
+| Entra app / SP / federated credential / app role / grant | Graph | yes (Graph extension) | — | delete + recycle bin purge | **documented no** |
+| Entra client secret | Graph | **no** | yes | with the app | follows the app (Graph as a class: documented no) |
+| Search index schema | **data plane** | no | — | with the service | n/a — data plane |
+| Container image build | build action | no | — | with the registry | n/a — an action, not state |
+| GitHub environment / secrets / variable | GitHub API | **no** | yes | manual | n/a — not Azure |
 
 Three things fall out of this table.
 
@@ -78,22 +88,34 @@ lab" is not true. That includes the row people assume is a no: Entra
 applications, service principals and federated identity credentials all have
 Graph Bicep types.
 
-**What is genuinely not declarable clusters in three places** — a data-plane
-schema, the *generation* of secrets, and systems that are not Azure.
+**What is genuinely not declarable clusters in three kinds of state** — a
+data-plane schema, the *generation* of secrets, and systems that are not
+Azure — plus one row that is not state at all: the container image build is an
+action, and the declarative question does not apply to it.
 
-**The dividing line is the last column, and the last column has not been
-verified.** This repository has never run a deployment stack. Every "inferred
-no" is reasoning from the documented behaviour of `actionOnUnmanage`, and every
-"not verified" is exactly that. See [The two axes](#the-two-axes).
+**The dividing line is the last column, and no cell in it carries first-hand
+evidence — but the grades differ.** Purge-bearing resources are an *inferred*
+no, Graph objects and Key Vault secrets are a *documented* no, and the rest is
+*unverified*: three different strengths, none of them observation, because
+this repository has never run a deployment stack. See
+[The two axes](#the-two-axes).
 
 Two rows are worth reading closely, because both were misclassified on the way
 here. **Key Vault secret values are not data-plane-only**:
 `Microsoft.KeyVault/vaults/secrets` is a control-plane child resource and
 `properties.value` is declarable. The real constraints are different ones —
 retrieving a key with `listAdminKeys` to put it there is a resource function
-`what-if` cannot evaluate, and a literal value in a template lands in the
-deployment history. And the **APIM subscription** row was missing entirely from
-the first pass, for the create-verb reason above.
+`what-if` cannot evaluate, a literal value in a template lands in the
+deployment history, and the teardown side has its own documented limitation:
+**deployment stacks cannot delete Key Vault secrets** (checked 2026-08,
+[stacks known issues](https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/deployment-stacks-known-issues));
+removing an explicitly managed secret requires detach handling. The three CLI
+`actionOnUnmanage` presets are not the whole schema — the
+`Microsoft.Resources/deploymentStacks` type separately exposes
+`resourcesWithoutDeleteSupport: detach | fail` for exactly this class of
+resource. None of that implies the parent vault cannot be deleted. And the
+**APIM subscription** row was missing entirely from the first pass, for the
+create-verb reason above.
 
 ## The two axes
 
@@ -102,7 +124,8 @@ Handing infrastructure to a template is two decisions, not one.
 **Axis 1 — provisioning ownership.** Create and update move to Bicep; teardown
 stays in the scripts. Conditions: (a) a type can express it, (b) the properties
 you care about are not resource functions or generated secrets, (c) changes can
-be previewed.
+be previewed — `what-if` supports the resource type, where documented coverage
+is the bar and a live run only raises the evidence strength.
 
 **Axis 2 — full lifecycle ownership.** Teardown moves too, via deployment
 stacks. Axis 1 plus: (d) the teardown semantics fit `actionOnUnmanage` — no
@@ -116,11 +139,15 @@ the account.
 Against the table above: **AOAI, the budget and the resource group clear axis
 1**, and AOAI is now across it. The evidence is not uniform, so it is worth
 separating — AOAI has a live `what-if` behind it (below); the budget and the
-resource group have types and documentation and no live probe.
+resource group have types and documentation and no live probe. **Graph objects
+do not clear it**: they pass (a) through the Graph extension, but `what-if`
+does not support Graph resources, so (c) fails — declaring them buys creation
+without preview.
 
-**Axis 2 has nothing on it.** Purge-bearing resources are an inferred no, Graph
+**Axis 2 has nothing on it.** Purge-bearing resources are an inferred no; Graph
 objects are a documented no — deployment stacks do not support them, and
-neither does `what-if` — and everything else is unverified. Unverified is not
+neither does `what-if` — as are Key Vault secrets; and everything else is
+unverified. Unverified is not
 the same as refuted; it means there are no grounds to decide yet, and teardown
 is the wrong place to guess. Deployment stacks default to `detachAll`: get
 `actionOnUnmanage` wrong and the thing you meant to delete quietly keeps
@@ -183,14 +210,15 @@ One counter-example, in the interest of not stacking the deck: `az bicep
 decompile` on that export produced **one** boilerplate disclaimer and **zero**
 Bicep diagnostics. "Export then decompile gives you a mess" did not hold here.
 
-There is also a **read-direction twin of a Day 24 bug**.
+There is also what looks like a **read-direction twin of a Day 24 bug**.
 `az cognitiveservices account show` does not return `a365LoggingEnabled` or
 `a365Status`, but a raw ARM `GET` at the same api-version the CLI itself uses
-does. The CLI's typed response model drops fields it does not know about. Day
-24 was the same seam facing the other way: an omitted YAML field materialised
-as an explicit `null` on the way in. In both directions the typed model is
-between you and the API, and in both directions what you see is not what ARM
-said.
+does — so the drop happens somewhere in the CLI's own pipeline, and the
+likeliest seam is the SDK's typed response model, though the capture does not
+pin the exact drop site. Day 24 was the same seam facing the other way, with
+source-level evidence: an omitted YAML field materialised as an explicit
+`null` on the way in. In both directions something typed sits between you and
+the API, and in both directions what you see is not what ARM said.
 
 ## What crossing axis 1 does not buy you
 
@@ -207,7 +235,10 @@ of how much else converts:
   the one that is not.
 - **The search index schema** — data plane.
 - **GitHub** — not ARM.
-- **Every fail-closed read-back.**
+- **The fail-closed read-backs that guard what the scripts still own.** The
+  create/update read-back for a converted resource is absorbed by ARM's own
+  deployment outcome; the read-backs around purges, ordering and cross-system
+  steps stay.
 
 ## When to revisit
 
@@ -220,8 +251,12 @@ have to hold.
 A [bounded live probe](../infra/bicep/README.md#roadmap) for the managed
 identity and its role assignments is the next step on axis 2 — dedicated
 resource group, per-run unique names, least-privilege role, resource-id
-inventory before and after, cleanup on failure. It closes two rows. It does not
-generalise to purge-bearing resources or to Graph.
+inventory before and after, cleanup on failure, plus the stack-specific
+`what-if` Microsoft published on 2026-08-14 as a pre-mutation check (the
+stacks known-issues page still said it was unavailable on the same date —
+checked 2026-08; the probe records that conflict instead of trusting either
+page). It closes two rows. It does not generalise to purge-bearing resources
+or to Graph.
 
 And the honest caveat about all of this: **this lab is unusual.** Its
 infrastructure is ephemeral by design, because it runs under a US$20/month
