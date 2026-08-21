@@ -363,11 +363,28 @@ the full request flow.
 
 The middleware in `azgenai_lab.core.correlation`:
 
-- reads `X-Correlation-Id` from the request, or generates a UUID when absent,
+- reads `X-Correlation-Id` from the request and uses it **if it is usable**, otherwise generates a UUID,
 - stores it on `request.state.correlation_id`,
 - always returns it as the `X-Correlation-Id` response header.
 
-It appears in every error body and in every diagnostic log line; it is also the join key across the audit log (Day 22 — see [audit-logging.md](audit-logging.md)) and, as the series progresses, traces (the Day 27 Application Insights article).
+It appears in every error body and in every diagnostic log line; it is also the join key across the audit log (Day 22 — see [audit-logging.md](audit-logging.md)) and across traces (Day 27 — see [observability.md](observability.md)).
+
+### What counts as usable (Day 27)
+
+An inbound `X-Correlation-Id` is adopted only when all four hold:
+
+| Rule | Why |
+|---|---|
+| Exactly one header | A duplicated header is representable at the ASGI layer; picking one of two silently means correlating against an id nobody sent |
+| 1–128 bytes | Bounded length, because the value is now copied onto every server and application span |
+| ASCII VCHAR only (`0x21`–`0x7E`) | No spaces, no control characters, no multi-byte sequences reaching a second store |
+| Taken verbatim, never normalised | Trimming would make the echoed value differ from the accepted one in a second, quieter way |
+
+**Failing these is not an error.** The request proceeds normally and the status code is unchanged — the backend simply stops trusting the caller's string and uses its own. The cost is explicit and worth stating: **the `X-Correlation-Id` you get back may not be the one you sent.** When that happens, the response header, the `correlation_id` in the body, the log lines and the trace all carry the substituted value, so there is still exactly one id per request.
+
+This closes the gap [audit-logging.md](audit-logging.md) recorded on Day 22, where `correlation_id` was caller-controlled free text written back verbatim.
+
+The id is **not** forwarded upstream. Calls to Azure OpenAI and AI Search carry standard W3C `traceparent` and no `X-Correlation-Id`: this id is a contract between this service and its callers, and no upstream knows what to do with it.
 
 ## Placeholder policy
 
