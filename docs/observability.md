@@ -293,6 +293,8 @@ Headers came back at 1.07 s; the first chunk did not arrive until 2.41 s,
 because the model spent the gap reasoning (that response reported 64 reasoning
 tokens). Reading the httpx span as "how long the model took" would have
 under-reported this request by more than half.
+[diagrams/streaming-latency.md](diagrams/streaming-latency.md) draws the
+containment relationship.
 
 The ASGI server span, by contrast, ends only on the final body message
 (`http.response.body` with `more_body` false), so it does span the whole SSE
