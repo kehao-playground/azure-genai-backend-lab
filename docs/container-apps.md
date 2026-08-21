@@ -204,6 +204,11 @@ up**.
 All three probes are configured explicitly, all HTTP `GET /health` on port
 8000:
 
+> Day 27 note: three probes against one path, liveness every 10 seconds, is
+> also the largest volume of telemetry this app would emit. `/health` is
+> excluded from tracing for that reason — see
+> [observability.md](observability.md#composition).
+
 | Probe | Settings |
 |---|---|
 | Startup | `initialDelaySeconds: 2`, `periodSeconds: 3` |

@@ -1,0 +1,29 @@
+%% Publication source (zh-TW) for the Day 27 article figure.
+%% English semantic companion: request-lifecycle.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    server["POST /api/v1/rag<br/>SERVER · 掛 correlation_id"]
+
+    subgraph retrieval["rag.retrieval · INTERNAL"]
+        emb["embeddings {deployment}<br/>gen_ai.request.model"]
+        search["azure.search.query<br/>azgenai.search.hit_count"]
+        embHttp["POST /openai/v1/embeddings<br/>httpx · 只是傳輸層"]
+        searchHttp["POST /indexes/.../docs/search<br/>httpx · 只是傳輸層"]
+        emb --> embHttp
+        search --> searchHttp
+    end
+
+    assemble["rag.assemble_context · INTERNAL<br/>沒有上游呼叫"]
+
+    subgraph generation["rag.generation · INTERNAL"]
+        chat["chat {deployment}<br/>gen_ai.usage.* · azgenai.outcome"]
+        chatHttp["POST /openai/v1/responses<br/>httpx · 回到 header 就結束，不是生成時間"]
+        chat --> chatHttp
+    end
+
+    server --> retrieval
+    server --> assemble
+    server --> generation
+
+    noAnswer["零 hits：整個 generation stage 不存在<br/>（Day 14 結構性 no-answer）"]
+    retrieval -. "hits == 0" .-> noAnswer
