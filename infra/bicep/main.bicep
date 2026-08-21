@@ -9,12 +9,18 @@
 // explains where that line comes from and what would have to be true to move
 // it.
 //
-// API version: 2026-05-01 is the newest *stable* version of
-// Microsoft.CognitiveServices for which Bicep CLI 0.46.1 ships types (checked
-// 2026-08-20 against `az provider show`; 2026-05-15-preview is newer and also
-// typed, but this series pins stable versions). The two newest versions the
-// provider advertises -- 2026-07-15-preview and 2026-07-01 -- have no types in
-// this toolchain. That matters more than it looks: an untyped version still
+// API version: for Microsoft.CognitiveServices/accounts, 2026-05-01 is the
+// newest *stable* version for which Bicep CLI 0.46.1 ships types (checked
+// 2026-08-20 against the provider's version list for that resource type;
+// 2026-05-15-preview is newer and also typed, but this series pins stable
+// versions). That "newest typed stable" ordering is an accounts-only claim:
+// the child type accounts/deployments has no provider-advertised version list
+// of its own (the provider manifest does not list it -- checked 2026-08-21).
+// What is verified for the child type is narrower: a per-version sweep found
+// six untyped versions, 2026-05-01 not among them, and this file builds with
+// zero diagnostics. The two newest versions the provider advertises for
+// accounts -- 2026-07-15-preview and 2026-07-01 -- have no types in this
+// toolchain. That matters more than it looks: an untyped version still
 // compiles, with BCP081 and no property checking whatsoever, which throws away
 // the reason to write this file instead of the script.
 
