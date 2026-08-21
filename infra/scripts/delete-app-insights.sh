@@ -149,13 +149,18 @@ fi
 # standing means this one is not ours to remove -- the same ownership rule
 # law_owned applies to the workspace.
 echo "== step 4: Smart Detection action group =="
-# `component list`, not `component show`: show requires --app and would fail,
-# and a `|| echo 0` fallback on that failure is fail-OPEN -- it would report
-# "no components left" every time and delete a shared action group. That is the
-# same trap Day 19 and Day 21 recorded for `az ... -o tsv` reading empty, and a
-# fake-CLI test caught it here after a live run had not (there was only ever
-# one component to see).
-REMAINING=$(az monitor app-insights component list \
+# `component show` with only --resource-group returns every component in the
+# group; --app is optional, despite what an earlier revision of this comment
+# claimed. There is no `component list` subcommand at all -- the group offers
+# create/delete/show/update, and asking for `list` aborts the whole teardown
+# with "'list' is misspelled or not recognized".
+#
+# What made the first version of this check fail-OPEN was never the command. It
+# was the `|| echo 0` fallback: any failure became "no components left", which
+# deletes an action group shared with somebody else's component. The fallback is
+# gone and require_value fails closed on an empty read, which is the rule Day 19
+# and Day 21 already recorded for `az ... -o tsv`.
+REMAINING=$(az monitor app-insights component show \
   --subscription "$AZ_SUBSCRIPTION_ID" --resource-group "$AZ_RESOURCE_GROUP" \
   --query "length(@)" -o tsv)
 require_value "$REMAINING" "the remaining Application Insights component count"

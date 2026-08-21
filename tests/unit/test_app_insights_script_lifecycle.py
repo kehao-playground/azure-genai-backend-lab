@@ -100,6 +100,13 @@ if args[:4] == ["monitor", "app-insights", "component", "create"]:
         groups.append("Application Insights Smart Detection")
     ok()
 if args[:4] == ["monitor", "app-insights", "component", "show"]:
+    # --app is OPTIONAL on the real command: with only --resource-group it
+    # returns every component in the group. The fake used to assume --app was
+    # present, which let a caller ask for a `component list` subcommand that
+    # does not exist and still go green.
+    if "--app" not in args:
+        out(len(s.get("components", {})))
+        ok()
     name = args[args.index("--app") + 1]
     comp = s.get("components", {}).get(name)
     if comp is None:
@@ -110,7 +117,11 @@ if args[:4] == ["monitor", "app-insights", "component", "show"]:
         out(os.environ["FAKE_CONNECTION_STRING"])
     ok()
 if args[:4] == ["monitor", "app-insights", "component", "list"]:
-    out(len(s.get("components", {})))
+    # There is no such subcommand. az offers create/delete/show/update on this
+    # group and nothing else, so this is what the real CLI does.
+    save(s)
+    sys.stderr.write("'list' is misspelled or not recognized by the system.\\n")
+    sys.exit(2)
 if args[:4] == ["monitor", "app-insights", "component", "delete"]:
     name = args[args.index("--app") + 1]
     if os.environ.get("FAKE_COMPONENT_STICKY") == "true":
@@ -340,6 +351,30 @@ def test_teardown_removes_the_action_group_azure_created_behind_our_back(
     result = h.delete()
     assert result.returncode == 0, result.stderr
     assert h.state["action_groups"] == []
+
+
+def test_teardown_counts_components_with_a_subcommand_that_exists(
+    tmp_path: Path,
+) -> None:
+    # A live teardown aborted at step 4 with "'list' is misspelled or not
+    # recognized by the system": the count was being read from `az monitor
+    # app-insights component list`, which is not a subcommand. Every test still
+    # passed, because the fake az answered it.
+    #
+    # Asserting on the emitted call, not just on the exit code: with the fake
+    # now rejecting `list` the script would fail anyway, but this pins WHICH
+    # command replaced it. `show` with only --resource-group is the real one --
+    # --app is optional there, contrary to what the first fix claimed.
+    h = Harness(tmp_path)
+    assert h.create().returncode == 0
+
+    result = h.delete()
+    assert result.returncode == 0, result.stderr
+    assert not any("app-insights component list" in call for call in h.calls)
+    assert any(
+        "app-insights component show" in call and "--app" not in call
+        for call in h.calls
+    )
 
 
 def test_teardown_leaves_the_action_group_when_another_component_shares_it(
