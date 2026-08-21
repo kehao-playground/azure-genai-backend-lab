@@ -23,6 +23,7 @@ import httpx
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
+from azgenai_lab.core.telemetry import instrumented_httpx_client
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.search import (
     DEFAULT_VECTOR_K,
@@ -296,7 +297,7 @@ class AzureSearchClient:
         # is sharing it — a test's MockTransport client, or an application-wide
         # pool a later composition point may hand in.
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
+        self._client = client or instrumented_httpx_client(timeout=settings.llm_timeout_seconds)
         # One record rather than four mutable fields a caller has to read in
         # the right order and narrow individually. The live evidence file
         # needs all of it or none of it. ``request_body`` is stored as a

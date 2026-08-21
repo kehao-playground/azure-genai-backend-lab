@@ -27,6 +27,7 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
+from azgenai_lab.core.telemetry import instrumented_httpx_client
 from azgenai_lab.models.rag import Chunk
 from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
 from azgenai_lab.services.azure_openai_auth import resolve_aoai_auth
@@ -199,6 +200,9 @@ class AzureOpenAIEmbeddingClient:
             api_key=auth.api_key,  # str | async Callable — matches AsyncOpenAI's own type
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
+            # See build_chat_service: the SDK's own httpx client is not
+            # instrumented by anything.
+            http_client=instrumented_httpx_client(timeout=settings.llm_timeout_seconds),
         )
         # entra mode only (Day 24): closes the ManagedIdentityCredential
         # backing `self._client`'s callable api_key. A no-op in api_key

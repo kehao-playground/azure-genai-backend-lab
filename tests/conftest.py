@@ -14,6 +14,10 @@ os.environ["USE_FAKE_EMBEDDINGS"] = "true"
 # developer's shell or .env happens to have set.
 os.environ["AUTH_MODE"] = "headers"
 
+# Day 27. Registered here rather than in tests/unit/conftest.py: pytest
+# rejects pytest_plugins in any non-rootdir conftest outright.
+pytest_plugins = ["tests.unit.telemetry_helpers"]
+
 from collections.abc import Generator  # noqa: E402
 
 import pytest  # noqa: E402

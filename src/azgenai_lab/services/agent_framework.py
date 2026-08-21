@@ -21,6 +21,7 @@ import openai
 
 from azgenai_lab.core.audit import AgentAuditTerminalSnapshot, AuditToolExecution
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.telemetry import instrumented_httpx_client
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.prompts.loader import PromptTemplate
@@ -689,6 +690,9 @@ class AgentFrameworkService:
             base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
+            # The framework emits invoke_agent/chat/execute_tool itself, but
+            # nothing underneath them: the HTTP leg is ours to instrument.
+            http_client=instrumented_httpx_client(timeout=settings.llm_timeout_seconds),
         )
         # Everything after the transport exists runs under this guard: the
         # transport is owned from the moment it is constructed, and a failure
