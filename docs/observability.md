@@ -117,9 +117,18 @@ and `/rag` do not go through the framework — they use the OpenAI SDK directly 
 so their `chat` span is raised by this codebase.
 
 The two look alike **by decision**: the framework names its span
-`chat {deployment}` and so do we, and both carry the same `gen_ai.*` attribute
-subset. A test holds the intersection so a framework upgrade that renames
-either one turns red instead of quietly splitting the tree in two.
+`chat {deployment}` and so do we, and both carry `gen_ai.operation.name` and
+`gen_ai.request.model`. A test holds that intersection so a framework upgrade
+that renames either one turns red instead of quietly splitting the tree in two.
+
+They are not identical, and the difference is worth knowing before you filter
+on it. Measured against a live component (2026-08-21):
+
+| Span source | `gen_ai.provider.name` |
+|---|---|
+| ours (`/chat`, `/rag`) | `azure.ai.openai` |
+| framework's `chat` | `openai` |
+| framework's `invoke_agent` | `microsoft.agent_framework` |
 
 Read a trace and you will see `invoke_agent` suffixed with the agent's UUID
 rather than a readable name. That is the framework's choice, not ours.
@@ -177,6 +186,19 @@ assumption that an upstream default will not change, and this switch decides
 whether conversation content is copied into a second store. That is a data
 governance decision, not a convenience.
 
+**Measured caveat (2026-08-21, live).** "Sensitive data off" does not mean "no
+application text". The framework's `execute_tool` span carries
+`gen_ai.tool.description` — the tool function's **full docstring, verbatim** —
+with `enable_sensitive_data=False`. That switch governs prompts, completions
+and tool arguments, not a tool's own self-description.
+
+The name-based guard above does not catch it either: `gen_ai.tool.description`
+contains none of the forbidden substrings. This is the concrete instance of
+the limitation listed under [honest boundaries](#honest-boundaries) — the guard
+checks attribute names, not values. Here the text is our own docstring rather
+than user data, so the exposure is small; it would not be, for a tool whose
+description carried internal detail.
+
 One more, deliberately not left to the exception machinery: every span this
 codebase opens passes `record_exception=False`. OpenTelemetry's default is
 `True`, and it writes the exception's own **message** into a span event —
@@ -224,9 +246,21 @@ Three timings, and they are three different numbers:
 **The httpx span ends when response headers come back, not when the body is
 consumed.** Its `with` block wraps `handle_async_request`, which returns once
 the status and headers are available; the body is a stream read outside that
-block. For a streaming request it measures roughly "request sent → first byte
-readable", and reading it as "how long the model took" underestimates by the
-entire generation.
+block.
+
+One streamed `/chat/stream` call against gpt-5-mini, measured on a live
+component (2026-08-21, japaneast) — three numbers from one request:
+
+| Measurement | Value | What it covers |
+|---|---|---|
+| httpx span | **1.067 s** | request sent → response headers back |
+| `gen_ai.response.time_to_first_chunk` | **2.410 s** | → the first content chunk |
+| `chat chat-mini` span | **2.568 s** | the whole generation |
+
+Headers came back at 1.07 s; the first chunk did not arrive until 2.41 s,
+because the model spent the gap reasoning (that response reported 64 reasoning
+tokens). Reading the httpx span as "how long the model took" would have
+under-reported this request by more than half.
 
 The ASGI server span, by contrast, ends only on the final body message
 (`http.response.body` with `more_body` false), so it does span the whole SSE
@@ -308,6 +342,20 @@ Turning off logs, metrics, live metrics and performance counters, and excluding
 
 Following Day 9's rule: **the authority on what was ingested is Cost
 Management, not our own span count.**
+
+## Running it locally
+
+Starting the image on a non-Azure host logs **two ERROR lines with tracebacks**
+during startup:
+
+```
+ERROR opentelemetry.resource.detector.azure.vm Failed to receive Azure VM metadata: timed out
+```
+
+Nothing is wrong. The distro enables the `azure_app_service,azure_vm` resource
+detectors by default (`OTEL_EXPERIMENTAL_RESOURCE_DETECTORS`) and they probe
+IMDS, which does not exist outside Azure. Telemetry works regardless — the line
+to look for is `Transmission succeeded: Item received: N. Items accepted: N`.
 
 ## Honest boundaries
 

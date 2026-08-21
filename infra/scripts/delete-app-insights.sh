@@ -137,6 +137,48 @@ else
        --query \"length([?name=='$AZ_LAW_NAME'])\" -o tsv"
 fi
 
+# === step 4: the action group Azure created behind our back =================
+# Creating an Application Insights component also creates an action group named
+# "Application Insights Smart Detection" in the same resource group -- nothing
+# in this script asked for it, and until it was found in a live teardown
+# read-back nothing removed it either. Same shape as the Day 24 orphan
+# workspace: the resource you asked for brought a second one with it.
+#
+# Deleted only when no Application Insights component remains in the group. The
+# action group is per-resource-group and shared, so a second component still
+# standing means this one is not ours to remove -- the same ownership rule
+# law_owned applies to the workspace.
+echo "== step 4: Smart Detection action group =="
+# `component list`, not `component show`: show requires --app and would fail,
+# and a `|| echo 0` fallback on that failure is fail-OPEN -- it would report
+# "no components left" every time and delete a shared action group. That is the
+# same trap Day 19 and Day 21 recorded for `az ... -o tsv` reading empty, and a
+# fake-CLI test caught it here after a live run had not (there was only ever
+# one component to see).
+REMAINING=$(az monitor app-insights component list \
+  --subscription "$AZ_SUBSCRIPTION_ID" --resource-group "$AZ_RESOURCE_GROUP" \
+  --query "length(@)" -o tsv)
+require_value "$REMAINING" "the remaining Application Insights component count"
+if [ "$REMAINING" != "0" ]; then
+  echo "  skipped: $REMAINING component(s) still in $AZ_RESOURCE_GROUP share this action group"
+else
+  SMART_DETECT="Application Insights Smart Detection"
+  FOUND=$(az monitor action-group list --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --query "length([?name=='$SMART_DETECT'])" -o tsv)
+  require_value "$FOUND" "the Smart Detection action group count"
+  if [ "$FOUND" = "0" ]; then
+    echo "  none present"
+  else
+    az monitor action-group delete --subscription "$AZ_SUBSCRIPTION_ID" \
+      --resource-group "$AZ_RESOURCE_GROUP" --name "$SMART_DETECT" -o none
+    wait_until_gone "action group $SMART_DETECT" \
+      "az monitor action-group list \
+         --subscription '$AZ_SUBSCRIPTION_ID' --resource-group '$AZ_RESOURCE_GROUP' \
+         --query \"length([?name=='$SMART_DETECT'])\" -o tsv"
+  fi
+fi
+
 rm -f "$AZ_RECORD_FILE"
 echo
 echo "Teardown complete; record file removed."
