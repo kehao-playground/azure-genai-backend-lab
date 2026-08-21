@@ -22,6 +22,7 @@ from azgenai_lab.core.errors import (
 )
 from azgenai_lab.core.keyed_lock import KeyedLock
 from azgenai_lab.core.logging import configure_logging
+from azgenai_lab.core.telemetry import configure_telemetry, instrument_fastapi_app
 from azgenai_lab.services.agent_turn import build_agent_turn_service
 from azgenai_lab.services.conversation import build_conversation_service
 from azgenai_lab.services.conversation_store import build_conversation_store
@@ -210,6 +211,10 @@ def create_app() -> FastAPI:
     # prompt_name/prompt_version/correlation_id line) are silently dropped
     # under a plain `uvicorn` run.
     configure_logging(settings.log_level)
+    # Absent a connection string this installs nothing and returns False; the
+    # return value gates the instrumentation below, because instrument_app()
+    # patches an app whether or not a provider exists.
+    telemetry_installed = configure_telemetry(settings)
     app = FastAPI(
         title="Azure GenAI Backend Lab",
         description="Production-minded Azure GenAI backend patterns with Python and FastAPI.",
@@ -250,6 +255,14 @@ def create_app() -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def root() -> dict[str, str]:
         return {"service": settings.app_name, "docs": "/docs", "health": "/health"}
+
+    # Last, after every middleware and router: Starlette's add_middleware
+    # inserts at position 0, so whatever registers last runs outermost.
+    # Instrumenting earlier would leave correlation_id_middleware outside the
+    # OpenTelemetry middleware, running before any server span exists -- and
+    # the correlation id it stamps would land on nothing, silently.
+    if telemetry_installed:
+        instrument_fastapi_app(app)
 
     return app
 

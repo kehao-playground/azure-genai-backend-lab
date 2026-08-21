@@ -36,6 +36,8 @@ import jwt
 from jwt import PyJWK
 from jwt.exceptions import PyJWTError
 
+from azgenai_lab.core.telemetry import instrumented_httpx_client
+
 logger = logging.getLogger(__name__)
 
 # The only host this verifier will talk to. Discovery hands us a `jwks_uri`,
@@ -109,7 +111,9 @@ class EntraTokenVerifier:
         # caller and outlives us; one we build is ours to tear down.
         self._owns_client = client is None
         self._client = (
-            client if client is not None else httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
+            client
+            if client is not None
+            else instrumented_httpx_client(timeout=HTTP_TIMEOUT_SECONDS)
         )
         # Monotonic by default and injectable so cache-age behaviour can be
         # tested without sleeping. Wall-clock time would let an NTP correction

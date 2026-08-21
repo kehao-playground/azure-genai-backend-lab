@@ -33,6 +33,7 @@ import httpx
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ConfigurationError, UpstreamError
+from azgenai_lab.core.telemetry import instrumented_httpx_client
 from azgenai_lab.models.rag import IndexingAction
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION, to_index_definition
 from azgenai_lab.services.azure_search import SearchUnavailableError, map_search_status, search_url
@@ -204,7 +205,7 @@ class SearchDataPlane:
         # is sharing it — a test's MockTransport client, or an application-wide
         # pool a later composition point may hand in.
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
+        self._client = client or instrumented_httpx_client(timeout=settings.llm_timeout_seconds)
 
     async def aclose(self) -> None:
         """Release the connection pool, if this object is the one that made it.

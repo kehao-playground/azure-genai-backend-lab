@@ -39,6 +39,7 @@ from azgenai_lab.core.errors import (
     UpstreamThrottledError,
     UpstreamTimeoutError,
 )
+from azgenai_lab.core.telemetry import instrumented_httpx_client
 from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.prompts.loader import PromptTemplate
@@ -502,6 +503,10 @@ def build_chat_service(settings: Settings, *, prompt: PromptTemplate) -> ChatSer
         base_url=settings.azure_openai_endpoint.rstrip("/") + "/openai/v1/",
         timeout=settings.llm_timeout_seconds,  # per attempt (default 30s), not end-to-end
         max_retries=settings.llm_max_retries,  # explicit policy; the SDK default is 2
+        # The SDK would otherwise build its own httpx client, which nothing
+        # instruments: the distro bundles no httpx instrumentation, so this is
+        # the only way the upstream call appears as a dependency at all.
+        http_client=instrumented_httpx_client(timeout=settings.llm_timeout_seconds),
     )
     return AzureOpenAIChatService(
         client,

@@ -38,6 +38,7 @@ from dataclasses import replace
 
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
+from azgenai_lab.core.telemetry import configure_telemetry
 from azgenai_lab.models.principal import validate_identifier
 from azgenai_lab.models.rag import Chunk, IndexingAction, SourceDocument, make_parent_id
 from azgenai_lab.services.chunking import chunk_markdown
@@ -119,6 +120,11 @@ async def main() -> None:
             "OpenAI embedding credentials before running this tool."
         )
     configure_logging(settings.log_level)
+    # The second entrypoint. Indexing a corpus is this repo's largest single
+    # embedding spend, which makes it exactly the run whose dependency spans
+    # are worth having. configure_telemetry is reentrant, so a process that
+    # somehow reaches both entrypoints still installs one provider.
+    configure_telemetry(settings)
 
     # The data plane owns its connection pool here, so it is closed on the way
     # out — including when a SystemExit below aborts the run partway.

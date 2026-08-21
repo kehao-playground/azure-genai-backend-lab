@@ -20,8 +20,14 @@ being ingested and billed twice.
 
 import logging
 import os
+from typing import Any
 
+import httpx
+from agent_framework.observability import enable_instrumentation
 from azure.monitor.opentelemetry import configure_azure_monitor
+from fastapi import FastAPI
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 
 from azgenai_lab.core.config import Settings
@@ -43,6 +49,19 @@ CONTROLLED_ENV: dict[str, str] = {
     "OTEL_METRICS_EXPORTER": "none",
     "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "false",
 }
+
+# `excluded_urls` is a comma-separated list of regexes joined with "|" and
+# matched with re.search against the *full* URL
+# (opentelemetry/util/http/__init__.py:74-83). A bare "health" would therefore
+# also swallow /api/v1/healthz, any request whose query string mentions health,
+# and a host named health.example -- so the pattern is anchored, and a negative
+# test covers the URLs it must still trace.
+#
+# The exclusion exists because Container Apps runs startup, liveness and
+# readiness probes against GET /health, liveness every 10 seconds
+# (docs/container-apps.md). At sampling_ratio 1.0 those would dominate the
+# data, and this milestone is about the lifecycle of one LLM request.
+HEALTH_EXCLUDED_URLS = r"^https?://[^/]+/health$"
 
 _installed = False
 
@@ -117,6 +136,14 @@ def configure_telemetry(settings: Settings) -> bool:
         sampling_ratio=settings.telemetry_sampling_ratio,
         resource=Resource.create({SERVICE_NAME: settings.otel_service_name}),
     )
+    # Programmatic, not environmental. agent-framework's OBSERVABILITY_SETTINGS
+    # is a module-level singleton built at import time, so setting
+    # ENABLE_SENSITIVE_DATA after that changes nothing -- and passing
+    # enable_sensitive_data=None makes this function re-read the environment,
+    # which hands the decision back to whoever set it. Instrumentation itself
+    # stays enabled: /agent's spans (invoke_agent, chat, execute_tool) are the
+    # framework's, by design.
+    enable_instrumentation(enable_sensitive_data=False)
     _installed = True
     logger.info(
         "telemetry configured service_name=%s sampling_ratio=%s",
@@ -124,3 +151,52 @@ def configure_telemetry(settings: Settings) -> bool:
         settings.telemetry_sampling_ratio,
     )
     return True
+
+
+def instrument_fastapi_app(app: FastAPI) -> None:
+    """Instrument this app instance rather than the FastAPI class.
+
+    The distro's automatic mode replaces ``fastapi.FastAPI`` in the fastapi
+    module namespace, but `main.py` binds that name at import time and
+    `create_app()` uses the bound reference -- so automatic instrumentation
+    reaches nothing here and every server span silently disappears.
+    Instrumenting the instance is independent of import order, which is why the
+    automatic path is disabled outright rather than left on in the hope that it
+    misses.
+
+    Call this *after* every middleware and router is registered. Starlette's
+    ``add_middleware`` inserts at position 0, so whatever is added last runs
+    outermost: instrument earlier and `correlation_id_middleware` ends up
+    outside the OpenTelemetry middleware, where there is no server span yet for
+    it to stamp the correlation id onto.
+    """
+    if not _installed:
+        # Guarded here as well as at the call site: tools/index_corpus.py is a
+        # second entrypoint and does not go through create_app()'s branch.
+        return
+    FastAPIInstrumentor.instrument_app(
+        app,
+        # Without this the ASGI instrumentation also emits `http send` and
+        # `http receive` children, and the documented span tree stops being the
+        # only correct answer a structure test can assert.
+        exclude_spans=["receive", "send"],
+        excluded_urls=HEALTH_EXCLUDED_URLS,
+    )
+
+
+def instrumented_httpx_client(**kwargs: Any) -> httpx.AsyncClient:
+    """Build an httpx client, instrumented per client rather than globally.
+
+    Every upstream call this service makes travels over httpx -- the openai SDK
+    included -- and httpx is not in the distro's bundled instrumentation list,
+    so without this the dependency half of a request's lifecycle is empty.
+
+    Per client rather than `HTTPXClientInstrumentor().instrument()` for two
+    reasons: which clients are traced stays answerable by reading the
+    composition point, and a global patch stacked on top of a per-client one is
+    a combination whose behaviour is not specified anywhere.
+    """
+    client = httpx.AsyncClient(**kwargs)
+    if _installed:
+        HTTPXClientInstrumentor.instrument_client(client)
+    return client
