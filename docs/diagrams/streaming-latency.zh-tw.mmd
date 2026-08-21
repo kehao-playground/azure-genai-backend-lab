@@ -1,0 +1,14 @@
+%% Publication source (zh-TW) for the Day 27 article figure.
+%% English semantic companion: streaming-latency.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+gantt
+    title 一次 /chat/stream 的三個時間量（gpt-5-mini，japaneast，2026-08-21）
+    dateFormat x
+    axisFormat %S.%L s
+    tickInterval 500millisecond
+    section 語意 span
+        chat chat-mini（整段生成 2.568 s） : active, 0, 2568
+        第一個內容 chunk（TTFB 2.410 s）   : milestone, 2410, 0
+    section httpx span
+        送出請求 → response headers（1.067 s） : crit, 0, 1067
+        headers 已回、chunk 未到（模型推理 1.34 s） : done, 1067, 2410
