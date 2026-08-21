@@ -93,6 +93,11 @@ if args[:4] == ["monitor", "app-insights", "component", "create"]:
     name = args[args.index("--app") + 1]
     workspace = args[args.index("--workspace") + 1]
     s.setdefault("components", {})[name] = {"workspace": workspace}
+    # The real service creates this behind your back; a fake that does not
+    # would let the teardown gap this exists to close pass unnoticed.
+    groups = s.setdefault("action_groups", [])
+    if "Application Insights Smart Detection" not in groups:
+        groups.append("Application Insights Smart Detection")
     ok()
 if args[:4] == ["monitor", "app-insights", "component", "show"]:
     name = args[args.index("--app") + 1]
@@ -104,11 +109,26 @@ if args[:4] == ["monitor", "app-insights", "component", "show"]:
     if "connectionString" in joined:
         out(os.environ["FAKE_CONNECTION_STRING"])
     ok()
+if args[:4] == ["monitor", "app-insights", "component", "list"]:
+    out(len(s.get("components", {})))
 if args[:4] == ["monitor", "app-insights", "component", "delete"]:
     name = args[args.index("--app") + 1]
     if os.environ.get("FAKE_COMPONENT_STICKY") == "true":
         ok()  # delete returns, resource stays -- the Day 24/25 shape
     s.get("components", {}).pop(name, None)
+    ok()
+
+# --- Action groups ----------------------------------------------------------
+if args[:3] == ["monitor", "action-group", "list"]:
+    name = None
+    for a in args:
+        if a.startswith("length([?name=='"):
+            name = a.split("'")[1]
+    out(1 if name in s.get("action_groups", []) else 0)
+if args[:3] == ["monitor", "action-group", "delete"]:
+    name = args[args.index("--name") + 1]
+    if name in s.get("action_groups", []):
+        s["action_groups"].remove(name)
     ok()
 
 # --- Key Vault --------------------------------------------------------------
@@ -303,3 +323,38 @@ def test_delete_fails_closed_when_the_component_survives_its_delete(tmp_path: Pa
     assert result.returncode != 0
     assert "still present" in result.stderr
     assert not any("workspace delete" in call for call in h.calls)
+
+
+def test_teardown_removes_the_action_group_azure_created_behind_our_back(
+    tmp_path: Path,
+) -> None:
+    # Found in a live teardown read-back, not by reading docs: creating a
+    # component also creates an action group named "Application Insights Smart
+    # Detection" in the same resource group, and nothing removed it. Same shape
+    # as the Day 24 orphan workspace -- the resource you asked for brought a
+    # second one with it.
+    h = Harness(tmp_path)
+    assert h.create().returncode == 0
+    assert "Application Insights Smart Detection" in h.state["action_groups"]
+
+    result = h.delete()
+    assert result.returncode == 0, result.stderr
+    assert h.state["action_groups"] == []
+
+
+def test_teardown_leaves_the_action_group_when_another_component_shares_it(
+    tmp_path: Path,
+) -> None:
+    # The action group is per resource group. A second component still standing
+    # means this one is not ours to remove -- the same ownership rule law_owned
+    # applies to the workspace.
+    h = Harness(tmp_path)
+    assert h.create().returncode == 0
+    state = h.state
+    state["components"]["another-component"] = {"workspace": "w"}
+    h.state_path.write_text(json.dumps(state))
+
+    result = h.delete()
+    assert result.returncode == 0, result.stderr
+    assert "still in" in result.stdout
+    assert h.state["action_groups"] == ["Application Insights Smart Detection"]
