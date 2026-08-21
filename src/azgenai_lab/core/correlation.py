@@ -6,9 +6,16 @@ from contextvars import ContextVar
 from fastapi import Request, Response
 from opentelemetry import trace
 
-from azgenai_lab.core.telemetry import ATTR_CORRELATION_ID
-
 CORRELATION_ID_HEADER = "X-Correlation-Id"
+
+# The join key across every telemetry surface, defined here rather than in
+# core.telemetry so the dependency runs one way only: telemetry reads this
+# module, this module knows nothing about telemetry beyond the OpenTelemetry
+# API. Application Insights has its own identifier -- operation_Id, the W3C
+# trace id -- and it is not this one: that describes the tree, this is the
+# contract Day 5 published and every error envelope since has carried.
+# Queries join on this.
+ATTR_CORRELATION_ID = "correlation_id"
 
 CORRELATION_ID_MAX_BYTES = 128
 # RFC 7230's VCHAR: printable ASCII, no space, no control characters. Chosen

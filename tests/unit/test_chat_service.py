@@ -26,6 +26,7 @@ from azgenai_lab.services.azure_openai import (
     AzureOpenAIChatService,
     FakeChatService,
     StreamDone,
+    TracingChatService,
     _fake_output_item,
     build_chat_service,
 )
@@ -51,7 +52,12 @@ def make_settings(**overrides: Any) -> Settings:
 def test_default_settings_build_fake_service() -> None:
     service = build_chat_service(Settings(_env_file=None), prompt=PROMPT)
 
-    assert isinstance(service, FakeChatService)
+    # Day 27: the composition point now wraps whatever it selects in one
+    # semantic span per model call, so what comes back is the decorator around
+    # the adapter. Asserting the wrapped type as well as the wrapper keeps this
+    # a statement about which adapter was chosen, which is what it was for.
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, FakeChatService)
 
 
 async def test_fake_service_never_calls_azure() -> None:
@@ -108,11 +114,12 @@ async def test_real_service_api_key_mode_aclose_is_a_safe_no_op_and_still_closes
     # AsyncOpenAI client, and awaiting the resolver's no-op closer must not
     # raise.
     service = build_chat_service(make_real_settings(), prompt=PROMPT)
-    assert isinstance(service, AzureOpenAIChatService)
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, AzureOpenAIChatService)
 
     await service.aclose()
 
-    assert service._client.is_closed()
+    assert service.inner._client.is_closed()
 
 
 def test_real_service_builds_in_entra_mode_with_no_api_key(
@@ -130,8 +137,9 @@ def test_real_service_builds_in_entra_mode_with_no_api_key(
 
     service = build_chat_service(settings, prompt=PROMPT)
 
-    assert isinstance(service, AzureOpenAIChatService)
-    provider = service._client._api_key_provider
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, AzureOpenAIChatService)
+    provider = service.inner._client._api_key_provider
     # Identity, not just "some coroutine function": this is the exact
     # object the resolver's fake provider returned, not a lookalike.
     assert provider is created["provider"]
@@ -153,14 +161,15 @@ async def test_real_service_entra_mode_aclose_closes_credential_and_client(
         azure_openai_deployment_name="chat-mini",
     )
     service = build_chat_service(settings, prompt=PROMPT)
-    assert isinstance(service, AzureOpenAIChatService)
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, AzureOpenAIChatService)
     credential = created["credential"]
     assert isinstance(credential, CloseTrackingCredential)
 
     await service.aclose()
 
     assert credential.close_count == 1
-    assert service._client.is_closed()
+    assert service.inner._client.is_closed()
 
     await service.aclose()  # idempotent: no second close
 
@@ -180,15 +189,17 @@ def make_real_settings() -> Settings:
 def test_real_service_built_from_complete_settings() -> None:
     service = build_chat_service(make_real_settings(), prompt=PROMPT)
 
-    assert isinstance(service, AzureOpenAIChatService)
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, AzureOpenAIChatService)
 
 
 def test_real_client_uses_configured_timeout_not_sdk_default() -> None:
     service = build_chat_service(make_real_settings(), prompt=PROMPT)
 
-    assert isinstance(service, AzureOpenAIChatService)
-    assert service._client.timeout == 30.0
-    assert service._client.max_retries == 2
+    assert isinstance(service, TracingChatService)
+    assert isinstance(service.inner, AzureOpenAIChatService)
+    assert service.inner._client.timeout == 30.0
+    assert service.inner._client.max_retries == 2
 
 
 class StubOutputItem:
