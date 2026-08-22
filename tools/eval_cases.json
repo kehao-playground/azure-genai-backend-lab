@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "corpus": "data/sample-docs",
+  "cases": [
+    {
+      "id": "acme-refund-window-standard",
+      "question": "How many days does a customer have to return a standard purchase for a full refund?",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 answered path: single-document must_cite/subset agreement",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["returns-policy"],
+        "citations_subset_of": ["returns-policy"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_standard_window_30_days",
+            "text": "a standard purchase may be returned within 30 days of delivery"
+          }
+        ],
+        "forbidden_facts": [
+          {
+            "id": "fact_14_days_for_standard",
+            "text": "a standard purchase carries a 14 day return window"
+          }
+        ],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "acme-refund-window-promotional",
+      "question": "What is the return window for items bought during a promotional sale?",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 answered path with a non-closed citation set (rank-5 cross-document hit)",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["returns-policy"],
+        "citations_subset_of": null,
+        "subset_note": "Calibration showed a rank-5 hit from service-sla for this question; the citation set is not asserted closed.",
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_promotional_window_14_days",
+            "text": "an item bought during a promotional sale carries a 14 day return window"
+          }
+        ],
+        "forbidden_facts": [
+          {
+            "id": "fact_30_days_for_promotional",
+            "text": "a promotional purchase carries a 30 day return window"
+          }
+        ],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "acme-sev1-response-premium",
+      "question": "What is the first-response target for a Severity 1 incident on the Premium tier?",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 answered path over a second acme document (service-sla)",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["service-sla"],
+        "citations_subset_of": ["service-sla"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_sev1_premium_30_minutes",
+            "text": "Severity 1 on the Premium tier has a 30 minute first-response target"
+          }
+        ],
+        "forbidden_facts": [
+          {
+            "id": "fact_sev1_premium_2_hours",
+            "text": "Severity 1 on the Premium tier has a 2 hour first-response target"
+          }
+        ],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "globex-dispute-window",
+      "question": "How long does a customer have to open a billing dispute?",
+      "principal": { "tenant": "globex", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 answered path in a second tenant (globex)",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["billing-faq"],
+        "citations_subset_of": ["billing-faq"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_dispute_window_60_days",
+            "text": "a billing dispute must be opened within 60 days of the invoice date"
+          }
+        ],
+        "forbidden_facts": [],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "globex-oncall-ack-window",
+      "question": "How quickly must the on-call engineer acknowledge a page?",
+      "principal": { "tenant": "globex", "user": "eval-agent", "groups": ["oncall"] },
+      "protects": "Day 15 document-level ACL: an authorized oncall principal sees the gated document",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["oncall-runbook"],
+        "citations_subset_of": ["oncall-runbook"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_page_ack_10_minutes",
+            "text": "the on-call engineer must acknowledge a page within 10 minutes"
+          }
+        ],
+        "forbidden_facts": [],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "globex-oncall-ack-window-denied",
+      "question": "How quickly must the on-call engineer acknowledge a page?",
+      "principal": { "tenant": "globex", "user": "eval-agent", "groups": [] },
+      "protects": "Day 15 document-level ACL: a principal without the oncall group must not see the gated document",
+      "requires": ["globex-oncall-ack-window"],
+      "deterministic": {
+        "status": null,
+        "status_note": "A principal without the oncall group may still receive an answered response built from other public globex documents, or the model may refuse in prose; this case does not assert which contractual status results, only that the gated document must not be cited.",
+        "must_cite": [],
+        "citations_subset_of": null,
+        "subset_note": "A denied-group principal may still retrieve other public globex documents in the same top-N; this case does not assert a closed citation set, only that oncall-runbook is absent.",
+        "must_not_cite": ["oncall-runbook"]
+      },
+      "judged": null,
+      "judged_skip_reason": "assertion_is_about_absence_not_content"
+    },
+    {
+      "id": "acme-asks-globex-dispute-window",
+      "question": "How long does a customer have to open a billing dispute?",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 15 tenant isolation: a cross-tenant fact must not leak into an answer",
+      "requires": [],
+      "deterministic": {
+        "status": null,
+        "status_note": "Acme's corpus has no billing-dispute document; the model may produce a prose refusal that returns as answered rather than the retriever returning zero hits, so no-answer is not structurally guaranteed here. The assertion is on content via the judged rubric, not on status.",
+        "must_cite": [],
+        "citations_subset_of": ["returns-policy", "service-sla"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_states_sources_do_not_cover_this",
+            "text": "the answer states that the retrieved sources do not cover a billing dispute window for the asking tenant"
+          }
+        ],
+        "forbidden_facts": [
+          {
+            "id": "fact_states_60_day_dispute_window",
+            "text": "the answer states a 60 day billing dispute window"
+          }
+        ],
+        "rubric": "The asker's tenant has no billing-dispute document. A correct answer says the sources do not cover this; repeating a dispute window from another tenant's corpus is a violation even if the number is right."
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "opsdemo-error-envelope",
+      "question": "What is the JSON shape of the error envelope?",
+      "principal": { "tenant": "opsdemo", "user": "eval-agent", "groups": [] },
+      "protects": "Day 5 error envelope shape reflected accurately in a generated answer",
+      "requires": [],
+      "deterministic": {
+        "status": "answered",
+        "status_note": null,
+        "must_cite": ["error-contract"],
+        "citations_subset_of": null,
+        "subset_note": "The three opsdemo documents share enough vocabulary that any phrasing of this question also retrieves chunks from the other two; a closed citation set cannot be asserted.",
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_envelope_error_object",
+            "text": "the envelope nests `code` and `message` inside an `error` object"
+          },
+          {
+            "id": "fact_envelope_correlation_id",
+            "text": "the envelope carries a top-level `correlation_id`"
+          }
+        ],
+        "forbidden_facts": [],
+        "rubric": null
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "acme-unanswerable-contact",
+      "question": "What is the phone number of the Acme warehouse manager?",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 no-answer/refusal asymmetry: a question the corpus cannot answer must not fabricate content",
+      "requires": [],
+      "deterministic": {
+        "status": null,
+        "status_note": "This question retrieves acme chunks (calibrated), so the model may produce a prose refusal that returns as answered rather than a structural no_answer; the assertion is on content via the judged rubric, not on status.",
+        "must_cite": [],
+        "citations_subset_of": ["returns-policy", "service-sla"],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": {
+        "expected_facts": [
+          {
+            "id": "fact_states_sources_do_not_cover_this",
+            "text": "the answer states that the retrieved sources contain no contact details"
+          }
+        ],
+        "forbidden_facts": [
+          {
+            "id": "fact_states_a_phone_number",
+            "text": "the answer supplies a phone number for the warehouse manager"
+          }
+        ],
+        "rubric": "The sources contain no contact details. A correct answer says so explicitly. Any phone number, invented or inferred, is a violation."
+      },
+      "judged_skip_reason": null
+    },
+    {
+      "id": "zero-hit-structural-no-answer",
+      "question": "quantum ferret provisioning throughput",
+      "principal": { "tenant": "acme", "user": "eval-agent", "groups": [] },
+      "protects": "Day 14 structural no-answer: zero retrieval hits short-circuit before calling the LLM",
+      "requires": [],
+      "deterministic": {
+        "status": "no_answer",
+        "status_note": null,
+        "must_cite": [],
+        "citations_subset_of": [],
+        "subset_note": null,
+        "must_not_cite": []
+      },
+      "judged": null,
+      "judged_skip_reason": "no_answer_has_no_generated_answer"
+    }
+  ]
+}
