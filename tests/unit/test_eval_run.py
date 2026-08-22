@@ -1860,6 +1860,15 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
 
     corpus_manifest = document["corpus_manifest"]
     assert isinstance(corpus_manifest, dict)
+    # Every path's hash pinned against the real file, not just the key's
+    # presence: the manifest exists so a later reader can prove the corpus
+    # has not moved under the run, and a manifest of constant values would
+    # satisfy a presence-only check while proving nothing.
+    corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
+    assert corpus_manifest == {
+        str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
+        for path in sorted(corpus_dir.glob("*/*.md"))
+    }
     assert "acme/returns-policy.md" in corpus_manifest
 
     rag_prompt = document["rag_prompt"]
@@ -1888,6 +1897,12 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     assert judged_doc["verdict"] == "pass"
     repeat_doc = judged_doc["repeats"][0]
     assert repeat_doc["raw_response"] == "raw text one"
+    # `outcome` is the pass/fail/error value this whole layer exists to
+    # produce, and `attempt` is what orders the sequence the stability line
+    # prints. Neither was asserted at all before (Day 28 review, Task 6
+    # re-review round 3).
+    assert repeat_doc["attempt"] == 1
+    assert repeat_doc["outcome"] == "pass"
     # Every hash the repeat carries must reach the document intact. Blanking
     # any one of them left the whole suite green until this assertion existed
     # (Day 28 review, Task 6 mutation backfill M25): the evidence file is what
