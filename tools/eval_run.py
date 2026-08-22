@@ -1390,7 +1390,15 @@ async def run_judged_layer(
                         case_id=case.id,
                         verdict=None,
                         state="INCONCLUSIVE",
-                        reason=f"pass_b_generation_error: {exc}",
+                        # Exception CLASS only, never `{exc}`: an upstream
+                        # message is text this runner does not control, and
+                        # a real Azure 429 reads "...exceeded call rate
+                        # limit." -- which would put the word "rate" into a
+                        # report whose whole contract is that it never states
+                        # one. Same discipline as the Day 14 stage logs
+                        # (`services/rag.py:378-383`), which log the class
+                        # name and the duration and nothing else.
+                        reason=f"pass_b_generation_error: {type(exc).__name__}",
                         repeats=(),
                     )
                     continue
