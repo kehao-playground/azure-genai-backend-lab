@@ -1880,7 +1880,16 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     judged_doc = case_doc["judged"]
     assert judged_doc["state"] == "JUDGED"
     assert judged_doc["verdict"] == "pass"
-    assert judged_doc["repeats"][0]["raw_response"] == "raw text one"
+    repeat_doc = judged_doc["repeats"][0]
+    assert repeat_doc["raw_response"] == "raw text one"
+    # Every hash the repeat carries must reach the document intact. Blanking
+    # any one of them left the whole suite green until this assertion existed
+    # (Day 28 review, Task 6 mutation backfill M25): the evidence file is what
+    # a later reader replays from, and a hash that silently became "" would
+    # make the run unreplayable while still looking well-formed.
+    assert repeat_doc["answer_sha256"] == "a" * 64
+    assert repeat_doc["sources_sha256"] == "s" * 64
+    assert repeat_doc["judge_input_sha256"] == "j" * 64
 
     assert document["cases_sha256"] == sha256_hex(eval_run.canonical_json(cases_doc))
 
