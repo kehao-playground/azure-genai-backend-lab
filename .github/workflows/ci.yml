@@ -29,6 +29,16 @@ jobs:
         run: uv run ruff check .
       - name: Mypy
         run: uv run mypy
+      - name: Mypy (tools)
+        # `mypy` with no argument checks only the configured packages
+        # (pyproject: packages = ["azgenai_lab"]), so every script under
+        # tools/ -- twelve of them now, including the Day 28 eval runner whose
+        # own gate depends on being type-checked -- went uncovered until
+        # this step existed. A directory, never a hand-maintained list of
+        # filenames: a list silently stops covering the next file someone
+        # adds, which is the stale-enumeration failure this repo has been
+        # bitten by before.
+        run: uv run mypy tools/
       - name: Pytest
         run: uv run pytest
       - name: Behave
