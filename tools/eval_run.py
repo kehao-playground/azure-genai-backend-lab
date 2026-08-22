@@ -32,7 +32,7 @@ import secrets
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -42,6 +42,7 @@ import azgenai_lab
 from azgenai_lab.core.audit import build_audit_attribution
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.errors import ContentFilteredError, UpstreamError
+from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal, validate_identifier
 from azgenai_lab.models.rag import make_parent_id
@@ -49,7 +50,11 @@ from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services import agent_tools
 from azgenai_lab.services.azure_openai import ChatService, build_chat_service
-from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
+from azgenai_lab.services.document_loader import (
+    SAMPLE_DOCS_DIR,
+    SourceDocumentError,
+    load_documents,
+)
 from azgenai_lab.services.rag import RagAnswer, RagService
 
 
@@ -856,7 +861,7 @@ def build_judge_input(
         }
         for number, hit in enumerate(hits, start=1)
     ]
-    return {
+    judge_input: dict[str, object] = {
         "question": case.question,
         "answer": _fence("ANSWER", nonce, None, answer),
         "sources": sources,
@@ -867,6 +872,19 @@ def build_judge_input(
             {"id": fact.id, "text": fact.text} for fact in case.judged.forbidden_facts
         ],
     }
+    # The rubric is dataset-authored, so it belongs on the trusted side of the
+    # boundary drawn above -- alongside `expected_facts`/`forbidden_facts`, not
+    # inside a fence. Omitted entirely when null rather than sent as `None`, so
+    # the judge sees no key at all and the built-in rubric stands unqualified.
+    #
+    # Two shipped cases carry their *positive* requirement only here ("a correct
+    # answer says the sources do not cover this"), with `expected_facts: []` and
+    # a `status_note` that points at the rubric by name. Dropping it left those
+    # two graded on their forbidden facts alone, so an answer that said nothing
+    # useful would have passed.
+    if case.judged.rubric is not None:
+        judge_input["rubric"] = case.judged.rubric
+    return judge_input
 
 
 JUDGE_PROMPT_VERSION: int = 1
@@ -897,6 +915,13 @@ List, in "unsupported_claims", any factual claim the answer makes that is \
 not one of the expected or forbidden facts above and that you cannot find \
 grounded in any of the "sources[].content" fields. This is free text -- \
 there is no id for a claim the dataset did not anticipate.
+
+If the input has a "rubric" field, it is a case-specific grading \
+instruction written by the dataset author, not retrieved data: apply it on top \
+of everything above. It can require something of the answer that no expected \
+fact captures -- typically that the answer state the sources do not cover the \
+question. An answer that fails the rubric has not covered the expected facts, \
+whatever else it says.
 
 Give a short "rationale" for your grading, one or two sentences.
 
@@ -1113,6 +1138,18 @@ class JudgeRepeat:
     `derive_judged_result` needs them on every repeat to detect one that was
     (by caller error) handed a different answer/sources than the others
     (design §7.3: "how five reviews of the same answer are proven").
+
+    `nonce` is recorded because `judge_input_sha256` is otherwise a fingerprint
+    of something no reader can reconstruct: the nonce is drawn fresh per repeat
+    (Day 21 per-request discipline), so without it the hash cannot be recomputed
+    from the sidecar own contents. It is a fence label, not a secret -- it
+    exists so corpus text cannot forge a fence within one request, and a spent
+    one grants nothing.
+
+    `model_version` and `usage` are the provider own answers to which model
+    graded this and what it cost. Both are `None` on the paths where no
+    `ChatResult` came back at all, and both are irrecoverable once the process
+    exits -- redoing a live run to recover them costs the whole run again.
     """
 
     attempt: int
@@ -1121,6 +1158,25 @@ class JudgeRepeat:
     sources_sha256: str
     judge_input_sha256: str
     raw_response: str
+    nonce: str
+    model_version: str | None
+    usage: TokenUsage | None
+
+
+@dataclass(frozen=True)
+class JudgedSource:
+    """One chunk pass B actually put in front of the judge.
+
+    `sources_sha256` on each repeat proves the five repeats saw the same
+    sources; it cannot say *which* ones. Attribution and replay need the
+    identities, so they are recorded per case: same shape
+    `calibration_document` already emits, content by hash rather than text
+    (the corpus is in the repo, and a sidecar is not a second copy of it).
+    """
+
+    doc_id: str
+    chunk_id: str
+    content_sha256: str
 
 
 @dataclass(frozen=True)
@@ -1140,6 +1196,11 @@ class JudgedResult:
     state: Literal["JUDGED", "INCONCLUSIVE", "SKIPPED"]
     reason: str | None
     repeats: tuple[JudgeRepeat, ...]
+    # Pass B provenance. Defaulted because the SKIPPED and INCONCLUSIVE paths
+    # reach a result without ever generating an answer -- an empty tuple there
+    # is the truth, not a missing value.
+    generation_usage: TokenUsage | None = None
+    sources: tuple[JudgedSource, ...] = ()
 
 
 async def _judge_once(
@@ -1182,6 +1243,9 @@ async def _judge_once(
             sources_sha256=src_sha,
             judge_input_sha256=judge_input_sha,
             raw_response=str(exc),
+            nonce=nonce,
+            model_version=None,
+            usage=None,
         )
     except UpstreamError as exc:
         return JudgeRepeat(
@@ -1191,6 +1255,9 @@ async def _judge_once(
             sources_sha256=src_sha,
             judge_input_sha256=judge_input_sha,
             raw_response=str(exc),
+            nonce=nonce,
+            model_version=None,
+            usage=None,
         )
 
     try:
@@ -1203,6 +1270,9 @@ async def _judge_once(
             sources_sha256=src_sha,
             judge_input_sha256=judge_input_sha,
             raw_response=result.message,
+            nonce=nonce,
+            model_version=result.model_version,
+            usage=result.usage,
         )
 
     return JudgeRepeat(
@@ -1212,6 +1282,9 @@ async def _judge_once(
         sources_sha256=src_sha,
         judge_input_sha256=judge_input_sha,
         raw_response=result.message,
+        nonce=nonce,
+        model_version=result.model_version,
+        usage=result.usage,
     )
 
 
@@ -1361,9 +1434,10 @@ async def run_judged_layer(
     # echo -- every repeat ERROR(parse), every case INCONCLUSIVE, exit 0, and
     # provider calls spent on answers nothing ever graded. That is exactly the
     # "silently judging a fake echo" this function's contract rules out, so the
-    # two passes now derive their settings from one value that cannot diverge.
+    # two passes now derive from `judge_settings` -- one value, passed to both,
+    # rather than two independently-constructed copies that merely agree today.
     judge_settings = settings.model_copy(update={"use_fake_llm": False})
-    real_service = build_seeded_rag_service(settings, use_fake_llm=False)
+    real_service = build_seeded_rag_service(judge_settings, use_fake_llm=False)
     try:
         judge_chat = build_chat_service(judge_settings, prompt=judge_prompt_template())
         try:
@@ -1443,7 +1517,23 @@ async def run_judged_layer(
                     repeats=repeats,
                     nonce_factory=nonce_factory,
                 )
-                results[case.id] = derive_judged_result(case.id, repeats_run)
+                # Attached after the fact rather than threaded through
+                # `derive_judged_result`, whose contract is "repeats in,
+                # verdict out" and whose tests pin exactly that. What pass B
+                # cost and which chunks it retrieved are provenance about the
+                # same run, not inputs to the verdict.
+                results[case.id] = replace(
+                    derive_judged_result(case.id, repeats_run),
+                    generation_usage=pass_b.usage,
+                    sources=tuple(
+                        JudgedSource(
+                            doc_id=_doc_id_from_parent_id(hit.parent_id),
+                            chunk_id=hit.chunk_id,
+                            content_sha256=sha256_hex(hit.content.encode("utf-8")),
+                        )
+                        for hit in pass_b.hits
+                    ),
+                )
 
             return results
         finally:
@@ -1498,6 +1588,26 @@ def render_report(det: Mapping[str, CaseResult], judged: Mapping[str, JudgedResu
     return "\n".join(lines) + "\n"
 
 
+def _usage_doc(usage: TokenUsage | None) -> dict[str, int | None] | None:
+    """Provider-reported token counts, or `None` where the provider returned
+    nothing at all.
+
+    `None` and a zero-filled record are different facts and are kept
+    different: the error paths never received a `ChatResult`, so there is no
+    usage to report -- writing zeros there would state a measurement that was
+    never taken. Day 9 discipline: this is metering for attribution, never a
+    billing record; the invoice remains the authority.
+    """
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    }
+
+
 def evidence_document(
     *,
     run_id: str,
@@ -1526,8 +1636,10 @@ def evidence_document(
     `_resolve_corpus_dir`): this raises `DatasetError` rather than stamping
     one tree's commit onto another tree's corpus.
 
-    No rate or percentage is computed anywhere in this document (design §9)
-    -- only counts, ids, and the literal per-case, per-repeat sequence.
+    No rate or percentage is computed anywhere in this document (design §9):
+    counts, ids, and the literal per-case, per-repeat sequence, plus each
+    repeat's verbatim `raw_response`, which is model text this runner does not
+    constrain and does not parse for numbers.
     Group ids never appear here, only `groups_count` and each group's own
     SHA-256 (Day 15) -- the same redaction `calibration_document` already
     applies, reused rather than re-invented.
@@ -1565,6 +1677,17 @@ def evidence_document(
                         "state": judged_result.state,
                         "verdict": judged_result.verdict,
                         "reason": judged_result.reason,
+                        "generation": {
+                            "usage": _usage_doc(judged_result.generation_usage),
+                            "sources": [
+                                {
+                                    "doc_id": src.doc_id,
+                                    "chunk_id": src.chunk_id,
+                                    "content_sha256": src.content_sha256,
+                                }
+                                for src in judged_result.sources
+                            ],
+                        },
                         "repeats": [
                             {
                                 "attempt": r.attempt,
@@ -1572,6 +1695,9 @@ def evidence_document(
                                 "answer_sha256": r.answer_sha256,
                                 "sources_sha256": r.sources_sha256,
                                 "judge_input_sha256": r.judge_input_sha256,
+                                "nonce": r.nonce,
+                                "model_version": r.model_version,
+                                "usage": _usage_doc(r.usage),
                                 "raw_response": r.raw_response,
                             }
                             for r in judged_result.repeats
@@ -1590,7 +1716,7 @@ def evidence_document(
         "dataset_sha256": sha256_hex(_DATASET_PATH.read_bytes()),
         "corpus_manifest": {
             str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
-            for path in sorted(corpus_dir.glob("*/*.md"))
+            for path in sorted(corpus_dir.rglob("*.md"))
         },
         "rag_prompt": {
             "name": rag_prompt.name,
@@ -1600,6 +1726,15 @@ def evidence_document(
         "judge_prompt": {
             "version": judge_prompt.version,
             "sha256": judge_prompt.sha256,
+        },
+        # Recorded so a reader cannot mistake this for an end-to-end run.
+        # Retrieval is seeded and fake here by design (design §2), and the
+        # difference between "the model wrote this" and "a fake echoed it" is
+        # the difference between evidence and a wiring demo.
+        "adapters": {
+            "use_fake_llm": settings.use_fake_llm,
+            "use_fake_search": settings.use_fake_search,
+            "use_fake_embeddings": settings.use_fake_embeddings,
         },
         "cases": cases_doc,
     }
@@ -1710,7 +1845,7 @@ async def calibration_document(
         "corpus_dir": str(corpus_dir.relative_to(resolved_root)),
         "corpus_sha256": {
             str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
-            for path in sorted(corpus_dir.glob("*/*.md"))
+            for path in sorted(corpus_dir.rglob("*.md"))
         },
         "questions_sha256": sha256_hex(_DATASET_PATH.read_bytes()),
         "settings": {
@@ -1822,11 +1957,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return ExitCode.SETUP_FAILED
 
+    # Both of these are checked before anything is built, for one reason: on a
+    # judged run they would otherwise surface *after* the provider calls are
+    # billed. An unwritable --evidence-out discarded the whole sidecar -- the
+    # deliverable of the run -- once every answer had already been paid for,
+    # and --repeats 0 got as far as case 1's generation before failing.
+    # Flags that would otherwise parse fine and do nothing. `--calibrate`
+    # returns before any of the judged-layer flags is read, so asking for both
+    # silently got a calibration document and no judging -- and `--evidence-out`
+    # without `--judge` silently produced no sidecar. Neither is a typo the user
+    # would notice from the output, and on a run someone expected to cost money
+    # the silence is the whole problem.
+    if args.calibrate and args.judge:
+        print(
+            "SETUP FAILURE: --calibrate and --judge are separate runs; pass one.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    if not args.judge and args.evidence_out is not None:
+        print(
+            "SETUP FAILURE: --evidence-out records a judged run; it needs --judge.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    if args.repeats < 1:
+        print(
+            f"SETUP FAILURE: --repeats must be at least 1, got {args.repeats}.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    if args.evidence_out is not None and not args.evidence_out.parent.is_dir():
+        print(
+            f"SETUP FAILURE: --evidence-out directory does not exist: "
+            f"{args.evidence_out.parent}",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
     corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
 
+    # `SourceDocumentError` alongside `DatasetError`: `load_cases` reaches the
+    # corpus through `_corpus_keys` -> `load_documents`, so "the corpus would
+    # not load" -- which both this module's ExitCode docstring and the public
+    # docs name as a SETUP_FAILED case -- arrived here as an uncaught traceback
+    # and exit 1. Exit 1 is the one code meaning the gate ran and found a
+    # problem with the thing under test; a corpus that never loaded is not that.
     try:
         cases = load_cases(_DATASET_PATH, corpus_dir)
-    except DatasetError as exc:
+    except (DatasetError, SourceDocumentError) as exc:
         print(f"SETUP FAILURE: {exc}", file=sys.stderr)
         return ExitCode.SETUP_FAILED
 
@@ -1843,7 +2024,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True))
             return ExitCode.OK
 
-        corpus = build_corpus_map(corpus_dir)
+        try:
+            corpus = build_corpus_map(corpus_dir)
+        except SourceDocumentError as exc:
+            print(f"SETUP FAILURE: {exc}", file=sys.stderr)
+            return ExitCode.SETUP_FAILED
         results = asyncio.run(run_pass_a(cases, service, corpus))
         propagated = propagate_requires(cases, results)
 
@@ -1865,7 +2050,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             judged = asyncio.run(run_judged_layer(cases, service, settings, repeats=args.repeats))
         except ValueError as exc:
-            print(f"SETUP FAILURE: --judge requires real credentials: {exc}", file=sys.stderr)
+            # Class name, not a fixed diagnosis: this also catches
+            # `build_judge_input`'s judged=None guard and every ValueError from
+            # `_doc_id_from_parent_id`, each of which was previously reported as
+            # "requires real credentials" -- the exit code was right and the
+            # explanation was wrong.
+            print(
+                f"SETUP FAILURE: --judge could not start: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
             return ExitCode.SETUP_FAILED
 
         print(render_report(propagated, judged))
@@ -1888,7 +2081,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             except DatasetError as exc:
                 print(f"SETUP FAILURE: {exc}", file=sys.stderr)
                 return ExitCode.SETUP_FAILED
-            args.evidence_out.write_bytes(canonical_json(document))
+            try:
+                args.evidence_out.write_bytes(canonical_json(document))
+            except OSError as exc:
+                # Deliberately not a blanket `except Exception`, which would
+                # hide genuine bugs behind exit 2. On a judged run the answers
+                # are already paid for by this point, so the failure is
+                # reported loudly rather than swallowed -- but it is still a
+                # setup failure, not a verdict about the thing under test.
+                print(f"SETUP FAILURE: could not write evidence: {exc}", file=sys.stderr)
+                return ExitCode.SETUP_FAILED
             print(f"evidence written to {args.evidence_out}", file=sys.stderr)
         return gate_exit_code(propagated)
     finally:

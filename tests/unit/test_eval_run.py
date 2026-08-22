@@ -35,6 +35,7 @@ import pytest
 
 from azgenai_lab.core.config import Settings
 from azgenai_lab.core.errors import ContentFilteredError, UpstreamTimeoutError
+from azgenai_lab.models.chat import TokenUsage
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
@@ -764,6 +765,7 @@ def _judged_case(
     case_id: str = "judged-case",
     expected: tuple["Fact", ...] = (),
     forbidden: tuple["Fact", ...] = (),
+    rubric: str | None = None,
 ) -> EvalCase:
     return EvalCase(
         id=case_id,
@@ -774,7 +776,7 @@ def _judged_case(
         protects="test coverage",
         requires=(),
         deterministic=_det(),
-        judged=JudgedSpec(expected_facts=expected, forbidden_facts=forbidden, rubric=None),
+        judged=JudgedSpec(expected_facts=expected, forbidden_facts=forbidden, rubric=rubric),
         judged_skip_reason=None,
     )
 
@@ -923,6 +925,46 @@ def test_build_judge_input_source_carries_doc_id_and_heading_path() -> None:
     assert isinstance(sources, list)
     assert sources[0]["doc_id"] == "doc-a"
     assert sources[0]["heading_path"] == "Doc A > Section 1"
+
+
+def test_build_judge_input_carries_a_non_null_rubric_to_the_judge() -> None:
+    # The rubric is where two shipped cases keep their positive requirement
+    # ("a correct answer says the sources do not cover this"), and no fact id
+    # captures it. It was parsed, documented and shipped but never reached
+    # `build_judge_input`, so those two cases were graded on their forbidden
+    # facts alone. It goes in unfenced: dataset-authored text is trusted input,
+    # the same side of the boundary as expected_facts/forbidden_facts.
+    case = _judged_case(
+        expected=(_fact("f1"),), rubric="The answer must say the sources are silent."
+    )
+    payload = build_judge_input(case, "answer", [], nonce="n")
+    assert payload["rubric"] == "The answer must say the sources are silent."
+
+
+def test_build_judge_input_omits_the_rubric_key_entirely_when_null() -> None:
+    # Absent, not `None`: a null rubric means "the built-in rubric stands", and
+    # sending an explicit null would put a second, empty instruction in front of
+    # the judge for the eight cases that do not define one.
+    case = _judged_case(expected=(_fact("f1"),))
+    payload = build_judge_input(case, "answer", [], nonce="n")
+    assert "rubric" not in payload
+
+
+def test_judge_prompt_tells_the_model_to_apply_a_rubric_when_present() -> None:
+    # Carrying the field is half the fix -- an input key the prompt never
+    # mentions is one the model has no instruction to honour.
+    assert "rubric" in eval_run.JUDGE_PROMPT
+
+
+def test_shipped_dataset_rubrics_reach_the_judge_input() -> None:
+    # The two real cases the finding was about, driven end to end through the
+    # shipped dataset rather than a fixture.
+    for case_id in ("acme-asks-globex-dispute-window", "acme-unanswerable-contact"):
+        case = _case_by_id(case_id)
+        assert case.judged is not None
+        assert case.judged.rubric is not None
+        payload = build_judge_input(case, "answer", [], nonce="n")
+        assert payload["rubric"] == case.judged.rubric
 
 
 def test_build_judge_input_rejects_a_case_with_judged_none() -> None:
@@ -1261,6 +1303,9 @@ def _repeat(
     sources_sha256: str = "s" * 64,
     judge_input_sha256: str = "j" * 64,
     raw_response: str = "{}",
+    nonce: str = "n" * 32,
+    model_version: str | None = "stub",
+    usage: TokenUsage | None = None,
 ) -> "JudgeRepeat":
     return JudgeRepeat(
         attempt=attempt,
@@ -1269,6 +1314,9 @@ def _repeat(
         sources_sha256=sources_sha256,
         judge_input_sha256=judge_input_sha256,
         raw_response=raw_response,
+        nonce=nonce,
+        model_version=model_version,
+        usage=usage,
     )
 
 
@@ -1645,7 +1693,7 @@ async def test_run_judged_layer_upstream_error_text_never_reaches_the_report(
     assert result.reason == "pass_b_generation_error: UpstreamTimeoutError"
     report = render_report({case.id: _result(case.id, Verdict.PASS)}, results)
     assert not re.search(r"%", report)
-    assert not re.search(r"rate", report, re.IGNORECASE)
+    assert not re.search(r"\brate\b", report, re.IGNORECASE)
 
 
 async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with_zero_repeats(
@@ -1835,7 +1883,7 @@ def test_render_report_prints_the_actual_sequence_and_never_a_rate() -> None:
 
     assert "pass,pass,fail,pass,pass" in report
     assert not re.search(r"%", report)
-    assert not re.search(r"rate", report, re.IGNORECASE)
+    assert not re.search(r"\brate\b", report, re.IGNORECASE)
 
 
 def test_render_report_skipped_case_shows_the_datasets_skip_reason() -> None:
@@ -1914,7 +1962,30 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     det = {case.id: _result(case.id, Verdict.PASS)}
     judged = {
         case.id: JudgedResult(
-            case.id, "pass", "JUDGED", None, (_repeat(1, "pass", raw_response="raw text one"),)
+            case.id,
+            "pass",
+            "JUDGED",
+            None,
+            (
+                _repeat(
+                    1,
+                    "pass",
+                    raw_response="raw text one",
+                    nonce="deadbeef" * 4,
+                    model_version="chat-mini",
+                    usage=TokenUsage(
+                        input_tokens=11, output_tokens=22, total_tokens=33, reasoning_tokens=4
+                    ),
+                ),
+            ),
+            generation_usage=TokenUsage(
+                input_tokens=100, output_tokens=200, total_tokens=300, reasoning_tokens=None
+            ),
+            sources=(
+                eval_run.JudgedSource(
+                    doc_id="returns-policy", chunk_id="c-0001", content_sha256="c" * 64
+                ),
+            ),
         )
     }
 
@@ -1945,7 +2016,7 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
     assert corpus_manifest == {
         str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
-        for path in sorted(corpus_dir.glob("*/*.md"))
+        for path in sorted(corpus_dir.rglob("*.md"))
     }
     assert "acme/returns-policy.md" in corpus_manifest
 
@@ -1989,8 +2060,163 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     assert repeat_doc["answer_sha256"] == "a" * 64
     assert repeat_doc["sources_sha256"] == "s" * 64
     assert repeat_doc["judge_input_sha256"] == "j" * 64
+    # The nonce is what makes judge_input_sha256 checkable at all: it is drawn
+    # fresh per repeat, so without it recorded the hash fingerprints something
+    # no reader can reconstruct.
+    assert repeat_doc["nonce"] == "deadbeef" * 4
+    # Which model graded this, and what it cost. Both are irrecoverable once
+    # the process exits -- recovering them means paying for the run again.
+    assert repeat_doc["model_version"] == "chat-mini"
+    assert repeat_doc["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 22,
+        "total_tokens": 33,
+        "reasoning_tokens": 4,
+    }
+
+    generation_doc = judged_doc["generation"]
+    assert generation_doc["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 200,
+        "total_tokens": 300,
+        "reasoning_tokens": None,
+    }
+    # sources_sha256 proves the repeats saw the SAME sources; only this says
+    # which ones. Pinned whole, not by key presence.
+    assert generation_doc["sources"] == [
+        {"doc_id": "returns-policy", "chunk_id": "c-0001", "content_sha256": "c" * 64}
+    ]
 
     assert document["cases_sha256"] == sha256_hex(eval_run.canonical_json(cases_doc))
+
+
+def test_main_rejects_calibrate_together_with_judge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `--calibrate` returns before any judged-layer flag is read, so the two
+    # together silently produced a calibration document and no judging.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    exit_code = eval_run.main(["--calibrate", "--judge"])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "separate runs" in capsys.readouterr().err
+
+
+def test_main_rejects_evidence_out_without_judge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Silently wrote nothing: the sidecar is only produced on the judged path.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    out = tmp_path / "evidence.json"
+
+    exit_code = eval_run.main(["--evidence-out", str(out)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "needs --judge" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_real_report_from_the_shipped_dataset_states_no_rate() -> None:
+    # The other no-rates guards run over synthesised fixtures, so none of them
+    # was ever pointed at the surface the contract is about. This builds the
+    # report from all ten shipped cases.
+    #
+    # The check needs word boundaries: the real report legitimately contains
+    # "rate" as a substring of `generated`, inside
+    # `SKIPPED(no_answer_has_no_generated_answer)`. That is not a rate, and a
+    # naive substring check could therefore never be run against real output.
+    cases = eval_run.load_cases(eval_run._DATASET_PATH, Path(SAMPLE_DOCS_DIR))
+    det = {case.id: _result(case.id, Verdict.PASS) for case in cases}
+    # Faithful to what a real run produces: the two cases the dataset marks
+    # `judged: null` come back SKIPPED carrying their own skip reason, which is
+    # where the `generated` substring actually comes from.
+    judged = {
+        case.id: (
+            JudgedResult(case.id, None, "SKIPPED", case.judged_skip_reason, ())
+            if case.judged is None
+            else JudgedResult(
+                case.id, "pass", "JUDGED", None, (_repeat(1, "pass"), _repeat(2, "fail"))
+            )
+        )
+        for case in cases
+    }
+
+    report = eval_run.render_report(det, judged)
+
+    assert "generated" in report  # the substring that makes the boundary matter
+    assert not re.search(r"\brate\b", report, re.IGNORECASE)
+    assert "%" not in report
+
+
+async def test_evidence_document_records_the_three_adapter_flags_distinctly() -> None:
+    # Recorded so nobody reads a seeded-retrieval run as end to end. Driven
+    # with three values that are NOT all equal, and asserted against literals
+    # rather than against `settings` again: an assertion that re-reads the same
+    # object it is checking passes under any constant, which is how the first
+    # version of this check survived a mutation that hard-coded True.
+    settings = Settings(
+        _env_file=None,
+        use_fake_llm=True,
+        use_fake_search=False,
+        use_fake_embeddings=True,
+    )
+    case = _case_by_id("acme-refund-window-standard")
+
+    document = evidence_document(
+        run_id="r",
+        started_at="2026-08-22T00:00:00Z",
+        completed_at="2026-08-22T00:05:00Z",
+        lab_root=_LAB_ROOT,
+        settings=settings,
+        cases=[case],
+        det={case.id: _result(case.id, Verdict.PASS)},
+        judged={},
+    )
+
+    # Each flag differs from at least one neighbour, so a hard-coded constant
+    # or a swapped key cannot satisfy this.
+    assert document["adapters"] == {
+        "use_fake_llm": True,
+        "use_fake_search": False,
+        "use_fake_embeddings": True,
+    }
+
+
+async def test_evidence_document_reports_absent_usage_as_null_not_zeros() -> None:
+    # A repeat that never got a ChatResult has no usage to report. Zeros would
+    # state a measurement nobody took -- and would silently understate the run's
+    # cost if they were ever summed.
+    settings = _fresh_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    judged = {
+        case.id: JudgedResult(
+            case.id,
+            None,
+            "INCONCLUSIVE",
+            "repeat error(s): attempt 1=ERROR(upstream)",
+            (_repeat(1, "ERROR(upstream)", model_version=None, usage=None),),
+        )
+    }
+
+    document = evidence_document(
+        run_id="r",
+        started_at="2026-08-22T00:00:00Z",
+        completed_at="2026-08-22T00:05:00Z",
+        lab_root=_LAB_ROOT,
+        settings=settings,
+        cases=[case],
+        det={case.id: _result(case.id, Verdict.PASS)},
+        judged=judged,
+    )
+
+    cases_doc = document["cases"]
+    assert isinstance(cases_doc, list)
+    judged_doc = cases_doc[0]["judged"]
+    assert judged_doc["repeats"][0]["usage"] is None
+    assert judged_doc["repeats"][0]["model_version"] is None
+    assert judged_doc["generation"]["usage"] is None
+    assert judged_doc["generation"]["sources"] == []
 
 
 async def test_evidence_document_records_the_reason_an_inconclusive_case_has_no_verdict() -> None:
@@ -2217,6 +2443,11 @@ def test_main_without_evidence_out_writes_no_file(
         eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
     )
 
+    # chdir first: nothing in main() ever writes into tmp_path, so without this
+    # the assertion below passes no matter what. A regression that wrote a
+    # default sidecar would put it in the cwd -- which is what this now is.
+    monkeypatch.chdir(tmp_path)
+
     exit_code = eval_run.main(["--judge", "--repeats", "1"])
 
     assert exit_code == ExitCode.OK
@@ -2228,6 +2459,69 @@ def test_run_id_is_unique_per_call() -> None:
     # collision would attach one run's adjudication to another run's answers.
     ids = {eval_run._run_id() for _ in range(64)}
     assert len(ids) == 64
+
+
+def test_main_unloadable_corpus_exits_setup_failed_not_gate_failed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Both this module's ExitCode docstring and docs/evaluation.md name "the
+    # corpus would not load" as a SETUP_FAILED case, but `load_cases` reaches
+    # the corpus via `load_documents`, which raises SourceDocumentError -- not
+    # DatasetError -- so it escaped as a traceback and exit 1. Exit 1 is the one
+    # code that means the gate ran and found a problem with the thing under
+    # test; a corpus that never loaded is not a verdict about anything.
+    monkeypatch.setattr(
+        eval_run,
+        "get_settings",
+        lambda: Settings(_env_file=None, sample_docs_dir="/nonexistent-corpus-dir"),
+    )
+
+    exit_code = eval_run.main([])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert exit_code != ExitCode.GATE_FAILED
+    assert "SETUP FAILURE" in capsys.readouterr().err
+
+
+def test_main_rejects_repeats_below_one_before_building_anything(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `--repeats 0` used to reach `derive_judged_result`'s empty-repeats guard,
+    # which meant one real generation call was already billed, and then reported
+    # the failure as missing credentials. Rejected up front instead.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once --repeats is rejected")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+
+    exit_code = eval_run.main(["--judge", "--repeats", "0"])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "--repeats must be at least 1" in capsys.readouterr().err
+
+
+def test_main_rejects_an_unwritable_evidence_out_before_any_provider_call(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The expensive ordering bug: the sidecar was written after the judged layer
+    # finished, so on a live run an unwritable path threw away the deliverable
+    # once every answer had been paid for. The directory is checked before
+    # anything is built.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once --evidence-out is rejected")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+    missing = tmp_path / "no-such-dir" / "evidence.json"
+
+    exit_code = eval_run.main(["--judge", "--evidence-out", str(missing)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "--evidence-out directory does not exist" in capsys.readouterr().err
+    assert not missing.exists()
 
 
 def test_main_judge_flag_with_fake_llm_exits_setup_failed_making_no_provider_call(
