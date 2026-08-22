@@ -179,7 +179,12 @@
         "must_not_cite": []
       },
       "judged": {
-        "expected_facts": [],
+        "expected_facts": [
+          {
+            "id": "fact_states_sources_do_not_cover_this",
+            "text": "the answer states that the retrieved sources do not cover a billing dispute window for the asking tenant"
+          }
+        ],
         "forbidden_facts": [
           {
             "id": "fact_states_60_day_dispute_window",
@@ -235,7 +240,12 @@
         "must_not_cite": []
       },
       "judged": {
-        "expected_facts": [],
+        "expected_facts": [
+          {
+            "id": "fact_states_sources_do_not_cover_this",
+            "text": "the answer states that the retrieved sources contain no contact details"
+          }
+        ],
         "forbidden_facts": [
           {
             "id": "fact_states_a_phone_number",

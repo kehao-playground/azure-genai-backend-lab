@@ -41,7 +41,7 @@ from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services.azure_openai import ChatResult
-from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 from azgenai_lab.services.rag import RagAnswer, build_rag_service
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "eval_run.py"
@@ -927,6 +927,64 @@ def test_build_judge_input_source_carries_doc_id_and_heading_path() -> None:
     assert sources[0]["heading_path"] == "Doc A > Section 1"
 
 
+def test_rubric_cases_have_an_expected_fact_so_a_rubric_failure_can_reach_fail() -> None:
+    # The rubric alone cannot fail a case. `derive_judge_verdict` fails only on
+    # missing/violated fact ids or unsupported claims, and `parse_judge_response`
+    # invariant 2 requires covered|missing to be a subset of expected_facts --
+    # which, when expected_facts is empty, forces missing to be empty too.
+    #
+    # So with `expected_facts: []` a judge that ignores the rubric grades pass,
+    # and one that obeys it and names anything gets a parse error. Neither is
+    # fail. The positive requirement therefore needs an id the invariants can
+    # carry, and this asserts both rubric cases have one.
+    for case_id in ("acme-asks-globex-dispute-window", "acme-unanswerable-contact"):
+        case = _case_by_id(case_id)
+        assert case.judged is not None
+        assert case.judged.rubric is not None
+        assert [f.id for f in case.judged.expected_facts] == [
+            "fact_states_sources_do_not_cover_this"
+        ]
+
+
+def test_a_rubric_case_fails_when_the_judge_reports_the_positive_fact_missing() -> None:
+    # The channel end to end on a real case: naming the expected fact as missing
+    # parses cleanly and derives `fail`. This is what was impossible before the
+    # case gained an expected fact.
+    case = _case_by_id("acme-unanswerable-contact")
+    response = json.dumps(
+        {
+            "covered_fact_ids": [],
+            "missing_fact_ids": ["fact_states_sources_do_not_cover_this"],
+            "violated_fact_ids": [],
+            "unsupported_claims": [],
+            "rationale": "the answer never says the sources are silent",
+        }
+    )
+
+    output = eval_run.parse_judge_response(response, case)
+
+    assert eval_run.derive_judge_verdict(output) == "fail"
+
+
+def test_a_rubric_case_passes_when_the_judge_reports_the_positive_fact_covered() -> None:
+    # The other side of the same channel, so the test above is not satisfied by
+    # a derivation that simply always fails these cases.
+    case = _case_by_id("acme-unanswerable-contact")
+    response = json.dumps(
+        {
+            "covered_fact_ids": ["fact_states_sources_do_not_cover_this"],
+            "missing_fact_ids": [],
+            "violated_fact_ids": [],
+            "unsupported_claims": [],
+            "rationale": "the answer says the sources contain no contact details",
+        }
+    )
+
+    output = eval_run.parse_judge_response(response, case)
+
+    assert eval_run.derive_judge_verdict(output) == "pass"
+
+
 def test_build_judge_input_carries_a_non_null_rubric_to_the_judge() -> None:
     # The rubric is where two shipped cases keep their positive requirement
     # ("a correct answer says the sources do not cover this"), and no fact id
@@ -950,10 +1008,17 @@ def test_build_judge_input_omits_the_rubric_key_entirely_when_null() -> None:
     assert "rubric" not in payload
 
 
-def test_judge_prompt_tells_the_model_to_apply_a_rubric_when_present() -> None:
+def test_judge_prompt_instructs_on_the_rubric_and_lists_it_as_trusted() -> None:
     # Carrying the field is half the fix -- an input key the prompt never
-    # mentions is one the model has no instruction to honour.
-    assert "rubric" in eval_run.JUDGE_PROMPT
+    # mentions is one the model has no instruction to honour. Asserting on the
+    # instruction rather than on the word: a rewrite that keeps "rubric" while
+    # dropping the instruction, or that leaves the trusted-source sentence
+    # naming only two fields (which contradicted this paragraph four
+    # paragraphs later), must not stay green.
+    prompt = eval_run.JUDGE_PROMPT
+    assert 'If the input has a "rubric" field' in prompt
+    assert "apply it on top" in prompt
+    assert '"forbidden_facts" and "rubric" schema fields' in prompt
 
 
 def test_shipped_dataset_rubrics_reach_the_judge_input() -> None:
@@ -1744,6 +1809,122 @@ async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with
     assert judge.calls == []
 
 
+async def test_sources_mismatch_still_records_the_billed_pass_b_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The one early exit where pass B actually ran, answered, and was billed.
+    # Every other INCONCLUSIVE path never generated anything, so empty usage and
+    # sources are the truth there; here they would be a lie, and this is exactly
+    # the branch where "which chunks did each pass see" is the whole diagnostic
+    # question the sidecar has to answer.
+    settings = _judge_ready_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    pass_b_usage = TokenUsage(
+        input_tokens=5, output_tokens=6, total_tokens=11, reasoning_tokens=None
+    )
+    principal = Principal(tenant_id=case.tenant, user_id=case.user, group_ids=case.groups)
+    pass_a = await fake_service.answer(case.question, principal)
+    # Same hits, reversed: a different sources_sha256 with no other change.
+    mismatched = tuple(reversed(pass_a.hits))
+    assert mismatched != pass_a.hits
+
+    generation = _StaticChatService(ChatResult(message="answer", model_version="stub"))
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    class _PassBService:
+        async def answer(self, question: str, principal: Principal) -> RagAnswer:
+            return RagAnswer(
+                status="answered",
+                answer="answer",
+                hits=mismatched,
+                usage=pass_b_usage,
+                incomplete_reason=None,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        eval_run, "build_seeded_rag_service", lambda settings, *, use_fake_llm: _PassBService()
+    )
+
+    try:
+        results = await run_judged_layer([case], fake_service, settings, repeats=1)
+    finally:
+        await fake_service.aclose()
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    assert result.reason == "pass_a_pass_b_sources_sha256_mismatch"
+    assert result.repeats == ()
+    # No verdict, but the money was spent and the evidence must say so.
+    assert result.generation_usage == pass_b_usage
+    assert [src.chunk_id for src in result.sources] == [hit.chunk_id for hit in mismatched]
+
+
+async def test_run_judged_layer_attaches_pass_b_usage_and_sources_to_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The evidence tests pin how a JudgedResult is *serialised*; nothing pinned
+    # that the runner ever populates those fields. Deleting the whole attach
+    # step left all tests green, and the sidecar it produces -- every judged
+    # case reading `"usage": null, "sources": []` -- is by this runner's own
+    # convention indistinguishable from "no measurement was taken". That is the
+    # irrecoverable loss the provenance exists to prevent, and it costs a live
+    # run to notice.
+    settings = _judge_ready_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    pass_b_usage = TokenUsage(
+        input_tokens=7, output_tokens=8, total_tokens=15, reasoning_tokens=None
+    )
+    principal = Principal(tenant_id=case.tenant, user_id=case.user, group_ids=case.groups)
+    pass_a = await fake_service.answer(case.question, principal)
+    generation = _StaticChatService(
+        ChatResult(message="a real-sounding answer", model_version="stub")
+    )
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    class _PassBService:
+        async def answer(self, question: str, principal: Principal) -> RagAnswer:
+            # Same hits as pass A, so the sources check agrees and judging runs.
+            return RagAnswer(
+                status="answered",
+                answer="a real-sounding answer",
+                hits=pass_a.hits,
+                usage=pass_b_usage,
+                incomplete_reason=None,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        eval_run, "build_seeded_rag_service", lambda settings, *, use_fake_llm: _PassBService()
+    )
+
+    try:
+        results = await run_judged_layer([case], fake_service, settings, repeats=1)
+    finally:
+        await fake_service.aclose()
+
+    result = results[case.id]
+    assert result.state == "JUDGED"
+    assert result.generation_usage == pass_b_usage
+    assert [src.chunk_id for src in result.sources] == [hit.chunk_id for hit in pass_a.hits]
+    assert result.sources
+    assert all(len(src.content_sha256) == 64 for src in result.sources)
+
+
 async def test_run_judged_layer_builds_both_passes_from_forced_real_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2016,7 +2197,7 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
     assert corpus_manifest == {
         str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
-        for path in sorted(corpus_dir.rglob("*.md"))
+        for path in sorted(corpus_dir.glob("*/*.md"))
     }
     assert "acme/returns-policy.md" in corpus_manifest
 
@@ -2181,6 +2362,54 @@ async def test_evidence_document_records_the_three_adapter_flags_distinctly() ->
         "use_fake_search": False,
         "use_fake_embeddings": True,
     }
+
+
+def test_corpus_manifest_ignores_files_the_loader_would_never_load(tmp_path: Path) -> None:
+    # The depth rule, tested against a corpus that actually nests -- the shipped
+    # one does not, so in place the two globs are indistinguishable and a silent
+    # switch to `rglob` stays green. `load_documents` reads exactly
+    # <base>/<tenant>/<doc>.md, and the manifest must describe what was read:
+    # not a file one level up, and not one buried a level deeper.
+    (tmp_path / "acme").mkdir()
+    (tmp_path / "acme" / "policy.md").write_text("loaded", encoding="utf-8")
+    (tmp_path / "stray.md").write_text("too shallow", encoding="utf-8")
+    (tmp_path / "acme" / "nested").mkdir()
+    (tmp_path / "acme" / "nested" / "deep.md").write_text("too deep", encoding="utf-8")
+
+    manifest = eval_run._corpus_manifest(tmp_path)
+
+    assert set(manifest) == {"acme/policy.md"}
+    assert manifest["acme/policy.md"] == sha256_hex(b"loaded")
+
+
+async def test_corpus_manifest_lists_exactly_what_the_loader_reads() -> None:
+    # The manifest's job is to say what the run actually read, so the invariant
+    # is "mirrors `load_documents`", not "finds every .md". Pinned against the
+    # loader's own output rather than against the same glob expression the
+    # runner uses -- a test that recomputes the expectation the same way cannot
+    # catch the expression changing. (A `rglob` sweep looked like the safer
+    # choice, but it would list a file at another depth that the loader would
+    # never have loaded, which is a manifest that over-reports what was read.)
+    settings = _fresh_settings()
+    corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
+    case = _case_by_id("acme-refund-window-standard")
+
+    document = evidence_document(
+        run_id="r",
+        started_at="2026-08-22T00:00:00Z",
+        completed_at="2026-08-22T00:05:00Z",
+        lab_root=_LAB_ROOT,
+        settings=settings,
+        cases=[case],
+        det={case.id: _result(case.id, Verdict.PASS)},
+        judged={},
+    )
+
+    manifest = document["corpus_manifest"]
+    assert isinstance(manifest, dict)
+    loaded = load_documents(corpus_dir)
+    assert set(manifest) == {f"{doc.tenant_id}/{doc.doc_id}.md" for doc in loaded}
+    assert len(manifest) == len(loaded)
 
 
 async def test_evidence_document_reports_absent_usage_as_null_not_zeros() -> None:
@@ -2461,6 +2690,24 @@ def test_run_id_is_unique_per_call() -> None:
     assert len(ids) == 64
 
 
+def test_main_invalid_configuration_exits_setup_failed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `get_settings()` is the first thing main() does, and a malformed env var
+    # is a configuration failure -- exactly what exit 2 is reserved for. It used
+    # to escape as a pydantic traceback and exit 1.
+    def _bad() -> Settings:
+        Settings(_env_file=None, llm_max_output_tokens="not-a-number")  # type: ignore[arg-type]
+        raise AssertionError("unreachable: the line above must raise")
+
+    monkeypatch.setattr(eval_run, "get_settings", _bad)
+
+    exit_code = eval_run.main([])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "invalid configuration" in capsys.readouterr().err
+
+
 def test_main_unloadable_corpus_exits_setup_failed_not_gate_failed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2479,7 +2726,6 @@ def test_main_unloadable_corpus_exits_setup_failed_not_gate_failed(
     exit_code = eval_run.main([])
 
     assert exit_code == ExitCode.SETUP_FAILED
-    assert exit_code != ExitCode.GATE_FAILED
     assert "SETUP FAILURE" in capsys.readouterr().err
 
 
@@ -2500,6 +2746,45 @@ def test_main_rejects_repeats_below_one_before_building_anything(
 
     assert exit_code == ExitCode.SETUP_FAILED
     assert "--repeats must be at least 1" in capsys.readouterr().err
+
+
+def test_main_evidence_write_failure_is_setup_failed_not_gate_failed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The up-front directory check cannot cover everything: a directory that
+    # exists but is not writable, a path that became a directory between the
+    # check and the write, a full disk. That write-time catch had no test, and
+    # it is the one that runs after the answers are paid for.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(
+        ChatResult(message="a real-sounding answer", model_version="stub")
+    )
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    # A directory where the sidecar file should go: parent.is_dir() passes, the
+    # write raises IsADirectoryError (an OSError).
+    out = tmp_path / "evidence.json"
+    out.mkdir()
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1", "--evidence-out", str(out)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "could not write evidence" in capsys.readouterr().err
+
+
+def test_main_rejects_repeats_without_judge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `--repeats 3` without `--judge` used to be silently ignored while
+    # `--repeats 0` was a hard failure: one flag, two policies, chosen by value.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    exit_code = eval_run.main(["--repeats", "3"])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "needs --judge" in capsys.readouterr().err
 
 
 def test_main_rejects_an_unwritable_evidence_out_before_any_provider_call(
