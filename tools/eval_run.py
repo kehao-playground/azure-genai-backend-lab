@@ -1,12 +1,15 @@
 """Day 28 GenAI evaluation: golden-question dataset and runner.
 
-This module currently implements the dataset section (`load_cases`), the
-deterministic assertion evaluator (`evaluate_deterministic`), and `requires`
-propagation / exit codes (`evaluation_order`, `propagate_requires`,
-`gate_exit_code`) (design `drafts/research/day-28-evaluation.md` r04,
-§5/§6/§7.2/§7.5/§8; implementation plan `plans/day-28-implementation-plan.md`
-Tasks 1-3). Later tasks append the judge contract and
-orchestration/reporting to this same file — they are deliberately absent
+This module implements the dataset section (`load_cases`), the deterministic
+assertion evaluator (`evaluate_deterministic`), `requires` propagation / exit
+codes (`evaluation_order`, `propagate_requires`, `gate_exit_code`), and pass A
+-- a corpus-seeded `RagService`, its execution over the dataset
+(`build_seeded_rag_service`, `run_pass_a`), and machine-captured retrieval
+calibration (`calibration_document`, wired to `--calibrate`) (design
+`drafts/research/day-28-evaluation.md` r04, §4/§5/§6/§7/§7.2/§7.5/§8;
+implementation plan `plans/day-28-implementation-plan.md` Tasks 1-4). Later
+tasks append the judge contract and multi-pass orchestration/reporting
+(`--judge`, `--repeats`) to this same file -- they are deliberately absent
 here, not stubbed.
 
 `tools/` is not an installed package (no `tools/__init__.py`); tests load
@@ -16,16 +19,29 @@ uses.
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import hashlib
 import json
 import re
+import subprocess
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Literal
 
-from azgenai_lab.models.principal import validate_identifier
-from azgenai_lab.services.document_loader import load_documents
+import azgenai_lab
+from azgenai_lab.core.audit import build_audit_attribution
+from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.models.principal import Principal, validate_identifier
+from azgenai_lab.models.rag import make_parent_id
+from azgenai_lab.prompts.loader import load_prompt
+from azgenai_lab.services import agent_tools
+from azgenai_lab.services.azure_openai import build_chat_service
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
+from azgenai_lab.services.rag import RagService
 
 
 @dataclass(frozen=True)
@@ -617,3 +633,292 @@ def gate_exit_code(results: Mapping[str, CaseResult]) -> ExitCode:
     if any(result.verdict != Verdict.PASS for result in results.values()):
         return ExitCode.GATE_FAILED
     return ExitCode.OK
+
+
+# --- Pass A: corpus-seeded retrieval, execution, calibration (Task 4) ---
+
+# The dataset lives alongside this module, not passed on the command line
+# (design §7's usage examples take no --dataset flag): one file, one runner.
+_DATASET_PATH = Path(__file__).resolve().parent / "eval_cases.json"
+
+
+def build_corpus_map(corpus_dir: Path) -> dict[str, tuple[str, str]]:
+    """`{make_parent_id(tenant_id, doc_id): (tenant_id, doc_id)}` for every
+    document under `corpus_dir` -- the shape `attribute_source` (and
+    therefore `evaluate_deterministic`) consumes. Built once per run,
+    through the production loader, the same discipline `_corpus_keys` above
+    already follows for dataset validation; this is retrieval time's
+    counterpart, keyed by parent id rather than left as a bare set.
+    """
+    return {
+        make_parent_id(doc.tenant_id, doc.doc_id): (doc.tenant_id, doc.doc_id)
+        for doc in load_documents(corpus_dir)
+    }
+
+
+def build_seeded_rag_service(settings: Settings, *, use_fake_llm: bool) -> RagService:
+    """Build a `RagService` whose retriever is seeded from the real sample
+    corpus.
+
+    Mirrors `azgenai_lab.services.rag.build_rag_service` -- the same one
+    `PromptTemplate` instance goes to `build_chat_service`, to
+    `build_audit_attribution`, and to this function's byte-cost calculation
+    (Day 22: "a second load of the same file is not the same instance") --
+    in every respect except retrieval. `build_rag_service` calls
+    `build_retriever`, which in fake mode returns an **empty**
+    `FakeSearchClient` (Day 13): a wiring demo over zero documents would
+    prove nothing about this dataset's assertions. This calls
+    `agent_tools._seeded_fake_retriever` instead (`services/agent_tools.py`),
+    reached by module attribute access -- `from azgenai_lab.services import
+    agent_tools` above, then `agent_tools._seeded_fake_retriever(...)` below
+    -- rather than a `from ... import _seeded_fake_retriever` that would pull
+    the private name into this module's own namespace.
+
+    This was a decision, not a default (user, 2026-08-22). The alternatives:
+    the public `build_agent_tool_deps` reaches the same retriever but demands
+    an unused `conversation_store` and files "the RAG eval's retriever"
+    under "agent tool dependencies"; promoting the helper to public would
+    overturn this plan's no-production-changes constraint; re-implementing
+    the seeding here would be a second encoding of the same rule, which the
+    Day 12/15 lesson says drifts from the first. A copy would drift; this
+    reuses the one seeding path instead.
+
+    `use_fake_llm` is threaded through a copy of `settings` -- this
+    function's only mutation of its input -- rather than as a second branch
+    here, so `build_chat_service`'s own `settings.use_fake_llm` check
+    remains the single place fake/real chat selection happens.
+    """
+    run_settings = settings.model_copy(update={"use_fake_llm": use_fake_llm})
+    prompt = load_prompt("rag_answer")
+    return RagService(
+        agent_tools._seeded_fake_retriever(run_settings),
+        build_chat_service(run_settings, prompt=prompt),
+        instructions_bytes=len(prompt.text.encode("utf-8")),
+        audit_attribution=build_audit_attribution(run_settings, prompt),
+    )
+
+
+async def run_pass_a(
+    cases: Sequence[EvalCase], service: RagService, corpus: Mapping[str, tuple[str, str]]
+) -> dict[str, CaseResult]:
+    """Run pass A (design §7.1): every case's question through `service`
+    (built with a fake LLM), each answer scored by `evaluate_deterministic`.
+
+    Iterates `cases` in the order given (dataset order, per `load_cases`) --
+    scoring one case never depends on another's outcome; only
+    `propagate_requires`, run separately by the caller over this function's
+    result, does that.
+    """
+    results: dict[str, CaseResult] = {}
+    for case in cases:
+        principal = Principal(tenant_id=case.tenant, user_id=case.user, group_ids=case.groups)
+        answer = await service.answer(case.question, principal)
+        source_chunk_ids = tuple(hit.chunk_id for hit in answer.hits)
+        results[case.id] = evaluate_deterministic(case, answer.status, source_chunk_ids, corpus)
+    return results
+
+
+def canonical_json(value: object) -> bytes:
+    """Canonical JSON encoding for content-addressing eval artifacts: UTF-8,
+    sorted keys, no separator padding, array order preserved (retrieval rank
+    is meaningful data, not incidental ordering). Matches
+    `reviews/evidence/day28/calibrate_probe.py`'s `canonical_sha256` byte
+    for byte. Defined here as this task's first consumer; Task 5 reuses it
+    for judge-transcript hashing.
+    """
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _resolve_lab_root(lab_root: Path) -> Path:
+    """Fail-closed guard 1/2 (mirrors `calibrate_probe.py`'s `resolve_lab_root`):
+    `lab_root` must be a git worktree, and the `azgenai_lab` package actually
+    running must live under it -- otherwise this run would stamp one tree's
+    commit onto another tree's corpus. Raises `DatasetError`; the caller maps
+    that to `ExitCode.SETUP_FAILED`, never `GATE_FAILED` (design §7.5: this
+    happens before any verdict exists)."""
+    resolved = lab_root.resolve()
+    if not (resolved / ".git").exists():
+        raise DatasetError(f"--lab-root is not a git worktree: {resolved}")
+    package_root = Path(azgenai_lab.__file__).resolve().parent
+    if not package_root.is_relative_to(resolved):
+        raise DatasetError(
+            "the imported azgenai_lab does not live under --lab-root "
+            f"(imported from {package_root}, lab root {resolved}); this run "
+            "would stamp one tree's commit onto another tree's corpus"
+        )
+    return resolved
+
+
+def _resolve_corpus_dir(settings: Settings, lab_root: Path) -> Path:
+    """Fail-closed guard 2/2: the corpus `settings` resolves to must be the
+    one under `lab_root`. Raises `DatasetError` otherwise (see
+    `_resolve_lab_root`)."""
+    from_settings = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR).resolve()
+    expected = (lab_root / "data" / "sample-docs").resolve()
+    if from_settings != expected:
+        raise DatasetError(
+            f"settings resolve the corpus to {from_settings}, but --lab-root "
+            f"implies {expected}"
+        )
+    return expected
+
+
+def _git_describe(lab_root: Path) -> str:
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=lab_root, check=False
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=lab_root, check=False
+    ).stdout.strip()
+    return commit + ("+dirty" if dirty else "")
+
+
+async def calibration_document(
+    cases: Sequence[EvalCase], service: RagService, settings: Settings, lab_root: Path
+) -> dict[str, object]:
+    """Emit the same document shape as
+    `reviews/evidence/day28/calibrate_probe.py`'s output: retrieval-only
+    observations for every case, plus everything needed to tell whether a
+    later run saw the same corpus, dataset wording, and settings this
+    dataset was calibrated against.
+
+    Deliberately reads `service`'s retriever directly
+    (`service._retriever.retrieve(...)` -- the same access pattern
+    `RagService`'s own module already sanctions for tests that need the
+    real composed value, per its docstring on `audit_attribution`) rather
+    than calling `service.answer()`: calibration exists to "fix the literal
+    question wording" against retrieval (design §4), not against a
+    generated answer, and `service.answer()` would also invoke the chat
+    service and, for status "answered", could trim hits to the prompt byte
+    budget -- a result this document does not claim to reproduce.
+
+    Same fail-closed environment guards as the probe: see
+    `_resolve_lab_root` / `_resolve_corpus_dir`.
+    """
+    resolved_root = _resolve_lab_root(lab_root)
+    corpus_dir = _resolve_corpus_dir(settings, resolved_root)
+
+    observations: list[dict[str, object]] = []
+    for case in cases:
+        principal = Principal(tenant_id=case.tenant, user_id=case.user, group_ids=case.groups)
+        result = await service._retriever.retrieve(case.question, principal)
+        observations.append(
+            {
+                "id": case.id,
+                "question": case.question,
+                "principal": {
+                    "tenant": case.tenant,
+                    "groups_count": len(case.groups),
+                    # Day 15: group ids never enter logs or evidence.
+                    "group_sha256": [_sha256_hex(group.encode("utf-8")) for group in case.groups],
+                },
+                "hit_count": len(result.hits),
+                "hits": [
+                    {
+                        "rank": rank,
+                        "chunk_id": hit.chunk_id,
+                        "score": hit.score,
+                        "heading_path": hit.heading_path,
+                        "content_sha256": _sha256_hex(hit.content.encode("utf-8")),
+                    }
+                    for rank, hit in enumerate(result.hits, start=1)
+                ],
+            }
+        )
+
+    document: dict[str, object] = {
+        "kind": "day28-offline-calibration",
+        "lab_commit": _git_describe(resolved_root),
+        "corpus_dir": str(corpus_dir.relative_to(resolved_root)),
+        "corpus_sha256": {
+            str(path.relative_to(corpus_dir)): _sha256_hex(path.read_bytes())
+            for path in sorted(corpus_dir.glob("*/*.md"))
+        },
+        "questions_sha256": _sha256_hex(_DATASET_PATH.read_bytes()),
+        "settings": {
+            "rag_top": settings.rag_top,
+            "chunk_max_chars": settings.chunk_max_chars,
+            "chunk_overlap_chars": settings.chunk_overlap_chars,
+            # Seeding always uses FakeEmbeddingClient regardless of
+            # settings.use_fake_embeddings (agent_tools._seeded_fake_retriever's
+            # own docstring) -- a literal, not settings.use_fake_embeddings.
+            "use_fake_embeddings_for_seed": True,
+        },
+        "note": (
+            "FakeSearchClient scores lexically in every mode; these hits say "
+            "nothing about real Search retrieval quality. They exist only to "
+            "fix the literal question wording of the Day 28 dataset."
+        ),
+        "observations": observations,
+    }
+    document["observations_sha256"] = _sha256_hex(canonical_json(observations))
+    return document
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Day 28 golden-question evaluation runner (deterministic pass A)."
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "Emit a machine-captured retrieval calibration document (same "
+            "shape as reviews/evidence/day28/*-offline-calibration.json) "
+            "instead of running the deterministic gate."
+        ),
+    )
+    parser.add_argument(
+        "--lab-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="Repo root the corpus and git identity are read from (--calibrate only).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    settings = get_settings()
+    corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
+
+    try:
+        cases = load_cases(_DATASET_PATH, corpus_dir)
+    except DatasetError as exc:
+        print(f"SETUP FAILURE: {exc}", file=sys.stderr)
+        return ExitCode.SETUP_FAILED
+
+    service = build_seeded_rag_service(settings, use_fake_llm=True)
+    try:
+        if args.calibrate:
+            try:
+                document = asyncio.run(
+                    calibration_document(cases, service, settings, args.lab_root)
+                )
+            except DatasetError as exc:
+                print(f"SETUP FAILURE: {exc}", file=sys.stderr)
+                return ExitCode.SETUP_FAILED
+            print(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True))
+            return ExitCode.OK
+
+        corpus = build_corpus_map(corpus_dir)
+        results = asyncio.run(run_pass_a(cases, service, corpus))
+        propagated = propagate_requires(cases, results)
+        for case in cases:
+            result = propagated[case.id]
+            print(f"{result.verdict.value}\t{case.id}")
+            for failure in result.failures:
+                print(f"\t{failure}")
+        return gate_exit_code(propagated)
+    finally:
+        asyncio.run(service.aclose())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
