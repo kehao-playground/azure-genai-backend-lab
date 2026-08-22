@@ -38,7 +38,7 @@ from azgenai_lab.core.errors import ContentFilteredError, UpstreamTimeoutError
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
-from azgenai_lab.prompts.loader import PromptTemplate
+from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services.azure_openai import ChatResult
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
 from azgenai_lab.services.rag import RagAnswer, build_rag_service
@@ -1865,6 +1865,12 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     rag_prompt = document["rag_prompt"]
     assert isinstance(rag_prompt, dict)
     assert rag_prompt["name"] == "rag_answer"
+    # Pinned to the loaded template, the same way judge_prompt is below: a
+    # version or sha256 that silently blanked would leave the evidence file
+    # unable to say which prompt produced the answers it records.
+    _loaded_rag_prompt = load_prompt("rag_answer")
+    assert rag_prompt["version"] == _loaded_rag_prompt.version
+    assert rag_prompt["sha256"] == _loaded_rag_prompt.sha256
     judge_prompt = document["judge_prompt"]
     assert isinstance(judge_prompt, dict)
     assert judge_prompt["version"] == eval_run.JUDGE_PROMPT_VERSION
@@ -1892,6 +1898,42 @@ async def test_evidence_document_shape_for_the_real_lab_root() -> None:
     assert repeat_doc["judge_input_sha256"] == "j" * 64
 
     assert document["cases_sha256"] == sha256_hex(eval_run.canonical_json(cases_doc))
+
+
+async def test_evidence_document_records_the_reason_an_inconclusive_case_has_no_verdict() -> None:
+    # For an INCONCLUSIVE or SKIPPED case the reason is the ONLY text saying
+    # why no verdict exists. Nothing asserted it until this test: the shape
+    # test above covers a JUDGED case, whose reason is None (Day 28 review,
+    # Task 6 re-review). An evidence file that lost it would still look
+    # well-formed while being unreplayable -- the same failure M25 exposed
+    # for the repeat hashes.
+    settings = _fresh_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    det = {case.id: _result(case.id, Verdict.PASS)}
+    judged = {
+        case.id: JudgedResult(
+            case.id, None, "INCONCLUSIVE", "pass_a_pass_b_sources_sha256_mismatch", ()
+        )
+    }
+
+    document = evidence_document(
+        run_id="test-run-2",
+        started_at="2026-08-22T00:00:00Z",
+        completed_at="2026-08-22T00:05:00Z",
+        lab_root=_LAB_ROOT,
+        settings=settings,
+        cases=[case],
+        det=det,
+        judged=judged,
+    )
+
+    cases_doc = document["cases"]
+    assert isinstance(cases_doc, list)
+    judged_doc = cases_doc[0]["judged"]
+    assert judged_doc["state"] == "INCONCLUSIVE"
+    assert judged_doc["verdict"] is None
+    assert judged_doc["reason"] == "pass_a_pass_b_sources_sha256_mismatch"
+    assert judged_doc["repeats"] == []
 
 
 async def test_evidence_document_rejects_a_lab_root_that_is_not_a_git_worktree(
