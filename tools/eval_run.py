@@ -1226,8 +1226,9 @@ async def run_judge_repeats(
     """Run `repeats` independent judge calls over the same `answer`/`hits`,
     sequentially -- design §7's usage examples run this in-process with no
     stated concurrency budget, so this does not invent one. Every attempt
-    runs regardless of an earlier attempt's outcome (design §7.3: "重試若發
-    生，attempt次數逐次記錄，不靜默吞掉"), so the returned tuple always has
+    runs regardless of an earlier attempt's outcome (design §7.3: if a retry
+    happens, each attempt is recorded in turn and never silently swallowed),
+    so the returned tuple always has
     exactly `repeats` entries, in attempt order.
     """
     out: list[JudgeRepeat] = []
@@ -1319,8 +1320,9 @@ async def run_judged_layer(
     `cases`, keyed by case id.
 
     `fake_service` is the same seeded, fake-LLM `RagService` pass A already
-    used (design §7.1: "同一retriever、同一principal、同一問句，檢索不含隨
-    機性"): this calls its `.answer()` a second time per judged-eligible case
+    used (design §7.1: same retriever, same principal, same question -- retrieval
+    carries no randomness): this calls its `.answer()` a second time per
+    judged-eligible case
     rather than widening `run_pass_a`'s own shipped contract to carry
     `RagAnswer`s out.
 
@@ -1344,8 +1346,9 @@ async def run_judged_layer(
     for pass B too (retrieval has no randomness), so pass B is never called
     for it; `INCONCLUSIVE(no_answer_at_runtime)`. If pass A answered, pass B
     is attempted; an upstream failure there, or a `sources_sha256`
-    disagreement between the two passes (design §7.1: "那代表檢索本身有非決
-    定性，量尺的抖動就不可歸因了"), is `INCONCLUSIVE` with its own `repeats`
+    disagreement between the two passes (design §7.1: that would mean retrieval
+    itself is non-deterministic, and the measuring instrument's own jitter
+    could no longer be attributed), is `INCONCLUSIVE` with its own `repeats`
     left empty -- judging is not attempted at all when the run itself did
     not reproduce. Only then does judging run, and its outcome is
     `derive_judged_result`'s.
@@ -1786,7 +1789,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"\t{failure}")
             return gate_exit_code(propagated)
 
-        # design §7.5: "--judge 缺憑證＝2，不是 0" -- a ValueError here means
+        # design §7.5: `--judge` without credentials exits 2, not 0 -- a
+        # ValueError here means
         # build_chat_service (via build_seeded_rag_service, forced real) or
         # resolve_aoai_auth rejected the credentials before any judged
         # verdict exists, which is a setup failure, not a gate failure.
