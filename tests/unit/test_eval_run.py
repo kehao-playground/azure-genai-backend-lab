@@ -642,21 +642,26 @@ async def test_calibration_document_rejects_a_lab_root_that_is_not_a_git_worktre
         await service.aclose()
 
 
-async def test_calibration_document_rejects_a_lab_root_whose_corpus_settings_disagree() -> None:
-    # The private planning repo one level up: a real git worktree that
-    # azgenai_lab *does* live under (so both checks in _resolve_lab_root
-    # pass -- package_root is relative_to this ancestor too), but whose
-    # data/sample-docs is not where the settings-resolved corpus actually
-    # is (that's one level down, inside the lab checkout). This isolates
-    # _resolve_corpus_dir's own guard from _resolve_lab_root's: a lab_root
-    # of a fresh empty tmp_path repo would already fail the package-root
-    # check above and never reach this one.
-    planning_root = _LAB_ROOT.parent
-    assert (planning_root / ".git").exists()
+async def test_calibration_document_rejects_a_lab_root_whose_corpus_settings_disagree(
+    tmp_path: Path,
+) -> None:
+    # Isolates `_resolve_corpus_dir`'s guard from `_resolve_lab_root`'s by
+    # moving the side the guard compares that a test can freely control: the
+    # real `_LAB_ROOT` (so both of `_resolve_lab_root`'s checks pass -- it is
+    # a git worktree, and the imported azgenai_lab does live under it) with
+    # settings whose `sample_docs_dir` points somewhere else entirely.
+    #
+    # The disagreement must NOT be produced by walking to a real directory
+    # outside the checkout. This test previously used `_LAB_ROOT.parent`,
+    # relying on the lab being a submodule of the author's private planning
+    # repo: it passed locally and failed in CI, where the public repo is
+    # checked out standalone and the parent has no `.git`. A public repo's
+    # tests cannot depend on a private repo existing next to them.
+    settings = Settings(_env_file=None, sample_docs_dir=str(tmp_path / "elsewhere"))
     service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
     try:
         with pytest.raises(DatasetError, match="settings resolve the corpus to"):
-            await eval_run.calibration_document([], service, _fresh_settings(), planning_root)
+            await eval_run.calibration_document([], service, settings, _LAB_ROOT)
     finally:
         await service.aclose()
 
