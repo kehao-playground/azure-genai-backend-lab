@@ -99,8 +99,16 @@ def _judge_ready_settings() -> Settings:
     calls `build_audit_attribution`, which independently rejects real mode
     without `azure_openai_deployment_name` -- a check Task 6's tests must
     satisfy even though the actual chat call is always stubbed via a
-    monkeypatched `build_chat_service`, never real credentials."""
-    return Settings(_env_file=None, azure_openai_deployment_name="stub-deployment")
+    monkeypatched `build_chat_service`, never real credentials.
+
+    `use_fake_llm=False` because `--judge` under an ambient fake mode is
+    refused at the CLI boundary: these tests are about what the judged layer
+    does once it runs, so their settings must be ones it is allowed to run
+    under. Nothing here reaches a real model regardless -- pass A forces
+    `use_fake_llm=True` and both judged-layer chat services are stubbed."""
+    return Settings(
+        _env_file=None, use_fake_llm=False, azure_openai_deployment_name="stub-deployment"
+    )
 
 
 # --- fixtures: a corpus map and minimal EvalCase/chunk-id builders ---
@@ -1683,6 +1691,45 @@ async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with
     assert judge.calls == []
 
 
+async def test_run_judged_layer_builds_both_passes_from_forced_real_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression guard for a real bug: the generation service applied the
+    # `use_fake_llm=False` override (inside `build_seeded_rag_service`) but the
+    # judge was built from the caller's bare settings, so an ambient fake mode
+    # produced real answers graded by a fake echo -- every repeat unparseable,
+    # every case INCONCLUSIVE, and the run still exited 0. Asserting on both
+    # recorded settings, not just the judge's, is what makes this a guard
+    # against the two passes diverging rather than against one line's value.
+    settings = Settings(
+        _env_file=None, use_fake_llm=True, azure_openai_deployment_name="stub-deployment"
+    )
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    generation = _StaticChatService(
+        ChatResult(
+            message="A standard purchase may be returned within 30 days of delivery.",
+            model_version="stub",
+        )
+    )
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    seen: dict[str, bool] = {}
+
+    def _recording(settings_arg: Settings, *, prompt: PromptTemplate) -> object:
+        seen[prompt.name] = settings_arg.use_fake_llm
+        return judge if prompt.name == "eval_judge" else generation
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _recording)
+
+    try:
+        await run_judged_layer([case], fake_service, settings, repeats=1)
+    finally:
+        await fake_service.aclose()
+
+    assert seen == {"rag_answer": False, "eval_judge": False}
+
+
 async def test_run_judged_layer_matching_sources_runs_judging_and_reports_judged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2178,10 +2225,37 @@ def test_run_id_is_unique_per_call() -> None:
     assert len(ids) == 64
 
 
+def test_main_judge_flag_with_fake_llm_exits_setup_failed_making_no_provider_call(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The incoherent combination: `--judge` forces real generation for pass B,
+    # so under an ambient fake mode the run would spend provider calls on
+    # answers and grade them with a fake echo. The refusal must land before
+    # anything is built -- exit 2, and `build_chat_service` never reached.
+    monkeypatch.setattr(eval_run, "get_settings", _fresh_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("no chat service may be built once --judge is refused")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+
+    exit_code = eval_run.main(["--judge"])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert exit_code != ExitCode.OK
+    captured = capsys.readouterr()
+    assert "SETUP FAILURE" in captured.err
+    assert "USE_FAKE_LLM" in captured.err
+
+
 def test_main_judge_flag_missing_credentials_exits_setup_failed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(eval_run, "get_settings", _fresh_settings)
+    # `_judge_ready_settings` (real ambient mode) so this reaches the
+    # credentials check rather than stopping at the fake-mode refusal above:
+    # both exit 2 with "SETUP FAILURE", so nothing in the assertions below
+    # would notice the difference.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
     real_build_chat_service = eval_run.build_chat_service
 
     def _guarded(settings: Settings, *, prompt: PromptTemplate) -> object:

@@ -98,11 +98,21 @@ cannot silently promote a judged assertion into a gating one.
 |---|---|---|---|
 | `0` | `OK` | The deterministic gate ran and every case's deterministic verdict was `PASS` (judged-layer results, if any, do not affect this) | The only green result |
 | `1` | `GATE_FAILED` | The deterministic gate ran and at least one case came back `FAIL` or `INCONCLUSIVE` | The only code that means "something is wrong with the thing under test" |
-| `2` | `SETUP_FAILED` | Dataset validation failed, the corpus would not load, or `--judge` was passed without usable credentials — every one of these happens *before* any verdict exists | A run that never reached a verdict must not look the same as `0` |
+| `2` | `SETUP_FAILED` | Dataset validation failed, the corpus would not load, or `--judge` was passed without usable credentials or with `USE_FAKE_LLM=true` — every one of these happens *before* any verdict exists | A run that never reached a verdict must not look the same as `0` |
 
 `--judge` without credentials is a `SETUP_FAILED`, not a silent skip: a
 layer that did not run and a layer that ran clean have to be visibly
-different results, or a missing check reads as a passing one. The judged
+different results, or a missing check reads as a passing one.
+
+`--judge` with `USE_FAKE_LLM=true` is refused for the same reason, before
+anything is built. The judged layer forces real generation for pass B
+whatever that setting says, so the combination is not a cheap dry run: it
+spends real provider calls on the answers and then grades them with
+whatever the fake adapter echoes back. Every repeat fails to parse, every
+case lands on `INCONCLUSIVE`, and the process still exits `0` — a report
+shaped exactly like a measurement, of nothing. There is no fake-judge
+mode: to exercise the wiring without a model, stub `build_chat_service`,
+which is what this repo's own tests do. The judged
 layer, however it turns out, never changes which of these three codes the
 process exits with — `gate_exit_code` only ever takes the deterministic
 results as its argument; there is no parameter through which a judged
@@ -232,7 +242,7 @@ has already caught a real regression yet.
 
 ```
 uv run python tools/eval_run.py                         # deterministic layer only, offline
-uv run python tools/eval_run.py --judge                 # + judged layer, needs real chat-mini credentials
+uv run python tools/eval_run.py --judge                 # + judged layer; needs real chat-mini credentials and USE_FAKE_LLM=false
 uv run python tools/eval_run.py --judge --repeats 5      # + N judge repeats per case (default is already 5)
 uv run python tools/eval_run.py --calibrate --lab-root .  # retrieval-only calibration document, no generation
 uv run python tools/eval_run.py --judge --evidence-out run.json  # + write the replayable evidence sidecar

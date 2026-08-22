@@ -1354,9 +1354,18 @@ async def run_judged_layer(
     not reproduce. Only then does judging run, and its outcome is
     `derive_judged_result`'s.
     """
+    # Pass C is built from the same forced-real settings as pass B. Passing
+    # bare `settings` here was a real bug: `build_seeded_rag_service` applies
+    # the `use_fake_llm=False` override internally, so under an ambient
+    # `USE_FAKE_LLM=true` the generation was real while the judge was a fake
+    # echo -- every repeat ERROR(parse), every case INCONCLUSIVE, exit 0, and
+    # provider calls spent on answers nothing ever graded. That is exactly the
+    # "silently judging a fake echo" this function's contract rules out, so the
+    # two passes now derive their settings from one value that cannot diverge.
+    judge_settings = settings.model_copy(update={"use_fake_llm": False})
     real_service = build_seeded_rag_service(settings, use_fake_llm=False)
     try:
-        judge_chat = build_chat_service(settings, prompt=judge_prompt_template())
+        judge_chat = build_chat_service(judge_settings, prompt=judge_prompt_template())
         try:
             results: dict[str, JudgedResult] = {}
             for case in cases:
@@ -1795,6 +1804,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = get_settings()
+
+    # Refused here, before any work: `--judge` means "bring a real model in",
+    # and the judged layer forces real generation regardless of this setting.
+    # The combination is incoherent rather than merely unusual, and letting it
+    # run costs real provider calls for pass B and then grades their answers
+    # with whatever the fake adapter echoes -- a report of INCONCLUSIVE rows
+    # that reads like a measurement. A refusal is not a silent skip: exit 2
+    # says setup, never the 0 a caller could mistake for a clean judged run.
+    if args.judge and settings.use_fake_llm:
+        print(
+            "SETUP FAILURE: --judge needs a real model, but USE_FAKE_LLM is true. "
+            "The judged layer forces real generation for pass B whatever this is "
+            "set to, so the run would spend provider calls on answers and then "
+            "grade them with a fake echo. Set USE_FAKE_LLM=false to judge.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
     corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
 
     try:
