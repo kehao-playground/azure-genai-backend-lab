@@ -986,6 +986,16 @@ def parse_judge_response(raw: str, case: EvalCase) -> JudgeOutput:
     if not isinstance(rationale, str):
         raise JudgeParseError("rationale must be a string")
 
+    # `case.judged` is only ever `None` here if a caller invoked this
+    # function directly against a `judged: null` case, bypassing
+    # `build_judge_input` (which refuses to build an input for such a case
+    # at all -- see its docstring). There is no response to validate a
+    # non-existent expected/forbidden-fact set against, so both id sets are
+    # empty, which forces every one of the four invariants below to accept
+    # only a response with all three id-bearing arrays empty. This is a
+    # deliberately permissive fallback for a case parse_judge_response
+    # itself never needs to raise on, not a claim that calling it this way
+    # is a supported path.
     expected_ids = {fact.id for fact in case.judged.expected_facts} if case.judged else set()
     forbidden_ids = {fact.id for fact in case.judged.forbidden_facts} if case.judged else set()
 
@@ -993,15 +1003,23 @@ def parse_judge_response(raw: str, case: EvalCase) -> JudgeOutput:
     missing_set = set(missing)
     violated_set = set(violated)
 
-    # design §7.3's "covered_fact_ids union missing_fact_ids exactly equals
-    # expected_facts" is one set equality, but it is enforced here as two
-    # independent directions -- invariant 1 (nothing expected was left out)
-    # and invariant 4 (nothing unknown was let in) -- precisely so each
-    # direction has its own test that turns red when *only* that direction
-    # is disabled. A single combined `!=` check would make invariant 4
-    # unreachable dead code: invariants 1+3 together already force every id
-    # in play to be a known one, so a fourth check phrased as "the union
-    # equals expected exactly" would never independently fire.
+    # design §7.3 states one invariant, "covered_fact_ids union
+    # missing_fact_ids exactly equals expected_facts" -- a single set
+    # equality. It is enforced here as its two directions, invariants 1 and
+    # 2, so each direction has its own test that turns red when *only* that
+    # direction is disabled (a combined `!=` check cannot be independently
+    # mutation-tested per direction). An earlier version of this function
+    # replaced the "nothing extra" direction with the broader claim
+    # "covered_fact_ids/missing_fact_ids/violated_fact_ids only ever contain
+    # ids known to this case (expected *or* forbidden)" -- that is a
+    # materially weaker check: it let a `forbidden_facts` id sit inside
+    # covered_fact_ids or missing_fact_ids, which design §7.3 never allows
+    # (those two arrays partition `expected_facts` only), and in the
+    # missing_fact_ids case it flipped `derive_judge_verdict` to a spurious
+    # "fail" on a response that had in fact covered every one of its
+    # expected facts. Invariant 2 below is the correction: it constrains
+    # covered_fact_ids/missing_fact_ids to `expected_ids` specifically, not
+    # to the broader expected-or-forbidden union.
 
     # Invariant 1: every expected fact id is classified as covered or
     # missing -- catches the judge silently dropping an expected fact
@@ -1014,33 +1032,36 @@ def parse_judge_response(raw: str, case: EvalCase) -> JudgeOutput:
             f"missing_fact_ids: {sorted(expected_ids - (covered_set | missing_set))}"
         )
 
-    # Invariant 2: no fact id is claimed both covered and missing at once.
+    # Invariant 2: covered_fact_ids and missing_fact_ids together name
+    # nothing beyond this case's expected_facts -- catches a forbidden-fact
+    # id, an id from a different case, or free text, smuggled into either
+    # array. Together with invariant 1, this is design §7.3's "covered
+    # union missing exactly equals expected" equality, enforced in full.
+    if not (covered_set | missing_set) <= expected_ids:
+        raise JudgeParseError(
+            f"covered_fact_ids/missing_fact_ids contain id(s) outside "
+            f"expected_facts: {sorted((covered_set | missing_set) - expected_ids)}"
+        )
+
+    # Invariant 3: no fact id is claimed both covered and missing at once.
+    # Not implied by invariants 1+2 -- both can hold on a set union that
+    # still has a non-empty intersection.
     if covered_set & missing_set:
         raise JudgeParseError(
             f"covered_fact_ids and missing_fact_ids overlap on "
             f"{sorted(covered_set & missing_set)}"
         )
 
-    # Invariant 3: every violated id actually names one of this case's
-    # forbidden facts -- the judge cannot invent a forbidden fact. (Stricter
-    # than "known": an id that is a real *expected* fact still fails this
-    # check if it shows up in violated_fact_ids, because expected facts are
-    # not forbidden facts.)
+    # Invariant 4: every violated id actually names one of this case's
+    # forbidden facts -- the judge cannot invent a forbidden fact, and
+    # cannot list a real *expected* fact here either, because expected
+    # facts are not forbidden facts. Invariants 1-3 say nothing about
+    # violated_fact_ids at all, so this is independent of all three.
     if not violated_set <= forbidden_ids:
         raise JudgeParseError(
             f"violated_fact_ids contains id(s) outside forbidden_facts: "
             f"{sorted(violated_set - forbidden_ids)}"
         )
-
-    # Invariant 4: every id anywhere in the three id-bearing arrays is a
-    # known id for this case (expected or forbidden) -- catches a fact
-    # returned as free text, or an id copied from a different case, or an
-    # invented extra id added alongside genuine ones, in whichever array it
-    # turns up in.
-    known_ids = expected_ids | forbidden_ids
-    all_ids = covered_set | missing_set | violated_set
-    if not all_ids <= known_ids:
-        raise JudgeParseError(f"unknown fact id(s): {sorted(all_ids - known_ids)}")
 
     return JudgeOutput(
         covered_fact_ids=covered,
