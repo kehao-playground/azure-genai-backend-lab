@@ -1,8 +1,12 @@
-"""Tests for `tools/eval_run.py`'s deterministic assertion evaluators (Task 2)
-and `requires` propagation / exit codes (Task 3).
+"""Tests for `tools/eval_run.py`'s deterministic assertion evaluators (Task 2),
+`requires` propagation / exit codes (Task 3), and pass A -- the corpus-seeded
+`RagService`, its execution over the dataset, and `--calibrate` (Task 4).
 
 Table-driven: one test per rule in the design (`drafts/research/day-28-evaluation.md`
 r04 §8/§7.2/§7.5) plus a few direct `attribute_source` tests for its own branches.
+The Task 4 section below runs the real seeded pipeline end to end
+(`USE_FAKE_LLM=true`, no Azure resources -- `tests/conftest.py` pins the three
+fake-adapter flags for the whole suite).
 
 `tools/` is not a package (no `tools/__init__.py`), so the module is loaded
 by path, the same pattern `tests/unit/test_eval_cases.py` uses.
@@ -10,11 +14,18 @@ by path, the same pattern `tests/unit/test_eval_cases.py` uses.
 
 import importlib.util
 import inspect
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
+from azgenai_lab.core.config import Settings
+from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
+from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
+from azgenai_lab.services.rag import build_rag_service
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "eval_run.py"
 _SPEC = importlib.util.spec_from_file_location("eval_run", _MODULE_PATH)
@@ -24,6 +35,7 @@ sys.modules[_SPEC.name] = eval_run
 _SPEC.loader.exec_module(eval_run)
 
 CaseResult = eval_run.CaseResult
+DatasetError = eval_run.DatasetError
 DeterministicSpec = eval_run.DeterministicSpec
 EvalCase = eval_run.EvalCase
 ExitCode = eval_run.ExitCode
@@ -33,6 +45,18 @@ evaluate_deterministic = eval_run.evaluate_deterministic
 evaluation_order = eval_run.evaluation_order
 gate_exit_code = eval_run.gate_exit_code
 propagate_requires = eval_run.propagate_requires
+
+# The real lab worktree these tests run in -- test_eval_run.py lives at
+# tests/unit/, two levels below the repo root.
+_LAB_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _fresh_settings() -> Settings:
+    """Settings isolated from the repo-root `.env` (same discipline
+    `test_agent_toolset.py::_settings` uses): only `conftest.py`'s three
+    pinned fake-adapter flags are guaranteed, everything else is still
+    ambient without `_env_file=None`."""
+    return Settings(_env_file=None)
 
 
 # --- fixtures: a corpus map and minimal EvalCase/chunk-id builders ---
@@ -417,3 +441,252 @@ def test_gate_exit_code_ignores_judged_layer_failure_still_exits_zero() -> None:
         ),
     }
     assert gate_exit_code(results) == ExitCode.OK
+
+
+# --- Task 4: seeded RagService, pass A execution, --calibrate ---
+
+
+def _case_by_id(case_id: str) -> EvalCase:
+    cases = eval_run.load_cases(eval_run._DATASET_PATH, SAMPLE_DOCS_DIR)
+    for case in cases:
+        if case.id == case_id:
+            return case
+    raise AssertionError(f"no shipped case named {case_id!r}")
+
+
+async def test_seeded_service_answers_acme_refund_window_with_returns_policy_sources() -> None:
+    service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
+    corpus = eval_run.build_corpus_map(SAMPLE_DOCS_DIR)
+    try:
+        answer = await service.answer(
+            "How many days does a customer have to return a standard purchase "
+            "for a full refund?",
+            Principal(tenant_id="acme", user_id="eval-agent", group_ids=()),
+        )
+    finally:
+        await service.aclose()
+
+    assert answer.status == "answered"
+    assert answer.hits  # never assert on an empty result set
+    for hit in answer.hits:
+        assert attribute_source(hit.chunk_id, corpus) == ("acme", "returns-policy")
+
+
+async def test_seeded_service_returns_no_answer_with_zero_sources_for_nonsense_question() -> None:
+    service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
+    try:
+        answer = await service.answer(
+            "quantum ferret provisioning throughput",
+            Principal(tenant_id="acme", user_id="eval-agent", group_ids=()),
+        )
+    finally:
+        await service.aclose()
+
+    assert answer.status == "no_answer"
+    assert answer.hits == ()
+
+
+async def test_seeded_service_gates_oncall_runbook_on_the_oncall_group() -> None:
+    service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
+    corpus = eval_run.build_corpus_map(SAMPLE_DOCS_DIR)
+    question = "How quickly must the on-call engineer acknowledge a page?"
+    try:
+        granted = await service.answer(
+            question, Principal(tenant_id="globex", user_id="eval-agent", group_ids=("oncall",))
+        )
+        denied = await service.answer(
+            question, Principal(tenant_id="globex", user_id="eval-agent", group_ids=())
+        )
+    finally:
+        await service.aclose()
+
+    granted_docs = {attribute_source(hit.chunk_id, corpus) for hit in granted.hits}
+    assert ("globex", "oncall-runbook") in granted_docs
+
+    # "Never assert on an empty result set" (tools/tenant_smoke.py:9-24): the
+    # denied principal must still retrieve *something* -- the assertion is
+    # that the gated document specifically is absent, not that nothing came
+    # back at all.
+    assert denied.hits
+    denied_docs = {attribute_source(hit.chunk_id, corpus) for hit in denied.hits}
+    assert ("globex", "oncall-runbook") not in denied_docs
+
+
+async def test_stock_build_rag_service_has_no_seeded_documents() -> None:
+    # Regression guard for design §2's whole reason to exist: build_retriever
+    # (via build_rag_service) hits an *empty* FakeSearchClient in fake mode
+    # (Day 13) -- without the seeded retriever, even a case the seeded
+    # service answers cleanly comes back no_answer.
+    service = build_rag_service(_fresh_settings())
+    try:
+        answer = await service.answer(
+            "How many days does a customer have to return a standard purchase "
+            "for a full refund?",
+            Principal(tenant_id="acme", user_id="eval-agent", group_ids=()),
+        )
+    finally:
+        await service.aclose()
+
+    assert answer.status == "no_answer"
+    assert answer.hits == ()
+
+
+def test_build_corpus_map_uses_make_parent_id_keys() -> None:
+    corpus = eval_run.build_corpus_map(SAMPLE_DOCS_DIR)
+    assert corpus[make_parent_id("acme", "returns-policy")] == ("acme", "returns-policy")
+    assert corpus[make_parent_id("globex", "oncall-runbook")] == ("globex", "oncall-runbook")
+
+
+async def test_run_pass_a_scores_every_shipped_case_pass() -> None:
+    # End-to-end: the actual dataset, the actual corpus, the actual seeded
+    # service -- this is "make it actually run" exercised in full, not a
+    # synthetic fixture.
+    settings = _fresh_settings()
+    corpus_dir = Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
+    cases = eval_run.load_cases(eval_run._DATASET_PATH, corpus_dir)
+    corpus = eval_run.build_corpus_map(corpus_dir)
+    service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+    try:
+        results = await eval_run.run_pass_a(cases, service, corpus)
+    finally:
+        await service.aclose()
+
+    assert set(results) == {case.id for case in cases}
+    for case_id, result in results.items():
+        assert result.verdict == Verdict.PASS, (case_id, result.failures)
+
+
+# --- canonical_json ---
+
+
+def test_canonical_json_is_stable_under_key_reordering() -> None:
+    assert eval_run.canonical_json({"b": 1, "a": 2}) == eval_run.canonical_json({"a": 2, "b": 1})
+
+
+def test_canonical_json_is_not_stable_under_a_whitespace_change_inside_a_value() -> None:
+    assert eval_run.canonical_json({"a": "x y"}) != eval_run.canonical_json({"a": "x  y"})
+
+
+def test_canonical_json_preserves_array_order() -> None:
+    assert eval_run.canonical_json([1, 2, 3]) != eval_run.canonical_json([3, 2, 1])
+
+
+def test_canonical_json_uses_compact_separators_and_keeps_unicode() -> None:
+    encoded = eval_run.canonical_json({"a": 1, "b": "café"})
+    assert encoded == b'{"a":1,"b":"caf\xc3\xa9"}'
+
+
+# --- calibration_document: fail-closed guards ---
+
+
+async def test_calibration_document_rejects_a_lab_root_that_is_not_a_git_worktree(
+    tmp_path: Path,
+) -> None:
+    service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
+    try:
+        with pytest.raises(DatasetError, match="not a git worktree"):
+            await eval_run.calibration_document([], service, _fresh_settings(), tmp_path)
+    finally:
+        await service.aclose()
+
+
+async def test_calibration_document_rejects_a_lab_root_whose_corpus_settings_disagree() -> None:
+    # The private planning repo one level up: a real git worktree that
+    # azgenai_lab *does* live under (so both checks in _resolve_lab_root
+    # pass -- package_root is relative_to this ancestor too), but whose
+    # data/sample-docs is not where the settings-resolved corpus actually
+    # is (that's one level down, inside the lab checkout). This isolates
+    # _resolve_corpus_dir's own guard from _resolve_lab_root's: a lab_root
+    # of a fresh empty tmp_path repo would already fail the package-root
+    # check above and never reach this one.
+    planning_root = _LAB_ROOT.parent
+    assert (planning_root / ".git").exists()
+    service = eval_run.build_seeded_rag_service(_fresh_settings(), use_fake_llm=True)
+    try:
+        with pytest.raises(DatasetError, match="settings resolve the corpus to"):
+            await eval_run.calibration_document([], service, _fresh_settings(), planning_root)
+    finally:
+        await service.aclose()
+
+
+async def test_calibration_document_matches_shape_for_the_real_lab_root() -> None:
+    settings = _fresh_settings()
+    cases = [
+        _case_by_id("acme-refund-window-standard"),
+        _case_by_id("zero-hit-structural-no-answer"),
+    ]
+    service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+    try:
+        document = await eval_run.calibration_document(cases, service, settings, _LAB_ROOT)
+    finally:
+        await service.aclose()
+
+    assert document["kind"] == "day28-offline-calibration"
+    assert document["corpus_dir"] == "data/sample-docs"
+    assert isinstance(document["lab_commit"], str) and document["lab_commit"]
+    corpus_sha256 = document["corpus_sha256"]
+    assert isinstance(corpus_sha256, dict)
+    assert set(corpus_sha256) == {
+        "acme/returns-policy.md",
+        "acme/service-sla.md",
+        "globex/billing-faq.md",
+        "globex/oncall-runbook.md",
+        "opsdemo/error-contract.md",
+        "opsdemo/streaming-sse.md",
+        "opsdemo/token-budget.md",
+    }
+    assert document["settings"] == {
+        "rag_top": settings.rag_top,
+        "chunk_max_chars": settings.chunk_max_chars,
+        "chunk_overlap_chars": settings.chunk_overlap_chars,
+        "use_fake_embeddings_for_seed": True,
+    }
+
+    observations = document["observations"]
+    assert isinstance(observations, list)
+    by_id = {obs["id"]: obs for obs in observations}
+    assert by_id.keys() == {"acme-refund-window-standard", "zero-hit-structural-no-answer"}
+
+    answered = by_id["acme-refund-window-standard"]
+    assert answered["hit_count"] > 0
+    assert answered["hits"][0]["chunk_id"] == "t4=acmed14=returns-policy-0001"
+    assert answered["principal"] == {"tenant": "acme", "groups_count": 0, "group_sha256": []}
+
+    zero_hit = by_id["zero-hit-structural-no-answer"]
+    assert zero_hit["hit_count"] == 0
+    assert zero_hit["hits"] == []
+
+    # observations_sha256 is derivable, not just present.
+    assert document["observations_sha256"] == eval_run._sha256_hex(
+        eval_run.canonical_json(observations)
+    )
+
+
+# --- main(): CLI wiring ---
+
+
+def test_main_calibrate_exits_setup_failed_not_gate_failed_on_a_bad_lab_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = eval_run.main(["--calibrate", "--lab-root", str(tmp_path)])
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert exit_code != ExitCode.GATE_FAILED
+    captured = capsys.readouterr()
+    assert "SETUP FAILURE" in captured.err
+
+
+def test_main_calibrate_prints_the_document_for_the_real_lab_root(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = eval_run.main(["--calibrate", "--lab-root", str(_LAB_ROOT)])
+    assert exit_code == ExitCode.OK
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert document["kind"] == "day28-offline-calibration"
+    assert {obs["id"] for obs in document["observations"]} == {
+        case.id for case in eval_run.load_cases(eval_run._DATASET_PATH, SAMPLE_DOCS_DIR)
+    }
+
+
+def test_main_default_run_gates_on_the_real_dataset_and_exits_ok() -> None:
+    assert eval_run.main([]) == ExitCode.OK
