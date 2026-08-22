@@ -1221,6 +1221,13 @@ class _CannedAnswerService:
         self.calls += 1
         return self._answer
 
+    async def aclose(self) -> None:
+        # Lets this double also stand in for `real_service` (pass B) via a
+        # monkeypatched `build_seeded_rag_service` -- `run_judged_layer`
+        # calls `await real_service.aclose()` unconditionally in its
+        # `finally`.
+        return None
+
 
 def _stub_build_chat_service_factory(generation: object, judge: object):  # noqa: ANN201
     """A `build_chat_service`-shaped callable that hands back `generation`
@@ -1586,6 +1593,54 @@ async def test_run_judged_layer_pass_b_upstream_error_is_inconclusive_with_zero_
     assert judge.calls == []
 
 
+async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with_zero_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pass A answered (so its own no_answer check above did not fire), but
+    # pass B's real generation call -- built from `build_seeded_rag_service`,
+    # which `run_judged_layer` does not take as an injectable parameter --
+    # structurally no-answers instead of raising. This is a second, distinct
+    # no_answer branch from pass A's (mutation-verified separately: with the
+    # dataset-driven pass-A no_answer check alone disabled, this scenario's
+    # own test above still stubs pass B to answer, so it never exercises
+    # this branch -- confirmed empty-coverage before this test existed).
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(_hit(tenant="acme", doc_id="returns-policy"),),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    pass_b_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    monkeypatch.setattr(
+        eval_run,
+        "build_seeded_rag_service",
+        lambda settings, *, use_fake_llm: pass_b_service,
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    assert result.reason == "no_answer_at_runtime"
+    assert result.verdict is None
+    assert result.repeats == ()
+    # Pass B's generation ran (it's the one that returned no_answer);
+    # judging never does.
+    assert pass_b_service.calls == 1
+    assert judge.calls == []
+
+
 async def test_run_judged_layer_matching_sources_runs_judging_and_reports_judged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1905,6 +1960,31 @@ def test_main_judge_flag_wires_report_and_still_exits_ok(
     assert "deterministic:" in captured.out
     assert "judged:" in captured.out
     assert "stability:" in captured.out
+
+
+def test_main_repeats_flag_is_the_value_run_judged_layer_actually_receives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `--repeats`'s default (5) is also what the shipped code would use if
+    # the CLI value were silently dropped -- a run with a non-default value
+    # is the only way to catch that. Stubs `run_judged_layer` itself (rather
+    # than driving it end to end) so this pins exactly the CLI-to-call-site
+    # wiring, independent of dataset composition or judge-call counting.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    captured_kwargs: dict[str, object] = {}
+
+    async def _fake_run_judged_layer(
+        cases: object, service: object, settings: object, *, repeats: int, **_: object
+    ) -> dict[str, object]:
+        captured_kwargs["repeats"] = repeats
+        return {}
+
+    monkeypatch.setattr(eval_run, "run_judged_layer", _fake_run_judged_layer)
+
+    exit_code = eval_run.main(["--judge", "--repeats", "7"])
+
+    assert exit_code == ExitCode.OK
+    assert captured_kwargs["repeats"] == 7
 
 
 def test_main_judge_flag_missing_credentials_exits_setup_failed(
