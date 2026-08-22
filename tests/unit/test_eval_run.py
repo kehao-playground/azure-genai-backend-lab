@@ -1,12 +1,17 @@
 """Tests for `tools/eval_run.py`'s deterministic assertion evaluators (Task 2),
-`requires` propagation / exit codes (Task 3), and pass A -- the corpus-seeded
-`RagService`, its execution over the dataset, and `--calibrate` (Task 4).
+`requires` propagation / exit codes (Task 3), pass A -- the corpus-seeded
+`RagService`, its execution over the dataset, and `--calibrate` (Task 4) --
+and the judge contract's input fencing, canonical hashing, and
+invariant-checked strict parsing (Task 5).
 
 Table-driven: one test per rule in the design (`drafts/research/day-28-evaluation.md`
-r04 §8/§7.2/§7.5) plus a few direct `attribute_source` tests for its own branches.
-The Task 4 section below runs the real seeded pipeline end to end
+r04 §8/§7.2/§7.3/§7.5) plus a few direct `attribute_source` tests for its own
+branches. The Task 4 section below runs the real seeded pipeline end to end
 (`USE_FAKE_LLM=true`, no Azure resources -- `tests/conftest.py` pins the three
-fake-adapter flags for the whole suite).
+fake-adapter flags for the whole suite). The Task 5 section is pure --
+no `RagService`, no provider call; it exercises `build_judge_input` /
+`parse_judge_response` / `derive_judge_verdict` against hand-built
+`SearchHit`s and raw response strings only.
 
 `tools/` is not a package (no `tools/__init__.py`), so the module is loaded
 by path, the same pattern `tests/unit/test_eval_cases.py` uses.
@@ -24,6 +29,8 @@ import pytest
 from azgenai_lab.core.config import Settings
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
+from azgenai_lab.models.search import SearchHit
+from azgenai_lab.prompts.loader import PromptTemplate
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
 from azgenai_lab.services.rag import build_rag_service
 
@@ -45,6 +52,17 @@ evaluate_deterministic = eval_run.evaluate_deterministic
 evaluation_order = eval_run.evaluation_order
 gate_exit_code = eval_run.gate_exit_code
 propagate_requires = eval_run.propagate_requires
+Fact = eval_run.Fact
+JudgedSpec = eval_run.JudgedSpec
+JudgeOutput = eval_run.JudgeOutput
+JudgeParseError = eval_run.JudgeParseError
+answer_sha256 = eval_run.answer_sha256
+build_judge_input = eval_run.build_judge_input
+derive_judge_verdict = eval_run.derive_judge_verdict
+judge_prompt_template = eval_run.judge_prompt_template
+parse_judge_response = eval_run.parse_judge_response
+sha256_hex = eval_run.sha256_hex
+sources_sha256 = eval_run.sources_sha256
 
 # The real lab worktree these tests run in -- test_eval_run.py lives at
 # tests/unit/, two levels below the repo root.
@@ -657,7 +675,7 @@ async def test_calibration_document_matches_shape_for_the_real_lab_root() -> Non
     assert zero_hit["hits"] == []
 
     # observations_sha256 is derivable, not just present.
-    assert document["observations_sha256"] == eval_run._sha256_hex(
+    assert document["observations_sha256"] == eval_run.sha256_hex(
         eval_run.canonical_json(observations)
     )
 
@@ -690,3 +708,390 @@ def test_main_calibrate_prints_the_document_for_the_real_lab_root(
 
 def test_main_default_run_gates_on_the_real_dataset_and_exits_ok() -> None:
     assert eval_run.main([]) == ExitCode.OK
+
+
+# --- Task 5: judge contract (design §7.3) ---
+#
+# Pure -- no RagService, no provider call. build_judge_input / parse_judge_
+# response / derive_judge_verdict are exercised against hand-built EvalCases,
+# SearchHits, and raw response strings only.
+
+
+def _fact(fact_id: str, text: str = "some fact text") -> "Fact":
+    return Fact(id=fact_id, text=text)
+
+
+def _judged_case(
+    case_id: str = "judged-case",
+    expected: tuple["Fact", ...] = (),
+    forbidden: tuple["Fact", ...] = (),
+) -> EvalCase:
+    return EvalCase(
+        id=case_id,
+        question="does this answer cover the expected facts?",
+        tenant="acme",
+        user="eval-agent",
+        groups=(),
+        protects="test coverage",
+        requires=(),
+        deterministic=_det(),
+        judged=JudgedSpec(expected_facts=expected, forbidden_facts=forbidden, rubric=None),
+        judged_skip_reason=None,
+    )
+
+
+def _hit(
+    tenant: str = "acme",
+    doc_id: str = "doc-a",
+    ordinal: int = 0,
+    heading_path: str = "Doc A > Section",
+    content: str = "some content",
+    score: float = 1.0,
+) -> SearchHit:
+    parent_id = make_parent_id(tenant, doc_id)
+    return SearchHit(
+        chunk_id=make_chunk_id(parent_id, ordinal),
+        parent_id=parent_id,
+        title="Doc A",
+        heading_path=heading_path,
+        content=content,
+        score=score,
+    )
+
+
+# --- sha256_hex / answer_sha256 ---
+
+
+def test_sha256_hex_matches_hashlib() -> None:
+    import hashlib
+
+    assert sha256_hex(b"hello") == hashlib.sha256(b"hello").hexdigest()
+
+
+def test_answer_sha256_is_sha256_of_the_answers_own_utf8_bytes() -> None:
+    assert answer_sha256("hello") == sha256_hex(b"hello")
+
+
+def test_answer_sha256_differs_on_a_whitespace_only_change() -> None:
+    assert answer_sha256("a b") != answer_sha256("a  b")
+
+
+# --- sources_sha256 ---
+
+
+def test_sources_sha256_unchanged_when_only_score_changes() -> None:
+    hit_a = _hit(score=1.0)
+    hit_b = _hit(score=99.0)
+    assert sources_sha256([hit_a]) == sources_sha256([hit_b])
+
+
+def test_sources_sha256_changes_when_content_changes() -> None:
+    hit_a = _hit(content="alpha")
+    hit_b = _hit(content="beta")
+    assert sources_sha256([hit_a]) != sources_sha256([hit_b])
+
+
+def test_sources_sha256_changes_when_two_hits_swap_rank() -> None:
+    hit_a = _hit(doc_id="doc-a", content="alpha")
+    hit_b = _hit(doc_id="doc-b", content="beta")
+    assert sources_sha256([hit_a, hit_b]) != sources_sha256([hit_b, hit_a])
+
+
+def test_sources_sha256_is_canonical_json_of_doc_id_chunk_id_heading_path_content() -> None:
+    hit = _hit(
+        tenant="acme", doc_id="doc-a", ordinal=3, heading_path="Doc A > S1", content="body text"
+    )
+    payload = [
+        {
+            "doc_id": "doc-a",
+            "chunk_id": hit.chunk_id,
+            "heading_path": "Doc A > S1",
+            "content": "body text",
+        }
+    ]
+    assert sources_sha256([hit]) == sha256_hex(eval_run.canonical_json(payload))
+
+
+# --- build_judge_input: nonce fencing ---
+
+
+def test_build_judge_input_embeds_the_nonce_in_the_answer_fence() -> None:
+    case = _judged_case(expected=(_fact("f1"),))
+    payload = build_judge_input(case, "the answer text", [], nonce="abc123")
+    answer = payload["answer"]
+    assert isinstance(answer, str)
+    assert "BEGIN UNTRUSTED ANSWER abc123" in answer
+    assert "END UNTRUSTED ANSWER abc123" in answer
+    assert "the answer text" in answer
+
+
+def test_build_judge_input_embeds_the_nonce_in_each_source_content_fence() -> None:
+    case = _judged_case(expected=(_fact("f1"),))
+    hit1 = _hit(doc_id="doc-a", content="alpha content")
+    hit2 = _hit(doc_id="doc-b", content="beta content")
+    payload = build_judge_input(case, "answer", [hit1, hit2], nonce="deadbeef")
+    sources = payload["sources"]
+    assert isinstance(sources, list)
+    assert len(sources) == 2
+    for source in sources:
+        assert "deadbeef" in source["content"]
+    assert "alpha content" in sources[0]["content"]
+    assert "beta content" in sources[1]["content"]
+
+
+def test_build_judge_input_uses_the_same_nonce_everywhere_in_one_call() -> None:
+    case = _judged_case(expected=(_fact("f1"),))
+    hit = _hit(content="alpha content")
+    payload = build_judge_input(case, "answer text", [hit], nonce="samenonce")
+    answer = payload["answer"]
+    sources = payload["sources"]
+    assert isinstance(answer, str)
+    assert isinstance(sources, list)
+    source_content = sources[0]["content"]
+    # BEGIN and END each carry the nonce once -- two occurrences per fence.
+    assert answer.count("samenonce") == 2
+    assert source_content.count("samenonce") == 2
+
+
+def test_build_judge_input_uses_a_different_nonce_on_the_next_call() -> None:
+    case = _judged_case(expected=(_fact("f1"),))
+    payload_a = build_judge_input(case, "answer", [], nonce="nonce-one")
+    payload_b = build_judge_input(case, "answer", [], nonce="nonce-two")
+    answer_a = payload_a["answer"]
+    answer_b = payload_b["answer"]
+    assert isinstance(answer_a, str) and isinstance(answer_b, str)
+    assert "nonce-one" in answer_a and "nonce-two" not in answer_a
+    assert "nonce-two" in answer_b and "nonce-one" not in answer_b
+
+
+def test_build_judge_input_carries_question_and_fact_id_text_pairs() -> None:
+    case = _judged_case(
+        case_id="c1",
+        expected=(_fact("f1", "fact one text"),),
+        forbidden=(_fact("f2", "fact two text"),),
+    )
+    payload = build_judge_input(case, "answer", [], nonce="n")
+    assert payload["question"] == case.question
+    assert payload["expected_facts"] == [{"id": "f1", "text": "fact one text"}]
+    assert payload["forbidden_facts"] == [{"id": "f2", "text": "fact two text"}]
+
+
+def test_build_judge_input_source_carries_doc_id_and_heading_path() -> None:
+    case = _judged_case(expected=(_fact("f1"),))
+    hit = _hit(doc_id="doc-a", heading_path="Doc A > Section 1")
+    payload = build_judge_input(case, "answer", [hit], nonce="n")
+    sources = payload["sources"]
+    assert isinstance(sources, list)
+    assert sources[0]["doc_id"] == "doc-a"
+    assert sources[0]["heading_path"] == "Doc A > Section 1"
+
+
+def test_build_judge_input_rejects_a_case_with_judged_none() -> None:
+    case = _case()  # existing Task 1-4 helper: judged=None, judged_skip_reason set
+    with pytest.raises(ValueError, match="judged=None"):
+        build_judge_input(case, "answer", [], nonce="n")
+
+
+# --- judge_prompt_template: in-memory, not a prompts/ file ---
+
+
+def test_judge_prompt_template_shape() -> None:
+    template = judge_prompt_template()
+    assert isinstance(template, PromptTemplate)
+    assert template.name == "eval_judge"
+    assert template.version == eval_run.JUDGE_PROMPT_VERSION
+    assert template.text == eval_run.JUDGE_PROMPT
+    assert template.sha256 == sha256_hex(eval_run.JUDGE_PROMPT.encode("utf-8"))
+
+
+def test_judge_prompt_template_is_not_a_file_under_prompts_dir() -> None:
+    prompts_dir = _LAB_ROOT / "src" / "azgenai_lab" / "prompts"
+    assert not (prompts_dir / "eval_judge.md").exists()
+
+
+def test_judge_prompt_states_the_only_trusted_instruction_sources() -> None:
+    prompt = eval_run.JUDGE_PROMPT.lower()
+    assert "only instructions" in prompt
+
+
+def test_judge_prompt_states_fenced_content_is_data_never_instructions() -> None:
+    prompt = eval_run.JUDGE_PROMPT.lower()
+    assert "never an instruction" in prompt
+
+
+def test_judge_prompt_tells_the_model_not_to_follow_fenced_instructions() -> None:
+    prompt = eval_run.JUDGE_PROMPT.lower()
+    assert "do not execute" in prompt
+
+
+def test_judge_prompt_tells_the_model_to_reply_with_only_the_json_object() -> None:
+    prompt = eval_run.JUDGE_PROMPT.lower()
+    assert "nothing else" in prompt
+
+
+# --- parse_judge_response: strict parsing, four id-set invariants ---
+
+
+def _one_expected_case() -> EvalCase:
+    return _judged_case(expected=(_fact("e1"),), forbidden=(_fact("f1"),))
+
+
+def _two_expected_case() -> EvalCase:
+    return _judged_case(expected=(_fact("e1"), _fact("e2")), forbidden=(_fact("f1"),))
+
+
+def _judge_response(
+    covered: tuple[str, ...] = (),
+    missing: tuple[str, ...] = (),
+    violated: tuple[str, ...] = (),
+    unsupported: tuple[str, ...] = (),
+    rationale: str = "ok",
+) -> str:
+    return json.dumps(
+        {
+            "covered_fact_ids": list(covered),
+            "missing_fact_ids": list(missing),
+            "violated_fact_ids": list(violated),
+            "unsupported_claims": list(unsupported),
+            "rationale": rationale,
+        }
+    )
+
+
+def test_parse_judge_response_accepts_a_well_formed_response() -> None:
+    case = _one_expected_case()
+    output = parse_judge_response(_judge_response(covered=("e1",)), case)
+    assert output.covered_fact_ids == ("e1",)
+    assert output.missing_fact_ids == ()
+    assert output.violated_fact_ids == ()
+    assert output.unsupported_claims == ()
+    assert output.rationale == "ok"
+
+
+def test_parse_judge_response_rejects_malformed_json() -> None:
+    case = _one_expected_case()
+    with pytest.raises(JudgeParseError):
+        parse_judge_response("{not valid json", case)
+
+
+def test_parse_judge_response_rejects_json_with_prose_wrapped_around_it() -> None:
+    case = _one_expected_case()
+    raw = "Here is my answer: " + _judge_response(covered=("e1",))
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_a_missing_key() -> None:
+    case = _one_expected_case()
+    payload = json.loads(_judge_response(covered=("e1",)))
+    del payload["rationale"]
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(json.dumps(payload), case)
+
+
+def test_parse_judge_response_rejects_when_an_expected_fact_is_classified_nowhere() -> None:
+    # Invariant 1: expected_ids <= covered | missing. e2 appears in neither
+    # list -- disabling *only* this check must be the thing that turns this
+    # test red (verified in Step 4's mutation pass).
+    case = _two_expected_case()
+    raw = _judge_response(covered=("e1",), missing=())
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_the_self_contradictory_all_empty_response() -> None:
+    # The response r03 was written to stop: both lists empty for a case
+    # that has one expected fact. Caught by the same invariant 1 as above.
+    case = _one_expected_case()
+    raw = _judge_response(covered=(), missing=())
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_covered_and_missing_overlap() -> None:
+    # Invariant 2: covered & missing == set(). Both lists claim e1: the
+    # union already equals expected (invariant 1 alone would accept this),
+    # so only invariant 2 isolates it.
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1",), missing=("e1",))
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_a_violated_id_absent_from_forbidden_facts() -> None:
+    # Invariant 3: violated <= forbidden_ids. "e1" is a real id (it is this
+    # case's expected fact) but not a forbidden one, so invariant 4's
+    # "known id" check alone would not catch it -- only invariant 3 does.
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1",), violated=("e1",))
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_an_extra_unknown_id_alongside_a_real_one() -> None:
+    # Invariant 4: (covered | missing | violated) <= known_ids. "e1" alone
+    # would satisfy invariant 1 (union == expected would need exactly
+    # {"e1"} here since expected has only e1 -- so adding "not-a-real-id"
+    # breaks invariant 4 without breaking invariant 1's "nothing expected
+    # left out" direction).
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1", "not-a-real-id"), missing=())
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_a_fact_returned_as_free_text_instead_of_an_id() -> None:
+    # Also invariant 4, but via missing_fact_ids and both expected ids
+    # legitimately classified (unlike the extra-id test above, which uses
+    # an id-shaped typo) -- a natural-language sentence dropped in among
+    # real ids. Isolated from invariant 3 deliberately: this uses
+    # missing_fact_ids, not violated_fact_ids, so invariant 3 (which only
+    # constrains violated_fact_ids) can never be the one that fires here.
+    case = _two_expected_case()
+    raw = _judge_response(covered=("e1",), missing=("e2", "the answer mentions 30 days"))
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+# --- derive_judge_verdict ---
+
+
+def _judge_output(
+    covered: tuple[str, ...] = (),
+    missing: tuple[str, ...] = (),
+    violated: tuple[str, ...] = (),
+    unsupported: tuple[str, ...] = (),
+) -> JudgeOutput:
+    return JudgeOutput(
+        covered_fact_ids=covered,
+        missing_fact_ids=missing,
+        violated_fact_ids=violated,
+        unsupported_claims=unsupported,
+        rationale="r",
+    )
+
+
+def test_derive_judge_verdict_pass_when_all_three_are_empty() -> None:
+    assert derive_judge_verdict(_judge_output(covered=("e1",))) == "pass"
+
+
+def test_derive_judge_verdict_fail_when_missing_is_non_empty() -> None:
+    assert derive_judge_verdict(_judge_output(missing=("e1",))) == "fail"
+
+
+def test_derive_judge_verdict_fail_when_violated_is_non_empty() -> None:
+    assert derive_judge_verdict(_judge_output(covered=("e1",), violated=("f1",))) == "fail"
+
+
+def test_derive_judge_verdict_fail_when_unsupported_claims_is_non_empty() -> None:
+    output = _judge_output(covered=("e1",), unsupported=("an ungrounded claim",))
+    assert derive_judge_verdict(output) == "fail"
+
+
+# --- canonical_json (Task 4, additional Task 5 coverage) ---
+
+
+def test_canonical_json_is_stable_under_key_reordering_task5() -> None:
+    assert eval_run.canonical_json({"z": 1, "a": {"y": 2, "x": 3}}) == eval_run.canonical_json(
+        {"a": {"x": 3, "y": 2}, "z": 1}
+    )
