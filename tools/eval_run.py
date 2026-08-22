@@ -71,8 +71,9 @@ class DatasetError(Exception):
 def _corpus_keys(corpus_dir: Path) -> frozenset[tuple[str, str]]:
     """`{(tenant_id, doc_id)}` for every document under `corpus_dir`, built
     through the same loader the production indexing path uses (design §8:
-    "每個 doc_id 真的存在於 corpus 且租戶相符") — never a second, hand-rolled
-    reading of the corpus directory."""
+    every `doc_id` must really exist in the corpus, under the tenant the
+    case claims) — never a second, hand-rolled reading of the corpus
+    directory."""
     documents = load_documents(corpus_dir)
     return frozenset((doc.tenant_id, doc.doc_id) for doc in documents)
 
