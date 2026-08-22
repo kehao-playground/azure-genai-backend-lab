@@ -159,7 +159,7 @@ its own runner (`tools/prompt_shields_cases.json`, Day 21). Each case:
 | `principal` | yes | `tenant` / `user` / `groups`; every case carries the identity that asks it |
 | `protects` | yes | Which day's decision this case guards. A case with no cited decision is a wish, not a regression test |
 | `requires` | yes | Array, may be empty. Ids of prerequisite cases (§4.3) |
-| `deterministic.status` | yes | `"answered"`, `"no_answer"`, or `null` (no assertion made) |
+| `deterministic.status` | no | `"answered"`, `"no_answer"`, or `null`/absent (no assertion made) |
 | `deterministic.status_note` | conditional | Required, non-empty, when `status` is `null` — forces a reason to be written down |
 | `must_cite` | yes | Array of doc ids (may be empty). All must appear among the cited documents |
 | `citations_subset_of` | yes | Array of doc ids, or `null` (no closed-set claim) |
@@ -169,7 +169,12 @@ its own runner (`tools/prompt_shields_cases.json`, Day 21). Each case:
 | `judged_skip_reason` | conditional | Required, non-empty, when `judged` is `null` |
 | `judged.expected_facts` | yes | Facts the answer must cover, each `{id, text}`; the judge reports only `id`s, never text (§6) |
 | `judged.forbidden_facts` | yes | Facts the answer must not assert, same `{id, text}` shape |
-| `judged.rubric` | yes | Free text, or `null` to fall back to the built-in rubric |
+| `judged.rubric` | no | Free text, or `null`/absent to fall back to the built-in rubric. When present it is sent to the judge as a case-specific grading instruction, on the trusted side of the fence |
+
+The two `no` rows are read with `.get`, so omitting them is exactly
+equivalent to writing `null`. Every other field is rejected when absent —
+including `must_cite` / `must_not_cite` / `citations_subset_of`, where the
+loader deliberately distinguishes "absent" from "empty" (§4.2).
 
 ### 4.2 `[]` versus `null`
 
@@ -265,7 +270,7 @@ deterministic pass:
 
 | Pass | Model | Calls per case | Produces | Used for |
 |---|---|---|---|---|
-| A — deterministic | Fake | 1 | status, cited sources | The gate, and the exit code |
+| A — deterministic | Fake | 1 (2 under `--judge`) | status, cited sources | The gate, and the exit code |
 | B — generation | Real `chat-mini` | 1 (only for judged-eligible cases) | The answer and sources the judge will review | Input to pass C |
 | C — judging | Real `chat-mini` | `--repeats` (default 5) | A judge verdict per repeat | The judged-layer result and its stability record |
 
@@ -385,11 +390,15 @@ own attempt, not swallowed) and applies two checks before it will report a
 verdict at all:
 
 1. **Every repeat must agree on `answer_sha256` and `sources_sha256`.**
-   These are computed once, from pass B's output, before any repeat runs;
-   if a later repeat's hash of what it actually reviewed differs (it
-   should not — the same `answer`/`hits` are passed to every repeat), the
-   case is `INCONCLUSIVE`: the repeats did not all review the same thing,
-   so nothing about their disagreement can be attributed to judge
+   Each repeat computes them itself, from the `answer`/`hits` it was
+   handed, before it calls the model. In the shipped path every repeat
+   receives the same two arguments, so this check *structurally cannot*
+   fire — it is a caller-error guard, not a runtime observation, and it
+   exists so that a future caller who passes a different answer to repeat
+   4 gets an `INCONCLUSIVE` rather than a stability number. Were it to
+   fire, the case is `INCONCLUSIVE`: the repeats did not all review the
+   same thing, so nothing about their disagreement can be attributed to
+   judge
    instability.
 2. **Every repeat's outcome must be `"pass"` or `"fail"`** — any
    `ERROR(...)` outcome anywhere in the set makes the case `INCONCLUSIVE`.
