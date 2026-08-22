@@ -1,13 +1,13 @@
 """Day 28 GenAI evaluation: golden-question dataset and runner.
 
-This module currently implements the dataset section only: the frozen
-dataclasses describing one evaluation case, and `load_cases`, which loads
-and validates `tools/eval_cases.json` against the real sample corpus (design
-`drafts/research/day-28-evaluation.md` r04, §5/§6/§8; implementation plan
-`plans/day-28-implementation-plan.md` Task 1). Later tasks append the
-deterministic evaluators, `requires` propagation and exit codes, the judge
-contract, and orchestration/reporting to this same file — they are
-deliberately absent here, not stubbed.
+This module currently implements the dataset section (`load_cases`), the
+deterministic assertion evaluator (`evaluate_deterministic`), and `requires`
+propagation / exit codes (`evaluation_order`, `propagate_requires`,
+`gate_exit_code`) (design `drafts/research/day-28-evaluation.md` r04,
+§5/§6/§7.2/§7.5/§8; implementation plan `plans/day-28-implementation-plan.md`
+Tasks 1-3). Later tasks append the judge contract and
+orchestration/reporting to this same file — they are deliberately absent
+here, not stubbed.
 
 `tools/` is not an installed package (no `tools/__init__.py`); tests load
 this module by path, the same pattern `tests/unit/test_prompt_shields_probe.py`
@@ -20,7 +20,7 @@ import json
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -496,3 +496,124 @@ def evaluate_deterministic(
 
     verdict = Verdict.FAIL if failures else Verdict.PASS
     return CaseResult(case_id=case.id, verdict=verdict, failures=tuple(failures))
+
+
+def evaluation_order(cases: Sequence[EvalCase]) -> tuple[EvalCase, ...]:
+    """Return `cases` in *a* topological order over the `requires` DAG.
+
+    Acyclicity is `load_cases`'s job (`_validate_requires`); this function
+    assumes it already holds and does not re-check it. A DAG in general has
+    more than one valid topological order (design §7.2, r03: r02's "acyclic
+    implies a unique order" was wrong), so this only guarantees that every
+    prerequisite precedes its dependents — not any particular order beyond
+    that. Ties (cases with no ordering constraint between them) are broken
+    by dataset order, i.e. the order `cases` was given in, which is what a
+    plain depth-first placement over `cases` in sequence naturally produces.
+
+    This is *not* the order results get reported in -- report order is
+    dataset order, produced separately by iterating `cases` itself, not by
+    calling this function.
+    """
+    by_id = {case.id: case for case in cases}
+    placed: set[str] = set()
+    order: list[EvalCase] = []
+
+    def place(case: EvalCase) -> None:
+        if case.id in placed:
+            return
+        for req_id in case.requires:
+            place(by_id[req_id])
+        placed.add(case.id)
+        order.append(case)
+
+    for case in cases:
+        place(case)
+
+    return tuple(order)
+
+
+def propagate_requires(
+    cases: Sequence[EvalCase], results: Mapping[str, CaseResult]
+) -> dict[str, CaseResult]:
+    """Apply `requires` propagation to one pass's deterministic `results`.
+
+    Design §7.2: propagation is decided purely by the *deterministic*
+    verdict of each prerequisite — the judged layer never participates,
+    because letting it in would let judged-layer noise contaminate the
+    gate. Any prerequisite that is not PASS (FAIL *or* INCONCLUSIVE, r02's
+    FAIL-only rule was a gap the r02 review round caught) turns a
+    dependent's *own* PASS into INCONCLUSIVE. A dependent that already
+    failed on its own merits is never touched: propagation only ever
+    introduces INCONCLUSIVE, it never upgrades an existing FAIL into
+    anything, and it never downgrades a PASS into anything worse than
+    INCONCLUSIVE either.
+
+    Processing happens in `evaluation_order` so that a prerequisite's own
+    propagated result is already final by the time a dependent looks it up
+    -- that is what makes a transitive chain (A FAIL -> B INCONCLUSIVE ->
+    C INCONCLUSIVE) propagate correctly in one pass instead of needing a
+    fixed-point loop.
+
+    Returns a new mapping; `results` and `cases` are not mutated. The
+    returned mapping preserves `results`'s own key order — it is not
+    reordered to `evaluation_order` or to dataset order. Report order is a
+    separate concern the caller owns (design §7.2).
+    """
+    propagated: dict[str, CaseResult] = dict(results)
+
+    for case in evaluation_order(cases):
+        own = propagated[case.id]
+        if own.verdict == Verdict.FAIL:
+            continue
+
+        blocking = [
+            req_id for req_id in case.requires if propagated[req_id].verdict != Verdict.PASS
+        ]
+        if not blocking:
+            continue
+
+        reasons = tuple(
+            f"requires: prerequisite {req_id!r} is {propagated[req_id].verdict.value}"
+            for req_id in blocking
+        )
+        propagated[case.id] = CaseResult(
+            case_id=case.id,
+            verdict=Verdict.INCONCLUSIVE,
+            failures=own.failures + reasons,
+        )
+
+    return propagated
+
+
+class ExitCode(IntEnum):
+    """The runner's process exit code (design §7.5).
+
+    Deliberately three-way, not a bool: `0` means the deterministic gate
+    was actually evaluated and every case passed it; `1` means it was
+    evaluated and found a problem with the thing under test (a FAIL or an
+    INCONCLUSIVE); `2` is reserved for setup/configuration failures that
+    happen *before* any verdict exists at all (invalid dataset, corpus
+    that will not load, `--judge` requested without credentials) -- a
+    later task raises those directly, this enum just names the code they
+    exit with. Collapsing `2` into `0` would make a run that never
+    executed the gate look green.
+    """
+
+    OK = 0
+    GATE_FAILED = 1
+    SETUP_FAILED = 2
+
+
+def gate_exit_code(results: Mapping[str, CaseResult]) -> ExitCode:
+    """Map deterministic-gate results to a process exit code (design §7.5).
+
+    Takes only the deterministic-layer results mapping -- there is no
+    parameter here for judged-layer outcomes, by construction, so a run
+    where every case's deterministic verdict is PASS exits 0 regardless of
+    what the judged layer (scored separately, never gating) found. The
+    judged layer is reported alongside the gate result, never folded into
+    it.
+    """
+    if any(result.verdict != Verdict.PASS for result in results.values()):
+        return ExitCode.GATE_FAILED
+    return ExitCode.OK
