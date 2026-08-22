@@ -17,8 +17,10 @@ uses.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+import re
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
@@ -382,3 +384,115 @@ def load_cases(path: Path, corpus_dir: Path) -> tuple[EvalCase, ...]:
     _validate_requires(cases)
 
     return tuple(cases)
+
+
+class Verdict(StrEnum):
+    """Outcome of scoring one case against one run's output.
+
+    `evaluate_deterministic` below only ever produces PASS or FAIL.
+    INCONCLUSIVE is defined here, not added later, because Task 3's
+    `requires` propagation (a case whose prerequisite failed or was itself
+    inconclusive) needs a third value from this same enum.
+    """
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    INCONCLUSIVE = "INCONCLUSIVE"
+
+
+@dataclass(frozen=True)
+class CaseResult:
+    case_id: str
+    verdict: Verdict
+    failures: tuple[str, ...]
+
+
+# A chunk id is `make_chunk_id(parent_id, ordinal)`: the parent id with a
+# `-dddd` ordinal suffix appended (`azgenai_lab.models.rag`). `.+` is greedy,
+# so it backtracks to the *last* place a trailing `-\d{4}` fits, stripping
+# only that ordinal even if the parent id itself contains hyphens.
+_CHUNK_ORDINAL = re.compile(r"(.+)-\d{4}")
+
+
+def attribute_source(
+    chunk_id: str, corpus: Mapping[str, tuple[str, str]]
+) -> tuple[str, str] | None:
+    """Resolve a chunk id to the `(tenant_id, doc_id)` of its source document.
+
+    `corpus` maps `make_parent_id(tenant_id, doc_id)` (`azgenai_lab.models.rag`)
+    to `(tenant_id, doc_id)`, built once by the caller from `load_documents`.
+    Mapping to the pair, not to `doc_id` alone, lets one lookup recover both
+    fields without this function re-deriving them from the length-prefixed
+    parent id format itself.
+
+    This strips exactly the trailing `-\\d{4}` ordinal `make_chunk_id` appends
+    and looks the remainder up in `corpus`. Returns `None` when `chunk_id` has
+    no such suffix, or the stripped remainder names no document in `corpus` --
+    an unattributable source. Callers must score that as its own failure, not
+    treat it as an absent source to skip.
+    """
+    match = _CHUNK_ORDINAL.fullmatch(chunk_id)
+    if match is None:
+        return None
+    return corpus.get(match.group(1))
+
+
+def evaluate_deterministic(
+    case: EvalCase,
+    status: Literal["answered", "no_answer"],
+    source_chunk_ids: Sequence[str],
+    corpus: Mapping[str, tuple[str, str]],
+) -> CaseResult:
+    """Score one case's deterministic assertions against one run's output.
+
+    Every violated assertion is collected into `failures` -- there is no
+    early return, so a run wrong on several axes reports all of them, and
+    the verdict is FAIL iff `failures` is non-empty (never INCONCLUSIVE;
+    that verdict belongs to Task 3's `requires` propagation).
+
+    Two checks apply to every source unconditionally, with no per-case
+    dataset field to opt into them: a source that resolves to no known
+    document is a FAIL distinct from a wrong-tenant source, and a source
+    attributable to a tenant other than `case.tenant` is always a FAIL --
+    whether or not `must_not_cite` happens to name it. Cross-tenant leakage
+    is a structural property of the run being scored, not something a case
+    author enumerates a document id to catch.
+    """
+    spec = case.deterministic
+    failures: list[str] = []
+
+    if spec.status is not None and status != spec.status:
+        failures.append(f"status: expected {spec.status!r}, got {status!r}")
+
+    cited_doc_ids: set[str] = set()
+    for chunk_id in source_chunk_ids:
+        attributed = attribute_source(chunk_id, corpus)
+        if attributed is None:
+            failures.append(
+                f"unattributable source: chunk id {chunk_id!r} matches no known document"
+            )
+            continue
+        tenant_id, doc_id = attributed
+        if tenant_id != case.tenant:
+            failures.append(
+                f"cross-tenant source: chunk id {chunk_id!r} belongs to tenant "
+                f"{tenant_id!r}, case tenant is {case.tenant!r}"
+            )
+            continue
+        cited_doc_ids.add(doc_id)
+
+    missing = sorted(set(spec.must_cite) - cited_doc_ids)
+    if missing:
+        failures.append(f"must_cite: missing {missing}")
+
+    if spec.citations_subset_of is not None:
+        foreign = sorted(cited_doc_ids - set(spec.citations_subset_of))
+        if foreign:
+            failures.append(f"citations_subset_of: unexpected {foreign}")
+
+    forbidden = sorted(cited_doc_ids & set(spec.must_not_cite))
+    if forbidden:
+        failures.append(f"must_not_cite: forbidden doc(s) present {forbidden}")
+
+    verdict = Verdict.FAIL if failures else Verdict.PASS
+    return CaseResult(case_id=case.id, verdict=verdict, failures=tuple(failures))
