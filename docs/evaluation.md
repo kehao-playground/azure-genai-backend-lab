@@ -172,7 +172,8 @@ its own runner (`tools/prompt_shields_cases.json`, Day 21). Each case:
 | `judged.rubric` | no | Free text, or `null`/absent to fall back to the built-in rubric. When present it is sent to the judge as a case-specific grading instruction, on the trusted side of the fence |
 
 The two `no` rows are read with `.get`, so omitting them is exactly
-equivalent to writing `null`. Every other field is rejected when absent —
+equivalent to writing `null`. So are the `conditional` rows when their
+condition does not apply. Every `yes` row is rejected when absent —
 including `must_cite` / `must_not_cite` / `citations_subset_of`, where the
 loader deliberately distinguishes "absent" from "empty" (§4.2).
 
@@ -305,9 +306,17 @@ input built by `build_judge_input`:
   "answer": "BEGIN UNTRUSTED ANSWER <nonce>\n...\nEND UNTRUSTED ANSWER <nonce>",
   "sources": [{"doc_id": "...", "heading_path": "...", "content": "BEGIN UNTRUSTED SOURCE <nonce> 1\n...\nEND UNTRUSTED SOURCE <nonce> 1"}],
   "expected_facts": [{"id": "fact_standard_window_30_days", "text": "..."}],
-  "forbidden_facts": [{"id": "fact_14_days_for_standard", "text": "..."}]
+  "forbidden_facts": [{"id": "fact_14_days_for_standard", "text": "..."}],
+  "rubric": "..."
 }
 ```
+
+The sources check in §7.4 compares **pass A's second invocation** (the one
+`run_judged_layer` makes, per case) against pass B — not pass A's first,
+gate-producing call. The two pass-A calls are never compared with each
+other, so a retriever that acquired jitter could in principle feed one
+status to the deterministic gate and another to the judged layer. Nothing
+observes that today; it is recorded here rather than implied away.
 
 ### 7.1 The data boundary
 
@@ -315,8 +324,11 @@ input built by `build_judge_input`:
 instructions — both a generated answer and retrieved corpus text can
 contain instruction-shaped wording, and the judge is precisely the thing
 reading both. The only trusted instruction sources are `JUDGE_PROMPT`
-itself and the dataset's own `expected_facts`/`forbidden_facts` schema
-fields. Both untrusted fields are wrapped in a `BEGIN UNTRUSTED ... {nonce}`
+itself and the dataset's own `expected_facts`/`forbidden_facts`/`rubric`
+schema fields. The `rubric` key is present only for the cases that define
+one — the built-in rubric is what applies otherwise, and sending an empty
+instruction to the other eight cases would be a second, contentless
+instruction in front of the judge. Both untrusted fields are wrapped in a `BEGIN UNTRUSTED ... {nonce}`
 / `END UNTRUSTED ... {nonce}` fence, where the nonce is drawn once per call
 (`secrets.token_hex(16)`) — the same per-request nonce discipline `/rag`
 adopted after Day 21 found its own fixed-literal fence could be forged by
