@@ -1772,13 +1772,20 @@ def evidence_document(
             "sha256": judge_prompt.sha256,
         },
         # Recorded so a reader cannot mistake this for an end-to-end run.
-        # Retrieval is seeded and fake here by design (design §2), and the
-        # difference between "the model wrote this" and "a fake echoed it" is
-        # the difference between evidence and a wiring demo.
+        # These are the runner's fixed topology, NOT the ambient settings.
+        # Echoing the settings was actively misleading: the first live run's
+        # sidecar read `use_fake_search: false` on a run whose retrieval was
+        # entirely the seeded FakeSearchClient, because
+        # `agent_tools._seeded_fake_retriever` never consults that setting --
+        # and `--judge` forces real generation regardless of `use_fake_llm`.
+        # Constant-but-true beats variable-but-false: what a reader of this file
+        # needs to know is that retrieval was fake and the graded text was not.
         "adapters": {
-            "use_fake_llm": settings.use_fake_llm,
-            "use_fake_search": settings.use_fake_search,
-            "use_fake_embeddings": settings.use_fake_embeddings,
+            "pass_a_llm": "fake",
+            "pass_b_llm": "real",
+            "judge_llm": "real",
+            "retrieval": "seeded_fake_search_client",
+            "seed_embeddings": "fake_embedding_client",
         },
         "cases": cases_doc,
     }
