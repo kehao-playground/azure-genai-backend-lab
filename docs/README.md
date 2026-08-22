@@ -11,6 +11,7 @@
 - [Container Apps](container-apps.md) — the Day 24 deployment: ingress, revisions, scaling, Key Vault references, the readiness gate, teardown ordering
 - [CI/CD Pipeline](ci-cd.md) — the Day 25 GitHub Actions workflow: two OIDC identities, subject binding, environment approval, digest-pinned deploy, teardown
 - [Infrastructure Evolution](infra-evolution.md) — why 24 scripts and one Bicep template: what is declarable, the two ownership axes, what a live `what-if` really reports
+- [Evaluation](evaluation.md) — deterministic vs. judged layers, the dataset format, judge repeats and stability, what this day does not measure
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
