@@ -1751,6 +1751,12 @@ def test_render_report_three_labelled_lines_per_case_for_every_state() -> None:
     assert sum(line.startswith("deterministic:") for line in labelled) == 3
     assert sum(line.startswith("judged:") for line in labelled) == 3
     assert sum(line.startswith("stability:") for line in labelled) == 3
+    # Each block must be headed by its own case id, in `det` order. Nothing
+    # asserted this before (Day 28 review, Task 6 re-review round 4): the
+    # header is the only thing telling a human which case a block describes,
+    # and it is the surface people read without opening the JSON sidecar.
+    headers = [line for line in report.splitlines() if line and not line.startswith(" ")]
+    assert headers == ["skipped-case", "inconclusive-case", "judged-case"]
 
 
 def test_render_report_stability_not_measured_when_repeats_empty() -> None:
@@ -1825,6 +1831,26 @@ def test_render_report_deterministic_failures_are_included_on_their_own_line() -
     report = render_report(det, {})
 
     assert "FAIL (must_cite: missing ['doc-a'])" in report
+
+
+def test_render_report_joins_multiple_failures_on_one_line() -> None:
+    # A case can violate several assertions at once -- `evaluate_deterministic`
+    # collects them all rather than returning early -- so the join format is
+    # real output, not a hypothetical. Only the single-failure shape was
+    # covered before (Day 28 review, Task 6 re-review round 4).
+    det = {
+        "c1": _result(
+            "c1",
+            Verdict.FAIL,
+            ("must_cite: missing ['doc-a']", "must_not_cite: present ['doc-b']"),
+        )
+    }
+
+    report = render_report(det, {})
+
+    assert (
+        "FAIL (must_cite: missing ['doc-a']; must_not_cite: present ['doc-b'])" in report
+    )
 
 
 # --- evidence_document: Task 10's live-run sidecar shape ---
