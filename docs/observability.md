@@ -66,10 +66,11 @@ Two details in that call:
   pattern is anchored. A bare `health` would also swallow `/api/v1/healthz` and
   any request whose query string mentioned health.
 
-`/health` is excluded because Container Apps runs startup, liveness and
-readiness probes against it, liveness every 10 seconds
-([container-apps.md](container-apps.md)). At 100% sampling those would dominate
-the data. Deployed, the container's own access log shows two `GET /health`
+`/health` is excluded because Container Apps runs three probes against it
+([container-apps.md](container-apps.md)): a startup probe that runs only
+during startup (every 3 seconds here), then liveness and readiness each every
+10 seconds — two requests every 10 seconds in steady state. At 100% sampling
+those would dominate the data. Deployed, the container's own access log shows two `GET /health`
 every ten seconds while `AppRequests` holds none of them — the exclusion is
 what makes the difference, not an absence of traffic. In one 34-minute session
 181 of the container's last 200 log lines were health probes, against zero rows
@@ -79,9 +80,9 @@ in telemetry.
 also gets hit. The line is who generates the traffic: the platform's probes are
 high-frequency traffic you configured and already know the answer to, while a
 request to `/` came from outside and is the kind of thing telemetry exists to
-show you. The volumes are not comparable: probes arrive at twelve
-a minute, every minute, forever, while one deployed session saw three
-unsolicited requests to `/` in total. Note that telemetry will not tell you
+show you. The volumes are not comparable: in steady state the liveness and
+readiness probes arrive at twelve a minute for as long as the app runs, while
+one deployed session saw three unsolicited requests to `/` in total. Note that telemetry will not tell you
 *who* sent them: the exporter reports `ClientIP` as `0.0.0.0` by default.
 
 One thing that is **not** load-bearing, stated because the opposite is a
@@ -425,8 +426,9 @@ and check date for that reason — a bare figure in a document is a stale claim
 waiting to happen.
 
 Turning off logs, metrics, live metrics and performance counters, and excluding
-`/health`, are all cost decisions as much as clarity ones: probe traffic every
-10 seconds is the largest volume this app would otherwise emit.
+`/health`, are all cost decisions as much as clarity ones: steady-state probe
+traffic — two requests every 10 seconds — is the largest volume this app would
+otherwise emit.
 
 Following Day 9's rule, scoped to what it actually governs: **the authority on
 the finally billed quantity and cost is Cost Management + Billing, not our own
