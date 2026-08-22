@@ -232,9 +232,13 @@ def instrument_fastapi_app(app: FastAPI) -> None:
 def instrumented_httpx_client(**kwargs: Any) -> httpx.AsyncClient:
     """Build an httpx client, instrumented per client rather than globally.
 
-    Every upstream call this service makes travels over httpx -- the openai SDK
-    included -- and httpx is not in the distro's bundled instrumentation list,
-    so without this the dependency half of a request's lifecycle is empty.
+    Every upstream call this application makes through clients it builds
+    itself travels over httpx -- the openai SDK included; six construction
+    sites in six service modules. httpx is not in the distro's bundled
+    instrumentation list, so without this those calls leave no dependency
+    spans at all. (Azure SDK traffic, e.g. a managed identity's token fetch,
+    uses its own transport and is covered by the distro's azure_sdk
+    instrumentation instead.)
 
     Per client rather than `HTTPXClientInstrumentor().instrument()` for two
     reasons: which clients are traced stays answerable by reading the

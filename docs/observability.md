@@ -15,7 +15,7 @@ after that call and before any of the work described below:
 | Concern | State after one line |
 |---|---|
 | Request trace | Present — with a caveat that silently removes it, see [Composition](#composition) |
-| Dependency calls | **Empty.** The distro bundles no httpx instrumentation, and every upstream call this service makes travels over httpx |
+| Dependency calls | **Empty.** The distro bundles no httpx instrumentation, and every upstream call this application makes through clients it builds itself — six of them, in six files — travels over httpx. (Traffic inside Azure SDKs, such as a managed identity's token fetch, is the exception — see the [token-fetch span](#a-span-that-only-appears-once-deployed)) |
 | Correlation id | An `operation_Id` exists, but it is not the id this API's contract has used since Day 5 |
 | Model latency | HTTP-level only, and even that does not mean what it looks like — see [Streaming](#streaming) |
 | Streaming trace | The server span does cover the stream; the ownership model underneath it does not match Day 22's, and assuming it does leads to wrong conclusions |
@@ -28,7 +28,8 @@ there ([issue #3436](https://github.com/open-telemetry/opentelemetry-python-cont
 whose linked PR landed response extractors rather than instrumentation), and
 Day 5 pinned this whole series to the Responses API.
 
-So the dependency half of every trace is ours to build.
+So the dependency spans for this application's own upstream calls are ours to
+build.
 
 ## Composition
 
@@ -258,6 +259,48 @@ Outbound calls carry W3C `traceparent` and **no** `X-Correlation-Id`: no
 upstream knows what to do with our id, and forwarding it would copy
 caller-controlled text somewhere else for nobody's benefit.
 
+## Querying it
+
+Where the spans land, measured against a live workspace-based component
+(japaneast, 2026-08-21):
+
+| Concept | Log Analytics table / field |
+|---|---|
+| Server span | `AppRequests` (`Name` = `POST /api/v1/chat`, …) |
+| Every other span — semantic and httpx alike | `AppDependencies` (one table, not split by layer) |
+| Trace id | `OperationId` |
+| Span attributes | `Properties` (`Properties['correlation_id']`, …) |
+
+The join is two steps — find the root by `correlation_id`, then pull the tree
+by `OperationId`:
+
+```kusto
+AppRequests
+| where TimeGenerated > ago(1h)
+| where tostring(Properties['correlation_id']) == '<your-id>'
+| project OperationId, Name, DurationMs
+```
+
+```kusto
+AppDependencies
+| where OperationId == '<operation-id-from-above>'
+| project Name, DurationMs, Target, Properties
+```
+
+Two rules learned by getting confident wrong answers, both from the same live
+session (2026-08-21):
+
+- **Query through `az monitor log-analytics query --workspace <customer-id>`,
+  not `az monitor app-insights query`.** The two surfaces use different
+  schemas: the workspace tables above versus the classic names (`requests`,
+  `dependencies`, `traces`). Feeding a workspace table name to the classic
+  surface fails with a `BadArgumentError` that carries no inner error and no
+  hint that the table name is the problem.
+- **Read any number you intend to use as evidence from `-o json`, not
+  `-o tsv`.** In that session, `az monitor app-insights query` with a
+  `| count` query printed `1` under `-o tsv` while `-o json` held the true
+  value `12`. A plausible-looking number is not the same thing as the answer.
+
 ## Streaming
 
 A streaming call's span cannot be a context manager. It opens before the
@@ -289,10 +332,13 @@ component (2026-08-21, japaneast) — three numbers from one request:
 | `gen_ai.response.time_to_first_chunk` | **2.410 s** | → the first content chunk |
 | `chat chat-mini` span | **2.568 s** | the whole generation |
 
-Headers came back at 1.07 s; the first chunk did not arrive until 2.41 s,
-because the model spent the gap reasoning (that response reported 64 reasoning
-tokens). Reading the httpx span as "how long the model took" would have
-under-reported this request by more than half.
+Headers came back at 1.07 s; the first chunk did not arrive until 2.41 s. The
+1.343 s in between is, strictly, the headers-to-first-content-chunk gap: no
+content byte had arrived yet. That response reported 64 reasoning tokens, so
+reasoning happened in there, but nothing in this measurement decomposes the
+gap's ownership between model reasoning, service-side scheduling, and network
+delivery. What the numbers do prove: reading the httpx span as "how long the
+model took" would have under-reported this request by more than half.
 [diagrams/streaming-latency.md](diagrams/streaming-latency.md) draws the
 containment relationship.
 
@@ -353,7 +399,7 @@ overwrite.
 
 Application Insights here is workspace-based, so it bills at Log Analytics
 rates. From the Azure Retail Prices API for **japaneast, USD (checked
-2026-08-21)**:
+2026-08-22)**:
 
 | Meter | Tier | Price |
 |---|---|---|
@@ -366,6 +412,14 @@ than as a separate benefit: the first 5 GB are priced at zero. Note the grant
 is per billing account, not per workspace, so a second workspace does not bring
 a second 5 GB.
 
+The retention meter does not apply from day one. Data ingested into
+Application Insights — classic or workspace-based — carries **90 days of
+retention at no charge** ([Azure Monitor pricing](https://azure.microsoft.com/pricing/details/monitor/),
+checked 2026-08; general Analytics Logs tables get 31 days,
+[cost details](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/cost-logs)).
+The 0.15 USD/GB/month above is what that meter charges for data retained
+**beyond** its no-charge window, at that region, currency and date.
+
 Prices are regional and change. The numbers above carry their region, currency
 and check date for that reason — a bare figure in a document is a stale claim
 waiting to happen.
@@ -374,8 +428,11 @@ Turning off logs, metrics, live metrics and performance counters, and excluding
 `/health`, are all cost decisions as much as clarity ones: probe traffic every
 10 seconds is the largest volume this app would otherwise emit.
 
-Following Day 9's rule: **the authority on what was ingested is Cost
-Management, not our own span count.**
+Following Day 9's rule, scoped to what it actually governs: **the authority on
+the finally billed quantity and cost is Cost Management + Billing, not our own
+span count.** For operational visibility into ingestion volume before the bill,
+the workspace's own Usage table and *Usage and estimated costs* view are the
+tools — they estimate; the bill decides.
 
 ## Running it locally
 
@@ -406,7 +463,7 @@ to look for is `Transmission succeeded: Item received: N. Items accepted: N`.
 - Disabling FastAPI's is not disabling automatic instrumentation. The distro's
   supported set is `azure_sdk`, `django`, `fastapi`, `flask`, `psycopg2`,
   `requests`, `urllib`, `urllib3`
-  (`azure/monitor/opentelemetry/_constants.py:74-83`); one name is turned off
+  (`azure/monitor/opentelemetry/_constants.py:74-85`); one name is turned off
   and the rest stay on. Three of them are simply not installed here, but
   `azure_sdk` is, and it emits spans this document does not design — see the
   token fetch below.
