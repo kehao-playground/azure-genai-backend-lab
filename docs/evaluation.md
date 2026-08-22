@@ -235,7 +235,15 @@ uv run python tools/eval_run.py                         # deterministic layer on
 uv run python tools/eval_run.py --judge                 # + judged layer, needs real chat-mini credentials
 uv run python tools/eval_run.py --judge --repeats 5      # + N judge repeats per case (default is already 5)
 uv run python tools/eval_run.py --calibrate --lab-root .  # retrieval-only calibration document, no generation
+uv run python tools/eval_run.py --judge --evidence-out run.json  # + write the replayable evidence sidecar
 ```
+
+`--evidence-out` is what turns a judged run into a record someone can check
+later. The console report deliberately omits the hashes and the judge's raw
+responses; the sidecar carries them, as canonical JSON (sorted keys, compact
+separators) so two runs can be diffed and the file itself hashed. It is
+written even when the deterministic gate fails — the run a reader most wants
+to replay is the one that failed.
 
 Without `--judge`, the process makes zero provider calls: it runs the fake
 LLM over the corpus-seeded fake search, scores every case's deterministic
@@ -441,7 +449,7 @@ live in `tools/eval_cases.json` — those describe what a good answer to this
 question looks like, independent of any one run.
 
 A human's read of an actual answer belongs in that run's evidence record
-(`evidence_document`), tied together by hash: `run_id`, `answer_sha256`,
+(the `--evidence-out` sidecar), tied together by hash: `run_id`, `answer_sha256`,
 `sources_sha256`, `lab_commit`, and `dataset_sha256`. Putting a human
 verdict in the dataset itself would conflate two different judgments that
 must stay separable — "is this expectation reasonable" versus "did this
