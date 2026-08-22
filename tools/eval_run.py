@@ -33,6 +33,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Literal
@@ -1723,6 +1724,25 @@ async def calibration_document(
     return document
 
 
+def _utc_now() -> str:
+    """UTC timestamp for the evidence sidecar's run bounds, seconds
+    precision -- the sidecar records when a run happened, not how long its
+    parts took (that would be a duration claim this runner does not measure).
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_id() -> str:
+    """A run's own identity, unique per invocation.
+
+    Random rather than derived from a timestamp: two runs started in the same
+    second must not share an id, and the human verdict recorded in the
+    evidence file is bound to this value (design §5.3), so a collision would
+    attach one run's adjudication to another's answers.
+    """
+    return f"run-{secrets.token_hex(6)}"
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Day 28 golden-question evaluation runner (deterministic pass A)."
@@ -1757,6 +1777,17 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=int,
         default=5,
         help="Judge repeats per case (--judge only; design's own live run uses 5).",
+    )
+    parser.add_argument(
+        "--evidence-out",
+        type=Path,
+        default=None,
+        help=(
+            "Write the judged run's evidence sidecar to this path as "
+            "canonical JSON (--judge only). Without it the run leaves no "
+            "replayable record -- the console report deliberately omits the "
+            "hashes and raw responses the sidecar carries."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -1797,6 +1828,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"\t{failure}")
             return gate_exit_code(propagated)
 
+        run_id = _run_id()
+        started_at = _utc_now()
         # design §7.5: `--judge` without credentials exits 2, not 0 -- a
         # ValueError here means
         # build_chat_service (via build_seeded_rag_service, forced real) or
@@ -1809,6 +1842,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             return ExitCode.SETUP_FAILED
 
         print(render_report(propagated, judged))
+        if args.evidence_out is not None:
+            # Written before the return so a gate failure still leaves the
+            # record behind: the run a reader most wants to replay is the one
+            # that failed. `evidence_document` raises DatasetError on its own
+            # fail-closed guards, which is a setup failure, not a gate one.
+            try:
+                document = evidence_document(
+                    run_id=run_id,
+                    started_at=started_at,
+                    completed_at=_utc_now(),
+                    lab_root=args.lab_root,
+                    settings=settings,
+                    cases=cases,
+                    det=propagated,
+                    judged=judged,
+                )
+            except DatasetError as exc:
+                print(f"SETUP FAILURE: {exc}", file=sys.stderr)
+                return ExitCode.SETUP_FAILED
+            args.evidence_out.write_bytes(canonical_json(document))
+            print(f"evidence written to {args.evidence_out}", file=sys.stderr)
         return gate_exit_code(propagated)
     finally:
         asyncio.run(service.aclose())

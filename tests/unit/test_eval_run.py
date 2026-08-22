@@ -2095,6 +2095,63 @@ def test_main_repeats_flag_is_the_value_run_judged_layer_actually_receives(
     assert captured_kwargs["repeats"] == 7
 
 
+def test_main_evidence_out_writes_a_canonical_replayable_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `evidence_document` was fully implemented and unit-tested but nothing
+    # called it -- the runner printed a console report and left no replayable
+    # record, which is exactly what the live run's evidence step needs
+    # (Day 28 Task 7 review). This pins the wiring.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(
+        ChatResult(message="a real-sounding answer", model_version="stub")
+    )
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    out = tmp_path / "evidence.json"
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1", "--evidence-out", str(out)])
+
+    assert exit_code == ExitCode.OK
+    raw = out.read_bytes()
+    # Canonical bytes, not pretty-printed: the sidecar is hashed and diffed.
+    assert raw == eval_run.canonical_json(json.loads(raw))
+    document = json.loads(raw)
+    assert document["kind"] == "day28-judged-evaluation-run"
+    assert document["run_id"].startswith("run-")
+    assert document["started_at"].endswith("Z")
+    assert document["completed_at"].endswith("Z")
+    shipped = eval_run.load_cases(eval_run._DATASET_PATH, SAMPLE_DOCS_DIR)
+    assert len(document["cases"]) == len(shipped)
+
+
+def test_main_without_evidence_out_writes_no_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(
+        ChatResult(message="a real-sounding answer", model_version="stub")
+    )
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1"])
+
+    assert exit_code == ExitCode.OK
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_run_id_is_unique_per_call() -> None:
+    # The human verdict recorded in an evidence file is bound to run_id, so a
+    # collision would attach one run's adjudication to another run's answers.
+    ids = {eval_run._run_id() for _ in range(64)}
+    assert len(ids) == 64
+
+
 def test_main_judge_flag_missing_credentials_exits_setup_failed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
