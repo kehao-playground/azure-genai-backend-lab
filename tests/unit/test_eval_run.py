@@ -1,17 +1,23 @@
 """Tests for `tools/eval_run.py`'s deterministic assertion evaluators (Task 2),
 `requires` propagation / exit codes (Task 3), pass A -- the corpus-seeded
 `RagService`, its execution over the dataset, and `--calibrate` (Task 4) --
-and the judge contract's input fencing, canonical hashing, and
-invariant-checked strict parsing (Task 5).
+the judge contract's input fencing, canonical hashing, and invariant-checked
+strict parsing (Task 5), and passes B/C: real second generation, N judge
+repeats, stability, reporting, and the evidence sidecar (Task 6).
 
 Table-driven: one test per rule in the design (`drafts/research/day-28-evaluation.md`
-r04 §8/§7.2/§7.3/§7.5) plus a few direct `attribute_source` tests for its own
-branches. The Task 4 section below runs the real seeded pipeline end to end
-(`USE_FAKE_LLM=true`, no Azure resources -- `tests/conftest.py` pins the three
-fake-adapter flags for the whole suite). The Task 5 section is pure --
-no `RagService`, no provider call; it exercises `build_judge_input` /
+r04 §8/§7.1/§7.2/§7.3/§7.4/§7.5/§9) plus a few direct `attribute_source` tests
+for its own branches. The Task 4 section below runs the real seeded pipeline
+end to end (`USE_FAKE_LLM=true`, no Azure resources -- `tests/conftest.py`
+pins the three fake-adapter flags for the whole suite). The Task 5 section is
+pure -- no `RagService`, no provider call; it exercises `build_judge_input` /
 `parse_judge_response` / `derive_judge_verdict` against hand-built
-`SearchHit`s and raw response strings only.
+`SearchHit`s and raw response strings only. The Task 6 section never touches
+the network either: it monkeypatches `eval_run.build_chat_service` with
+in-memory stubs (task-6-brief.md constraint 5) -- always *after* building any
+real `FakeChatService`-backed `RagService` the test needs, so the monkeypatch
+only ever intercepts the calls Task 6's own code makes (pass B's generation,
+pass C's judging), never pass A's.
 
 `tools/` is not a package (no `tools/__init__.py`), so the module is loaded
 by path, the same pattern `tests/unit/test_eval_cases.py` uses.
@@ -20,6 +26,7 @@ by path, the same pattern `tests/unit/test_eval_cases.py` uses.
 import importlib.util
 import inspect
 import json
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -27,12 +34,14 @@ from pathlib import Path
 import pytest
 
 from azgenai_lab.core.config import Settings
+from azgenai_lab.core.errors import ContentFilteredError, UpstreamTimeoutError
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import PromptTemplate
+from azgenai_lab.services.azure_openai import ChatResult
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
-from azgenai_lab.services.rag import build_rag_service
+from azgenai_lab.services.rag import RagAnswer, build_rag_service
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "eval_run.py"
 _SPEC = importlib.util.spec_from_file_location("eval_run", _MODULE_PATH)
@@ -63,6 +72,13 @@ judge_prompt_template = eval_run.judge_prompt_template
 parse_judge_response = eval_run.parse_judge_response
 sha256_hex = eval_run.sha256_hex
 sources_sha256 = eval_run.sources_sha256
+JudgeRepeat = eval_run.JudgeRepeat
+JudgedResult = eval_run.JudgedResult
+derive_judged_result = eval_run.derive_judged_result
+run_judge_repeats = eval_run.run_judge_repeats
+run_judged_layer = eval_run.run_judged_layer
+render_report = eval_run.render_report
+evidence_document = eval_run.evidence_document
 
 # The real lab worktree these tests run in -- test_eval_run.py lives at
 # tests/unit/, two levels below the repo root.
@@ -75,6 +91,16 @@ def _fresh_settings() -> Settings:
     pinned fake-adapter flags are guaranteed, everything else is still
     ambient without `_env_file=None`."""
     return Settings(_env_file=None)
+
+
+def _judge_ready_settings() -> Settings:
+    """`_fresh_settings()` plus a deployment name for `run_judged_layer`'s
+    forced `use_fake_llm=False` branch: `build_seeded_rag_service` also
+    calls `build_audit_attribution`, which independently rejects real mode
+    without `azure_openai_deployment_name` -- a check Task 6's tests must
+    satisfy even though the actual chat call is always stubbed via a
+    monkeypatched `build_chat_service`, never real credentials."""
+    return Settings(_env_file=None, azure_openai_deployment_name="stub-deployment")
 
 
 # --- fixtures: a corpus map and minimal EvalCase/chunk-id builders ---
@@ -1130,3 +1156,794 @@ def test_derive_judge_verdict_never_reached_for_a_forbidden_id_in_missing() -> N
     raw = _judge_response(covered=("e1",), missing=("f1",))
     with pytest.raises(JudgeParseError):
         derive_judge_verdict(parse_judge_response(raw, case))
+
+
+# --- Task 6: passes B/C, stability reporting, evidence sidecar ---
+#
+# No test in this section touches the network. `_StaticChatService` and
+# `_ScriptedChatService` stand in for build_chat_service's real branch;
+# `_CannedAnswerService` stands in for a RagService's `.answer()` where a
+# test needs to control pass A's RagAnswer directly rather than depend on
+# the real seeded retriever's behavior for a particular question.
+
+
+class _StaticChatService:
+    """Every `.complete()` call returns the same `ChatResult` (or raises the
+    same exception) -- for judge repeats that must all see an identical,
+    well-formed response, and for pass B generation stubs."""
+
+    def __init__(self, outcome: ChatResult | Exception) -> None:
+        self._outcome = outcome
+        self.calls: list[Sequence[object]] = []
+
+    async def complete(self, items: Sequence[object]) -> ChatResult:
+        self.calls.append(items)
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _ScriptedChatService:
+    """One scripted `ChatResult`/exception per call, in order -- for
+    sequences where a specific attempt must behave differently from the
+    others (an error mid-sequence)."""
+
+    def __init__(self, script: Sequence["ChatResult | Exception"]) -> None:
+        self._script = list(script)
+        self.calls: list[Sequence[object]] = []
+
+    async def complete(self, items: Sequence[object]) -> ChatResult:
+        self.calls.append(items)
+        outcome = self._script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _CannedAnswerService:
+    """A `.answer()`-only double standing in for the `RagService` `run_
+    judged_layer` takes as `fake_service`: returns a fixed `RagAnswer`
+    regardless of question/principal. Drives pass A's branches (no_answer, a
+    specific hit set to compare against pass B) directly, without depending
+    on the real seeded retriever's behavior for a particular question."""
+
+    def __init__(self, answer: "RagAnswer") -> None:
+        self._answer = answer
+        self.calls = 0
+
+    async def answer(self, question: str, principal: Principal) -> "RagAnswer":
+        self.calls += 1
+        return self._answer
+
+
+def _stub_build_chat_service_factory(generation: object, judge: object):  # noqa: ANN201
+    """A `build_chat_service`-shaped callable that hands back `generation`
+    for the `rag_answer` prompt and `judge` for the `eval_judge` prompt --
+    distinguished by `prompt.name`, the same way `run_judged_layer` itself
+    selects between pass B's and pass C's prompts."""
+
+    def factory(settings: object, *, prompt: PromptTemplate) -> object:
+        return judge if prompt.name == "eval_judge" else generation
+
+    return factory
+
+
+def _repeat(
+    attempt: int,
+    outcome: str = "pass",
+    answer_sha256: str = "a" * 64,
+    sources_sha256: str = "s" * 64,
+    judge_input_sha256: str = "j" * 64,
+    raw_response: str = "{}",
+) -> "JudgeRepeat":
+    return JudgeRepeat(
+        attempt=attempt,
+        outcome=outcome,  # type: ignore[arg-type]
+        answer_sha256=answer_sha256,
+        sources_sha256=sources_sha256,
+        judge_input_sha256=judge_input_sha256,
+        raw_response=raw_response,
+    )
+
+
+def _judged_eval_case(
+    case_id: str,
+    question: str,
+    tenant: str = "acme",
+    expected: tuple["Fact", ...] = (),
+    forbidden: tuple["Fact", ...] = (),
+) -> EvalCase:
+    return EvalCase(
+        id=case_id,
+        question=question,
+        tenant=tenant,
+        user="eval-agent",
+        groups=(),
+        protects="test coverage",
+        requires=(),
+        deterministic=_det(),
+        judged=JudgedSpec(expected_facts=expected, forbidden_facts=forbidden, rubric=None),
+        judged_skip_reason=None,
+    )
+
+
+# --- derive_judged_result: pure, no I/O ---
+
+
+def test_derive_judged_result_raises_on_empty_repeats() -> None:
+    with pytest.raises(ValueError, match="at least one repeat"):
+        derive_judged_result("case-1", ())
+
+
+def test_derive_judged_result_all_pass_is_judged_pass() -> None:
+    repeats = (_repeat(1, "pass"), _repeat(2, "pass"), _repeat(3, "pass"))
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "JUDGED"
+    assert result.verdict == "pass"
+    assert result.reason is None
+    assert result.repeats == repeats
+
+
+def test_derive_judged_result_all_fail_is_judged_fail() -> None:
+    repeats = (_repeat(1, "fail"), _repeat(2, "fail"))
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "JUDGED"
+    assert result.verdict == "fail"
+
+
+def test_derive_judged_result_verdict_is_repeat_one_not_a_majority_vote() -> None:
+    # Four of five repeats pass; repeat 1 fails. A majority-vote aggregation
+    # would report "pass" here -- design's rule (derive_judged_result's own
+    # docstring) is "repeat 1's outcome, never an aggregate", so this must
+    # report "fail".
+    repeats = (
+        _repeat(1, "fail"),
+        _repeat(2, "pass"),
+        _repeat(3, "pass"),
+        _repeat(4, "pass"),
+        _repeat(5, "pass"),
+    )
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "JUDGED"
+    assert result.verdict == "fail"
+
+
+def test_derive_judged_result_one_error_makes_the_case_inconclusive() -> None:
+    repeats = (_repeat(1, "pass"), _repeat(2, "ERROR(upstream)"), _repeat(3, "pass"))
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "INCONCLUSIVE"
+    assert result.verdict is None
+    assert "ERROR(upstream)" in (result.reason or "")
+    # The sequence is preserved even though the case is inconclusive --
+    # render_report's stability line reads it regardless of state.
+    assert result.repeats == repeats
+
+
+def test_derive_judged_result_never_produces_a_verdict_alongside_inconclusive() -> None:
+    repeats = (_repeat(1, "ERROR(parse)"),)
+    result = derive_judged_result("case-1", repeats)
+    assert result.verdict is None
+
+
+def test_gate_exit_code_structurally_cannot_see_a_judged_layer_error() -> None:
+    # Companion to gate_exit_code's own signature test above (Task 3): a
+    # judged-layer INCONCLUSIVE can never even be represented in the
+    # deterministic results mapping gate_exit_code takes, so it structurally
+    # cannot flip the exit code (this task's ambiguity 1).
+    det_results = {"case-1": _result("case-1", Verdict.PASS)}
+    assert gate_exit_code(det_results) == ExitCode.OK
+
+
+def test_derive_judged_result_answer_sha256_mismatch_names_the_odd_attempt() -> None:
+    repeats = (
+        _repeat(1, "pass", answer_sha256="a" * 64),
+        _repeat(2, "pass", answer_sha256="a" * 64),
+        _repeat(3, "pass", answer_sha256="b" * 64),  # the odd one out
+    )
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "INCONCLUSIVE"
+    assert result.verdict is None
+    assert "3" in (result.reason or "")
+    assert result.repeats == repeats
+
+
+def test_derive_judged_result_sources_sha256_mismatch_is_also_inconclusive() -> None:
+    # Isolated from the answer_sha256 branch above: only sources_sha256
+    # differs here, proving the mismatch check's `or` has two
+    # independently-necessary operands.
+    repeats = (
+        _repeat(1, "pass", sources_sha256="s" * 64),
+        _repeat(2, "pass", sources_sha256="t" * 64),
+    )
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "INCONCLUSIVE"
+    assert "2" in (result.reason or "")
+
+
+def test_derive_judged_result_mismatch_check_runs_before_the_error_check() -> None:
+    # A repeat can be both hash-mismatched *and* errored; the mismatch
+    # reason must win (design §7.3: identity is checked first), not be
+    # silently shadowed by the error-count branch.
+    repeats = (
+        _repeat(1, "pass", answer_sha256="a" * 64),
+        _repeat(2, "ERROR(upstream)", answer_sha256="b" * 64),
+    )
+    result = derive_judged_result("case-1", repeats)
+    assert result.state == "INCONCLUSIVE"
+    assert "mismatch" in (result.reason or "")
+
+
+# --- _judge_once / run_judge_repeats: real judge-call plumbing, stubbed ---
+
+
+def _pass_response(covered: tuple[str, ...] = ("e1",)) -> ChatResult:
+    return ChatResult(message=_judge_response(covered=covered), model_version="stub")
+
+
+async def test_judge_once_well_formed_response_computes_correct_hashes_and_verdict() -> None:
+    case = _one_expected_case()
+    hit = _hit(content="the source text")
+    judge_chat = _StaticChatService(_pass_response(covered=("e1",)))
+
+    repeat = await eval_run._judge_once(case, "the answer", [hit], judge_chat, lambda: "nonce", 1)
+
+    assert repeat.attempt == 1
+    assert repeat.outcome == "pass"
+    assert repeat.answer_sha256 == answer_sha256("the answer")
+    assert repeat.sources_sha256 == sources_sha256([hit])
+    expected_input = build_judge_input(case, "the answer", [hit], "nonce")
+    assert repeat.judge_input_sha256 == sha256_hex(eval_run.canonical_json(expected_input))
+    assert repeat.raw_response == _judge_response(covered=("e1",))
+    assert len(judge_chat.calls) == 1
+
+
+async def test_judge_once_content_filtered_is_error_filtered() -> None:
+    case = _one_expected_case()
+    judge_chat = _StaticChatService(ContentFilteredError("blocked"))
+
+    repeat = await eval_run._judge_once(case, "answer", [], judge_chat, lambda: "n", 1)
+
+    assert repeat.outcome == "ERROR(filtered)"
+
+
+async def test_judge_once_upstream_timeout_is_error_upstream() -> None:
+    case = _one_expected_case()
+    judge_chat = _StaticChatService(UpstreamTimeoutError("timed out"))
+
+    repeat = await eval_run._judge_once(case, "answer", [], judge_chat, lambda: "n", 1)
+
+    assert repeat.outcome == "ERROR(upstream)"
+
+
+async def test_judge_once_malformed_response_is_error_parse_with_the_raw_text_preserved() -> None:
+    case = _one_expected_case()
+    judge_chat = _StaticChatService(ChatResult(message="not json at all", model_version="stub"))
+
+    repeat = await eval_run._judge_once(case, "answer", [], judge_chat, lambda: "n", 1)
+
+    assert repeat.outcome == "ERROR(parse)"
+    assert repeat.raw_response == "not json at all"
+
+
+async def test_run_judge_repeats_returns_exactly_repeats_entries_even_with_an_error_midway() -> (
+    None
+):
+    case = _one_expected_case()
+    script: list[ChatResult | Exception] = [
+        _pass_response(covered=("e1",)),
+        UpstreamTimeoutError("boom"),
+        _pass_response(covered=("e1",)),
+    ]
+    judge_chat = _ScriptedChatService(script)
+
+    repeats = await run_judge_repeats(
+        case, "answer", [], judge_chat, repeats=3, nonce_factory=lambda: "n"
+    )
+
+    assert len(repeats) == 3
+    assert [r.outcome for r in repeats] == ["pass", "ERROR(upstream)", "pass"]
+    assert [r.attempt for r in repeats] == [1, 2, 3]
+
+
+async def test_run_judge_repeats_draws_a_fresh_nonce_per_attempt() -> None:
+    case = _one_expected_case()
+    nonces = iter(["n1", "n2", "n3"])
+    judge_chat = _StaticChatService(_pass_response(covered=("e1",)))
+
+    repeats = await run_judge_repeats(
+        case, "answer", [], judge_chat, repeats=3, nonce_factory=lambda: next(nonces)
+    )
+
+    # Same answer/sources every attempt, but a different nonce means a
+    # different judge_input -- so judge_input_sha256 must differ per attempt.
+    assert len({r.judge_input_sha256 for r in repeats}) == 3
+    # ...while answer_sha256/sources_sha256 (computed from answer/hits, not
+    # the nonce) stay identical across attempts.
+    assert len({r.answer_sha256 for r in repeats}) == 1
+
+
+# --- run_judged_layer: orchestration (design §7.1/§7.4), stubbed only at
+# the build_chat_service boundary ---
+
+
+async def test_run_judged_layer_skipped_case_makes_no_generation_or_judge_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case()  # existing Task 1-4 helper: judged=None, judged_skip_reason set
+    fake_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "SKIPPED"
+    assert result.reason == case.judged_skip_reason
+    assert result.verdict is None
+    assert result.repeats == ()
+    assert fake_service.calls == 0
+    assert generation.calls == []
+    assert judge.calls == []
+
+
+async def test_run_judged_layer_pass_a_no_answer_is_inconclusive_with_zero_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _judged_eval_case("c1", "does not matter", expected=(_fact("f1"),))
+    fake_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    assert result.reason == "no_answer_at_runtime"
+    assert result.verdict is None
+    assert result.repeats == ()
+    # Pass A answered "no_answer" -- generation and judging must never run.
+    assert generation.calls == []
+    assert judge.calls == []
+
+
+async def test_run_judged_layer_pass_a_pass_b_sources_disagreement_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case_by_id("acme-refund-window-standard")
+    fabricated_hit = _hit(tenant="acme", doc_id="doc-a", content="not the real corpus content")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(fabricated_hit,),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    generation = _StaticChatService(
+        ChatResult(
+            message="Standard purchases may be returned within 30 days.", model_version="stub"
+        )
+    )
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    assert "sources" in (result.reason or "")
+    assert result.verdict is None
+    assert result.repeats == ()
+    # Pass B's generation *did* run (needed to know its sources); judging did not.
+    assert len(generation.calls) == 1
+    assert judge.calls == []
+
+
+async def test_run_judged_layer_pass_b_upstream_error_is_inconclusive_with_zero_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(_hit(tenant="acme", doc_id="returns-policy"),),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    generation = _StaticChatService(UpstreamTimeoutError("pass B generation timed out"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    assert "pass_b_generation_error" in (result.reason or "")
+    assert result.repeats == ()
+    assert judge.calls == []
+
+
+async def test_run_judged_layer_matching_sources_runs_judging_and_reports_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end wiring: a real seeded fake_service (built before the
+    # monkeypatch below, so its own real FakeChatService is unaffected) and
+    # a real dataset case -- only the two build_chat_service calls Task 6's
+    # own code makes (pass B, pass C) are stubbed.
+    settings = _judge_ready_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    generation = _StaticChatService(
+        ChatResult(
+            message="A standard purchase may be returned within 30 days of delivery.",
+            model_version="stub",
+        )
+    )
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    try:
+        results = await run_judged_layer([case], fake_service, settings, repeats=3)
+    finally:
+        await fake_service.aclose()
+
+    result = results[case.id]
+    assert result.state == "JUDGED"
+    assert result.verdict == "pass"
+    assert result.reason is None
+    assert len(result.repeats) == 3
+    assert [r.outcome for r in result.repeats] == ["pass", "pass", "pass"]
+    # Real generation ran exactly once (pass B); judging ran once per repeat.
+    assert len(generation.calls) == 1
+    assert len(judge.calls) == 3
+
+
+# --- render_report: three labelled lines per case, sequence not a rate ---
+
+
+def test_render_report_three_labelled_lines_per_case_for_every_state() -> None:
+    det = {
+        "skipped-case": _result("skipped-case", Verdict.PASS),
+        "inconclusive-case": _result("inconclusive-case", Verdict.PASS),
+        "judged-case": _result("judged-case", Verdict.PASS),
+    }
+    judged = {
+        "skipped-case": JudgedResult("skipped-case", None, "SKIPPED", "no judged block", ()),
+        "inconclusive-case": JudgedResult(
+            "inconclusive-case", None, "INCONCLUSIVE", "no_answer_at_runtime", ()
+        ),
+        "judged-case": JudgedResult(
+            "judged-case", "pass", "JUDGED", None, (_repeat(1, "pass"), _repeat(2, "pass"))
+        ),
+    }
+
+    report = render_report(det, judged)
+
+    labelled = [
+        line.strip()
+        for line in report.splitlines()
+        if line.strip().startswith(("deterministic:", "judged:", "stability:"))
+    ]
+    assert len(labelled) == 9  # three labels x three cases
+    assert sum(line.startswith("deterministic:") for line in labelled) == 3
+    assert sum(line.startswith("judged:") for line in labelled) == 3
+    assert sum(line.startswith("stability:") for line in labelled) == 3
+
+
+def test_render_report_stability_not_measured_when_repeats_empty() -> None:
+    det = {"c1": _result("c1", Verdict.PASS)}
+    judged = {"c1": JudgedResult("c1", None, "SKIPPED", "no judged block", ())}
+
+    report = render_report(det, judged)
+
+    assert "stability:     NOT MEASURED" in report
+
+
+def test_render_report_prints_the_actual_sequence_and_never_a_rate() -> None:
+    det = {"c1": _result("c1", Verdict.PASS)}
+    repeats = (
+        _repeat(1, "pass"),
+        _repeat(2, "pass"),
+        _repeat(3, "fail"),
+        _repeat(4, "pass"),
+        _repeat(5, "pass"),
+    )
+    judged = {"c1": JudgedResult("c1", None, "INCONCLUSIVE", "example", repeats)}
+
+    report = render_report(det, judged)
+
+    assert "pass,pass,fail,pass,pass" in report
+    assert not re.search(r"%", report)
+    assert not re.search(r"rate", report, re.IGNORECASE)
+
+
+def test_render_report_skipped_case_shows_the_datasets_skip_reason() -> None:
+    det = {"c1": _result("c1", Verdict.PASS)}
+    judged = {"c1": JudgedResult("c1", None, "SKIPPED", "no corpus coverage yet", ())}
+
+    report = render_report(det, judged)
+
+    assert "SKIPPED(no corpus coverage yet)" in report
+
+
+def test_render_report_inconclusive_case_shows_its_reason() -> None:
+    det = {"c1": _result("c1", Verdict.PASS)}
+    judged = {"c1": JudgedResult("c1", None, "INCONCLUSIVE", "no_answer_at_runtime", ())}
+
+    report = render_report(det, judged)
+
+    assert "INCONCLUSIVE(no_answer_at_runtime)" in report
+
+
+def test_render_report_judged_case_shows_its_verdict() -> None:
+    det = {"c1": _result("c1", Verdict.PASS)}
+    judged = {"c1": JudgedResult("c1", "pass", "JUDGED", None, (_repeat(1, "pass"),))}
+
+    report = render_report(det, judged)
+
+    assert "JUDGED(pass)" in report
+
+
+def test_render_report_case_missing_from_judged_mapping_is_not_run_not_blank() -> None:
+    # A case whose judged layer was never invoked at all (e.g. --judge was
+    # not passed) must show a named state, not a blank line pretending to
+    # be a measurement.
+    det = {"c1": _result("c1", Verdict.PASS)}
+
+    report = render_report(det, {})
+
+    assert "judged:        NOT RUN" in report
+    assert "stability:     NOT MEASURED" in report
+
+
+def test_render_report_deterministic_failures_are_included_on_their_own_line() -> None:
+    det = {"c1": _result("c1", Verdict.FAIL, ("must_cite: missing ['doc-a']",))}
+
+    report = render_report(det, {})
+
+    assert "FAIL (must_cite: missing ['doc-a'])" in report
+
+
+# --- evidence_document: Task 10's live-run sidecar shape ---
+
+
+async def test_evidence_document_shape_for_the_real_lab_root() -> None:
+    settings = _fresh_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    det = {case.id: _result(case.id, Verdict.PASS)}
+    judged = {
+        case.id: JudgedResult(
+            case.id, "pass", "JUDGED", None, (_repeat(1, "pass", raw_response="raw text one"),)
+        )
+    }
+
+    document = evidence_document(
+        run_id="test-run-1",
+        started_at="2026-08-22T00:00:00Z",
+        completed_at="2026-08-22T00:05:00Z",
+        lab_root=_LAB_ROOT,
+        settings=settings,
+        cases=[case],
+        det=det,
+        judged=judged,
+    )
+
+    assert document["kind"] == "day28-judged-evaluation-run"
+    assert document["run_id"] == "test-run-1"
+    assert document["started_at"] == "2026-08-22T00:00:00Z"
+    assert document["completed_at"] == "2026-08-22T00:05:00Z"
+    assert isinstance(document["lab_commit"], str) and document["lab_commit"]
+    assert document["dataset_sha256"] == sha256_hex(eval_run._DATASET_PATH.read_bytes())
+
+    corpus_manifest = document["corpus_manifest"]
+    assert isinstance(corpus_manifest, dict)
+    assert "acme/returns-policy.md" in corpus_manifest
+
+    rag_prompt = document["rag_prompt"]
+    assert isinstance(rag_prompt, dict)
+    assert rag_prompt["name"] == "rag_answer"
+    judge_prompt = document["judge_prompt"]
+    assert isinstance(judge_prompt, dict)
+    assert judge_prompt["version"] == eval_run.JUDGE_PROMPT_VERSION
+    assert judge_prompt["sha256"] == sha256_hex(eval_run.JUDGE_PROMPT.encode("utf-8"))
+
+    cases_doc = document["cases"]
+    assert isinstance(cases_doc, list)
+    assert len(cases_doc) == 1
+    case_doc = cases_doc[0]
+    assert case_doc["id"] == case.id
+    assert case_doc["principal"] == {"tenant": "acme", "groups_count": 0, "group_sha256": []}
+    assert case_doc["deterministic"] == {"verdict": "PASS", "failures": []}
+    judged_doc = case_doc["judged"]
+    assert judged_doc["state"] == "JUDGED"
+    assert judged_doc["verdict"] == "pass"
+    assert judged_doc["repeats"][0]["raw_response"] == "raw text one"
+
+    assert document["cases_sha256"] == sha256_hex(eval_run.canonical_json(cases_doc))
+
+
+async def test_evidence_document_rejects_a_lab_root_that_is_not_a_git_worktree(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(DatasetError, match="not a git worktree"):
+        evidence_document(
+            run_id="r",
+            started_at="t0",
+            completed_at="t1",
+            lab_root=tmp_path,
+            settings=_fresh_settings(),
+            cases=[],
+            det={},
+            judged={},
+        )
+
+
+async def test_evidence_document_redacts_group_ids_to_count_and_sha256() -> None:
+    case = EvalCase(
+        id="c1",
+        question="q",
+        tenant="acme",
+        user="u",
+        groups=("secret-group-name",),
+        protects="p",
+        requires=(),
+        deterministic=_det(),
+        judged=None,
+        judged_skip_reason="test",
+    )
+
+    document = evidence_document(
+        run_id="r",
+        started_at="t0",
+        completed_at="t1",
+        lab_root=_LAB_ROOT,
+        settings=_fresh_settings(),
+        cases=[case],
+        det={},
+        judged={},
+    )
+
+    cases_doc = document["cases"]
+    assert isinstance(cases_doc, list)
+    principal = cases_doc[0]["principal"]
+    assert principal["groups_count"] == 1
+    assert principal["group_sha256"] == [sha256_hex(b"secret-group-name")]
+    dumped = json.dumps(document)
+    assert "secret-group-name" not in dumped
+
+
+async def test_evidence_document_raw_response_only_ever_appears_inside_a_repeats_entry() -> None:
+    case = _case_by_id("acme-refund-window-standard")
+    marker = "UNIQUE_RAW_RESPONSE_MARKER_12345"
+    repeat = _repeat(1, "pass", raw_response=marker)
+    judged = {case.id: JudgedResult(case.id, "pass", "JUDGED", None, (repeat,))}
+
+    document = evidence_document(
+        run_id="r",
+        started_at="t0",
+        completed_at="t1",
+        lab_root=_LAB_ROOT,
+        settings=_fresh_settings(),
+        cases=[case],
+        det={case.id: _result(case.id, Verdict.PASS)},
+        judged=judged,
+    )
+
+    cases_doc = document["cases"]
+    assert isinstance(cases_doc, list)
+    case_doc = cases_doc[0]
+    judged_doc = case_doc["judged"]
+    assert judged_doc["repeats"][0]["raw_response"] == marker
+    without_repeats = {k: v for k, v in judged_doc.items() if k != "repeats"}
+    assert marker not in json.dumps(without_repeats)
+    without_judged = {k: v for k, v in case_doc.items() if k != "judged"}
+    assert marker not in json.dumps(without_judged)
+
+
+def test_evidence_document_computes_cases_sha256_from_canonical_json_of_cases() -> None:
+    case = _case_by_id("zero-hit-structural-no-answer")
+
+    document = evidence_document(
+        run_id="r",
+        started_at="t0",
+        completed_at="t1",
+        lab_root=_LAB_ROOT,
+        settings=_fresh_settings(),
+        cases=[case],
+        det={},
+        judged={},
+    )
+
+    assert document["cases_sha256"] == sha256_hex(eval_run.canonical_json(document["cases"]))
+
+
+# --- main(): --judge / --repeats CLI wiring ---
+
+
+def test_main_judge_flag_wires_report_and_still_exits_ok(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(
+        ChatResult(message="a real-sounding answer", model_version="stub")
+    )
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1"])
+
+    assert exit_code == ExitCode.OK
+    captured = capsys.readouterr()
+    assert "deterministic:" in captured.out
+    assert "judged:" in captured.out
+    assert "stability:" in captured.out
+
+
+def test_main_judge_flag_missing_credentials_exits_setup_failed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(eval_run, "get_settings", _fresh_settings)
+    real_build_chat_service = eval_run.build_chat_service
+
+    def _guarded(settings: Settings, *, prompt: PromptTemplate) -> object:
+        if not settings.use_fake_llm:
+            raise ValueError(
+                "USE_FAKE_LLM=false requires AZURE_OPENAI_ENDPOINT and "
+                "AZURE_OPENAI_DEPLOYMENT_NAME"
+            )
+        return real_build_chat_service(settings, prompt=prompt)
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _guarded)
+
+    exit_code = eval_run.main(["--judge"])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert exit_code != ExitCode.GATE_FAILED
+    captured = capsys.readouterr()
+    assert "SETUP FAILURE" in captured.err
+
+
+def test_main_without_judge_flag_never_reaches_the_real_llm_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression guard for the default path: without --judge, run_judged_
+    # layer (which forces use_fake_llm=False) must never run at all.
+    real_build_chat_service = eval_run.build_chat_service
+
+    def _guarded(settings: Settings, *, prompt: PromptTemplate) -> object:
+        if not settings.use_fake_llm:
+            raise AssertionError("the real (use_fake_llm=False) branch must not be reached")
+        return real_build_chat_service(settings, prompt=prompt)
+
+    monkeypatch.setattr(eval_run, "get_settings", _fresh_settings)
+    monkeypatch.setattr(eval_run, "build_chat_service", _guarded)
+
+    assert eval_run.main([]) == ExitCode.OK

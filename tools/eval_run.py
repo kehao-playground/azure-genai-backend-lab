@@ -5,14 +5,16 @@ assertion evaluator (`evaluate_deterministic`), `requires` propagation / exit
 codes (`evaluation_order`, `propagate_requires`, `gate_exit_code`), pass A --
 a corpus-seeded `RagService`, its execution over the dataset
 (`build_seeded_rag_service`, `run_pass_a`), machine-captured retrieval
-calibration (`calibration_document`, wired to `--calibrate`), and the judge
+calibration (`calibration_document`, wired to `--calibrate`), the judge
 contract -- per-request nonce fencing, canonical hashing, and invariant-
 checked strict parsing (`build_judge_input`, `parse_judge_response`,
-`derive_judge_verdict`) (design `drafts/research/day-28-evaluation.md` r04,
-§4/§5/§6/§7/§7.2/§7.3/§7.5/§8; implementation plan
-`plans/day-28-implementation-plan.md` Tasks 1-5). A later task appends
-multi-pass orchestration and reporting (`--judge`, `--repeats`) to this same
-file -- deliberately absent here, not stubbed.
+`derive_judge_verdict`) -- and passes B/C: a real second generation per case,
+N independent judge repeats over it, stability reporting that never computes
+a rate, and the evidence sidecar (`run_judged_layer`, `derive_judged_result`,
+`render_report`, `evidence_document`, wired to `--judge`/`--repeats`)
+(design `drafts/research/day-28-evaluation.md` r04,
+§4/§5/§6/§7/§7.1/§7.2/§7.3/§7.4/§7.5/§8/§9; implementation plan
+`plans/day-28-implementation-plan.md` Tasks 1-6).
 
 `tools/` is not an installed package (no `tools/__init__.py`); tests load
 this module by path, the same pattern `tests/unit/test_prompt_shields_probe.py`
@@ -26,9 +28,10 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -37,14 +40,16 @@ from typing import Literal
 import azgenai_lab
 from azgenai_lab.core.audit import build_audit_attribution
 from azgenai_lab.core.config import Settings, get_settings
+from azgenai_lab.core.errors import ContentFilteredError, UpstreamError
+from azgenai_lab.models.conversation import ReplayItem
 from azgenai_lab.models.principal import Principal, validate_identifier
 from azgenai_lab.models.rag import make_parent_id
 from azgenai_lab.models.search import SearchHit
 from azgenai_lab.prompts.loader import PromptTemplate, load_prompt
 from azgenai_lab.services import agent_tools
-from azgenai_lab.services.azure_openai import build_chat_service
+from azgenai_lab.services.azure_openai import ChatService, build_chat_service
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
-from azgenai_lab.services.rag import RagService
+from azgenai_lab.services.rag import RagAnswer, RagService
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1087,505 @@ def derive_judge_verdict(output: JudgeOutput) -> Literal["pass", "fail"]:
     return "pass"
 
 
+# --- Passes B/C: real generation, judge repeats, stability, reporting,
+# evidence sidecar (Task 6) ---
+
+
+def _default_judge_nonce() -> str:
+    """One CSPRNG nonce per judge call (Day 21 G1 discipline, reused here per
+    `build_judge_input`'s docstring): 16 bytes -> 32 hex chars -> 128-bit
+    entropy, matching `services/rag.py`'s own `_default_nonce`. Injectable
+    (both `run_judge_repeats` and `run_judged_layer` take a `nonce_factory`
+    parameter) so tests can pin a deterministic value."""
+    return secrets.token_hex(16)
+
+
+@dataclass(frozen=True)
+class JudgeRepeat:
+    """One judge call's outcome (design §7.3's failure-semantics table).
+
+    `outcome` is either a real verdict (`"pass"`/`"fail"`, from
+    `derive_judge_verdict`) or one of three named error states -- never a
+    missing entry standing in for "it failed silently". The three hashes are
+    computed from what this attempt actually sent *before* the call is
+    attempted, so they are present on every outcome including an error one --
+    `derive_judged_result` needs them on every repeat to detect one that was
+    (by caller error) handed a different answer/sources than the others
+    (design §7.3: "how five reviews of the same answer are proven").
+    """
+
+    attempt: int
+    outcome: Literal["pass", "fail", "ERROR(parse)", "ERROR(upstream)", "ERROR(filtered)"]
+    answer_sha256: str
+    sources_sha256: str
+    judge_input_sha256: str
+    raw_response: str
+
+
+@dataclass(frozen=True)
+class JudgedResult:
+    """One case's judged-layer outcome (design §7.4/§7.5).
+
+    `state` names why `verdict` is `None` when it is: `SKIPPED` (the dataset
+    declared `judged: null`), `INCONCLUSIVE` (a runtime condition, named in
+    `reason`, made judging impossible or its result untrustworthy), or
+    `JUDGED` (a real verdict was reached, `reason` is `None`). This is never
+    left to be inferred from `verdict is None` alone -- an unexplained
+    absence of a verdict must be impossible (this task's ambiguity 2).
+    """
+
+    case_id: str
+    verdict: Literal["pass", "fail"] | None
+    state: Literal["JUDGED", "INCONCLUSIVE", "SKIPPED"]
+    reason: str | None
+    repeats: tuple[JudgeRepeat, ...]
+
+
+async def _judge_once(
+    case: EvalCase,
+    answer: str,
+    hits: Sequence[SearchHit],
+    judge_chat: ChatService,
+    nonce_factory: Callable[[], str],
+    attempt: int,
+) -> JudgeRepeat:
+    """One judge repeat over the *same* `answer`/`hits` (design §7.3).
+
+    Always returns a `JudgeRepeat` -- an upstream failure, a content-filter
+    rejection, and a malformed response are each their own named `outcome`,
+    never an exception that would leave `run_judge_repeats` with fewer than
+    `repeats` entries.
+
+    `answer`/`sources` are fenced with a nonce drawn once per call (`nonce_
+    factory`) and sent as the sole user-turn content to `judge_chat` -- the
+    same per-request nonce discipline `build_judge_input` documents (Day 21
+    G1). The bytes actually sent are what gets hashed into
+    `judge_input_sha256`, not a second, potentially-diverging encoding of
+    the same JSON.
+    """
+    nonce = nonce_factory()
+    judge_input = build_judge_input(case, answer, hits, nonce)
+    judge_input_bytes = canonical_json(judge_input)
+    ans_sha = answer_sha256(answer)
+    src_sha = sources_sha256(hits)
+    judge_input_sha = sha256_hex(judge_input_bytes)
+    items: list[ReplayItem] = [{"role": "user", "content": judge_input_bytes.decode("utf-8")}]
+
+    try:
+        result = await judge_chat.complete(items)
+    except ContentFilteredError as exc:
+        return JudgeRepeat(
+            attempt=attempt,
+            outcome="ERROR(filtered)",
+            answer_sha256=ans_sha,
+            sources_sha256=src_sha,
+            judge_input_sha256=judge_input_sha,
+            raw_response=str(exc),
+        )
+    except UpstreamError as exc:
+        return JudgeRepeat(
+            attempt=attempt,
+            outcome="ERROR(upstream)",
+            answer_sha256=ans_sha,
+            sources_sha256=src_sha,
+            judge_input_sha256=judge_input_sha,
+            raw_response=str(exc),
+        )
+
+    try:
+        output = parse_judge_response(result.message, case)
+    except JudgeParseError:
+        return JudgeRepeat(
+            attempt=attempt,
+            outcome="ERROR(parse)",
+            answer_sha256=ans_sha,
+            sources_sha256=src_sha,
+            judge_input_sha256=judge_input_sha,
+            raw_response=result.message,
+        )
+
+    return JudgeRepeat(
+        attempt=attempt,
+        outcome=derive_judge_verdict(output),
+        answer_sha256=ans_sha,
+        sources_sha256=src_sha,
+        judge_input_sha256=judge_input_sha,
+        raw_response=result.message,
+    )
+
+
+async def run_judge_repeats(
+    case: EvalCase,
+    answer: str,
+    hits: Sequence[SearchHit],
+    judge_chat: ChatService,
+    *,
+    repeats: int,
+    nonce_factory: Callable[[], str] = _default_judge_nonce,
+) -> tuple[JudgeRepeat, ...]:
+    """Run `repeats` independent judge calls over the same `answer`/`hits`,
+    sequentially -- design §7's usage examples run this in-process with no
+    stated concurrency budget, so this does not invent one. Every attempt
+    runs regardless of an earlier attempt's outcome (design §7.3: "重試若發
+    生，attempt次數逐次記錄，不靜默吞掉"), so the returned tuple always has
+    exactly `repeats` entries, in attempt order.
+    """
+    out: list[JudgeRepeat] = []
+    for attempt in range(1, repeats + 1):
+        out.append(await _judge_once(case, answer, hits, judge_chat, nonce_factory, attempt))
+    return tuple(out)
+
+
+def derive_judged_result(case_id: str, repeats: tuple[JudgeRepeat, ...]) -> JudgedResult:
+    """Fold an already-run, non-empty `repeats` into one `JudgedResult`
+    (design §7.5).
+
+    Pure and independently testable from I/O: this is the only place a
+    `state="JUDGED"` result is produced, and it requires two things to hold
+    across every repeat -- design §7.3's identity proof: every repeat's
+    `answer_sha256`/`sources_sha256` must agree with repeat 1's, or the
+    repeats did not all review the same thing and stability cannot be
+    claimed; and every repeat's `outcome` must be a real verdict, or at
+    least one review never reached one. Either violation is `INCONCLUSIVE`,
+    never silently dropped or averaged into a rate (this series' standing
+    "no rates, ever" rule -- Day 13, Day 21, design §9).
+
+    `verdict` is repeat 1's outcome, not a majority or any other aggregate:
+    every repeat is an equally valid independent judgment, and inventing an
+    aggregation rule across N of them would itself be exactly the kind of
+    rate/threshold this design forbids computing. The full sequence -- what
+    an aggregate would discard -- is preserved in `repeats` regardless, and
+    that is what `render_report`'s stability line reads (design §7.5:
+    report the sequence, not a rate).
+    """
+    if not repeats:
+        raise ValueError(
+            "derive_judged_result requires at least one repeat; a case with "
+            "zero repeats is SKIPPED or INCONCLUSIVE-before-any-repeat-ran, "
+            "constructed directly by the caller, never through this function"
+        )
+
+    base = repeats[0]
+    mismatched = [
+        r.attempt
+        for r in repeats
+        if r.answer_sha256 != base.answer_sha256 or r.sources_sha256 != base.sources_sha256
+    ]
+    if mismatched:
+        return JudgedResult(
+            case_id=case_id,
+            verdict=None,
+            state="INCONCLUSIVE",
+            reason=(
+                "answer_sha256/sources_sha256 mismatch across repeats at "
+                f"attempt(s) {mismatched}"
+            ),
+            repeats=repeats,
+        )
+
+    errored = [r for r in repeats if r.outcome not in ("pass", "fail")]
+    if errored:
+        detail = ", ".join(f"attempt {r.attempt}={r.outcome}" for r in errored)
+        return JudgedResult(
+            case_id=case_id,
+            verdict=None,
+            state="INCONCLUSIVE",
+            reason=f"repeat error(s): {detail}",
+            repeats=repeats,
+        )
+
+    verdict: Literal["pass", "fail"]
+    if base.outcome == "pass":
+        verdict = "pass"
+    elif base.outcome == "fail":
+        verdict = "fail"
+    else:  # pragma: no cover - unreachable: `errored` above already excluded this
+        raise AssertionError(f"unreachable outcome after error filtering: {base.outcome!r}")
+
+    return JudgedResult(
+        case_id=case_id, verdict=verdict, state="JUDGED", reason=None, repeats=repeats
+    )
+
+
+async def run_judged_layer(
+    cases: Sequence[EvalCase],
+    fake_service: RagService,
+    settings: Settings,
+    *,
+    repeats: int,
+    nonce_factory: Callable[[], str] = _default_judge_nonce,
+) -> dict[str, JudgedResult]:
+    """Run the judged layer (passes B and C, design §7.1) over every case in
+    `cases`, keyed by case id.
+
+    `fake_service` is the same seeded, fake-LLM `RagService` pass A already
+    used (design §7.1: "同一retriever、同一principal、同一問句，檢索不含隨
+    機性"): this calls its `.answer()` a second time per judged-eligible case
+    rather than widening `run_pass_a`'s own shipped contract to carry
+    `RagAnswer`s out.
+
+    Pass B's generation and pass C's judging both go through
+    `build_chat_service(settings, prompt=...)` (this task's ambiguity 2):
+    `build_seeded_rag_service(settings, use_fake_llm=False)` for pass B (the
+    same seeded retriever, `rag_answer` prompt), and a bare `ChatService`
+    built with `judge_prompt_template()` for pass C. Forcing
+    `use_fake_llm=False` here regardless of the ambient setting is
+    deliberate: `--judge` exists specifically to bring a real model into the
+    loop, and silently judging a fake echo instead would itself be exactly
+    the kind of unexplained silent pass ambiguity 2 rules out. Tests never
+    reach the network from this path -- `tests/unit/test_eval_run.py`'s
+    Task 6 section monkeypatches `build_chat_service` itself (constructing
+    `fake_service` beforehand, via the real one, so pass A is unaffected)
+    before calling this function.
+
+    For every case: `judged: null` in the dataset is `SKIPPED` with zero
+    calls made at all (design §7.4). Otherwise pass A's own status is
+    checked first -- a structural no-answer there is a structural no-answer
+    for pass B too (retrieval has no randomness), so pass B is never called
+    for it; `INCONCLUSIVE(no_answer_at_runtime)`. If pass A answered, pass B
+    is attempted; an upstream failure there, or a `sources_sha256`
+    disagreement between the two passes (design §7.1: "那代表檢索本身有非決
+    定性，量尺的抖動就不可歸因了"), is `INCONCLUSIVE` with its own `repeats`
+    left empty -- judging is not attempted at all when the run itself did
+    not reproduce. Only then does judging run, and its outcome is
+    `derive_judged_result`'s.
+    """
+    real_service = build_seeded_rag_service(settings, use_fake_llm=False)
+    try:
+        judge_chat = build_chat_service(settings, prompt=judge_prompt_template())
+        try:
+            results: dict[str, JudgedResult] = {}
+            for case in cases:
+                if case.judged is None:
+                    results[case.id] = JudgedResult(
+                        case_id=case.id,
+                        verdict=None,
+                        state="SKIPPED",
+                        reason=case.judged_skip_reason,
+                        repeats=(),
+                    )
+                    continue
+
+                principal = Principal(
+                    tenant_id=case.tenant, user_id=case.user, group_ids=case.groups
+                )
+                pass_a: RagAnswer = await fake_service.answer(case.question, principal)
+                if pass_a.status == "no_answer":
+                    results[case.id] = JudgedResult(
+                        case_id=case.id,
+                        verdict=None,
+                        state="INCONCLUSIVE",
+                        reason="no_answer_at_runtime",
+                        repeats=(),
+                    )
+                    continue
+
+                try:
+                    pass_b: RagAnswer = await real_service.answer(case.question, principal)
+                except UpstreamError as exc:
+                    results[case.id] = JudgedResult(
+                        case_id=case.id,
+                        verdict=None,
+                        state="INCONCLUSIVE",
+                        reason=f"pass_b_generation_error: {exc}",
+                        repeats=(),
+                    )
+                    continue
+                if pass_b.status == "no_answer":
+                    results[case.id] = JudgedResult(
+                        case_id=case.id,
+                        verdict=None,
+                        state="INCONCLUSIVE",
+                        reason="no_answer_at_runtime",
+                        repeats=(),
+                    )
+                    continue
+
+                if sources_sha256(pass_a.hits) != sources_sha256(pass_b.hits):
+                    results[case.id] = JudgedResult(
+                        case_id=case.id,
+                        verdict=None,
+                        state="INCONCLUSIVE",
+                        reason="pass_a_pass_b_sources_sha256_mismatch",
+                        repeats=(),
+                    )
+                    continue
+
+                # RagAnswer's own __post_init__ invariant: status="answered"
+                # requires answer to be set.
+                assert pass_b.answer is not None
+                repeats_run = await run_judge_repeats(
+                    case,
+                    pass_b.answer,
+                    pass_b.hits,
+                    judge_chat,
+                    repeats=repeats,
+                    nonce_factory=nonce_factory,
+                )
+                results[case.id] = derive_judged_result(case.id, repeats_run)
+
+            return results
+        finally:
+            await judge_chat.aclose()
+    finally:
+        await real_service.aclose()
+
+
+def render_report(det: Mapping[str, CaseResult], judged: Mapping[str, JudgedResult]) -> str:
+    """Render the console report (design §7.5): one block per case in
+    `det`'s own key order (`main()` builds `det` from `propagate_requires`,
+    which preserves dataset order -- see that function's docstring), exactly
+    three labelled lines per case (`deterministic:`/`judged:`/`stability:`)
+    so a case the judged layer never reached and one it reached but could
+    not judge are both visible on the page, never a blank line standing in
+    for either.
+
+    `stability` is `NOT MEASURED` exactly when `repeats` is empty --
+    independent of `state`: a case whose repeats disagreed still shows the
+    sequence that disagreed (`derive_judged_result` keeps `repeats` on an
+    `INCONCLUSIVE` result), because the actual sequence is what lets a
+    reader see *why* it is inconclusive. Nothing here computes or prints a
+    percentage or rate (design §9) -- only the literal, ordered outcome of
+    each attempt, comma-joined.
+    """
+    lines: list[str] = []
+    for case_id, result in det.items():
+        lines.append(case_id)
+
+        det_line = result.verdict.value
+        if result.failures:
+            det_line += " (" + "; ".join(result.failures) + ")"
+        lines.append(f"  deterministic: {det_line}")
+
+        judged_result = judged.get(case_id)
+        if judged_result is None:
+            judged_line = "NOT RUN"
+            stability_line = "NOT MEASURED"
+        else:
+            if judged_result.state == "JUDGED":
+                judged_line = f"JUDGED({judged_result.verdict})"
+            else:
+                judged_line = f"{judged_result.state}({judged_result.reason})"
+            stability_line = (
+                ",".join(r.outcome for r in judged_result.repeats)
+                if judged_result.repeats
+                else "NOT MEASURED"
+            )
+        lines.append(f"  judged:        {judged_line}")
+        lines.append(f"  stability:     {stability_line}")
+
+    return "\n".join(lines) + "\n"
+
+
+def evidence_document(
+    *,
+    run_id: str,
+    started_at: str,
+    completed_at: str,
+    lab_root: Path,
+    settings: Settings,
+    cases: Sequence[EvalCase],
+    det: Mapping[str, CaseResult],
+    judged: Mapping[str, JudgedResult],
+) -> dict[str, object]:
+    """Assemble the Task 10 live-run evidence sidecar (design §9's manifest
+    table): the identity of the run (`run_id`, UTC bounds, `lab_commit`),
+    what it ran against (`dataset_sha256`, `corpus_manifest`), which prompts
+    it used (`rag_prompt`, `judge_prompt`), and every case's deterministic
+    and judged-layer outcome in full -- including each judge repeat's raw
+    response text, kept here (unlike `render_report`, which deliberately
+    omits it from the console) because the evidence sidecar is the record a
+    later reader replays, not a console summary; a repeat's `raw_response`
+    lives only inside that repeat's own object in `cases[].judged.repeats`,
+    never concatenated into any narrative text this function writes, so an
+    untrusted model response can never be mistaken for the runner's own
+    prose.
+
+    Fail-closed guards match `calibration_document`'s (`_resolve_lab_root`/
+    `_resolve_corpus_dir`): this raises `DatasetError` rather than stamping
+    one tree's commit onto another tree's corpus.
+
+    No rate or percentage is computed anywhere in this document (design §9)
+    -- only counts, ids, and the literal per-case, per-repeat sequence.
+    Group ids never appear here, only `groups_count` and each group's own
+    SHA-256 (Day 15) -- the same redaction `calibration_document` already
+    applies, reused rather than re-invented.
+    """
+    resolved_root = _resolve_lab_root(lab_root)
+    corpus_dir = _resolve_corpus_dir(settings, resolved_root)
+    rag_prompt = load_prompt("rag_answer")
+    judge_prompt = judge_prompt_template()
+
+    cases_doc: list[dict[str, object]] = []
+    for case in cases:
+        det_result = det.get(case.id)
+        judged_result = judged.get(case.id)
+        cases_doc.append(
+            {
+                "id": case.id,
+                "principal": {
+                    "tenant": case.tenant,
+                    "groups_count": len(case.groups),
+                    # Day 15: group ids never enter logs or evidence.
+                    "group_sha256": [sha256_hex(g.encode("utf-8")) for g in case.groups],
+                },
+                "deterministic": (
+                    None
+                    if det_result is None
+                    else {
+                        "verdict": det_result.verdict.value,
+                        "failures": list(det_result.failures),
+                    }
+                ),
+                "judged": (
+                    None
+                    if judged_result is None
+                    else {
+                        "state": judged_result.state,
+                        "verdict": judged_result.verdict,
+                        "reason": judged_result.reason,
+                        "repeats": [
+                            {
+                                "attempt": r.attempt,
+                                "outcome": r.outcome,
+                                "answer_sha256": r.answer_sha256,
+                                "sources_sha256": r.sources_sha256,
+                                "judge_input_sha256": r.judge_input_sha256,
+                                "raw_response": r.raw_response,
+                            }
+                            for r in judged_result.repeats
+                        ],
+                    }
+                ),
+            }
+        )
+
+    document: dict[str, object] = {
+        "kind": "day28-judged-evaluation-run",
+        "run_id": run_id,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "lab_commit": _git_describe(resolved_root),
+        "dataset_sha256": sha256_hex(_DATASET_PATH.read_bytes()),
+        "corpus_manifest": {
+            str(path.relative_to(corpus_dir)): sha256_hex(path.read_bytes())
+            for path in sorted(corpus_dir.glob("*/*.md"))
+        },
+        "rag_prompt": {
+            "name": rag_prompt.name,
+            "version": rag_prompt.version,
+            "sha256": rag_prompt.sha256,
+        },
+        "judge_prompt": {
+            "version": judge_prompt.version,
+            "sha256": judge_prompt.sha256,
+        },
+        "cases": cases_doc,
+    }
+    document["cases_sha256"] = sha256_hex(canonical_json(cases_doc))
+    return document
+
+
 def _resolve_lab_root(lab_root: Path) -> Path:
     """Fail-closed guard 1/2 (mirrors `calibrate_probe.py`'s `resolve_lab_root`):
     `lab_root` must be a git worktree, and the `azgenai_lab` package actually
@@ -1227,6 +1731,22 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1],
         help="Repo root the corpus and git identity are read from (--calibrate only).",
     )
+    parser.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "Also run the judged layer (design §7.1, passes B and C): a real "
+            "second generation per judged-eligible case, plus --repeats "
+            "independent judge calls over it. Never affects the exit code "
+            "(gate_exit_code takes only the deterministic results)."
+        ),
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="Judge repeats per case (--judge only; design's own live run uses 5).",
+    )
     return parser.parse_args(argv)
 
 
@@ -1257,11 +1777,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         corpus = build_corpus_map(corpus_dir)
         results = asyncio.run(run_pass_a(cases, service, corpus))
         propagated = propagate_requires(cases, results)
-        for case in cases:
-            result = propagated[case.id]
-            print(f"{result.verdict.value}\t{case.id}")
-            for failure in result.failures:
-                print(f"\t{failure}")
+
+        if not args.judge:
+            for case in cases:
+                result = propagated[case.id]
+                print(f"{result.verdict.value}\t{case.id}")
+                for failure in result.failures:
+                    print(f"\t{failure}")
+            return gate_exit_code(propagated)
+
+        # design §7.5: "--judge 缺憑證＝2，不是 0" -- a ValueError here means
+        # build_chat_service (via build_seeded_rag_service, forced real) or
+        # resolve_aoai_auth rejected the credentials before any judged
+        # verdict exists, which is a setup failure, not a gate failure.
+        try:
+            judged = asyncio.run(run_judged_layer(cases, service, settings, repeats=args.repeats))
+        except ValueError as exc:
+            print(f"SETUP FAILURE: --judge requires real credentials: {exc}", file=sys.stderr)
+            return ExitCode.SETUP_FAILED
+
+        print(render_report(propagated, judged))
         return gate_exit_code(propagated)
     finally:
         asyncio.run(service.aclose())
