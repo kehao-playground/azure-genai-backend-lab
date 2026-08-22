@@ -1593,6 +1593,48 @@ async def test_run_judged_layer_pass_b_upstream_error_is_inconclusive_with_zero_
     assert judge.calls == []
 
 
+async def test_run_judged_layer_upstream_error_text_never_reaches_the_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The report's contract is that it never states a rate. An upstream error
+    # message is text this runner does not control, and a real Azure 429 reads
+    # "Requests to the ... exceeded call rate limit ... Please retry after 86
+    # seconds." Interpolating it into the INCONCLUSIVE reason would print the
+    # word "rate" -- and a percentage, given a message that carries one -- in
+    # a line the no-rates guard is supposed to own. Only the exception class
+    # name is kept (Day 28 review, Task 6).
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(_hit(tenant="acme", doc_id="returns-policy"),),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    generation = _StaticChatService(
+        UpstreamTimeoutError(
+            "Requests to the ChatCompletions_Create Operation under Azure OpenAI API "
+            "have exceeded call rate limit of 100%. Please retry after 86 seconds."
+        )
+    )
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    results = await run_judged_layer([case], fake_service, _judge_ready_settings(), repeats=5)  # type: ignore[arg-type]
+
+    result = results[case.id]
+    assert result.state == "INCONCLUSIVE"
+    # The class name survives; the upstream sentence does not.
+    assert result.reason == "pass_b_generation_error: UpstreamTimeoutError"
+    report = render_report({case.id: _result(case.id, Verdict.PASS)}, results)
+    assert not re.search(r"%", report)
+    assert not re.search(r"rate", report, re.IGNORECASE)
+
+
 async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with_zero_repeats(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
