@@ -2330,17 +2330,19 @@ def test_real_report_from_the_shipped_dataset_states_no_rate() -> None:
     assert "%" not in report
 
 
-async def test_evidence_document_records_the_three_adapter_flags_distinctly() -> None:
-    # Recorded so nobody reads a seeded-retrieval run as end to end. Driven
-    # with three values that are NOT all equal, and asserted against literals
-    # rather than against `settings` again: an assertion that re-reads the same
-    # object it is checking passes under any constant, which is how the first
-    # version of this check survived a mutation that hard-coded True.
+async def test_evidence_document_records_the_runner_topology_not_the_settings() -> None:
+    # The block exists so nobody reads a seeded-retrieval run as end to end, and
+    # echoing `settings` defeated exactly that: the first live run recorded
+    # `use_fake_search: false` on a run whose retrieval was entirely the seeded
+    # FakeSearchClient, because the seeded retriever never reads that setting --
+    # and `--judge` forces real generation whatever `use_fake_llm` says.
+    # Driven with settings that contradict every value asserted below, so an
+    # implementation that goes back to echoing them cannot pass.
     settings = Settings(
         _env_file=None,
         use_fake_llm=True,
         use_fake_search=False,
-        use_fake_embeddings=True,
+        use_fake_embeddings=False,
     )
     case = _case_by_id("acme-refund-window-standard")
 
@@ -2355,12 +2357,12 @@ async def test_evidence_document_records_the_three_adapter_flags_distinctly() ->
         judged={},
     )
 
-    # Each flag differs from at least one neighbour, so a hard-coded constant
-    # or a swapped key cannot satisfy this.
     assert document["adapters"] == {
-        "use_fake_llm": True,
-        "use_fake_search": False,
-        "use_fake_embeddings": True,
+        "pass_a_llm": "fake",
+        "pass_b_llm": "real",
+        "judge_llm": "real",
+        "retrieval": "seeded_fake_search_client",
+        "seed_embeddings": "fake_embedding_client",
     }
 
 
