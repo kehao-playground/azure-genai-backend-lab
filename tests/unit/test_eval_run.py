@@ -1008,10 +1008,40 @@ def test_parse_judge_response_rejects_the_self_contradictory_all_empty_response(
         parse_judge_response(raw, case)
 
 
+def test_parse_judge_response_rejects_a_forbidden_id_smuggled_into_covered() -> None:
+    # Invariant 2: (covered | missing) <= expected_ids. f1 is a real,
+    # case-known id -- it is this case's forbidden fact -- but it is not an
+    # expected fact, so it must never appear in covered_fact_ids. This is
+    # the exact regression the fix-round-1 review demonstrated against the
+    # earlier (too-broad) version of this check: with expected={e1},
+    # forbidden={f1}, covered=("e1","f1") used to be *accepted*, because
+    # f1 is a "known" id in the expected-or-forbidden sense the old
+    # invariant 4 tested. It is not a known id in the narrower
+    # expected-only sense invariant 2 tests, which is what design §7.3
+    # actually requires of covered_fact_ids/missing_fact_ids.
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1", "f1"), missing=())
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
+def test_parse_judge_response_rejects_a_forbidden_id_smuggled_into_missing() -> None:
+    # Same regression, via missing_fact_ids instead of covered_fact_ids --
+    # and this shape is the more dangerous one: f1 in missing_fact_ids used
+    # to be accepted by the old invariant 4 *and* then flip
+    # derive_judge_verdict to a spurious "fail" on a response that in fact
+    # covered its one and only expected fact (e1). Confirmed below in
+    # test_derive_judge_verdict_never_reached_for_a_forbidden_id_in_missing.
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1",), missing=("f1",))
+    with pytest.raises(JudgeParseError):
+        parse_judge_response(raw, case)
+
+
 def test_parse_judge_response_rejects_covered_and_missing_overlap() -> None:
-    # Invariant 2: covered & missing == set(). Both lists claim e1: the
-    # union already equals expected (invariant 1 alone would accept this),
-    # so only invariant 2 isolates it.
+    # Invariant 3: covered & missing == set(). Both lists claim e1: the
+    # union already equals expected (invariants 1+2 alone would accept
+    # this), so only invariant 3 isolates it.
     case = _one_expected_case()
     raw = _judge_response(covered=("e1",), missing=("e1",))
     with pytest.raises(JudgeParseError):
@@ -1019,9 +1049,10 @@ def test_parse_judge_response_rejects_covered_and_missing_overlap() -> None:
 
 
 def test_parse_judge_response_rejects_a_violated_id_absent_from_forbidden_facts() -> None:
-    # Invariant 3: violated <= forbidden_ids. "e1" is a real id (it is this
-    # case's expected fact) but not a forbidden one, so invariant 4's
-    # "known id" check alone would not catch it -- only invariant 3 does.
+    # Invariant 4: violated <= forbidden_ids. "e1" is a real, case-known id
+    # (it is this case's expected fact) but not a forbidden one, so this is
+    # only caught because invariant 4 constrains violated_fact_ids
+    # specifically to forbidden_facts, not to "any known id."
     case = _one_expected_case()
     raw = _judge_response(covered=("e1",), violated=("e1",))
     with pytest.raises(JudgeParseError):
@@ -1029,11 +1060,10 @@ def test_parse_judge_response_rejects_a_violated_id_absent_from_forbidden_facts(
 
 
 def test_parse_judge_response_rejects_an_extra_unknown_id_alongside_a_real_one() -> None:
-    # Invariant 4: (covered | missing | violated) <= known_ids. "e1" alone
-    # would satisfy invariant 1 (union == expected would need exactly
-    # {"e1"} here since expected has only e1 -- so adding "not-a-real-id"
-    # breaks invariant 4 without breaking invariant 1's "nothing expected
-    # left out" direction).
+    # Invariant 2 again, but with a wholly fictional id (not a case-known
+    # forbidden id) -- the weaker failure mode the original invariant 4
+    # already caught, kept here so both shapes ("looks like a real id from
+    # elsewhere in the case" and "looks like nothing at all") stay covered.
     case = _one_expected_case()
     raw = _judge_response(covered=("e1", "not-a-real-id"), missing=())
     with pytest.raises(JudgeParseError):
@@ -1041,11 +1071,11 @@ def test_parse_judge_response_rejects_an_extra_unknown_id_alongside_a_real_one()
 
 
 def test_parse_judge_response_rejects_a_fact_returned_as_free_text_instead_of_an_id() -> None:
-    # Also invariant 4, but via missing_fact_ids and both expected ids
+    # Also invariant 2, via missing_fact_ids and both expected ids
     # legitimately classified (unlike the extra-id test above, which uses
     # an id-shaped typo) -- a natural-language sentence dropped in among
-    # real ids. Isolated from invariant 3 deliberately: this uses
-    # missing_fact_ids, not violated_fact_ids, so invariant 3 (which only
+    # real ids. Isolated from invariant 4 deliberately: this uses
+    # missing_fact_ids, not violated_fact_ids, so invariant 4 (which only
     # constrains violated_fact_ids) can never be the one that fires here.
     case = _two_expected_case()
     raw = _judge_response(covered=("e1",), missing=("e2", "the answer mentions 30 days"))
@@ -1088,10 +1118,15 @@ def test_derive_judge_verdict_fail_when_unsupported_claims_is_non_empty() -> Non
     assert derive_judge_verdict(output) == "fail"
 
 
-# --- canonical_json (Task 4, additional Task 5 coverage) ---
-
-
-def test_canonical_json_is_stable_under_key_reordering_task5() -> None:
-    assert eval_run.canonical_json({"z": 1, "a": {"y": 2, "x": 3}}) == eval_run.canonical_json(
-        {"a": {"x": 3, "y": 2}, "z": 1}
-    )
+def test_derive_judge_verdict_never_reached_for_a_forbidden_id_in_missing() -> None:
+    # End-to-end companion to
+    # test_parse_judge_response_rejects_a_forbidden_id_smuggled_into_missing:
+    # a response that covered its one expected fact (e1) but also, wrongly,
+    # listed a forbidden id (f1) in missing_fact_ids raises at the parse
+    # step -- there is no JudgeOutput for derive_judge_verdict to see, so it
+    # can never compute the spurious "fail" the pre-fix version of
+    # parse_judge_response would have let through.
+    case = _one_expected_case()
+    raw = _judge_response(covered=("e1",), missing=("f1",))
+    with pytest.raises(JudgeParseError):
+        derive_judge_verdict(parse_judge_response(raw, case))
