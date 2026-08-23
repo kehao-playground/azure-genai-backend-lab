@@ -92,6 +92,9 @@ under two separate JSON keys, `deterministic` and `judged`, not one array
 with a `"layer"` tag a typo could misclassify. Getting a string wrong
 cannot silently promote a judged assertion into a gating one.
 
+The two layers and the exit-code ownership are drawn in
+[diagrams/eval-two-layers.md](diagrams/eval-two-layers.md).
+
 `tools/eval_run.py` maps outcomes to a process exit code:
 
 | Exit code | `ExitCode` name | What produced it | Why it is its own code |
@@ -506,6 +509,10 @@ against a specific, hash-identified answer. The judged layer's automated
 verdict is not a substitute authority; it is a second, repeated,
 machine-produced opinion that a human's read can agree or disagree with,
 on the same evidence.
+
+The full chain — answer, hashes, sidecar, companion, pre-adjudication
+recheck — is drawn in
+[diagrams/eval-evidence-chain.md](diagrams/eval-evidence-chain.md).
 
 ### 8.1 The companion the adjudication reads: `--answers-out`
 

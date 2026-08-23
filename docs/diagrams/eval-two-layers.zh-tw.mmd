@@ -1,0 +1,32 @@
+%% Publication source (zh-TW) for the Day 28 article figure.
+%% English semantic companion: eval-two-layers.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    case["tools/eval_cases.json 的一題<br/>deterministic 與 judged 是兩個 key，不是一個欄位的兩個值"]
+
+    subgraph detside["確定性層 · 重跑給同一個答案"]
+        det["deterministic<br/>status · must_cite · citations_subset_of · must_not_cite"]
+        gate["gate_exit_code(results)<br/>簽名裡沒有 judged 參數"]
+        det --> gate
+    end
+
+    subgraph judside["判讀層 · 同一份答案重審可能翻"]
+        jud["judged<br/>expected_facts · forbidden_facts · rubric"]
+        judge["pass B 生成 → pass C judge ×5<br/>模型只回事實 id，verdict 由程式推導"]
+        report["報告：逐輪 outcome 序列<br/>量不到印 NOT MEASURED"]
+        jud --> judge --> report
+    end
+
+    case --> det
+    case --> jud
+
+    ok["exit 0<br/>gate 跑了，全過"]
+    bad["exit 1<br/>gate 跑了，被測物有問題"]
+    gate --> ok
+    gate --> bad
+
+    setup["setup 失敗<br/>dataset 不合法 · corpus 載不進來 · 缺憑證"]
+    two["exit 2<br/>受測物根本沒被測到"]
+    setup --> two
+
+    report -. "沒有這條路（結構上）" .-x gate

@@ -14,3 +14,5 @@ Mermaid-first diagrams: the reference architecture, then sequence diagrams for t
 - [Audit Event Exit Paths](audit-exit-paths.md)
 - [Container Shutdown Timeline](container-shutdown-timeline.md)
 - [Agent Tool-Call Sequence](agent-tool-call-sequence.md) (placeholder)
+- [Eval: Two Assertion Layers, One Exit Code](eval-two-layers.md)
+- [Eval: The Adjudication Evidence Chain](eval-evidence-chain.md)
