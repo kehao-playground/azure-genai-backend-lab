@@ -1256,10 +1256,16 @@ class JudgedTranscript:
     rebuilding `sources_sha256`'s payload -- `{doc_id, chunk_id, heading_path,
     content}` per source, in the order this tuple preserves, since rank order
     is meaningful data to that hash. That is the point: it turns the sidecar's
-    unrecomputable digests into verifiable ones without putting a single byte
-    of model output into the sidecar itself. `judge_input_sha256` stays a
-    provenance token even so -- it additionally covers the per-repeat nonce
-    and the fence framing built around each value.
+    unrecomputable digests into verifiable ones without the runner writing a
+    single byte of the answer into the sidecar itself.
+
+    `judge_input_sha256` joins them, with one more input: it covers the whole
+    judge input, so a reader needs this file, the `nonce` the sidecar records
+    per repeat (a fence label, not a secret -- `JudgeRepeat`'s own docstring),
+    and the case's facts and rubric from the dataset the sidecar pins by
+    `dataset_sha256`. `JudgeRepeat` is right that it cannot be recomputed
+    *from the sidecar alone*; that was always a statement about the sidecar,
+    not about the digest.
     """
 
     case_id: str
@@ -1927,10 +1933,16 @@ def answers_document(*, run_id: str, transcripts: Sequence[JudgedTranscript]) ->
     """Assemble the human-adjudication companion to the evidence sidecar
     (design §5.3), written by `--answers-out`.
 
-    Two files rather than one field added to the sidecar, deliberately: the
-    sidecar stays content-free and reference-only (Day 22's audit log,
-    mirrored), and this one carries the text that makes §5.3's human step
-    possible at all. `run_id` is the only thing binding the pair, so `main()`
+    Two files rather than one field added to the sidecar, deliberately: what
+    the sidecar records stays reference-only (Day 22's audit log, mirrored),
+    and this one carries the text that makes §5.3's human step possible at
+    all. "Reference-only" is a statement about the runner's own records, not
+    about every byte in the file -- `evidence_document` also keeps each judge
+    repeat's verbatim `raw_response`, which is model prose and can quote the
+    answer back (`JUDGE_PROMPT` asks for free text about the answer's claims).
+    Nothing the runner writes puts the answer in the sidecar; the judge can.
+
+    `run_id` is the only thing binding the pair, so `main()`
     passes the *same* value to both builders rather than calling `_run_id()` a
     second time. `kind` differs from the sidecar's (`day28-eval-answers`
     versus `day28-judged-evaluation-run`) for the same reason the ids matter:
@@ -2141,7 +2153,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--lab-root",
         type=Path,
         default=Path(__file__).resolve().parents[1],
-        help="Repo root the corpus and git identity are read from (--calibrate only).",
+        help=(
+            "Repo root the corpus and git identity are read from -- by "
+            "--calibrate, and by the evidence sidecar on a judged run, where a "
+            "wrong value aborts after the answers are billed."
+        ),
     )
     parser.add_argument(
         "--judge",
@@ -2249,6 +2265,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.judge and args.answers_out is not None:
         print(
             "SETUP FAILURE: --answers-out records a judged run; it needs --judge.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    # The companion states its own answer_sha256, so on its own a reader can
+    # only confirm that the file agrees with itself -- and the §5.3 human
+    # verdict binds to the sidecar's digest, not to the companion's. Written
+    # alone it is an artifact that looks like evidence and cannot check
+    # anything, produced by a run that exited 0. The collision guard below
+    # already refuses to let the two land on one path because they are only
+    # usable as a pair; this is the same rule at the other end.
+    if args.answers_out is not None and args.evidence_out is None:
+        print(
+            "SETUP FAILURE: --answers-out is checked against the sidecar's hashes; "
+            "it needs --evidence-out.",
             file=sys.stderr,
         )
         return ExitCode.SETUP_FAILED
@@ -2380,13 +2411,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             return ExitCode.SETUP_FAILED
 
         print(render_report(propagated, judged))
-        if args.evidence_out is not None:
-            # Written before the return so a gate failure still leaves the
-            # record behind: the run a reader most wants to replay is the one
-            # that failed. `evidence_document` raises DatasetError on its own
-            # fail-closed guards, which is a setup failure, not a gate one.
+
+        # Both records are attempted before either failure is reported, and the
+        # exit code is decided only afterwards. Sequential writes whose first
+        # failure `return`ed was a real defect: an unwritable `--evidence-out`
+        # -- a path typo, a full disk, a directory where a filename was meant --
+        # exited 2 with the companion never written, discarding every pass-B
+        # answer the run had already paid for and could not reproduce without
+        # paying again. A gate failure was already survivable; the sidecar's own
+        # failure was not, which is the opposite of the intended rule.
+        #
+        # The companion goes first because it is the file nothing else can
+        # reconstruct: the sidecar's contents are hashes over text only the
+        # companion keeps. It is written even when `evidence_document` refuses
+        # to build -- that refusal is about the *sidecar's* provenance claims
+        # (`_resolve_lab_root`/`_resolve_corpus_dir`: which tree's commit gets
+        # stamped onto which tree's corpus), and the companion makes no such
+        # claim. It carries text and hashes bound to `run_id`, all of which are
+        # true regardless.
+        write_failed = False
+
+        if args.answers_out is not None:
+            # Same `run_id` value the sidecar records below -- that identity is
+            # the only thing pairing the two files.
             try:
-                document = evidence_document(
+                args.answers_out.write_bytes(
+                    canonical_json(answers_document(run_id=run_id, transcripts=transcripts))
+                )
+            except OSError as exc:
+                print(f"SETUP FAILURE: could not write answers: {exc}", file=sys.stderr)
+                write_failed = True
+            else:
+                print(f"answers written to {args.answers_out}", file=sys.stderr)
+
+        if args.evidence_out is not None:
+            # `evidence_document` raises DatasetError on its own fail-closed
+            # guards, which is a setup failure, not a gate one.
+            evidence_doc: dict[str, object] | None = None
+            try:
+                evidence_doc = evidence_document(
                     run_id=run_id,
                     started_at=started_at,
                     completed_at=_utc_now(),
@@ -2398,32 +2461,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             except DatasetError as exc:
                 print(f"SETUP FAILURE: {exc}", file=sys.stderr)
-                return ExitCode.SETUP_FAILED
-            try:
-                args.evidence_out.write_bytes(canonical_json(document))
-            except OSError as exc:
-                # Deliberately not a blanket `except Exception`, which would
-                # hide genuine bugs behind exit 2. On a judged run the answers
-                # are already paid for by this point, so the failure is
-                # reported loudly rather than swallowed -- but it is still a
-                # setup failure, not a verdict about the thing under test.
-                print(f"SETUP FAILURE: could not write evidence: {exc}", file=sys.stderr)
-                return ExitCode.SETUP_FAILED
-            print(f"evidence written to {args.evidence_out}", file=sys.stderr)
-        if args.answers_out is not None:
-            # Written on the same terms as the sidecar, and for the same
-            # reason: what it holds was already paid for by the time this line
-            # is reached, so a gate failure must still leave it behind. Same
-            # `run_id` value the sidecar above recorded -- that identity is the
-            # only thing pairing the two files.
-            try:
-                args.answers_out.write_bytes(
-                    canonical_json(answers_document(run_id=run_id, transcripts=transcripts))
-                )
-            except OSError as exc:
-                print(f"SETUP FAILURE: could not write answers: {exc}", file=sys.stderr)
-                return ExitCode.SETUP_FAILED
-            print(f"answers written to {args.answers_out}", file=sys.stderr)
+                write_failed = True
+            if evidence_doc is not None:
+                try:
+                    args.evidence_out.write_bytes(canonical_json(evidence_doc))
+                except OSError as exc:
+                    # Deliberately not a blanket `except Exception`, which would
+                    # hide genuine bugs behind exit 2. On a judged run the
+                    # answers are already paid for by this point, so the failure
+                    # is reported loudly rather than swallowed -- but it is
+                    # still a setup failure, not a verdict about the thing under
+                    # test.
+                    print(f"SETUP FAILURE: could not write evidence: {exc}", file=sys.stderr)
+                    write_failed = True
+                else:
+                    print(f"evidence written to {args.evidence_out}", file=sys.stderr)
+
+        if write_failed:
+            return ExitCode.SETUP_FAILED
         return gate_exit_code(propagated)
     finally:
         asyncio.run(service.aclose())

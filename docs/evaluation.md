@@ -267,11 +267,16 @@ the sidecar records only a hash of. Same canonical encoding, same
 write-it-anyway-on-a-gate-failure rule, and the same class of refusal when
 it cannot be honoured — `SETUP_FAILED` (exit 2), before anything is built
 and before a single provider call is spent, if it is passed without
-`--judge`, if its parent directory does not exist, or if it resolves to the
-same file as `--evidence-out`. That last one is a refusal rather than a
-last-write-wins because the two files are only usable as a pair: one would
-overwrite the other, and what survives looks like a complete record of a run
-that kept both.
+`--judge`, without `--evidence-out`, if its parent directory does not exist,
+or if it resolves to the same file as `--evidence-out`.
+
+The last two are both the same rule, that the two files are only usable as a
+pair. A companion written to the sidecar's path would silently clobber it,
+and what survives looks like a complete record of a run that kept both. A
+companion written *without* a sidecar states its own `answer_sha256`, so a
+reader can confirm only that the file agrees with itself — and the §8 human
+verdict binds to the sidecar's digest, not the companion's. Both refusals
+cost a re-run of the command; neither costs the answers.
 
 Without `--judge`, the process makes zero provider calls: it runs the fake
 LLM over the corpus-seeded fake search, scores every case's deterministic
@@ -504,19 +509,23 @@ on the same evidence.
 
 ### 8.1 The companion the adjudication reads: `--answers-out`
 
-That step needs the answer, and the sidecar does not have it. The sidecar
-is reference-only by construction — ids, counts, outcomes, and hashes, the
-same discipline Day 22's audit log follows — so for each judged case it
-records an `answer_sha256` whose input is stored nowhere. Two consequences
+That step needs the answer, and the sidecar does not have it. What the
+sidecar records is reference-only by construction — ids, counts, outcomes,
+hashes, and each judge repeat's verbatim response, the same discipline
+Day 22's audit log follows — so for each judged case it records an
+`answer_sha256` whose input is stored nowhere. Two consequences
 follow, and both are real:
 
 - **Nobody can adjudicate an answer nobody kept.** Reading the judge's own
   `rationale` instead would be circular: that is the judge's claim *about*
   the answer, not the answer.
-- **Nobody can check the hashes.** `JudgeRepeat`'s own docstring already
-  says `judge_input_sha256` is a provenance token rather than a verifiable
-  digest, for exactly this reason. Such a hash proves two repeats sent
-  identical input; it cannot say what that input was.
+- **Nobody holding only the sidecar can check its hashes.**
+  `JudgeRepeat`'s own docstring already says `judge_input_sha256` is a
+  provenance token rather than a verifiable digest *from the sidecar alone*,
+  for exactly this reason. Such a hash proves two repeats sent identical
+  input; on its own it cannot say what that input was. (With the companion
+  beside it, every one of these digests becomes recomputable — see the end
+  of this section.)
 
 The fix is not to put the text into the sidecar. It is a second, opt-in
 file, written by `--answers-out`:
@@ -524,9 +533,20 @@ file, written by `--answers-out`:
 | | `--evidence-out` sidecar | `--answers-out` companion |
 |---|---|---|
 | Carries | Hashes, ids, counts, outcomes, each repeat's raw judge response | The pass-B answer text, and every source's `doc_id`, `chunk_id`, `heading_path` and text |
-| Model output text? | Never | Yes — that is the whole point of it |
-| Written when | `--judge` | `--judge`, and only if asked for |
+| Records the pass-B answer? | Never — it has no field for it | Yes — that is the whole point of it |
+| Written when | `--judge` **and** `--evidence-out` | `--judge` **and** `--answers-out`, which requires `--evidence-out` |
 | One entry per | Every case in the dataset | Every *billed* pass-B answer |
+
+That "Never" is about what the sidecar's own schema records — it is not a
+promise that no model prose reaches the file. The sidecar keeps every judge
+repeat's verbatim `raw_response`, deliberately, because that is what makes a
+repeat replayable; and `JUDGE_PROMPT` asks the model for free text about the
+answer (`unsupported_claims`, `rationale`), so a judge that quotes the
+answer back puts that quotation into the sidecar. Nothing in the runner
+writes the answer there. The judge can. Read a sidecar before publishing it,
+and do not treat "reference-only" as "checked, and safe to publish
+unread" — the two files differ in *who* put the text there, not in a
+guarantee that one of them has none.
 
 `run_id` is what binds the two: the runner draws it once and stamps the
 same value into both files, so a human verdict recorded against a `run_id`
@@ -539,7 +559,10 @@ With both files in hand, the sidecar's hashes become checkable — not just
 readable:
 
 - **`answer_sha256`**: take the companion's `answer` for a case, SHA-256 its
-  UTF-8 bytes, compare against that case's `answer_sha256` in the sidecar.
+  UTF-8 bytes, compare against the sidecar's
+  `cases[].judged.repeats[].answer_sha256` for the same case — one per
+  repeat, identical across them by construction, since every repeat reviews
+  the same answer.
 - **`content_sha256`**: the same, per source, against its own `content`.
 - **`sources_sha256`**: rebuild the payload it hashes — one
   `{"doc_id", "chunk_id", "heading_path", "content"}` object per source, in
@@ -549,12 +572,24 @@ readable:
   SHA-256 the bytes. The companion carries those four fields for exactly
   this reason.
 
-One hash stays a provenance token: **`judge_input_sha256`**. It covers the
-whole judge input, which includes the per-repeat nonce and the fence framing
-built around every value, and the companion carries neither. It still proves
-two repeats sent byte-identical input; it does not let a reader reconstruct
-what that input was. That is the honest remaining limit, and it is narrower
-than it was — nothing else here is unverifiable.
+**`judge_input_sha256`** is recomputable too, with one more input. It covers
+the whole judge input, so a reader needs the question, the answer and every
+source the judge saw (companion), each repeat's `nonce` — recorded in the
+sidecar, a fence label rather than a secret — and the case's
+`expected_facts` / `forbidden_facts` / `rubric`, which live in the dataset
+the sidecar pins by `dataset_sha256` at the `lab_commit` it names. The one
+thing not in any artifact is the fence format itself, which the reader takes
+from `_fence` in `tools/eval_run.py`: `BEGIN UNTRUSTED {label} {nonce}` (and
+` {n}` for the nth source), then the value, then the matching `END` line;
+the assembled object is encoded the same canonical way and hashed.
+
+`JudgeRepeat`'s docstring calls that digest a provenance token, and it is
+right about what it says: no reader can recompute it **from the sidecar
+alone**. With the companion beside it, they can — this repo's own test suite
+rebuilds it longhand, from the two files plus the dataset, without importing
+the runner. So the limit is narrower than "one hash you cannot check": every
+digest either file records can be recomputed, and what a reader must supply
+beyond the two files is the pinned dataset and one documented text format.
 
 The companion holds one entry per answer pass B actually produced —
 including the `pass_a_pass_b_sources_sha256_mismatch` case, where no verdict
