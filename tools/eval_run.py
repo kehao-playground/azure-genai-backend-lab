@@ -13,7 +13,7 @@ N independent judge repeats over it, stability reporting that never computes
 a rate, and the evidence sidecar (`run_judged_layer`, `derive_judged_result`,
 `render_report`, `evidence_document`, wired to `--judge`/`--repeats`), plus
 the human-adjudication companion that keeps the sidecar's answer hashes
-checkable while the sidecar itself stays reference-only (`JudgedTranscript`,
+checkable while the sidecar's own records stay text-free (`JudgedTranscript`,
 `answers_document`, wired to `--answers-out`)
 (design `drafts/research/day-28-evaluation.md` r04,
 §4/§5/§6/§7/§7.1/§7.2/§7.3/§7.4/§7.5/§8/§9; implementation plan
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -1213,8 +1214,12 @@ class TranscriptSource:
     one with optional fields: `JudgedSource` is what the evidence sidecar
     records, and it stays reference-only by construction (Day 22's audit-log
     discipline), so no later change to `evidence_document` can quietly turn
-    the sidecar into a second copy of the corpus. Source text lives here, in
-    the opt-in companion file, or nowhere.
+    the sidecar into a second copy of the corpus. Nothing the runner writes
+    puts source text anywhere but here, in the opt-in companion file -- which
+    is not the same as saying no source text can reach the sidecar: a judge
+    whose `rationale` or `unsupported_claims` quotes a retrieved chunk puts
+    that quotation into the repeat's `raw_response`, the same mechanism
+    `answers_document`'s docstring records for the answer itself.
 
     `heading_path` is here for one reason and it is not symmetry with the
     sidecar: `sources_sha256` hashes exactly
@@ -2115,6 +2120,39 @@ async def calibration_document(
     return document
 
 
+def _write_artifact(path: Path, payload: bytes) -> None:
+    """Write `payload` to `path` without ever leaving a partial file there.
+
+    `Path.write_bytes` truncates the destination and then streams into it, so a
+    failure part-way -- `ENOSPC` is the realistic one -- leaves a truncated
+    artifact where a whole one used to be, and a truncated JSON document is not
+    distinguishable from a whole one without parsing it. Both files this runner
+    writes are records of a run that has already been paid for, and the
+    companion is the one nothing else can reconstruct, so the payload goes to a
+    temp file beside the destination and is moved into place with
+    `Path.replace`: rename within one directory is atomic, so a reader sees the
+    previous content or the new content and never half of either.
+
+    Beside the destination, not in the system temp directory, because
+    `Path.replace` degrades to a copy across filesystems and stops being
+    atomic. The temp file is removed on failure so a run that could not write
+    leaves the directory as it found it. `OSError` propagates unchanged: this
+    function decides nothing about the run's outcome, the caller reports it and
+    sets the exit code.
+    """
+    tmp = path.parent / f".{path.name}.{secrets.token_hex(4)}.tmp"
+    try:
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+    except OSError:
+        # Cleanup must never replace the failure worth reporting: if the temp
+        # file cannot be removed either, the write error is still the one that
+        # reaches the caller.
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
 def _utc_now() -> str:
     """UTC timestamp for the evidence sidecar's run bounds, seconds
     precision -- the sidecar records when a run happened, not how long its
@@ -2192,13 +2230,18 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "Write the human-adjudication companion to this path as canonical "
-            "JSON (--judge only): one entry per billed pass-B answer, carrying "
-            "the answer text and the source text behind it alongside the same "
-            "hashes the sidecar records. This is the file a human reads to "
-            "adjudicate a judged run, and the file that makes the sidecar's "
-            "answer_sha256 and sources_sha256 checkable -- the sidecar stores "
-            "hashes only, so neither digest can be recomputed from it alone. "
-            "It carries model output text; the sidecar deliberately does not."
+            "JSON (needs --judge and --evidence-out): one entry per billed "
+            "pass-B answer, carrying the answer text and the source text "
+            "behind it alongside the same hashes the sidecar records. This is "
+            "the file a human reads to adjudicate a judged run, and the file "
+            "that makes the sidecar's answer_sha256 and sources_sha256 "
+            "recomputable rather than merely readable -- neither can be "
+            "checked against the sidecar alone. It is the only file this "
+            "runner writes the answer into: the sidecar has no field that "
+            "records it. That is not the same as the sidecar carrying no "
+            "model text -- it keeps every judge repeat's verbatim response, "
+            "which is model prose and can quote the answer back. See "
+            "docs/evaluation.md section 8.1."
         ),
     )
     return parser.parse_args(argv)
@@ -2435,8 +2478,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Same `run_id` value the sidecar records below -- that identity is
             # the only thing pairing the two files.
             try:
-                args.answers_out.write_bytes(
-                    canonical_json(answers_document(run_id=run_id, transcripts=transcripts))
+                _write_artifact(
+                    args.answers_out,
+                    canonical_json(answers_document(run_id=run_id, transcripts=transcripts)),
                 )
             except OSError as exc:
                 print(f"SETUP FAILURE: could not write answers: {exc}", file=sys.stderr)
@@ -2464,7 +2508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 write_failed = True
             if evidence_doc is not None:
                 try:
-                    args.evidence_out.write_bytes(canonical_json(evidence_doc))
+                    _write_artifact(args.evidence_out, canonical_json(evidence_doc))
                 except OSError as exc:
                     # Deliberately not a blanket `except Exception`, which would
                     # hide genuine bugs behind exit 2. On a judged run the

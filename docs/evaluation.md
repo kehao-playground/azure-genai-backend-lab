@@ -572,16 +572,27 @@ readable:
   SHA-256 the bytes. The companion carries those four fields for exactly
   this reason.
 
-**`judge_input_sha256`** is recomputable too, with one more input. It covers
-the whole judge input, so a reader needs the question, the answer and every
-source the judge saw (companion), each repeat's `nonce` — recorded in the
-sidecar, a fence label rather than a secret — and the case's
+**`judge_input_sha256`** is recomputable too, with one more input and more
+care. It covers the whole judge input, so a reader needs the question, the
+answer and every source the judge saw (companion), each repeat's `nonce` —
+recorded in the sidecar, a fence label rather than a secret — and the case's
 `expected_facts` / `forbidden_facts` / `rubric`, which live in the dataset
-the sidecar pins by `dataset_sha256` at the `lab_commit` it names. The one
-thing not in any artifact is the fence format itself, which the reader takes
-from `_fence` in `tools/eval_run.py`: `BEGIN UNTRUSTED {label} {nonce}` (and
-` {n}` for the nth source), then the value, then the matching `END` line;
-the assembled object is encoded the same canonical way and hashed.
+the sidecar pins by `dataset_sha256` at the `lab_commit` it names.
+
+What no artifact carries is the *shape* of that input, and the reader takes
+it from `build_judge_input` in `tools/eval_run.py` — not from `_fence`
+alone, which is the neighbouring helper and gives only the framing
+(`BEGIN UNTRUSTED ANSWER {nonce}` for the answer, `BEGIN UNTRUSTED SOURCE
+{nonce} {n}` for the nth source counting from 1, then the value, then the
+matching `END` line). Two of `build_judge_input`'s rules are not guessable
+from the companion, and each one alone makes every repeat mismatch:
+
+- the judge input's sources are `{doc_id, heading_path, content}` — **no
+  `chunk_id`**, even though the companion carries one and the
+  `sources_sha256` exercise directly above uses it;
+- `rubric` is **omitted entirely** when the case has none, never sent as
+  `null` — and most judged cases in the shipped dataset are on that side of
+  the branch.
 
 `JudgeRepeat`'s docstring calls that digest a provenance token, and it is
 right about what it says: no reader can recompute it **from the sidecar
@@ -589,7 +600,8 @@ alone**. With the companion beside it, they can — this repo's own test suite
 rebuilds it longhand, from the two files plus the dataset, without importing
 the runner. So the limit is narrower than "one hash you cannot check": every
 digest either file records can be recomputed, and what a reader must supply
-beyond the two files is the pinned dataset and one documented text format.
+beyond the two files is the pinned dataset and the judge input's shape, read
+out of the function that builds it.
 
 The companion holds one entry per answer pass B actually produced —
 including the `pass_a_pass_b_sources_sha256_mismatch` case, where no verdict
