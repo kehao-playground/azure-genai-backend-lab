@@ -2968,6 +2968,58 @@ def test_companion_answer_text_hashes_to_the_sidecars_answer_sha256(
     assert checked, "no judged case carried repeats; the relationship went unchecked"
 
 
+def test_sources_sha256_is_recomputable_from_the_companion_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The other half of "the companion makes the sidecar's hashes checkable".
+    # `answer_sha256` is one string's digest; `sources_sha256` is a digest over
+    # a structure, and it is only recomputable if the companion carries every
+    # field that structure contains -- `{doc_id, chunk_id, heading_path,
+    # content}` per source -- in the rank order the hash is computed over.
+    #
+    # Rebuilt here from the companion document by itself: no `SearchHit`, no
+    # `sources_sha256`, no `canonical_json`. The encoding is spelled out the
+    # way a reader following docs/evaluation.md would spell it (UTF-8, sorted
+    # keys, compact separators, array order preserved), so this test fails if
+    # the companion stops carrying what the hash needs -- which is the claim --
+    # rather than merely agreeing with the runner about how to hash.
+    import hashlib
+
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+    evidence = json.loads(raw_evidence)
+    by_case = {entry["case_id"]: entry for entry in companion["cases"]}
+
+    checked = 0
+    for case_doc in evidence["cases"]:
+        judged_doc = case_doc["judged"]
+        if judged_doc is None or not judged_doc["repeats"]:
+            continue
+        entry = by_case[case_doc["id"]]
+        payload = [
+            {
+                "doc_id": source["doc_id"],
+                "chunk_id": source["chunk_id"],
+                "heading_path": source["heading_path"],
+                "content": source["content"],
+            }
+            for source in entry["sources"]
+        ]
+        encoded = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        recomputed = hashlib.sha256(encoded).hexdigest()
+
+        assert recomputed == judged_doc["repeats"][0]["sources_sha256"]
+        # And the companion's own claim about itself agrees with both.
+        assert recomputed == entry["sources_sha256"]
+        # A digest over an empty list would satisfy the equality above while
+        # proving nothing about the fields; this run retrieved real chunks.
+        assert entry["sources"]
+        checked += 1
+
+    assert checked, "no judged case carried repeats; the relationship went unchecked"
+
+
 def _as_json_string_body(text: str) -> bytes:
     """The bytes `canonical_json` would write for `text` inside a JSON string,
     minus the surrounding quotes.
@@ -3369,6 +3421,7 @@ def test_answers_document_shape_for_hand_built_transcripts() -> None:
             TranscriptSource(
                 doc_id="returns-policy",
                 chunk_id="c-0001",
+                heading_path="Returns Policy > Standard purchases",
                 content_sha256=sha256_hex(b"chunk text"),
                 content="chunk text",
             ),
@@ -3392,6 +3445,7 @@ def test_answers_document_shape_for_hand_built_transcripts() -> None:
                     {
                         "doc_id": "returns-policy",
                         "chunk_id": "c-0001",
+                        "heading_path": "Returns Policy > Standard purchases",
                         "content_sha256": sha256_hex(b"chunk text"),
                         "content": "chunk text",
                     }
