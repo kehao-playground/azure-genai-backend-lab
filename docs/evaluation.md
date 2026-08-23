@@ -252,6 +252,7 @@ uv run python tools/eval_run.py --judge                 # + judged layer; needs 
 uv run python tools/eval_run.py --judge --repeats 5      # + N judge repeats per case (default is already 5)
 uv run python tools/eval_run.py --calibrate --lab-root .  # retrieval-only calibration document, no generation
 uv run python tools/eval_run.py --judge --evidence-out run.json  # + write the replayable evidence sidecar
+uv run python tools/eval_run.py --judge --evidence-out run.json --answers-out answers.json  # + the answers a human adjudicates (§8.1)
 ```
 
 `--evidence-out` is what turns a judged run into a record someone can check
@@ -260,6 +261,17 @@ responses; the sidecar carries them, as canonical JSON (sorted keys, compact
 separators) so two runs can be diffed and the file itself hashed. It is
 written even when the deterministic gate fails — the run a reader most wants
 to replay is the one that failed.
+
+`--answers-out` writes the companion file §8.1 describes: the answer text
+the sidecar records only a hash of. Same canonical encoding, same
+write-it-anyway-on-a-gate-failure rule, and the same class of refusal when
+it cannot be honoured — `SETUP_FAILED` (exit 2), before anything is built
+and before a single provider call is spent, if it is passed without
+`--judge`, if its parent directory does not exist, or if it resolves to the
+same file as `--evidence-out`. That last one is a refusal rather than a
+last-write-wins because the two files are only usable as a pair: one would
+overwrite the other, and what survives looks like a complete record of a run
+that kept both.
 
 Without `--judge`, the process makes zero provider calls: it runs the fake
 LLM over the corpus-seeded fake search, scores every case's deterministic
@@ -489,6 +501,56 @@ against a specific, hash-identified answer. The judged layer's automated
 verdict is not a substitute authority; it is a second, repeated,
 machine-produced opinion that a human's read can agree or disagree with,
 on the same evidence.
+
+### 8.1 The companion the adjudication reads: `--answers-out`
+
+That step needs the answer, and the sidecar does not have it. The sidecar
+is reference-only by construction — ids, counts, outcomes, and hashes, the
+same discipline Day 22's audit log follows — so for each judged case it
+records an `answer_sha256` whose input is stored nowhere. Two consequences
+follow, and both are real:
+
+- **Nobody can adjudicate an answer nobody kept.** Reading the judge's own
+  `rationale` instead would be circular: that is the judge's claim *about*
+  the answer, not the answer.
+- **Nobody can check the hash.** `JudgeRepeat`'s own docstring already says
+  `judge_input_sha256` is a provenance token rather than a verifiable
+  digest, for exactly this reason. It proves two repeats sent identical
+  input; it cannot say what that input was.
+
+The fix is not to put the text into the sidecar. It is a second, opt-in
+file, written by `--answers-out`:
+
+| | `--evidence-out` sidecar | `--answers-out` companion |
+|---|---|---|
+| Carries | Hashes, ids, counts, outcomes, each repeat's raw judge response | The pass-B answer text, and the text of every source behind it |
+| Model output text? | Never | Yes — that is the whole point of it |
+| Written when | `--judge` | `--judge`, and only if asked for |
+| One entry per | Every case in the dataset | Every *billed* pass-B answer |
+
+`run_id` is what binds the two: the runner draws it once and stamps the
+same value into both files, so a human verdict recorded against a `run_id`
+and an `answer_sha256` (§8) names exactly one answer in exactly one
+companion. The `kind` fields differ (`day28-eval-answers` versus
+`day28-judged-evaluation-run`) so the two can never be mistaken for one
+another.
+
+With both files in hand, the sidecar's hash becomes checkable: take the
+companion's `answer` for a case, SHA-256 its UTF-8 bytes, and compare
+against that case's `answer_sha256` in the sidecar. Each source's
+`content_sha256` checks the same way against its own `content`. Two hashes
+stay provenance tokens even so — `sources_sha256` and `judge_input_sha256`
+both cover fields the companion does not carry (`heading_path`, and for the
+judge input also the per-repeat nonce and the fence framing around every
+value), so they still prove two repeats sent identical input without
+letting a reader reconstruct it.
+
+The companion holds one entry per answer pass B actually produced —
+including the `pass_a_pass_b_sources_sha256_mismatch` case, where no verdict
+follows but the answer was billed all the same. Cases that were skipped, or
+that never reached an answer, are absent rather than present-and-empty:
+there is nothing to adjudicate for them, and an empty row would invite
+someone to try.
 
 ## 9. What this does not measure
 
