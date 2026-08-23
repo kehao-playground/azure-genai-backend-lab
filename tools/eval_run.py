@@ -11,7 +11,10 @@ checked strict parsing (`build_judge_input`, `parse_judge_response`,
 `derive_judge_verdict`) -- and passes B/C: a real second generation per case,
 N independent judge repeats over it, stability reporting that never computes
 a rate, and the evidence sidecar (`run_judged_layer`, `derive_judged_result`,
-`render_report`, `evidence_document`, wired to `--judge`/`--repeats`)
+`render_report`, `evidence_document`, wired to `--judge`/`--repeats`), plus
+the human-adjudication companion that keeps the sidecar's answer hashes
+checkable while the sidecar itself stays reference-only (`JudgedTranscript`,
+`answers_document`, wired to `--answers-out`)
 (design `drafts/research/day-28-evaluation.md` r04,
 §4/§5/§6/§7/§7.1/§7.2/§7.3/§7.4/§7.5/§8/§9; implementation plan
 `plans/day-28-implementation-plan.md` Tasks 1-6).
@@ -1201,6 +1204,85 @@ def _judged_sources(hits: Sequence[SearchHit]) -> tuple[JudgedSource, ...]:
 
 
 @dataclass(frozen=True)
+class TranscriptSource:
+    """One chunk pass B put in front of the judge, *with its text*.
+
+    The same three identity fields `JudgedSource` carries, plus the content
+    itself. That one extra field is the whole difference between the two
+    types, and it is why they are two types rather than one with an optional
+    field: `JudgedSource` is what the evidence sidecar records, and it stays
+    reference-only by construction (Day 22's audit-log discipline), so no
+    later change to `evidence_document` can quietly turn the sidecar into a
+    second copy of the corpus. Source text lives here, in the opt-in
+    companion file, or nowhere.
+    """
+
+    doc_id: str
+    chunk_id: str
+    content_sha256: str
+    content: str
+
+
+@dataclass(frozen=True)
+class JudgedTranscript:
+    """One billed pass-B answer in full text, carrying the same hashes the
+    sidecar records for that case (design §5.3).
+
+    §5.3 requires a *human* adjudication of the judged layer, recorded in the
+    evidence file and bound to `run_id` + `answer_sha256`. The sidecar alone
+    cannot support that step: `JudgeRepeat`'s own docstring says
+    `judge_input_sha256` is "a provenance token, not a verifiable digest",
+    because the verbatim answer and every source content it covers are stored
+    nowhere as text. Nobody can adjudicate an answer nobody kept, and reading
+    the judge's `rationale` instead would be circular -- that is the judge's
+    claim *about* the answer, not the answer.
+
+    `answer_sha256` and `sources_sha256` are produced by the module-level
+    `answer_sha256`/`sources_sha256` functions over the same values
+    `_judge_once` hashes, so a reader can hash this file's `answer` and check
+    it against the sidecar's recorded digest for the same `run_id` and case.
+    That check is the point: it turns the sidecar's unrecomputable hash into a
+    verifiable one without putting a single byte of model output into the
+    sidecar itself.
+    """
+
+    case_id: str
+    question: str
+    answer: str
+    answer_sha256: str
+    sources: tuple[TranscriptSource, ...]
+    sources_sha256: str
+
+
+def _judged_transcript(case: EvalCase, answer: str, hits: Sequence[SearchHit]) -> JudgedTranscript:
+    """Project one billed pass-B answer into its companion record.
+
+    Both hashes come from `answer_sha256`/`sources_sha256` -- the same two
+    functions `_judge_once` hashes every repeat with, over the same `answer`
+    and `hits` -- rather than from a second encoding written here, so the
+    companion and the sidecar cannot drift into disagreeing about one answer.
+    `content_sha256` is likewise computed exactly as `_judged_sources`
+    computes it, so the two projections of the same hit agree field for field.
+    """
+    return JudgedTranscript(
+        case_id=case.id,
+        question=case.question,
+        answer=answer,
+        answer_sha256=answer_sha256(answer),
+        sources=tuple(
+            TranscriptSource(
+                doc_id=_doc_id_from_parent_id(hit.parent_id),
+                chunk_id=hit.chunk_id,
+                content_sha256=sha256_hex(hit.content.encode("utf-8")),
+                content=hit.content,
+            )
+            for hit in hits
+        ),
+        sources_sha256=sources_sha256(hits),
+    )
+
+
+@dataclass(frozen=True)
 class JudgedResult:
     """One case's judged-layer outcome (design §7.4/§7.5).
 
@@ -1413,6 +1495,7 @@ async def run_judged_layer(
     *,
     repeats: int,
     nonce_factory: Callable[[], str] = _default_judge_nonce,
+    transcript_sink: Callable[[JudgedTranscript], None] | None = None,
 ) -> dict[str, JudgedResult]:
     """Run the judged layer (passes B and C, design §7.1) over every case in
     `cases`, keyed by case id.
@@ -1450,6 +1533,26 @@ async def run_judged_layer(
     left empty -- judging is not attempted at all when the run itself did
     not reproduce. Only then does judging run, and its outcome is
     `derive_judged_result`'s.
+
+    `transcript_sink`, when given, is called with one `JudgedTranscript` per
+    billed pass-B answer -- **emitted exactly when pass B produced an answer**,
+    which is the single point below where that has just become true, before the
+    `sources_sha256` comparison branches. So a transcript is emitted on the
+    `pass_a_pass_b_sources_sha256_mismatch` branch as well as on the normal
+    judged branch (that branch's whole diagnostic question is which chunks each
+    pass saw, and the answer it recorded was paid for), and never for
+    `SKIPPED`, for pass A `no_answer`, for a pass B `UpstreamError`, or for pass
+    B `no_answer` -- in each of those there is no answer to record and none was
+    billed. One emission point rather than one per branch, so the rule is
+    enforced by position instead of by several call sites that merely agree
+    today.
+
+    A callback, deliberately, and not a field on `JudgedResult` or a second
+    return value: `JudgedResult` carries no text by construction, so no future
+    change to `evidence_document` -- which sees only `JudgedResult`s -- can leak
+    answer or source text into the reference-only sidecar by accident. The text
+    reaches exactly one place, the caller's opt-in `--answers-out` companion
+    (`answers_document`), or nowhere at all when no sink is passed.
     """
     # Pass C is built from the same forced-real settings as pass B. Passing
     # bare `settings` here was a real bug: `build_seeded_rag_service` applies
@@ -1520,6 +1623,19 @@ async def run_judged_layer(
                     )
                     continue
 
+                # RagAnswer's own __post_init__ invariant: status="answered"
+                # requires answer to be set. Asserted here, above the branch
+                # below, because both sides of it need the answer: the judged
+                # path judges it, and the mismatch path still has to record it.
+                assert pass_b.answer is not None
+                # The one emission point for the whole layer, and it sits here
+                # for a reason: this line is reached exactly when pass B
+                # produced an answer, so the emission rule in this function's
+                # docstring is a property of where this call is, not of several
+                # branches agreeing to make it.
+                if transcript_sink is not None:
+                    transcript_sink(_judged_transcript(case, pass_b.answer, pass_b.hits))
+
                 if sources_sha256(pass_a.hits) != sources_sha256(pass_b.hits):
                     # Pass B ran, answered, and was billed here -- unlike every
                     # other early exit. Its usage and hits are recorded even
@@ -1538,9 +1654,6 @@ async def run_judged_layer(
                     )
                     continue
 
-                # RagAnswer's own __post_init__ invariant: status="answered"
-                # requires answer to be set.
-                assert pass_b.answer is not None
                 repeats_run = await run_judge_repeats(
                     case,
                     pass_b.answer,
@@ -1793,6 +1906,57 @@ def evidence_document(
     return document
 
 
+def answers_document(*, run_id: str, transcripts: Sequence[JudgedTranscript]) -> dict[str, object]:
+    """Assemble the human-adjudication companion to the evidence sidecar
+    (design §5.3), written by `--answers-out`.
+
+    Two files rather than one field added to the sidecar, deliberately: the
+    sidecar stays content-free and reference-only (Day 22's audit log,
+    mirrored), and this one carries the text that makes §5.3's human step
+    possible at all. `run_id` is the only thing binding the pair, so `main()`
+    passes the *same* value to both builders rather than calling `_run_id()` a
+    second time. `kind` differs from the sidecar's (`day28-eval-answers`
+    versus `day28-judged-evaluation-run`) for the same reason the ids matter:
+    two files a reader could mistake for each other would let one run's
+    answers be adjudicated against another run's hashes.
+
+    Every case here is one billed pass-B answer, in the order
+    `run_judged_layer` produced them (dataset order); cases pass B never
+    answered are absent rather than present-and-empty, because there is no
+    answer to adjudicate for them and an empty entry would invite one.
+
+    Everything in `answer` and `sources[].content` is text this runner did not
+    write -- the model's own output and the retrieved corpus. None of it is
+    parsed, summarised, or interpolated into prose: each value sits inside its
+    own JSON string field, the same containment `evidence_document` gives a
+    repeat's `raw_response`. Nothing here computes a rate or a percentage
+    (design §9); this document holds text and hashes, and counts nothing.
+    """
+    return {
+        "kind": "day28-eval-answers",
+        "run_id": run_id,
+        "cases": [
+            {
+                "case_id": transcript.case_id,
+                "question": transcript.question,
+                "answer": transcript.answer,
+                "answer_sha256": transcript.answer_sha256,
+                "sources_sha256": transcript.sources_sha256,
+                "sources": [
+                    {
+                        "doc_id": source.doc_id,
+                        "chunk_id": source.chunk_id,
+                        "content_sha256": source.content_sha256,
+                        "content": source.content,
+                    }
+                    for source in transcript.sources
+                ],
+            }
+            for transcript in transcripts
+        ],
+    }
+
+
 def _resolve_lab_root(lab_root: Path) -> Path:
     """Fail-closed guard 1/2 (mirrors `calibrate_probe.py`'s `resolve_lab_root`):
     `lab_root` must be a git worktree, and the `azgenai_lab` package actually
@@ -1930,7 +2094,9 @@ def _run_id() -> str:
     Random rather than derived from a timestamp: two runs started in the same
     second must not share an id, and the human verdict recorded in the
     evidence file is bound to this value (design §5.3), so a collision would
-    attach one run's adjudication to another's answers.
+    attach one run's adjudication to another's answers. It is also the only
+    field pairing that evidence sidecar with its `--answers-out` companion,
+    which is why `main()` draws it once and passes the one value to both.
     """
     return f"run-{secrets.token_hex(6)}"
 
@@ -1979,6 +2145,21 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "canonical JSON (--judge only). Without it the run leaves no "
             "replayable record -- the console report deliberately omits the "
             "hashes and raw responses the sidecar carries."
+        ),
+    )
+    parser.add_argument(
+        "--answers-out",
+        type=Path,
+        default=None,
+        help=(
+            "Write the human-adjudication companion to this path as canonical "
+            "JSON (--judge only): one entry per billed pass-B answer, carrying "
+            "the answer text and the source text behind it alongside the same "
+            "hashes the sidecar records. This is the file a human reads to "
+            "adjudicate a judged run, and the file that makes the sidecar's "
+            "answer_sha256 checkable -- the sidecar stores hashes only, so "
+            "that digest cannot be recomputed from it alone. It carries model "
+            "output text; the sidecar deliberately does not."
         ),
     )
     return parser.parse_args(argv)
@@ -2038,6 +2219,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return ExitCode.SETUP_FAILED
 
+    # Same shape, same reason: the companion only ever has content on the
+    # judged path (its entries are pass B's answers), so without --judge it
+    # would silently write an empty document -- or nothing at all -- and the
+    # caller who asked for something to adjudicate would get a clean exit 0.
+    if not args.judge and args.answers_out is not None:
+        print(
+            "SETUP FAILURE: --answers-out records a judged run; it needs --judge.",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
     # Any non-default --repeats, not just an invalid one. Rejecting `0` while
     # silently ignoring `3` would be two policies for one flag, decided by the
     # value rather than by whether the flag applies at all.
@@ -2059,6 +2251,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"SETUP FAILURE: --evidence-out directory does not exist: "
             f"{args.evidence_out.parent}",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    if args.answers_out is not None and not args.answers_out.parent.is_dir():
+        print(
+            f"SETUP FAILURE: --answers-out directory does not exist: {args.answers_out.parent}",
+            file=sys.stderr,
+        )
+        return ExitCode.SETUP_FAILED
+
+    # Resolved, not compared as written: `run.json` and `./run.json` are one
+    # file, and the second write would silently clobber the first. What
+    # survives is a run that looks like it recorded both the hashes and the
+    # text but kept only one of them -- and the two are only usable as a pair,
+    # since checking an answer against its digest needs both files. A refusal
+    # before any provider call is spent is strictly better than that.
+    if (
+        args.evidence_out is not None
+        and args.answers_out is not None
+        and args.evidence_out.resolve() == args.answers_out.resolve()
+    ):
+        print(
+            f"SETUP FAILURE: --evidence-out and --answers-out are the same file "
+            f"({args.answers_out.resolve()}); one would overwrite the other.",
             file=sys.stderr,
         )
         return ExitCode.SETUP_FAILED
@@ -2108,13 +2325,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         run_id = _run_id()
         started_at = _utc_now()
+        # Collected only when asked for: without --answers-out no sink is
+        # passed, so the layer holds no answer text in memory at all rather
+        # than accumulating text this run was never going to write.
+        transcripts: list[JudgedTranscript] = []
         # design §7.5: `--judge` without credentials exits 2, not 0 -- a
         # ValueError here means
         # build_chat_service (via build_seeded_rag_service, forced real) or
         # resolve_aoai_auth rejected the credentials before any judged
         # verdict exists, which is a setup failure, not a gate failure.
         try:
-            judged = asyncio.run(run_judged_layer(cases, service, settings, repeats=args.repeats))
+            judged = asyncio.run(
+                run_judged_layer(
+                    cases,
+                    service,
+                    settings,
+                    repeats=args.repeats,
+                    transcript_sink=(transcripts.append if args.answers_out is not None else None),
+                )
+            )
         except ValueError as exc:
             # Class name, not a fixed diagnosis: this also catches
             # `build_judge_input`'s judged=None guard and every ValueError from
@@ -2158,6 +2387,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"SETUP FAILURE: could not write evidence: {exc}", file=sys.stderr)
                 return ExitCode.SETUP_FAILED
             print(f"evidence written to {args.evidence_out}", file=sys.stderr)
+        if args.answers_out is not None:
+            # Written on the same terms as the sidecar, and for the same
+            # reason: what it holds was already paid for by the time this line
+            # is reached, so a gate failure must still leave it behind. Same
+            # `run_id` value the sidecar above recorded -- that identity is the
+            # only thing pairing the two files.
+            try:
+                args.answers_out.write_bytes(
+                    canonical_json(answers_document(run_id=run_id, transcripts=transcripts))
+                )
+            except OSError as exc:
+                print(f"SETUP FAILURE: could not write answers: {exc}", file=sys.stderr)
+                return ExitCode.SETUP_FAILED
+            print(f"answers written to {args.answers_out}", file=sys.stderr)
         return gate_exit_code(propagated)
     finally:
         asyncio.run(service.aclose())

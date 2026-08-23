@@ -80,6 +80,9 @@ run_judge_repeats = eval_run.run_judge_repeats
 run_judged_layer = eval_run.run_judged_layer
 render_report = eval_run.render_report
 evidence_document = eval_run.evidence_document
+JudgedTranscript = eval_run.JudgedTranscript
+TranscriptSource = eval_run.TranscriptSource
+answers_document = eval_run.answers_document
 
 # The real lab worktree these tests run in -- test_eval_run.py lives at
 # tests/unit/, two levels below the repo root.
@@ -2878,3 +2881,531 @@ def test_main_without_judge_flag_never_reaches_the_real_llm_branch(
     monkeypatch.setattr(eval_run, "build_chat_service", _guarded)
 
     assert eval_run.main([]) == ExitCode.OK
+
+
+# --- --answers-out: the human-adjudication companion (Task 12) ---
+#
+# The sidecar records `answer_sha256` for every judged case but stores the
+# answer nowhere, so design §5.3's human adjudication -- bound to `run_id` +
+# `answer_sha256` -- had nothing to read, and the hash itself was
+# unrecomputable by anyone holding only the sidecar. These tests pin the
+# companion that fixes both, and pin that fixing it did not put a single byte
+# of model output into the sidecar.
+
+_COMPANION_ANSWER = "A standard purchase may be returned within 30 days of delivery."
+
+
+def _run_main_with_both_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[bytes, dict[str, object]]:
+    """Drive `main()` once with `--evidence-out` and `--answers-out` both set,
+    returning the sidecar's raw bytes (test 2 asserts on bytes, not on parsed
+    values) and the parsed companion.
+
+    The judge stub answers with unparseable text on purpose: every repeat is
+    then `ERROR(parse)` and every case `INCONCLUSIVE`, which is the harder
+    shape for these assertions -- the repeats, and therefore the recorded
+    `answer_sha256`, still exist, and so must the answer they hash.
+    """
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(ChatResult(message=_COMPANION_ANSWER, model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    evidence_out = tmp_path / "evidence.json"
+    answers_out = tmp_path / "answers.json"
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--repeats",
+            "1",
+            "--evidence-out",
+            str(evidence_out),
+            "--answers-out",
+            str(answers_out),
+        ]
+    )
+
+    assert exit_code == ExitCode.OK
+    raw_answers = answers_out.read_bytes()
+    # Canonical bytes, the same encoding discipline the sidecar is written
+    # with: this file is diffed and hashed like the sidecar is.
+    assert raw_answers == eval_run.canonical_json(json.loads(raw_answers))
+    return evidence_out.read_bytes(), json.loads(raw_answers)
+
+
+def test_companion_answer_text_hashes_to_the_sidecars_answer_sha256(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The property this whole flag exists for, asserted as a *relationship*
+    # between the two files rather than as two independently hard-coded
+    # strings: hash the companion's answer text, and the digest the sidecar
+    # recorded for the same case in the same run must come back.
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+    evidence = json.loads(raw_evidence)
+
+    by_case = {entry["case_id"]: entry for entry in companion["cases"]}
+    assert by_case, "the run judged at least one case; the companion recorded none"
+
+    checked = 0
+    for case_doc in evidence["cases"]:
+        judged_doc = case_doc["judged"]
+        if judged_doc is None or not judged_doc["repeats"]:
+            continue
+        entry = by_case[case_doc["id"]]
+        for repeat in judged_doc["repeats"]:
+            assert sha256_hex(entry["answer"].encode("utf-8")) == repeat["answer_sha256"]
+        # The companion states the same digest itself, so a reader who checks
+        # it never has to open the sidecar to know what to compare against.
+        assert entry["answer_sha256"] == judged_doc["repeats"][0]["answer_sha256"]
+        # Each source's own content is checkable the same way.
+        for source in entry["sources"]:
+            assert sha256_hex(source["content"].encode("utf-8")) == source["content_sha256"]
+        checked += 1
+
+    assert checked, "no judged case carried repeats; the relationship went unchecked"
+
+
+def _as_json_string_body(text: str) -> bytes:
+    """The bytes `canonical_json` would write for `text` inside a JSON string,
+    minus the surrounding quotes.
+
+    Searching the sidecar for `text.encode("utf-8")` directly is not the same
+    check and quietly weaker: a corpus chunk contains newlines, which JSON
+    writes as the two characters `\\n`, so the decoded form is absent from the
+    bytes whether or not the text leaked. Mutation M2b (`_judged_sources`
+    recording raw content where it promises a hash) survived exactly that
+    version of this test. Dropping the quotes rather than keeping them is
+    deliberate too: a leak that concatenated the text into some longer string
+    would still be found.
+    """
+    return json.dumps(text, ensure_ascii=False)[1:-1].encode("utf-8")
+
+
+def test_the_evidence_sidecar_bytes_never_contain_the_answer_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The sidecar stays content-free and reference-only (Day 22's audit log,
+    # mirrored). Asserted on the canonical bytes, not on a walk of the parsed
+    # document, so a leak through any key at any depth -- one this test never
+    # thought to look under -- is still caught.
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+
+    assert _as_json_string_body(_COMPANION_ANSWER) not in raw_evidence
+    # The text is not merely absent everywhere; it is present in the one file
+    # that is supposed to have it.
+    assert any(entry["answer"] == _COMPANION_ANSWER for entry in companion["cases"])
+    # Source text is the sidecar's other content-free promise: it records each
+    # chunk's hash, never the chunk.
+    checked = 0
+    for entry in companion["cases"]:
+        for source in entry["sources"]:
+            assert _as_json_string_body(source["content"]) not in raw_evidence
+            checked += 1
+    assert checked, "no source text was checked; the corpus half went unasserted"
+
+
+def test_both_records_carry_the_same_run_id_and_their_own_kinds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `run_id` is the only field pairing the two files -- a human's verdict is
+    # bound to it (design §5.3), so two ids from two `_run_id()` calls would
+    # leave the pair unjoinable. The kinds differ for the opposite reason:
+    # nothing should be able to mistake one file for the other.
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+    evidence = json.loads(raw_evidence)
+
+    assert companion["run_id"] == evidence["run_id"]
+    assert companion["run_id"].startswith("run-")
+    assert companion["kind"] == "day28-eval-answers"
+    assert evidence["kind"] == "day28-judged-evaluation-run"
+    assert companion["kind"] != evidence["kind"]
+
+
+async def test_a_transcript_is_emitted_on_the_sources_mismatch_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pass B ran, answered, and was billed here -- the only early exit where
+    # that is true. The answer stays readable for exactly that reason: this is
+    # the branch whose diagnostic question is which chunks each pass saw, and
+    # it is answerable only if the answer that saw them survives.
+    settings = _judge_ready_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    principal = Principal(tenant_id=case.tenant, user_id=case.user, group_ids=case.groups)
+    pass_a = await fake_service.answer(case.question, principal)
+    mismatched = tuple(reversed(pass_a.hits))
+    assert mismatched != pass_a.hits
+
+    generation = _StaticChatService(ChatResult(message="the billed answer", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+    class _PassBService:
+        async def answer(self, question: str, principal: Principal) -> RagAnswer:
+            return RagAnswer(
+                status="answered",
+                answer="the billed answer",
+                hits=mismatched,
+                usage=None,
+                incomplete_reason=None,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        eval_run, "build_seeded_rag_service", lambda settings, *, use_fake_llm: _PassBService()
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    try:
+        results = await run_judged_layer(
+            [case], fake_service, settings, repeats=1, transcript_sink=transcripts.append
+        )
+    finally:
+        await fake_service.aclose()
+
+    assert results[case.id].reason == "pass_a_pass_b_sources_sha256_mismatch"
+    assert len(transcripts) == 1
+    transcript = transcripts[0]
+    assert transcript.case_id == case.id
+    assert transcript.question == case.question
+    assert transcript.answer == "the billed answer"
+    assert transcript.answer_sha256 == answer_sha256("the billed answer")
+    # Pass B's own hits, not pass A's: they are the ones the recorded answer
+    # was generated from, and telling the two sets apart is this branch's job.
+    assert [source.chunk_id for source in transcript.sources] == [
+        hit.chunk_id for hit in mismatched
+    ]
+    assert transcript.sources_sha256 == sources_sha256(mismatched)
+
+
+async def test_a_transcript_is_emitted_for_a_judged_case_with_the_sidecars_own_hashes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The normal branch, at the layer's own boundary: one transcript per billed
+    # answer, and its hashes are the same values the repeats carry into the
+    # sidecar -- computed by the same two functions, over the same answer and
+    # hits, so the pair cannot drift into disagreeing about one answer.
+    settings = _judge_ready_settings()
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = eval_run.build_seeded_rag_service(settings, use_fake_llm=True)
+
+    generation = _StaticChatService(ChatResult(message=_COMPANION_ANSWER, model_version="stub"))
+    judge = _StaticChatService(_pass_response(covered=("fact_standard_window_30_days",)))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    try:
+        results = await run_judged_layer(
+            [case], fake_service, settings, repeats=2, transcript_sink=transcripts.append
+        )
+    finally:
+        await fake_service.aclose()
+
+    result = results[case.id]
+    assert result.state == "JUDGED"
+    # Two repeats over one billed answer: the transcript counts answers, not
+    # judge calls.
+    assert len(result.repeats) == 2
+    assert len(transcripts) == 1
+    transcript = transcripts[0]
+    assert transcript.answer == _COMPANION_ANSWER
+    assert transcript.answer_sha256 == result.repeats[0].answer_sha256
+    assert transcript.sources_sha256 == result.repeats[0].sources_sha256
+    # The identity fields agree with the sidecar's own projection of the same
+    # hits, field for field, plus the content the sidecar deliberately omits.
+    assert [(s.doc_id, s.chunk_id, s.content_sha256) for s in transcript.sources] == [
+        (s.doc_id, s.chunk_id, s.content_sha256) for s in result.sources
+    ]
+    assert transcript.sources
+    for source in transcript.sources:
+        assert source.content_sha256 == sha256_hex(source.content.encode("utf-8"))
+
+
+async def test_no_transcript_for_a_skipped_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `judged: null`: nothing was generated and nothing was billed, so there is
+    # no answer to adjudicate. An entry here would be an empty row inviting a
+    # human to adjudicate something that never ran.
+    case = _case()  # judged=None, judged_skip_reason set
+    fake_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    results = await run_judged_layer(
+        [case],
+        fake_service,  # type: ignore[arg-type]
+        _judge_ready_settings(),
+        repeats=5,
+        transcript_sink=transcripts.append,
+    )
+
+    assert results[case.id].state == "SKIPPED"
+    assert transcripts == []
+
+
+async def test_no_transcript_when_pass_a_no_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pass A's structural no-answer is a structural no-answer for pass B too,
+    # so pass B is never called: no answer, no billing, no transcript.
+    case = _judged_eval_case("c1", "does not matter", expected=(_fact("f1"),))
+    fake_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    results = await run_judged_layer(
+        [case],
+        fake_service,  # type: ignore[arg-type]
+        _judge_ready_settings(),
+        repeats=5,
+        transcript_sink=transcripts.append,
+    )
+
+    assert results[case.id].reason == "no_answer_at_runtime"
+    assert transcripts == []
+
+
+async def test_no_transcript_when_pass_b_raises_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pass B raised, so no answer came back at all. Whether the call was
+    # nonetheless billed upstream is not something this runner can see (Day 9's
+    # same honest gap), and a transcript with no text in it would say the
+    # opposite of the truth.
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(_hit(tenant="acme", doc_id="returns-policy"),),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    generation = _StaticChatService(UpstreamTimeoutError("pass B generation timed out"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    results = await run_judged_layer(
+        [case],
+        fake_service,  # type: ignore[arg-type]
+        _judge_ready_settings(),
+        repeats=5,
+        transcript_sink=transcripts.append,
+    )
+
+    assert "pass_b_generation_error" in (results[case.id].reason or "")
+    assert transcripts == []
+
+
+async def test_no_transcript_when_pass_b_no_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pass B's own structural no-answer, a distinct branch from pass A's:
+    # `RagAnswer`'s invariant forces `answer=None` there, so there is
+    # literally no text an entry could carry.
+    case = _case_by_id("acme-refund-window-standard")
+    fake_service = _CannedAnswerService(
+        RagAnswer(
+            status="answered",
+            answer="[fake] pass A answer",
+            hits=(_hit(tenant="acme", doc_id="returns-policy"),),
+            usage=None,
+            incomplete_reason=None,
+        )
+    )
+    pass_b_service = _CannedAnswerService(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+    monkeypatch.setattr(
+        eval_run, "build_seeded_rag_service", lambda settings, *, use_fake_llm: pass_b_service
+    )
+    generation = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="unused", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    transcripts: list[JudgedTranscript] = []
+
+    results = await run_judged_layer(
+        [case],
+        fake_service,  # type: ignore[arg-type]
+        _judge_ready_settings(),
+        repeats=5,
+        transcript_sink=transcripts.append,
+    )
+
+    assert results[case.id].reason == "no_answer_at_runtime"
+    assert pass_b_service.calls == 1
+    assert transcripts == []
+
+
+def test_main_rejects_answers_out_without_judge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Its entries are pass B's answers, so off the judged path it can only ever
+    # write an empty document -- and a caller who asked for something to
+    # adjudicate would get exit 0 and a file with nothing in it.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once --answers-out is rejected")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+    out = tmp_path / "answers.json"
+
+    exit_code = eval_run.main(["--answers-out", str(out)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "--answers-out records a judged run; it needs --judge" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_main_rejects_answers_out_equal_to_evidence_out(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # One would clobber the other, and the survivor looks like a complete
+    # record of a run that recorded both. The two are only usable as a pair --
+    # checking an answer against its digest needs one of each -- so this is
+    # refused before a provider call is spent, not repaired afterwards.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once the two paths collide")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+    out = tmp_path / "run.json"
+    # Spelled two ways for one file. `pathlib` collapses a "." segment as it
+    # builds the path, so only a ".." through a real directory survives
+    # construction -- which is what makes this a test of the guard's own
+    # resolution rather than of `Path.__eq__`.
+    (tmp_path / "sub").mkdir()
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--evidence-out",
+            str(out),
+            "--answers-out",
+            str(tmp_path / "sub" / ".." / "run.json"),
+        ]
+    )
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "are the same file" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_main_rejects_an_unwritable_answers_out_before_any_provider_call(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The same expensive ordering bug the `--evidence-out` check exists for: a
+    # path that cannot be written is a setup failure, and finding that out
+    # after the judged layer has run means the answers were paid for and then
+    # discarded.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once --answers-out is rejected")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+    missing = tmp_path / "no-such-dir" / "answers.json"
+
+    exit_code = eval_run.main(["--judge", "--answers-out", str(missing)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "--answers-out directory does not exist" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def test_main_without_answers_out_writes_no_companion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The flag is opt-in: a judged run that did not ask for the text must not
+    # leave model output on disk anyway.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(ChatResult(message=_COMPANION_ANSWER, model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+    evidence_out = tmp_path / "evidence.json"
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1", "--evidence-out", str(evidence_out)])
+
+    assert exit_code == ExitCode.OK
+    assert [path.name for path in tmp_path.iterdir()] == ["evidence.json"]
+
+
+def test_answers_document_shape_for_hand_built_transcripts() -> None:
+    # The builder in isolation, so the shape is pinned independently of what a
+    # run happens to produce -- and so `run_id` is pinned as the caller's own
+    # value, never re-derived inside the builder.
+    transcript = JudgedTranscript(
+        case_id="acme-refund-window-standard",
+        question="how long do I have to return a standard purchase?",
+        answer="Thirty days from delivery.",
+        answer_sha256=answer_sha256("Thirty days from delivery."),
+        sources=(
+            TranscriptSource(
+                doc_id="returns-policy",
+                chunk_id="c-0001",
+                content_sha256=sha256_hex(b"chunk text"),
+                content="chunk text",
+            ),
+        ),
+        sources_sha256="s" * 64,
+    )
+
+    document = answers_document(run_id="run-abc123", transcripts=[transcript])
+
+    assert document == {
+        "kind": "day28-eval-answers",
+        "run_id": "run-abc123",
+        "cases": [
+            {
+                "case_id": "acme-refund-window-standard",
+                "question": "how long do I have to return a standard purchase?",
+                "answer": "Thirty days from delivery.",
+                "answer_sha256": answer_sha256("Thirty days from delivery."),
+                "sources_sha256": "s" * 64,
+                "sources": [
+                    {
+                        "doc_id": "returns-policy",
+                        "chunk_id": "c-0001",
+                        "content_sha256": sha256_hex(b"chunk text"),
+                        "content": "chunk text",
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_answers_document_with_no_transcripts_is_an_empty_case_list() -> None:
+    # A judged run where every case skipped or never reached an answer. The
+    # file still exists and still names its run; it just has nothing to
+    # adjudicate, which is a different statement from not being written.
+    document = answers_document(run_id="run-abc123", transcripts=[])
+
+    assert document["cases"] == []
+    assert document["run_id"] == "run-abc123"
