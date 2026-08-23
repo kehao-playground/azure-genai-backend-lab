@@ -2889,8 +2889,11 @@ def test_main_without_judge_flag_never_reaches_the_real_llm_branch(
 # answer nowhere, so design §5.3's human adjudication -- bound to `run_id` +
 # `answer_sha256` -- had nothing to read, and the hash itself was
 # unrecomputable by anyone holding only the sidecar. These tests pin the
-# companion that fixes both, and pin that fixing it did not put a single byte
-# of model output into the sidecar.
+# companion that fixes both, and pin that fixing it did not make the runner
+# write the answer into the sidecar. That is narrower than "no model text
+# reaches the sidecar", which is not true and never was: it keeps each judge
+# repeat's verbatim `raw_response`, and the stub judge used below returns
+# unparseable text, so no test here can see what a real judge would quote.
 
 _COMPANION_ANSWER = "A standard purchase may be returned within 30 days of delivery."
 
@@ -3380,12 +3383,20 @@ def test_main_rejects_an_unwritable_answers_out_before_any_provider_call(
 
     monkeypatch.setattr(eval_run, "build_chat_service", _never)
     missing = tmp_path / "no-such-dir" / "answers.json"
+    # A real `--evidence-out` alongside it: the companion requires one, and
+    # that guard sits above this one, so without it this test would stop at the
+    # wrong refusal and never reach the path check it is about.
+    evidence_out = tmp_path / "evidence.json"
 
-    exit_code = eval_run.main(["--judge", "--answers-out", str(missing)])
+    exit_code = eval_run.main(
+        ["--judge", "--evidence-out", str(evidence_out), "--answers-out", str(missing)]
+    )
 
     assert exit_code == ExitCode.SETUP_FAILED
     assert "--answers-out directory does not exist" in capsys.readouterr().err
     assert not missing.exists()
+    # Refused before anything was built, so the sidecar is not written either.
+    assert not evidence_out.exists()
 
 
 def test_main_without_answers_out_writes_no_companion(
@@ -3463,3 +3474,222 @@ def test_answers_document_with_no_transcripts_is_an_empty_case_list() -> None:
 
     assert document["cases"] == []
     assert document["run_id"] == "run-abc123"
+
+
+# --- Fix round 1: both records survive each other's failure, the companion is
+# never produced unpairable, and judge_input_sha256 is recomputable too ---
+
+
+def _judged_main_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The monkeypatch set every `main()`-level judged run below shares: real
+    settings, a generation stub that answers, and a judge stub whose response
+    parses so the repeats reach a verdict."""
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+    generation = _StaticChatService(ChatResult(message=_COMPANION_ANSWER, model_version="stub"))
+    judge = _StaticChatService(ChatResult(message="not valid json", model_version="stub"))
+    monkeypatch.setattr(
+        eval_run, "build_chat_service", _stub_build_chat_service_factory(generation, judge)
+    )
+
+
+def test_main_evidence_write_failure_still_leaves_the_companion_behind(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The two writes used to be sequential with the sidecar first and its
+    # failure paths returning, so an unwritable --evidence-out -- a path typo, a
+    # directory where a filename was meant, a full disk -- exited 2 with the
+    # companion never written. Every pass-B answer was already billed and is
+    # unrecoverable without paying for the run again, so that failure has to
+    # cost the sidecar only.
+    _judged_main_stubs(monkeypatch)
+    evidence_out = tmp_path / "evidence.json"
+    evidence_out.mkdir()  # write raises IsADirectoryError, an OSError
+    answers_out = tmp_path / "answers.json"
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--repeats",
+            "1",
+            "--evidence-out",
+            str(evidence_out),
+            "--answers-out",
+            str(answers_out),
+        ]
+    )
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    captured = capsys.readouterr()
+    assert "could not write evidence" in captured.err
+    # The billed text is on disk, and it is a whole, canonical document -- not
+    # a partial write left behind by a run that died mid-way.
+    assert answers_out.is_file()
+    raw = answers_out.read_bytes()
+    assert raw == eval_run.canonical_json(json.loads(raw))
+    assert json.loads(raw)["cases"]
+    assert f"answers written to {answers_out}" in captured.err
+
+
+def test_main_evidence_document_failure_still_leaves_the_companion_behind(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The other way the sidecar fails after the money is spent:
+    # `evidence_document`'s fail-closed guards refuse to build it at all. That
+    # refusal is about the *sidecar's* provenance claims -- which tree's commit
+    # gets stamped onto which tree's corpus -- and the companion makes no such
+    # claim, so it is still written. `--lab-root` is the flag that trips it, and
+    # it is read only here, long after pass B is billed.
+    _judged_main_stubs(monkeypatch)
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    evidence_out = tmp_path / "evidence.json"
+    answers_out = tmp_path / "answers.json"
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--repeats",
+            "1",
+            "--lab-root",
+            str(not_a_repo),
+            "--evidence-out",
+            str(evidence_out),
+            "--answers-out",
+            str(answers_out),
+        ]
+    )
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "not a git worktree" in capsys.readouterr().err
+    assert not evidence_out.exists()
+    assert answers_out.is_file()
+    assert json.loads(answers_out.read_bytes())["cases"]
+
+
+def test_main_answers_write_failure_is_setup_failed_and_still_writes_the_sidecar(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The mirror of the sidecar's own write-time catch, which had no
+    # counterpart here. The up-front directory check cannot cover a directory
+    # that exists but is not writable, a path that became a directory after the
+    # check, or a full disk -- and this is the branch that runs after the
+    # answers are paid for. The sidecar is still written: one failure must not
+    # take the other record with it, in either direction.
+    _judged_main_stubs(monkeypatch)
+    evidence_out = tmp_path / "evidence.json"
+    answers_out = tmp_path / "answers.json"
+    answers_out.mkdir()
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--repeats",
+            "1",
+            "--evidence-out",
+            str(evidence_out),
+            "--answers-out",
+            str(answers_out),
+        ]
+    )
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "could not write answers" in capsys.readouterr().err
+    assert evidence_out.is_file()
+    assert json.loads(evidence_out.read_bytes())["kind"] == "day28-judged-evaluation-run"
+
+
+def test_main_rejects_answers_out_without_evidence_out(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # A companion on its own states its own answer_sha256, so a reader can only
+    # confirm that the file agrees with itself. There is nothing to check it
+    # against, and the §5.3 human verdict binds to the sidecar's digest -- so a
+    # run that produced one alone exited 0 having paid for an artifact that
+    # cannot support the adjudication it exists for.
+    monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
+
+    def _never(settings: Settings, *, prompt: PromptTemplate) -> object:
+        raise AssertionError("nothing may be built once --answers-out is rejected")
+
+    monkeypatch.setattr(eval_run, "build_chat_service", _never)
+    answers_out = tmp_path / "answers.json"
+
+    exit_code = eval_run.main(["--judge", "--repeats", "1", "--answers-out", str(answers_out)])
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    assert "it needs --evidence-out" in capsys.readouterr().err
+    assert not answers_out.exists()
+
+
+def test_judge_input_sha256_is_recomputable_from_the_companion_sidecar_and_dataset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `JudgeRepeat`'s docstring is right that no reader can recompute this
+    # digest *from the sidecar alone*. With the companion in hand the reader has
+    # everything: the sidecar records each repeat's `nonce` (a fence label, not
+    # a secret, and its own docstring says so), the companion carries the
+    # question, the verbatim answer and every source's doc_id/heading_path/
+    # content, and the case's expected/forbidden facts and rubric live in the
+    # dataset the sidecar pins by `dataset_sha256` at the `lab_commit` it names.
+    # The one thing a reader must read out of the source is the fence format.
+    #
+    # Reconstructed longhand below -- no `build_judge_input`, no `_fence`, no
+    # `canonical_json`, no `sha256_hex` -- so this fails if the companion stops
+    # carrying what the judge input needs, rather than merely agreeing with the
+    # runner about how to build it.
+    import hashlib
+
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+    evidence = json.loads(raw_evidence)
+    by_case = {entry["case_id"]: entry for entry in companion["cases"]}
+    dataset = json.loads(eval_run._DATASET_PATH.read_text(encoding="utf-8"))
+    spec_by_case = {case["id"]: case for case in dataset["cases"]}
+
+    def fence(label: str, nonce: str, number: int | None, body: str) -> str:
+        tag = f"{label} {nonce}" if number is None else f"{label} {nonce} {number}"
+        return f"BEGIN UNTRUSTED {tag}\n{body}\nEND UNTRUSTED {tag}"
+
+    checked = 0
+    for case_doc in evidence["cases"]:
+        judged_doc = case_doc["judged"]
+        if judged_doc is None or not judged_doc["repeats"]:
+            continue
+        entry = by_case[case_doc["id"]]
+        judged_spec = spec_by_case[case_doc["id"]]["judged"]
+        for repeat in judged_doc["repeats"]:
+            nonce = repeat["nonce"]
+            judge_input: dict[str, object] = {
+                "question": entry["question"],
+                "answer": fence("ANSWER", nonce, None, entry["answer"]),
+                "sources": [
+                    {
+                        "doc_id": source["doc_id"],
+                        "heading_path": source["heading_path"],
+                        "content": fence("SOURCE", nonce, number, source["content"]),
+                    }
+                    for number, source in enumerate(entry["sources"], start=1)
+                ],
+                "expected_facts": [
+                    {"id": fact["id"], "text": fact["text"]}
+                    for fact in judged_spec["expected_facts"]
+                ],
+                "forbidden_facts": [
+                    {"id": fact["id"], "text": fact["text"]}
+                    for fact in judged_spec["forbidden_facts"]
+                ],
+            }
+            # Omitted entirely when null, so the judge sees no key at all.
+            if judged_spec["rubric"] is not None:
+                judge_input["rubric"] = judged_spec["rubric"]
+            encoded = json.dumps(
+                judge_input, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+
+            assert hashlib.sha256(encoded).hexdigest() == repeat["judge_input_sha256"]
+        checked += 1
+
+    assert checked, "no judged case carried repeats; the relationship went unchecked"
+    # A run where every case skipped its rubric would leave the rubric branch
+    # unexercised, and the shipped dataset has cases on both sides of it.
+    rubrics = {spec_by_case[case_id]["judged"]["rubric"] is None for case_id in by_case}
+    assert rubrics == {True, False}
