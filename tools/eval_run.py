@@ -1207,18 +1207,28 @@ def _judged_sources(hits: Sequence[SearchHit]) -> tuple[JudgedSource, ...]:
 class TranscriptSource:
     """One chunk pass B put in front of the judge, *with its text*.
 
-    The same three identity fields `JudgedSource` carries, plus the content
-    itself. That one extra field is the whole difference between the two
-    types, and it is why they are two types rather than one with an optional
-    field: `JudgedSource` is what the evidence sidecar records, and it stays
-    reference-only by construction (Day 22's audit-log discipline), so no
-    later change to `evidence_document` can quietly turn the sidecar into a
-    second copy of the corpus. Source text lives here, in the opt-in
-    companion file, or nowhere.
+    The three identity fields `JudgedSource` carries, plus `heading_path` and
+    the content itself. Those two extra fields are the whole difference
+    between the two types, and they are why these are two types rather than
+    one with optional fields: `JudgedSource` is what the evidence sidecar
+    records, and it stays reference-only by construction (Day 22's audit-log
+    discipline), so no later change to `evidence_document` can quietly turn
+    the sidecar into a second copy of the corpus. Source text lives here, in
+    the opt-in companion file, or nowhere.
+
+    `heading_path` is here for one reason and it is not symmetry with the
+    sidecar: `sources_sha256` hashes exactly
+    `{doc_id, chunk_id, heading_path, content}` per hit in rank order, so
+    without it a reader could recompute `answer_sha256` from the companion but
+    not `sources_sha256` -- and "this file makes the sidecar's hashes
+    checkable" would have been half true in a way only someone attempting the
+    check would find out. It is not sensitive: the indexing path already puts
+    it in front of the embedding model by design (Day 12).
     """
 
     doc_id: str
     chunk_id: str
+    heading_path: str
     content_sha256: str
     content: str
 
@@ -1241,9 +1251,15 @@ class JudgedTranscript:
     `answer_sha256`/`sources_sha256` functions over the same values
     `_judge_once` hashes, so a reader can hash this file's `answer` and check
     it against the sidecar's recorded digest for the same `run_id` and case.
-    That check is the point: it turns the sidecar's unrecomputable hash into a
-    verifiable one without putting a single byte of model output into the
-    sidecar itself.
+    Both are recomputable from the companion alone, not just stated by it:
+    `answer_sha256` from `answer`'s own UTF-8 bytes, and `sources_sha256` by
+    rebuilding `sources_sha256`'s payload -- `{doc_id, chunk_id, heading_path,
+    content}` per source, in the order this tuple preserves, since rank order
+    is meaningful data to that hash. That is the point: it turns the sidecar's
+    unrecomputable digests into verifiable ones without putting a single byte
+    of model output into the sidecar itself. `judge_input_sha256` stays a
+    provenance token even so -- it additionally covers the per-repeat nonce
+    and the fence framing built around each value.
     """
 
     case_id: str
@@ -1273,6 +1289,7 @@ def _judged_transcript(case: EvalCase, answer: str, hits: Sequence[SearchHit]) -
             TranscriptSource(
                 doc_id=_doc_id_from_parent_id(hit.parent_id),
                 chunk_id=hit.chunk_id,
+                heading_path=hit.heading_path,
                 content_sha256=sha256_hex(hit.content.encode("utf-8")),
                 content=hit.content,
             )
@@ -1925,6 +1942,11 @@ def answers_document(*, run_id: str, transcripts: Sequence[JudgedTranscript]) ->
     answered are absent rather than present-and-empty, because there is no
     answer to adjudicate for them and an empty entry would invite one.
 
+    Each source carries the four fields `sources_sha256` hashes -- `doc_id`,
+    `chunk_id`, `heading_path`, `content` -- and the array preserves the rank
+    order that hash is computed over, so the digest can be rebuilt from this
+    document by itself rather than merely read out of it.
+
     Everything in `answer` and `sources[].content` is text this runner did not
     write -- the model's own output and the retrieved corpus. None of it is
     parsed, summarised, or interpolated into prose: each value sits inside its
@@ -1946,6 +1968,7 @@ def answers_document(*, run_id: str, transcripts: Sequence[JudgedTranscript]) ->
                     {
                         "doc_id": source.doc_id,
                         "chunk_id": source.chunk_id,
+                        "heading_path": source.heading_path,
                         "content_sha256": source.content_sha256,
                         "content": source.content,
                     }
@@ -2157,9 +2180,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "the answer text and the source text behind it alongside the same "
             "hashes the sidecar records. This is the file a human reads to "
             "adjudicate a judged run, and the file that makes the sidecar's "
-            "answer_sha256 checkable -- the sidecar stores hashes only, so "
-            "that digest cannot be recomputed from it alone. It carries model "
-            "output text; the sidecar deliberately does not."
+            "answer_sha256 and sources_sha256 checkable -- the sidecar stores "
+            "hashes only, so neither digest can be recomputed from it alone. "
+            "It carries model output text; the sidecar deliberately does not."
         ),
     )
     return parser.parse_args(argv)
