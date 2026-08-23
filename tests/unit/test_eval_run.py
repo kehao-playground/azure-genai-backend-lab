@@ -2899,7 +2899,7 @@ _COMPANION_ANSWER = "A standard purchase may be returned within 30 days of deliv
 
 
 def _run_main_with_both_records(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, repeats: int = 1
 ) -> tuple[bytes, dict[str, object]]:
     """Drive `main()` once with `--evidence-out` and `--answers-out` both set,
     returning the sidecar's raw bytes (test 2 asserts on bytes, not on parsed
@@ -2909,6 +2909,13 @@ def _run_main_with_both_records(
     then `ERROR(parse)` and every case `INCONCLUSIVE`, which is the harder
     shape for these assertions -- the repeats, and therefore the recorded
     `answer_sha256`, still exist, and so must the answer they hash.
+
+    `repeats` defaults to 1 because most of these tests assert a per-case
+    property and a second repeat would only slow them down. A test whose claim
+    is per-*repeat* must raise it: at 1 a `for repeat in ...` loop runs once
+    and cannot tell "each repeat carries its own nonce" from "there is one
+    nonce". Nothing here stubs `nonce_factory`, so the nonces are the real
+    CSPRNG values the run drew.
     """
     monkeypatch.setattr(eval_run, "get_settings", _judge_ready_settings)
     generation = _StaticChatService(ChatResult(message=_COMPANION_ANSWER, model_version="stub"))
@@ -2923,7 +2930,7 @@ def _run_main_with_both_records(
         [
             "--judge",
             "--repeats",
-            "1",
+            str(repeats),
             "--evidence-out",
             str(evidence_out),
             "--answers-out",
@@ -3042,18 +3049,24 @@ def _as_json_string_body(text: str) -> bytes:
 def test_the_evidence_sidecar_bytes_never_contain_the_answer_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The sidecar stays content-free and reference-only (Day 22's audit log,
-    # mirrored). Asserted on the canonical bytes, not on a walk of the parsed
-    # document, so a leak through any key at any depth -- one this test never
-    # thought to look under -- is still caught.
+    # Nothing the runner writes puts the answer or a source chunk into the
+    # sidecar's own records (Day 22's audit-log discipline, mirrored) -- which
+    # is the claim here, and is narrower than "the sidecar holds no model
+    # text": it holds every repeat's verbatim `raw_response`, and the stub
+    # judge below returns unparseable text, so this test cannot see what a real
+    # judge would quote. Asserted on the canonical bytes, not on a walk of the
+    # parsed document, so a leak through any key at any depth -- one this test
+    # never thought to look under -- is still caught.
     raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
 
     assert _as_json_string_body(_COMPANION_ANSWER) not in raw_evidence
     # The text is not merely absent everywhere; it is present in the one file
     # that is supposed to have it.
     assert any(entry["answer"] == _COMPANION_ANSWER for entry in companion["cases"])
-    # Source text is the sidecar's other content-free promise: it records each
-    # chunk's hash, never the chunk.
+    # Source text is the other half of the same promise: the sidecar's records
+    # carry each chunk's hash, never the chunk. Same limit as above -- a judge
+    # that quotes a chunk in its `rationale` puts that quotation in
+    # `raw_response`, and this stub judge cannot.
     checked = 0
     for entry in companion["cases"]:
         for source in entry["sources"]:
@@ -3639,7 +3652,10 @@ def test_judge_input_sha256_is_recomputable_from_the_companion_sidecar_and_datas
     # runner about how to build it.
     import hashlib
 
-    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path)
+    # Three repeats, not the helper's default of one: this test's claim is that
+    # each repeat pairs with *its own* nonce, and a single-repeat run cannot
+    # tell that from a run with one nonce in it.
+    raw_evidence, companion = _run_main_with_both_records(monkeypatch, tmp_path, repeats=3)
     evidence = json.loads(raw_evidence)
     by_case = {entry["case_id"]: entry for entry in companion["cases"]}
     dataset = json.loads(eval_run._DATASET_PATH.read_text(encoding="utf-8"))
@@ -3656,6 +3672,11 @@ def test_judge_input_sha256_is_recomputable_from_the_companion_sidecar_and_datas
             continue
         entry = by_case[case_doc["id"]]
         judged_spec = spec_by_case[case_doc["id"]]["judged"]
+        # The pairing is only exercised if there is more than one repeat and
+        # they really drew different nonces -- otherwise every repeat's input
+        # is the same bytes and the loop below proves one thing N times.
+        assert len(judged_doc["repeats"]) == 3
+        assert len({repeat["nonce"] for repeat in judged_doc["repeats"]}) == 3
         for repeat in judged_doc["repeats"]:
             nonce = repeat["nonce"]
             judge_input: dict[str, object] = {
@@ -3693,3 +3714,69 @@ def test_judge_input_sha256_is_recomputable_from_the_companion_sidecar_and_datas
     # unexercised, and the shipped dataset has cases on both sides of it.
     rubrics = {spec_by_case[case_id]["judged"]["rubric"] is None for case_id in by_case}
     assert rubrics == {True, False}
+
+
+def test_a_failed_write_leaves_the_previous_artifact_whole(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # `Path.write_bytes` truncates first and streams after, so a failure
+    # part-way (ENOSPC is the realistic one) used to leave a truncated file
+    # where a whole one had been -- and truncated JSON is not distinguishable
+    # from whole JSON without parsing it. Both artifacts are records of a run
+    # that was already paid for, so the write goes via a temp file and a
+    # rename.
+    #
+    # Simulated by patching `Path.write_bytes` to write half its payload and
+    # then raise, which is what a disk filling up does. Under a direct write
+    # that half lands on the destination; under the rename it lands on a temp
+    # file nobody reads.
+    _judged_main_stubs(monkeypatch)
+    evidence_out = tmp_path / "evidence.json"
+    answers_out = tmp_path / "answers.json"
+    previous = b'{"kind":"an earlier run"}'
+    evidence_out.write_bytes(previous)
+    answers_out.write_bytes(previous)
+
+    real_write_bytes = Path.write_bytes
+
+    def _fails_half_way(self: Path, data: bytes) -> int:
+        real_write_bytes(self, data[: len(data) // 2])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", _fails_half_way)
+
+    exit_code = eval_run.main(
+        [
+            "--judge",
+            "--repeats",
+            "1",
+            "--evidence-out",
+            str(evidence_out),
+            "--answers-out",
+            str(answers_out),
+        ]
+    )
+
+    assert exit_code == ExitCode.SETUP_FAILED
+    captured = capsys.readouterr()
+    assert "could not write answers" in captured.err
+    assert "could not write evidence" in captured.err
+    # Neither destination was touched: what a reader finds is the previous
+    # whole document, not the first half of this run's.
+    assert evidence_out.read_bytes() == previous
+    assert answers_out.read_bytes() == previous
+    # And the half-written temp files are gone -- a run that could not write
+    # leaves the directory as it found it.
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["answers.json", "evidence.json"]
+
+
+def test_a_successful_write_leaves_no_temp_file_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The rename moves the temp file onto the destination rather than copying
+    # it, so the happy path must leave exactly the two artifacts -- a stray
+    # `.answers.json.<hex>.tmp` beside them would be a second, unversioned copy
+    # of text that is supposed to live in exactly one file.
+    _run_main_with_both_records(monkeypatch, tmp_path)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["answers.json", "evidence.json"]
