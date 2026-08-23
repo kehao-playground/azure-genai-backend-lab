@@ -12,7 +12,7 @@ flowchart TB
 
     subgraph judside["判讀層 · 同一份答案重審可能翻"]
         jud["judged<br/>expected_facts · forbidden_facts · rubric"]
-        judge["pass B 生成 → pass C judge ×5<br/>模型只回事實 id，verdict 由程式推導"]
+        judge["pass B 生成 → pass C judge ×5<br/>事實欄只回 id；unsupported_claims 與 rationale 是自由文字<br/>verdict 由程式推導"]
         report["報告：逐輪 outcome 序列<br/>量不到印 NOT MEASURED"]
         jud --> judge --> report
     end

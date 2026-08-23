@@ -6,14 +6,14 @@ flowchart TB
     hashes["answer_sha256 · sources_sha256<br/>產出當下就算好"]
     answer --> hashes
 
-    sidecar["evidence sidecar（--evidence-out）<br/>ids · counts · outcome · hash<br/>reference-only：型別裡沒有文字欄位"]
+    sidecar["evidence sidecar（--evidence-out）<br/>ids · counts · outcome · hash<br/>沒有專用的答案／來源全文欄位<br/>（每輪 raw_response 仍是模型文字）"]
     comp["answers companion（--answers-out）<br/>問題 / 答案 / 來源全文 ＋ 同一組 hash<br/>寫入順序在 sidecar 之前（答案已 billed）"]
 
     hashes --> sidecar
     answer --> comp
     hashes --> comp
 
-    recheck["判定前對帳：從 companion 的文字重算兩個 hash<br/>與 sidecar 比對——8 案全 MATCH 才開始讀"]
+    recheck["判定前對帳（從 companion）：answer_sha256 對答案 bytes；<br/>sources_sha256 先依序重建 doc_id/chunk_id/heading_path/content<br/>陣列再 canonical 編碼——與 sidecar 比對，全 MATCH 才開始讀"]
     comp --> recheck
     sidecar --> recheck
 

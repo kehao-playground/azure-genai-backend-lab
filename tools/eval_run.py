@@ -1002,9 +1002,16 @@ def parse_judge_response(raw: str, case: EvalCase) -> JudgeOutput:
     with exactly the five expected keys (malformed JSON, or a JSON object
     with prose wrapped around it, fails at the `json.loads` step below
     before any invariant runs), and it must satisfy all four id-set
-    invariants or the response is rejected outright -- a judge steered by
-    adversarial input into inventing, dropping, or misclassifying a fact id
-    can still only ever be rejected here, never turned into a verdict.
+    invariants or the response is rejected outright. What that rejects is
+    shape-level steering: invented or unknown ids, dropped or duplicated
+    expected ids, violations outside the forbidden set. It cannot tell
+    whether a *legitimate* expected id truthfully belongs in
+    `covered_fact_ids` or `missing_fact_ids`, and `unsupported_claims` is
+    free text checked only for being a list of strings -- a judge steered
+    while staying inside the schema still produces a verdict. The
+    structural guarantee here is set integrity, plus the fact that the
+    verdict itself is derived in code (`derive_judge_verdict`), never
+    returned by the model.
     """
     try:
         parsed = json.loads(raw)
