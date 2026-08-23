@@ -358,10 +358,15 @@ regardless of what it says.
 That prompt wording is **instruction-level mitigation, not a structural
 guarantee** — the same honest limit Day 21 recorded for tool results.
 Nothing stops a sufficiently adversarial model from ignoring the
-instruction anyway. The actual structural defense is what comes next: a
-judge response steered into inventing, dropping, or misclassifying a fact
-id is rejected before it ever becomes a verdict, regardless of what the
-prompt asked for.
+instruction anyway. What the next section's four invariants guarantee is
+narrower than an injection defense: they reject shape-level steering —
+invented or unknown ids, dropped or duplicated expected ids, violations
+outside the forbidden set — before it becomes a verdict. They cannot tell
+whether a legitimate expected id was classified into `covered` or
+`missing` truthfully, and `unsupported_claims` is free text: a judge
+steered while staying inside the schema still yields a verdict. The
+remaining structural guarantee is that the verdict itself is derived in
+code, never returned by the model.
 
 ### 7.2 Output shape and the four invariants
 
@@ -499,8 +504,12 @@ case-level expectations (`expected_facts`, `forbidden_facts`, `rubric`)
 live in `tools/eval_cases.json` — those describe what a good answer to this
 question looks like, independent of any one run.
 
-A human's read of an actual answer belongs in that run's evidence record
-(the `--evidence-out` sidecar), tied together by hash: `run_id`, `answer_sha256`,
+A human's read of an actual answer belongs in that run's evidence
+record — a human-written adjudication note kept alongside the machine
+artifacts, not inside them. The `--evidence-out` sidecar is written by the
+runner before any human verdict exists, and machine-captured files are not
+edited after the fact, so the sidecar never carries the human verdict. The
+note is tied to the run by hash: `run_id`, `answer_sha256`,
 `sources_sha256`, `lab_commit`, and `dataset_sha256`. Putting a human
 verdict in the dataset itself would conflate two different judgments that
 must stay separable — "is this expectation reasonable" versus "did this

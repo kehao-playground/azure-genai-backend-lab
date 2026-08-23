@@ -28,7 +28,7 @@ flowchart TB
 
     subgraph judside["Judged layer: re-judging the same answer can flip"]
         jud["judged<br/>expected_facts . forbidden_facts . rubric"]
-        judge["pass B generation, then pass C judge x5<br/>the model returns fact ids only;<br/>the verdict is derived in code"]
+        judge["pass B generation, then pass C judge x5<br/>fact fields return stable ids only; unsupported_claims<br/>and rationale are free text; the verdict is derived in code"]
         report["Report: per-repeat outcome sequence<br/>NOT MEASURED when it cannot be measured"]
         jud --> judge --> report
     end

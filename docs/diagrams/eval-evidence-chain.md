@@ -4,12 +4,16 @@ Human adjudication of the judged layer needs the answer text, and the
 reference-only evidence sidecar deliberately has no field for it. This
 diagram shows the chain that makes adjudication both possible and
 verifiable: the pass-B answer is hashed the moment it is produced; the
-sidecar records ids, counts, outcomes, and those hashes; the opt-in
-answers companion carries the readable text plus the same hashes and is
-written first, because the answer is already billed. Before anyone reads
-an answer, the two hashes are recomputed from the companion's text alone
-and checked against the sidecar — proving the text being adjudicated is
-the text that was judged. The human verdict is then recorded in the run's
+sidecar records ids, counts, outcomes, and those hashes (it has no
+dedicated answer or source-text field — though each judge repeat's
+`raw_response` is still model-written text); the opt-in answers companion
+carries the readable text plus the same hashes and is written first,
+because the answer is already billed. Before anyone reads an answer, both
+hashes are recomputed from the companion and checked against the sidecar
+— `answer_sha256` from the answer's UTF-8 bytes, `sources_sha256` by
+rebuilding the ordered `{doc_id, chunk_id, heading_path, content}` payload
+and canonical-encoding it — proving the text being adjudicated is the
+text that was judged. The human verdict is then recorded in the run's
 evidence, bound to `run_id` and `answer_sha256`, never written back into
 the dataset. See
 [evaluation.md](../evaluation.md#8-human-feedback-the-authority-is-a-person-bound-to-one-run).
@@ -24,14 +28,14 @@ flowchart TB
     hashes["answer_sha256 . sources_sha256<br/>computed the moment it is produced"]
     answer --> hashes
 
-    sidecar["Evidence sidecar (--evidence-out)<br/>ids . counts . outcome . hash<br/>reference-only: the type has no text field"]
+    sidecar["Evidence sidecar (--evidence-out)<br/>ids . counts . outcome . hash<br/>no dedicated answer or source-text field<br/>(each repeat raw_response is still model text)"]
     comp["Answers companion (--answers-out)<br/>question / answer / source text, plus the same hashes<br/>written before the sidecar (the answer is already billed)"]
 
     hashes --> sidecar
     answer --> comp
     hashes --> comp
 
-    recheck["Before adjudication: recompute both hashes<br/>from the companion's text alone, check against the sidecar<br/>read nothing until every case matches"]
+    recheck["Before adjudication, from the companion:<br/>answer_sha256 over the answer bytes;<br/>sources_sha256 over the ordered, canonical-encoded<br/>doc_id/chunk_id/heading_path/content payload<br/>read nothing until every case matches the sidecar"]
     comp --> recheck
     sidecar --> recheck
 
