@@ -1,0 +1,37 @@
+%% Publication source (zh-TW) for the Day 29 article figure.
+%% English semantic companion: readiness-dividing-line.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    req["checklist 上的一條要求"]
+    q{"它問的對象是什麼？"}
+    req --> q
+
+    subgraph codeside["程式的一個性質"]
+        cmd["✅ 後面掛一條可執行指令<br/>明確 pass／fail、違反時 exit 非零<br/>而且這一輪真的跑過"]
+        live["⚑ 驗得到，但要一個<br/>部署中的 app 才驗得到"]
+    end
+
+    subgraph personside["某個人做過的決定"]
+        question["✎ 寫成讀者要自己回答的問題"]
+        dated{"問得出<br/>日期與姓名嗎？"}
+        good["合格的問題：<br/>「誰核定的，核定日期是什麼時候？」"]
+        empty["空話：<br/>「確保已設定保留期限」<br/>——重寫"]
+        question --> dated
+        dated -->|"是"| good
+        dated -->|"否"| empty
+    end
+
+    q -->|"程式"| cmd
+    q -->|"程式，但需要<br/>部署中的 app"| live
+    q -->|"人"| question
+
+    oos["要求的是一個組織<br/>或一個真實使用者群"]
+    na["不適用——<br/>全表僅 on-call 這一條"]
+    q -->|"（罕見）"| oos --> na
+
+    cmd -.- warn["沒有含糊的中間態：<br/>沒跑過的指令<br/>不准冒充可機器驗"]
+
+    style cmd fill:#d3f0d8,stroke:#2e7d32
+    style good fill:#d3e5f0,stroke:#1565c0
+    style empty fill:#fde2e0,stroke:#c62828
+    style warn fill:#f8f9fa,stroke:#adb5bd,stroke-dasharray:4

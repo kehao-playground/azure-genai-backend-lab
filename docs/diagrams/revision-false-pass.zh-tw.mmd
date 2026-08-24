@@ -1,0 +1,30 @@
+%% Publication source (zh-TW) for the Day 29 article figure.
+%% English semantic companion: revision-false-pass.md — keep the two in the same topology.
+%% The planning repo stores only the rendered PNG snapshot (proposal 005).
+flowchart TB
+    subgraph script["update-container-app.sh（修正前）"]
+        c1["template image 讀回 ✓<br/>回報的是「你要求了什麼」"]
+        c2["runningState＝Activating ✓<br/>不是已知失敗態，放行"]
+        c3["/health 200，body 逐位元組正確 ✓"]
+        ok["exit 0：「Verified」<br/>而部署從未跑起來"]
+        c1 --> c2 --> c3 --> ok
+    end
+
+    subgraph data["資料面（single revision mode）"]
+        newrev["新 revision（壞）<br/>traffic 100<br/>拉不到 image 或 crash loop<br/>console log：零筆或只有 crash"]
+        oldrev["舊 revision<br/>traffic 0<br/>仍在服務"]
+    end
+
+    c3 -. "誰回答的？<br/>（console log 的 RevisionName_s）" .-> oldrev
+
+    subgraph control["控制面"]
+        f1["latestRevisionName＝壞的那個"]
+        f2["latestReadyRevisionName＝舊的那個<br/>唯一分得出差別的欄位——<br/>而沒有任何東西在讀它"]
+    end
+
+    fix["step 3b（修法）：對 latestReadyRevisionName 有界輪詢<br/>是輪詢不是單次讀回——健康的部署上<br/>這個欄位本來就會晚一步才跟上"]
+    f2 --> fix
+
+    style ok fill:#fde2e0,stroke:#c62828
+    style f2 fill:#d3e5f0,stroke:#1565c0
+    style fix fill:#d3f0d8,stroke:#2e7d32
