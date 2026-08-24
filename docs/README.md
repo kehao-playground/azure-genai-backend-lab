@@ -15,7 +15,7 @@
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
-- [Production Readiness Checklist](production-readiness-checklist.md)
+- [Production Readiness Checklist](production-readiness-checklist.md) — seven topics, each line a portable requirement paired with this lab's answer; checkable lines carry the command
 - [Cost and Monitoring](cost-and-monitoring.md)
 - [RAG Overview](rag-overview.md)
 - [Agent Decision Guide](agent-decision-guide.md)
