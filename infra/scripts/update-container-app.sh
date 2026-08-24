@@ -52,9 +52,11 @@
 #
 # The app runs in single-revision mode, so `properties.latestRevisionName`
 # names the revision this update produced. That is not the same as knowing it
-# is the one answering traffic: what happens to the previous revision when a
-# new one fails to start has never been observed here (docs/ci-cd.md section
-# 11, open item 14), so this script does not claim the two coincide. A
+# is the one answering traffic -- and on 2026-08-24 it was measured that they
+# come apart exactly when it matters: a revision that never starts leaves the
+# previous one serving, and every check this script had at the time passed.
+# Step 3b closes that by comparing against `latestReadyRevisionName`, which is
+# the platform's own readiness judgement (docs/ci-cd.md section 11). A
 # multi-revision app would need a different approach again.
 #
 # Usage: update-container-app.sh --image <ref>
@@ -158,6 +160,19 @@ on_exit() {
     echo "" >&2
     echo "update-container-app.sh failed (exit $status) after requesting the image change." >&2
     echo "No automatic rollback is performed. To roll back manually:" >&2
+    print_rollback_command 2
+  fi
+}
+
+# Printed on BOTH paths. Day 29 live session: the two failure modes that
+# actually happened did not take the failure path at all -- the script exited 0
+# -- so an operator who needed to roll back was handed nothing. A recovery
+# instruction that only appears on the branch that happens not to fire is not a
+# recovery instruction. $1 is the fd to write to (2 on the failure path, 1 on
+# the success path, so a success summary stays on stdout).
+print_rollback_command() {
+  local fd="${1:-2}"
+  {
     # `az` reads none of AZ_SUBSCRIPTION_ID / AZ_RESOURCE_GROUP -- those are
     # this repo's own script-level conventions, not az env fallbacks (az
     # configure --defaults group=... is the only alternative az itself
@@ -166,17 +181,17 @@ on_exit() {
     # exactly when an operator is under pressure and least likely to debug
     # the recovery instruction itself -- the same shape as Day 24's teardown
     # printer that omitted two knobs.
-    echo "  az containerapp update --subscription $AZ_SUBSCRIPTION_ID --resource-group $AZ_RESOURCE_GROUP \\" >&2
-    echo "    --name $AZ_ACA_APP_NAME --image $SNAPSHOT_IMAGE" >&2
+    echo "  az containerapp update --subscription $AZ_SUBSCRIPTION_ID --resource-group $AZ_RESOURCE_GROUP \\"
+    echo "    --name $AZ_ACA_APP_NAME --image $SNAPSHOT_IMAGE"
     case "$SNAPSHOT_IMAGE" in
       *@sha256:*) ;;
       *)
-        echo "  Warning: that snapshot is a TAG reference, not a digest. The command" >&2
-        echo "  above redeploys whatever the tag resolves to right NOW, which may no" >&2
-        echo "  longer be the image that was actually running when this script started." >&2
+        echo "  Warning: that snapshot is a TAG reference, not a digest. The command"
+        echo "  above redeploys whatever the tag resolves to right NOW, which may no"
+        echo "  longer be the image that was actually running when this script started."
         ;;
     esac
-  fi
+  } >&"$fd"
 }
 trap on_exit EXIT
 
@@ -260,14 +275,11 @@ require_value "$REVISION_NAME" "the latest revision name"
 # either. What stands in for success is the rest of what this script actually
 # checks: the step-3 read-back that the app's template now carries the exact
 # requested image, and step 4's exact-body /health probe. Those two, plus the
-# absence of a known failure state here, are the whole of it -- there is no
-# `active` or `provisioningState` read-back in this script, and describing one
-# would be describing code that does not exist. One caveat this does not
-# close: this app runs in
-# single revision mode, and it has never been observed here what happens when
-# a new revision fails to start -- whether /health would then be answered by
-# the previous revision, returning the expected body for the wrong reason.
-# See docs/ci-cd.md section 11 ("Still open").
+# absence of a known failure state here, are not on their own enough -- there
+# is no `active` or `provisioningState` read-back in this script, and
+# describing one would be describing code that does not exist. What this poll
+# cannot do is tell a revision that is coming up from one that will never come
+# up: both report `Activating`. That is step 3b's job, not this loop's.
 RUNNING_STATE=""
 for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
   RUNNING_STATE=$(az containerapp revision show \
@@ -292,7 +304,61 @@ if [ "$RUNNING_STATE" = "Processing" ]; then
   echo "Revision '$REVISION_NAME' runningState is still 'Processing' after $ACA_REVISION_POLL_ATTEMPTS attempts; aborting." >&2
   exit 1
 fi
-echo "  revision '$REVISION_NAME' reports runningState '$RUNNING_STATE' (not a known failure state; /health decides next)"
+echo "  revision '$REVISION_NAME' reports runningState '$RUNNING_STATE' (not a known failure state)"
+
+# === step 3b: readiness -- did the revision we asked for actually take over? ==
+# Day 29 (2026-08-24, japaneast) measured why this step has to exist. Two
+# failure modes were injected one at a time -- a digest that does not exist,
+# and an image that pulls and then dies at startup -- and each one passed all
+# three of the checks above:
+#
+#   * the template read-back reports the requested image, because it echoes
+#     the request; ARM stores the reference whether or not it ever runs;
+#   * runningState read 'Activating', which is not a known failure state and
+#     is exactly what a revision that never starts reports;
+#   * /health returned the byte-exact expected body, because under single
+#     revision mode the PREVIOUS revision keeps serving. Console logs
+#     (RevisionName_s) named the old revision as the one that answered.
+#
+# So those three answer "is something serving?", and the question an operator
+# actually has is "is the thing I just deployed serving?". The control plane
+# already distinguishes them: latestReadyRevisionName is the platform's own
+# judgement about readiness, and it stayed on the old revision both times
+# while latestRevisionName moved to the broken one. Traffic weight is not the
+# tell -- it read 100 on the broken revision in both runs.
+#
+# This is a poll, not a single read: on a healthy deployment the ready field
+# legitimately trails by tens of seconds before catching up, so a single read
+# would reject every normal deploy. Same budget as the poll above; no new knob.
+echo "== step 3b: readiness =="
+READY_REVISION=""
+for ((ATTEMPT = 1; ATTEMPT <= ACA_REVISION_POLL_ATTEMPTS; ATTEMPT++)); do
+  READY_REVISION=$(az containerapp show \
+    --subscription "$AZ_SUBSCRIPTION_ID" \
+    --resource-group "$AZ_RESOURCE_GROUP" \
+    --name "$AZ_ACA_APP_NAME" \
+    --query "properties.latestReadyRevisionName" -o tsv)
+  # Fail closed on an empty read: `az ... -o tsv` prints nothing on several
+  # failures and an unguarded comparison would silently treat that as "not
+  # ready yet", then time out with a misleading reason.
+  require_value "$READY_REVISION" "the latest ready revision name"
+  if [ "$READY_REVISION" = "$REVISION_NAME" ]; then
+    break
+  fi
+  if ((ATTEMPT < ACA_REVISION_POLL_ATTEMPTS)); then
+    sleep "$ACA_REVISION_POLL_INTERVAL"
+  fi
+done
+if [ "$READY_REVISION" != "$REVISION_NAME" ]; then
+  echo "Revision '$REVISION_NAME' never became the latest READY revision." >&2
+  echo "  latestRevisionName:      $REVISION_NAME" >&2
+  echo "  latestReadyRevisionName: $READY_REVISION" >&2
+  echo "  last runningState:       $RUNNING_STATE" >&2
+  echo "The previous revision is still serving, so /health would answer correctly" >&2
+  echo "for the wrong reason. Treating this as a failed deployment." >&2
+  exit 1
+fi
+echo "  revision '$REVISION_NAME' is the latest ready revision"
 
 # === step 4: data-plane smoke ================================================
 echo "== step 4: /health smoke =="
@@ -333,14 +399,20 @@ echo "  /health returned the expected body"
 
 cat <<SUMMARY
 
-Update requested and read back. Verified, precisely:
+Update requested and verified:
   - the app template now reports the requested image
   - the latest revision reported no known failure state
+  - the requested revision IS the latest ready revision (step 3b)
   - /health returned the exact expected body
-Not verified: which revision served that /health response. Under single
-revision mode with an image-pull failure, that is an open question -- see
-docs/ci-cd.md section 11.
+The third line is what separates "the revision I asked for is serving" from
+"something is serving" -- without it, the other three all pass while the
+previous revision answers for a revision that never started (docs/ci-cd.md 11).
   app:   $AZ_ACA_APP_NAME
   url:   $BASE_URL
   image: $IMAGE
 SUMMARY
+
+# Printed on the way out even though nothing failed: see print_rollback_command.
+echo ""
+echo "If you need to roll this back:"
+print_rollback_command 1
