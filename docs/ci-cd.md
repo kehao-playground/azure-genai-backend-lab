@@ -652,26 +652,77 @@ there is no `active` and no `provisioningState` read-back in it, and the
 step-1 pre-mutation snapshot is rollback data, not a success gate. See the
 comment above the poll in `infra/scripts/update-container-app.sh`.
 
+### Settled later, by the Day 29 session (2026-08-24)
+
+**Single-revision behaviour when a revision fails to start — the gap this
+section previously named as the one place where "the deployment succeeded"
+rested on an untested assumption.** It rested on a false one.
+
+Two failure modes were injected deliberately, one at a time: an image
+reference whose digest does not exist, and an image that pulls cleanly and
+then dies during startup. **In both, all three of `update-container-app.sh`'s
+checks passed and the script exited 0.**
+
+| Check | What it reported | Why it passed anyway |
+|---|---|---|
+| step 3 template read-back | "app reports the requested image" | it echoes what was requested; ARM stores the reference whether or not it runs |
+| step 3 `runningState` | `Activating` | not a known failure state, and a revision that never starts reports it |
+| step 4 `/health` | the byte-exact expected body | the **previous** revision was still serving |
+
+That last row is not an inference. Container Apps console logs carry
+`RevisionName_s`, and in each case the external probe appears against the old
+revision while the new one logged either nothing (image-pull failure —
+`ContainerTerminated` / `MANIFEST_UNKNOWN` in the system logs) or a startup
+crash loop:
+
+```text
+01:45:03.66Z  aca-…--0000002   "GET /health HTTP/1.1" 200 OK      <- previous revision
+01:45:04.71Z  aca-…--0000003   PromptTemplateError: … default_chat.md
+```
+
+The control plane distinguished the two the whole time, in a field the script
+was not reading: `latestRevisionName` moved to the broken revision both times
+while **`latestReadyRevisionName` stayed on the old one**. Traffic weight is
+not the tell — it read 100 on the broken revision in both runs.
+
+**That gap is now closed.** `update-container-app.sh` grew a step 3b that
+polls `latestReadyRevisionName` until it matches the revision the update
+produced, and fails the deployment when it never does. It is a poll rather
+than a single read because on a healthy deploy that field legitimately trails
+before catching up — a single read would reject every normal deployment.
+
+Two smaller things the same session found, both also fixed:
+
+- The caveat the script printed was **narrower than the behaviour**: it named
+  an image-pull failure, and a startup failure does the same thing.
+- The manual rollback command was printed **only on the failure path**.
+  Neither injected failure took that path, so neither produced any rollback
+  instructions — at exactly the moment an operator would want them. It now
+  prints on both paths.
+
+The fix was re-verified against real Azure the same day, in a separate run
+with its own resources: the nonexistent digest and the startup crash both now
+exit non-zero, **and a healthy deployment still exits 0** — the last being the
+one that matters, since a gate that also blocks good deploys gets bypassed.
+
+Scope, as everywhere else in this series: one session, one date, one region,
+single revision mode, one observation per scenario. It establishes that the
+false pass happened and that these three cases now behave correctly, not that
+every case does. Evidence:
+`reviews/evidence/day29/2026-08-24-rollback-live-session.md` and
+`…-readiness-gate-reverify.md` in the planning repository.
+
 ### Still open
 
-Three of these are gaps in the pipeline as it runs today; the fourth (ABAC)
-is a mode this series has never enabled, listed here so the two kinds are not
-confused with each other.
+Two of these are gaps in the pipeline as it runs today; the third (ABAC) is a
+mode this series has never enabled, listed here so the two kinds are not
+confused with each other. A fourth — single-revision behaviour when a revision
+fails to start — was settled by the Day 29 session above.
 
 - **`concurrency` behaviour under two competing runs** (§1) — untested; no
   two runs ever competed for the `production` group, and in particular
   whether a run waiting on approval counts as the queued `pending` slot was
   not exercised.
-- **Single-revision behaviour when a revision fails to start.** This
-  session's revisions both came up healthy. Because the app runs in single
-  revision mode, this leaves a specific gap worth naming: it has not been
-  observed whether a new revision that fails to pull its image would be
-  caught by the checks above, or whether the previous revision would keep
-  serving `/health` while the new one fails — which would make the probe
-  return the expected body for the wrong reason. The digest read-back is a
-  control-plane check and would still report what was requested. This is the
-  one place where "the deployment succeeded" rests on an untested
-  assumption.
 - **Role-assignment propagation timing for this pipeline** — **not measured
   this run.** The first workflow run authenticated and pushed without an
   authorization failure, which is a single non-failure, not a measurement.

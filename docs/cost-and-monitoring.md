@@ -29,6 +29,40 @@ The budget is a post-paid ledger: provider-reported usage accumulates atomically
 ## Known gaps (disclosed, not hidden)
 
 - A failed turn (upstream error, discarded `content_filter` text, disconnect) may have incurred billable processing upstream but never enters the ledger — turn-commit semantics (Day 7) win over accounting completeness. The same paths produce no `llm usage` log line either (there is no usage-bearing terminal to read): a missing line is not zero cost, and reconciliation belongs to Cost Management.
+- **A successful turn can sit on top of attempts nobody metered.** The client
+  is configured with `llm_max_retries` (default 2) and `llm_timeout_seconds`
+  (default 30.0, against the SDK's own default of 600) — an explicit policy,
+  and a deliberately tight one. The timeout is **per attempt**, not
+  end-to-end: the SDK rebuilds the request each time round its retry loop. So
+  a slow reply that trips the client timeout is abandoned and re-sent, and one
+  logical call reaches the provider up to three times. Measured against a
+  loopback server on 2026-08-24 with `openai==2.45.0`: three server-side
+  arrivals, carrying `x-stainless-retry-count` 0/1/2 and **no idempotency
+  header** — the SDK mints a key and reuses it across retries, but
+  `_idempotency_header` is `None` and nothing overrides it, so the key is
+  never sent and the second and third arrivals are ordinary new requests as
+  far as the service is concerned. `usage` is read off the response that
+  finally comes back, so the ledger, the `llm usage` line and the audit event
+  all record exactly one call. Retries are triggered by connection errors,
+  timeouts, 408, 409, 429 and 5xx.
+
+  Whether the provider bills for an attempt the client abandoned is **not
+  settled here**. Azure's stated rule is about processing, not about what the
+  caller received — "If the service performs processing, you'll be charged
+  even if the status code isn't successful (not 200)", naming a 408 timeout as
+  an example, while a 429 is explicitly not charged because nothing was
+  processed ([Azure OpenAI FAQ](https://learn.microsoft.com/en-us/azure/foundry-classic/openai/faq),
+  checked 2026-08-24). That page never addresses a client disconnect, so
+  applying the rule to this case is an inference, not a citation. What follows
+  from it is only this: of the retry triggers above, 429 is documented as free,
+  and the timeout and 5xx paths are the ones with exposure.
+
+  A second consequence is worth stating because it is not a cost one: the
+  caller's worst case is not 30 seconds. Backoff is
+  `INITIAL_RETRY_DELAY * 2**n` capped at 8 s with jitter and is independent of
+  the timeout, so three 30-second attempts plus backoff is roughly 91 seconds
+  behind one request.
+
 - The ledger is per conversation, not per user — still, and now by choice rather than by necessity. Day 19 put a verified identity on every protected request (`Principal.user_id`, from `X-User-Id` or the token's `oid`), so per-user and per-feature quotas are technically possible; they are deliberately not implemented. A per-user quota needs a durable per-identity counter with its own retention, reset and cross-instance-consistency story, and that is a different piece of machinery from the per-conversation ledger, not a wider version of it. See [entra-id-auth.md](entra-id-auth.md).
 - Log lines are attribution, not metrics: aggregation (spend per day, per prompt version) is a Cost Management / Application Insights job, not grep's. Day 27 carries `gen_ai.usage.*` on the model-call span, which makes per-request cost queryable — but note what it deliberately does not do: usage attributes are **absent** on failed and disconnected calls rather than zero, for the same reason the `llm usage` line is missing there. See [observability.md](observability.md#attributes).
 
