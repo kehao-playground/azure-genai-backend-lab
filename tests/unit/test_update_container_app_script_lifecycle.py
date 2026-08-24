@@ -700,3 +700,24 @@ def test_revision_that_becomes_ready_still_passes(tmp_path: Path) -> None:
     result = h.run()
     assert result.returncode == 0, result.stderr
     assert "/health returned the expected body" in result.stdout
+
+
+def test_rollback_command_is_printed_on_the_success_path_too(tmp_path: Path) -> None:
+    # Day 29: the failures that actually happened exited 0, so the failure-path
+    # rollback printer never fired and the operator got nothing. The command has
+    # to be available before it is needed, not only when a branch happens to run.
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert "If you need to roll this back:" in result.stdout
+    assert "az containerapp update" in result.stdout
+    assert TAG_IMAGE in result.stdout  # the pre-mutation snapshot
+    # The tag warning travels with it -- a snapshot that is a tag is not a version.
+    assert "TAG reference, not a digest" in result.stdout
+
+
+def test_success_path_rollback_line_stays_on_stdout_not_stderr(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    result = h.run()
+    assert result.returncode == 0
+    assert "If you need to roll this back:" not in result.stderr
