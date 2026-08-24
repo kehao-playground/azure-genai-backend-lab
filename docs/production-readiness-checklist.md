@@ -26,6 +26,9 @@ The split does not follow the topic. It follows whether the requirement is a
 | **Not present** | there is no inbound rate limiting | there is no on-call runbook |
 | **Out of scope** | (rare) | retention approved by legal |
 
+The split is drawn as a decision flow in
+[diagrams/readiness-dividing-line.md](diagrams/readiness-dividing-line.md).
+
 "Not present" is often *checkable* — a command that shows the thing is absent
 beats a sentence claiming it is. Two warnings about that, both learned here:
 
@@ -438,6 +441,10 @@ Every control, with the file that implements it:
   `latestRevisionName` was the broken revision, and
   **`latestReadyRevisionName` was still the old one**. Traffic weight is not
   the tell — it read 100 on the broken revision both times.
+
+  The full shape — three passing checks, two revisions, and the one
+  control-plane field that told the truth — is drawn in
+  [diagrams/revision-false-pass.md](diagrams/revision-false-pass.md).
 
   **The gate now reads that field.** `update-container-app.sh` step 3b polls
   `latestReadyRevisionName` until it matches the revision the update produced,
