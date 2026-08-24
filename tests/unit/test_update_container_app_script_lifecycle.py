@@ -67,6 +67,17 @@ if args[:2] == ["containerapp", "show"]:
         done(state.get("template_image", ""))
     if field == "properties.latestRevisionName":
         done(state.get("revision_name", ""))
+    if field == "properties.latestReadyRevisionName":
+        # Sequence form so a test can model the real lag: on a healthy deploy
+        # this field trails latestRevisionName by tens of seconds before it
+        # catches up. Scalar form stays supported for the steady states.
+        ready = state.get("ready_revision_names")
+        if ready is None:
+            done(state.get("ready_revision_name", state.get("revision_name", "")))
+        idx = state.get("ready_revision_call_index", 0)
+        value = ready[min(idx, len(ready) - 1)]
+        state["ready_revision_call_index"] = idx + 1
+        done(value)
     if field == "properties.configuration.ingress.fqdn":
         done(state.get("fqdn", ""))
     done("")
@@ -124,6 +135,7 @@ class Harness:
         state: dict[str, object] = {
             "template_image": TAG_IMAGE,
             "revision_name": "aca-faked25--abc123",
+            "ready_revision_name": "aca-faked25--abc123",
             "running_state": "Running",
             "fqdn": "aca-faked25.japaneast.azurecontainerapps.io",
             "health_status": "200",
@@ -598,3 +610,93 @@ def test_zero_interval_is_valid_but_zero_attempts_is_not(tmp_path: Path) -> None
 def test_script_exists_and_is_executable() -> None:
     assert SCRIPT.is_file()
     assert os.access(SCRIPT, os.X_OK)
+
+
+# ---------------------------------------------------------------------------
+# Readiness: "the revision I asked for is serving" vs "something is serving".
+#
+# Day 29 live session (2026-08-24, japaneast) injected two failure modes, one
+# at a time, and BOTH passed all three of this script's checks and exited 0:
+# the template read-back echoes the request, `Activating` is not a known
+# failure state, and under single revision mode the PREVIOUS revision keeps
+# answering /health with the byte-exact expected body. Container Apps console
+# logs (RevisionName_s) named the old revision as the one that answered.
+#
+# The control plane distinguished them the whole time. latestRevisionName
+# moved to the broken revision; latestReadyRevisionName stayed on the old one.
+# Traffic weight is not the tell -- it read 100 on the broken revision both
+# times.
+#
+# The two failure modes are deliberately NOT parametrized together: inside
+# ACA they are different paths (image pull vs. container startup), and keeping
+# them apart is what will show which one regresses first.
+# ---------------------------------------------------------------------------
+
+
+def test_startup_failure_that_never_becomes_ready_is_not_a_successful_update(
+    tmp_path: Path,
+) -> None:
+    # Mode 2: the image pulls, then the container dies during startup.
+    # Everything the script currently checks still looks fine.
+    h = Harness(
+        tmp_path,
+        revision_name="aca-faked25--0000003",
+        ready_revision_name="aca-faked25--0000002",  # the OLD one, still serving
+        running_state="Activating",
+        health_body=HEALTHY_BODY,  # answered by the previous revision
+    )
+    result = h.run()
+    assert result.returncode != 0, (
+        "script reported success for a revision that never became ready; "
+        f"stdout was:\n{result.stdout}"
+    )
+    assert "0000003" in result.stderr and "0000002" in result.stderr, result.stderr
+
+
+def test_image_pull_failure_that_never_becomes_ready_is_not_a_successful_update(
+    tmp_path: Path,
+) -> None:
+    # Mode 1: the digest does not exist, so no container ever runs.
+    h = Harness(
+        tmp_path,
+        revision_name="aca-faked25--0000001",
+        ready_revision_name="aca-faked25--s9rk0tq",  # the OLD one, still serving
+        running_state="Activating",
+        health_body=HEALTHY_BODY,
+    )
+    result = h.run()
+    assert result.returncode != 0, (
+        "script reported success for a revision that never pulled its image; "
+        f"stdout was:\n{result.stdout}"
+    )
+
+
+def test_ready_revision_is_allowed_to_lag_before_catching_up(tmp_path: Path) -> None:
+    # The gate must not be a single read: on a healthy deploy this field
+    # trails latestRevisionName and then catches up. Failing on the first
+    # read would break every normal deployment.
+    h = Harness(
+        tmp_path,
+        revision_name="aca-faked25--0000004",
+        ready_revision_names=[
+            "aca-faked25--0000003",  # still the previous one
+            "aca-faked25--0000003",
+            "aca-faked25--0000004",  # caught up
+        ],
+        running_state="RunningAtMaxScale",
+    )
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+
+
+def test_revision_that_becomes_ready_still_passes(tmp_path: Path) -> None:
+    # The reverse guard: tightening the gate must not reject a healthy deploy.
+    h = Harness(
+        tmp_path,
+        revision_name="aca-faked25--0000002",
+        ready_revision_name="aca-faked25--0000002",
+        running_state="RunningAtMaxScale",
+    )
+    result = h.run()
+    assert result.returncode == 0, result.stderr
+    assert "/health returned the expected body" in result.stdout
