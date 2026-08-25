@@ -16,7 +16,7 @@ Authentication, input validation, rate limiting, and the `X-Correlation-Id` midd
 
 ### Orchestration services (`services/`, with DTOs in `models/` and prompt assets in `prompts/`)
 
-Conversation state handling, prompt assembly, and routing decisions (plain chat vs. retrieval vs. tool calls), in `conversation.py`, `rag.py`, and `agent_turn.py`. This code is **fully deterministic**: same input and state produce the same prompt and the same routing. It is covered by ordinary unit tests with no real model involved.
+Conversation state handling, prompt assembly, and routing decisions (plain chat vs. retrieval vs. tool calls), in `conversation.py`, `rag.py`, and `agent_turn.py`. This code is **conventionally testable**: it is covered by ordinary unit tests with no real model involved. It is not, however, uniformly deterministic — it owns one deliberate source of randomness. `rag.py` draws a fresh untrusted-source fence nonce (`secrets.token_hex(16)`) per request and puts it in the prompt, so the same question against the same index does not produce the same prompt bytes (Day 21). That nondeterminism is injected (`nonce_factory`), which is what keeps it testable: tests pin it, production does not.
 
 Prompt assembly is centralized here on purpose — it is the only way to answer question 2, and the single place to apply data masking or filtering.
 
@@ -28,9 +28,9 @@ Prompt assembly is centralized here on purpose — it is the only way to answer 
 
 - **Swappable**: changing model version or provider touches one file.
 - **Testable**: fake adapters return fixed answers; the whole business-logic chain runs in milliseconds.
-- **Measurable**: timeout, retry, and circuit-breaking are implemented once, here.
+- **Measurable**: timeout and retry are implemented once, here. Circuit breaking is *not* implemented anywhere in this tree; it would be adapter-owned policy if it were added.
 
-This is the cage for nondeterminism: only adapter internals are unpredictable; everything outside is conventional, testable code.
+This is the cage for *provider* nondeterminism: model behaviour is unpredictable and stays behind the adapter. It is not a claim that everything outside is deterministic — orchestration owns the injectable randomness described above.
 
 **Dependency rule: `services/` never depends on `api/`.** An adapter answers a protocol-shaped question (e.g. *was this token signed by a key this tenant publishes?*) and forms no opinion about HTTP — no FastAPI imports, no `HTTPException`, no request/response models. Mapping a failure to a status code, or claims to an application identity, is the API layer's job, done by depending on the adapter's return value, never the other way round. This keeps every adapter testable with plain data and no ASGI app in the loop (see `services/entra_jwt.py` and [entra-id-auth.md](entra-id-auth.md) for a worked example).
 
@@ -38,11 +38,18 @@ This is the cage for nondeterminism: only adapter internals are unpredictable; e
 
 `core/` is not a layer in the request path; it is the primitives every layer uses: audit event schema, settings, correlation context, the error contract, structured logging, telemetry assembly, a keyed lock, and tenant context. Nothing here decides what to say to a model.
 
-The token budget is the clearest example of why the distinction is worth keeping. It is one guardrail spread across three owners: **policy** is configuration (`core/config.py`), **admission and the ledger** belong to the orchestration services (`_check_budget` reads only committed totals; the ledger commits with the turn in the same all-or-nothing `ConversationStore.append(... usage_tokens ...)`), and the **HTTP and audit projection** — turning `TokenBudgetExceededError` into a 429 envelope and one audit event — belongs to `api/`. Input length limits, mentioned above, are a separate and simpler gate; they do not read the ledger.
+The token budget is the clearest example of why the distinction is worth keeping. It is one guardrail spread across four owners:
+
+- **policy** is configuration (`core/config.py`);
+- **admission, and the decision of when to commit,** belong to the conversation and agent orchestration services (`_check_budget` reads only committed totals);
+- **ledger state and its atomic commit** belong to `ConversationStore`: the usage lands in the same all-or-nothing `append(... usage_tokens ...)` as the turn, so a reader never sees one without the other. The requirements every store implementation must satisfy — atomic visibility, non-negative usage, a monotonic total, revision conflict committing nothing — are stated in `tests/unit/test_conversation_store_contract.py`;
+- **HTTP and audit projection** — turning `TokenBudgetExceededError` into a 429 envelope and one audit event — belongs to `api/`.
+
+The path is scoped to conversation and agent turns. `/rag` has no conversation token ledger; its cost guardrail is the prompt byte budget (Day 14), which is a different mechanism. Input length limits, mentioned above, are a third and simpler gate; they do not read the ledger either.
 
 ### External dependencies and state
 
-Azure OpenAI (model), Azure AI Search (retrieval), and conversation state storage sit outside the system boundary. The LLM API is stateless — "conversation memory" is an illusion the backend assembles from its own state store, and its location, retention, and access are the backend's responsibility.
+Azure OpenAI (model), Azure AI Search (retrieval), and conversation state storage sit outside the system boundary. This application calls the Responses API with `store=False`, so no conversation state is kept upstream on its behalf (Day 5) — that is a project configuration, not a property of the API surface, which does offer server-side state. "Conversation memory" is therefore an illusion this backend assembles from its own state store, and its location, retention, and access are the backend's responsibility.
 
 ### Observability plane (cross-cutting)
 

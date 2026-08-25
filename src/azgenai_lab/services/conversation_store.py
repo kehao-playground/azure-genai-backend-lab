@@ -17,7 +17,18 @@ Contract for every implementation (review r01 findings 2, 3, 6; r04 1-2):
 - ``append`` is all-or-nothing: everything that can fail (validation,
   copying) happens before the first mutation; a turn is committed completely
   or not at all.
+- The ledger commits *with* the turn: ``usage_tokens`` is part of that same
+  all-or-nothing append, never a second write. A reader therefore never sees a
+  committed turn without its usage, or usage without its turn.
+- ``usage_tokens`` is a count, never negative; the committed total is
+  monotonic. Admission reads committed totals, so a store that allowed a
+  subtraction would hand back budget that was already spent.
 - Handed-out state never aliases internal state in either direction.
+
+These are requirements on *every* implementation, not descriptions of the
+in-memory one. ``tests/unit/test_conversation_store_contract.py`` states them as
+executable requirements against the Protocol surface alone; a new adapter
+registers itself there and must pass the suite unchanged (Day 30 review R4).
 """
 
 import copy
@@ -111,6 +122,12 @@ class InMemoryConversationStore:
                 raise ValueError("first append must carry the authorization scope")
         elif first_turn_authorization_group_ids is not None:
             raise ValueError("continuation append must not carry an authorization scope")
+        # The ledger is a ledger: usage is a count, so a store must refuse to
+        # subtract. Admission reads committed totals, so a negative append would
+        # hand back budget that was already spent (Day 30 review R4). Checked
+        # pre-mutation like every other rejection above.
+        if usage_tokens < 0:
+            raise ValueError("usage_tokens must not be negative")
         # Prepare-then-publish: everything that can fail (the deep copy)
         # happens before the first mutation, so a failed append leaves the
         # log untouched instead of half a two-representation turn.

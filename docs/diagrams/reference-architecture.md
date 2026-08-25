@@ -13,10 +13,10 @@ flowchart TB
     subgraph Backend["FastAPI Backend (reachable only via the gateway)"]
         direction TB
         APIL["API layer<br/>require_principal (401 unauthorized / 403 insufficient_scope<br/>+ WWW-Authenticate) · validation · rate limit · correlation ID"]
-        Orch["Orchestration services (deterministic, in services/)<br/>conversation · rag · agent_turn — parallel, not stacked<br/>conversation state (tenant-scoped) · prompt assembly · routing<br/>budget admission + ledger commit · audit attribution"]
-        subgraph Adapters["Adapters (same package, cage for nondeterminism)"]
+        Orch["Orchestration services (in services/)<br/>conversation · rag · agent_turn — parallel, not stacked<br/>conversation state (tenant-scoped) · prompt assembly · routing<br/>budget admission (conversation + agent) · commit decision · audit attribution<br/>rag draws a per-request fence nonce — injectable, not deterministic"]
+        subgraph Adapters["Adapters (same package, cage for provider nondeterminism)"]
             direction LR
-            LLMA["LLM adapter<br/>timeout · retry"]
+            LLMA["LLM adapter<br/>timeout · retry (no circuit breaker)"]
             RetA["Retrieval adapter<br/>principal required, no default —<br/>builds the ACL filter, never an unfiltered query"]
             AgtA["Agent adapter (AgentService Protocol)<br/>runtime behind an app-owned contract"]
         end
@@ -28,7 +28,7 @@ flowchart TB
     APIL -->|OIDC discovery / JWKS| Entra["Microsoft Entra ID"]
     LLMA --> AOAI["Azure OpenAI"]
     RetA --> Search[("Azure AI Search<br/>shared index, logical isolation —<br/>tenant_id + allowed_groups filter per query")]
-    Orch --> State[("Conversation state store<br/>keyed by (tenant_id, conversation_id)<br/>system of record for content · token ledger")]
+    Orch --> State[("Conversation state store<br/>keyed by (tenant_id, conversation_id)<br/>system of record for content · owns the token ledger<br/>and its atomic turn+usage commit")]
     AgtA --> Runtime["Agent runtime<br/>(Microsoft Agent Framework)"]
 
     Obs["Observability plane: Application Insights<br/>single assembly point (core/telemetry.py)<br/>correlation ID authoritative · trace id is baggage<br/>tenant_id · token usage · latency"]

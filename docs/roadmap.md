@@ -46,12 +46,20 @@ starting point, not results.
   orchestration services, not layers underneath it. Conversation scope, token
   budget admission, turn commit, and audit attribution stay here — they are
   answers this application owes its callers, not capabilities a runtime provides.
-- **Evidence for the boundary:** drawn 2026-08-02 (day 17) as a contract before
-  any runtime was wired to it, and pinned by
-  [`tests/unit/test_agent_framework_api_surface.py`](../tests/unit/test_agent_framework_api_surface.py),
-  which asserts the framework's API surface directly — iteration cap, client
-  construction, per-run tools, multiple tool calls — so an upstream change to any
-  of them fails here rather than in production.
+- **Evidence for the boundary,** in three layers that prove different things:
+  - **conformance** — strict mypy at the `-> AgentService` composition boundary
+    is what checks that an implementation actually satisfies the Protocol;
+  - **behaviour** — the fake and real adapter suites exercise what the
+    implementations do through that Protocol;
+  - **upstream assumptions** —
+    [`tests/unit/test_agent_framework_api_surface.py`](../tests/unit/test_agent_framework_api_surface.py)
+    asserts the *framework's* API surface (iteration cap, client construction,
+    per-run tools, multiple tool calls) so an upstream change fails there rather
+    than in production. Its own header says it is not a behaviour test, and it is
+    not evidence for the app-owned Protocol.
+
+  The contract itself was drawn 2026-08-02 (day 17), before any runtime was wired
+  to it.
 - **Trigger:** more than one application needs the same agent runtime, or the
   runtime's release cadence stops matching this service's. One app with one agent
   does not need a workflow platform; it needs a Protocol, which it has.
@@ -64,8 +72,8 @@ form, and each is enforced rather than documented.
 
 | Authority | Contract form today | Evidence | Trigger |
 |---|---|---|---|
-| Prompt versioning | Closed YAML front matter, validated fail-fast at startup: only `name`/`version`/`description`/`changelog` are accepted, `version` must be an `int` ≥ 1 — and a literal `true`/`false` is rejected, because `bool` is an `int` subclass ([`prompts/loader.py`](../src/azgenai_lab/prompts/loader.py)) | Drawn 2026-07-21 (day 8); 18 loader tests plus the logging tests that pin `prompt_name`/`prompt_version`/`prompt_sha256` on every upstream call | Prompts are edited by people who do not deploy this service, or the same prompt is served to more than one application |
-| Token budget | An admission/ledger invariant. Admission reads only committed totals (`_check_budget`); the ledger commits *with the turn*, in the same all-or-nothing `append(... usage_tokens ...)`, so usage can never drift from the turn that incurred it ([`services/conversation_store.py`](../src/azgenai_lab/services/conversation_store.py)) | Drawn 2026-07-22 (day 9); 13 budget tests and 15 store tests | Budget is enforced per user or per team rather than per conversation — which needs an identity this service does not own |
+| Prompt versioning | Closed YAML front matter, validated fail-fast at startup: only `name`/`version`/`description`/`changelog` are accepted, `version` must be an `int` ≥ 1 — and a literal `true`/`false` is rejected, because `bool` is an `int` subclass ([`prompts/loader.py`](../src/azgenai_lab/prompts/loader.py)) | Drawn 2026-07-21 (day 8); 19 loader test functions (25 cases, including the `true`/`false` regression) plus the logging tests that pin `prompt_name`/`prompt_version`/`prompt_sha256` on every upstream call | Prompts are edited by people who do not deploy this service, or the same prompt is served to more than one application |
+| Token budget | An admission/ledger invariant. Admission reads only committed totals (`_check_budget`); the ledger commits *with the turn*, in the same all-or-nothing `append(... usage_tokens ...)`, so provider-reported usage that reaches this ledger cannot drift from the turn that incurred it. It is not a billing record: failed turns, abandoned retry attempts, and any processing the provider performed without returning usage are outside it, and the invoice remains the authority (Day 9, Day 29) ([`services/conversation_store.py`](../src/azgenai_lab/services/conversation_store.py)) | Drawn 2026-07-22 (day 9); 13 budget tests, 15 store tests, and a portable store contract suite (`tests/unit/test_conversation_store_contract.py`) stating the requirements — atomic visibility, non-negative usage, monotonic total, revision conflict committing nothing — that any future adapter must satisfy | Budget is enforced per user or per team rather than per conversation — which needs an identity this service does not own |
 | Audit | A closed schema plus an emission boundary: `emit_audit_event` validates through `AUDIT_EVENT_ADAPTER.validate_python` before anything is written, so a type hint is not the boundary — the call is ([`core/audit.py`](../src/azgenai_lab/core/audit.py)) | Drawn 2026-08-10 (day 22); 20 schema tests plus per-producer suites, and a JSON Schema export with a CI drift check | The log must outlive the process that wrote it, or be queried by someone who cannot read this service's stdout |
 
 ## 4. Deployment scale — Container Apps to Kubernetes
@@ -84,12 +92,23 @@ form, and each is enforced rather than documented.
 
 ## What "movable" means here
 
-A boundary is movable when it has an explicit contract that tests exercise.
-The form differs: a Python `Protocol`, a closed schema, typed validation, or an
-admission/ledger invariant. Not every authority above is a `Protocol` — and that
-is the point. The test is whether something outside can depend on the contract
-without depending on the implementation, not whether the contract is spelled
-with a particular Python construct.
+An explicit contract that tests exercise is the **starting point** for moving a
+boundary safely. The form differs: a Python `Protocol`, a closed schema, typed
+validation, or an admission/ledger invariant. Not every authority above is a
+`Protocol` — and that is the point. The test is whether something outside can
+depend on the contract without depending on the implementation, not whether the
+contract is spelled with a particular Python construct.
 
-The inverse is the useful warning. A capability with no contract does not become
-movable by being wanted somewhere else; it becomes a rewrite.
+It is a prerequisite, not a proof. A contract that holds inside one process says
+nothing yet about what a move adds: a network boundary, partial failure,
+transactions that no longer share a process, authorization across a trust
+boundary, latency, rollback, and an operational owner. Nothing here has been
+built or measured, so this section describes what would have to be true first —
+not that any of it would work.
+
+The inverse is the useful warning, and it is narrower than "it becomes a
+rewrite." A capability with no contract does not become movable by being wanted
+somewhere else: it cannot be claimed as a lift-and-shift until its behaviour is
+characterized and contracted. Characterization tests or a consumer-driven
+contract can supply that first, which is exactly the work the move needs and
+exactly the work no one budgets for.

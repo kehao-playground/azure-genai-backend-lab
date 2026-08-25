@@ -88,6 +88,24 @@ def test_non_int_version_raises(tmp_path: Path) -> None:
         load_prompt("sample", base_dir=base)
 
 
+@pytest.mark.parametrize("literal", ["true", "false", "True", "False"])
+def test_bool_version_raises(tmp_path: Path, literal: str) -> None:
+    """`bool` is an `int` subclass, so a bare `isinstance(v, int)` check would
+    accept YAML `true` as version 1 — a silent version identity, not a loud
+    failure. This pins the explicit bool exclusion (Day 30 review R3: the edge
+    was implemented but never tested).
+
+    Only the `true` cases are load-bearing for the subclass trap: removing the
+    `isinstance(..., bool)` clause fails `true`/`True` and leaves `false`/`False`
+    passing, because `False == 0` is then rejected by the `>= 1` check for an
+    unrelated reason. The false cases are kept as boundary coverage, not as
+    evidence for the trap."""
+    content = VALID.replace("version: 2", f"version: {literal}")
+    base = _write(tmp_path, "sample", content)
+    with pytest.raises(PromptTemplateError, match="version"):
+        load_prompt("sample", base_dir=base)
+
+
 def test_name_filename_mismatch_raises(tmp_path: Path) -> None:
     base = _write(tmp_path, "other", VALID)  # front matter says "sample"
     with pytest.raises(PromptTemplateError, match="filename"):
