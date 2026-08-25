@@ -1,0 +1,20 @@
+flowchart LR
+    subgraph App["今天：一個 process"]
+        direction TB
+        API["api/<br/>對外合約 · 錯誤的投影"]
+        ORCH["orchestration services<br/>conversation · rag · AgentTurnService<br/>對話範圍 · 預算准入 · 提交 · audit 歸屬"]
+        PROV["provider adapters<br/>ChatService · SearchClient · EmbeddingClient"]
+        AGT["agent adapter<br/>AgentService"]
+        GOV["治理權威<br/>prompt 版本 · token 預算 · audit"]
+        API --> ORCH
+        ORCH --> PROV
+        ORCH --> AGT
+        ORCH -.-> GOV
+    end
+
+    PROV ==>|"合約：Protocol<br/>自 Day 4 起就有兩套實作"| GW["Model gateway<br/>平台擁有"]
+    AGT ==>|"合約：AgentService Protocol<br/>消費端留在原地"| WF["Agent workflow runtime"]
+    GOV ==>|"合約：封閉 schema · 型別驗證<br/>准入／帳本不變量"| GP["Governance plane"]
+
+    API -.->|"沒有可搬的合約——它就是這個服務"| STAY["留下"]
+    ORCH -.->|"欠呼叫端的是答案，不是能力"| STAY
