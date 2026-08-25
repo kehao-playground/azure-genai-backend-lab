@@ -13,6 +13,7 @@
 - [Infrastructure Evolution](infra-evolution.md) — why 24 scripts and one Bicep template: what is declarable, the two ownership axes, what a live `what-if` really reports
 - [Evaluation](evaluation.md) — deterministic vs. judged layers, the dataset format, judge repeats and stability, what this day does not measure
 - [Architecture](architecture.md) — layers, package boundaries, and dependency rules
+- [Roadmap](roadmap.md) — the boundaries that could move out of this process, the contract each would have to keep, and what would have to be true first
 - [Azure Services Map](azure-services-map.md)
 - [Testing Strategy](testing-strategy.md)
 - [Production Readiness Checklist](production-readiness-checklist.md) — seven topics, each line a portable requirement paired with this lab's answer; checkable lines carry the command
