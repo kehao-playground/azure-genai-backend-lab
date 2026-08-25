@@ -2,7 +2,9 @@
 
 The Day 29 readiness checklist separates machine-checkable lines from
 question lines without a `[verifiable]` tag: a line is machine-checkable
-if and only if a runnable command follows it. This diagram shows where
+only if a runnable command follows it — and the command is only candidate
+evidence, counting when its pass condition says what the requirement says
+and a plausible unwanted state makes it fail. This diagram shows where
 that line actually runs — not between topics, but between requirements
 whose subject is a **property of the code** and requirements whose
 subject is a **decision made by a person**. Code-side lines carry a
@@ -24,7 +26,7 @@ flowchart TB
     req --> q
 
     subgraph codeside["A property of the code"]
-        cmd["✅ a runnable command follows —<br/>clear pass/fail, non-zero exit on violation,<br/>actually run this round against this tree"]
+        cmd["✅ a runnable assertion follows —<br/>its pass condition is the requirement itself,<br/>non-zero exit on violation,<br/>actually run this round against this tree"]
         live["⚑ verifiable, but only against<br/>a deployed app"]
     end
 
@@ -46,7 +48,7 @@ flowchart TB
     na["Out of scope for a lab —<br/>the only such line is on-call"]
     q -->|"(rare)"| oos --> na
 
-    cmd -.- warn["No third state between these:<br/>a command not run this round<br/>must not pose as machine-checkable"]
+    cmd -.- warn["A command is only candidate evidence:<br/>one not run this round must not pose<br/>as machine-checkable, and a check an<br/>unwanted state satisfies is not a gate"]
 
     style cmd fill:#d3f0d8,stroke:#2e7d32
     style good fill:#d3e5f0,stroke:#1565c0

@@ -643,14 +643,18 @@ now failure-shaped: it aborts on the enum's named failure states, keeps
 waiting through `Processing`, and treats every other value — including
 vocabulary this project has not seen — as not evidence of failure. It does
 not establish what the service's full vocabulary is, nor that any particular
-new value will appear next. What stands in for success is therefore not the
-poll but the two checks around it: the step-3 read-back that the app's
-template now carries the exact requested image, and step 4's exact-body
-`/health` probe — together with the absence of a known failure state at the
-poll. **That is the whole list.** The script queries no other revision field:
-there is no `active` and no `provisioningState` read-back in it, and the
-step-1 pre-mutation snapshot is rollback data, not a success gate. See the
-comment above the poll in `infra/scripts/update-container-app.sh`.
+new value will appear next. What stood in for success at the
+time was not the poll but the two checks around it: the step-3 read-back that
+the app's template now carries the exact requested image, and step 4's
+exact-body `/health` probe — together with the absence of a known failure
+state at the poll. **That was the whole list until the Day 29 session**, and
+the next subsection records how those three checks false-passed and what was
+added. The current contract is four checks: the same three plus step 3b's
+`latestReadyRevisionName` readiness poll. Besides `runningState` and
+`latestReadyRevisionName` the script reads no other revision field — there is
+no `active` and no `provisioningState` read-back in it, and the step-1
+pre-mutation snapshot is rollback data, not a success gate. See the comments
+in `infra/scripts/update-container-app.sh`.
 
 ### Settled later, by the Day 29 session (2026-08-24)
 

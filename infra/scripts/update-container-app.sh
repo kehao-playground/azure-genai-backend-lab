@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Point an existing Container App at a new image and refuse to report success
-# unless three mechanical facts hold afterwards (see step 3/4 below). Note
-# what is NOT among them: this script cannot establish which revision is
-# actually serving traffic. This is the script the CI/CD deploy
+# unless four mechanical facts hold afterwards (see steps 3/3b/4 below).
+# HISTORY: until the Day 29 session (2026-08-24) this header promised only
+# three facts and stated that the script could not establish which revision
+# was actually serving traffic -- and that missing fact was exactly how two
+# injected failures passed every check while the old revision kept serving.
+# Step 3b (latestReadyRevisionName) exists because of that session.
+# This is the script the CI/CD deploy
 # job runs -- deploy-container-app.sh creates the app once; every deploy after
 # that goes through here.
 #
@@ -12,7 +16,7 @@
 # `az containerapp update` completely unmodified: no tag parsing, no
 # normalization, no appending ":latest".
 #
-# Four steps, in order:
+# Five steps, in order:
 #   1. Pre-mutation snapshot -- read the app's CURRENT TEMPLATE image,
 #      exactly as Azure stores it. This is the desired-state field, not
 #      proof of what any revision is serving: if an earlier deploy left a
@@ -28,16 +32,20 @@
 #      DETECTOR -- a known failure state aborts, "Processing" keeps waiting,
 #      and any other value (including vocabulary this project has not seen)
 #      is treated as "not evidence of failure", never as proof of success.
-#      This script does NOT read `active` or `provisioningState`; the only
-#      revision field it queries is runningState.
+#   3b. Readiness: a bounded poll on `latestReadyRevisionName` until it names
+#      the revision this update produced. This is the check that fails when
+#      a new revision never starts and the previous one keeps serving --
+#      the case steps 3 and 4 cannot see.
 #   4. Data-plane smoke: /health, polled with a bounded deadline, must return
 #      the exact body.
 #
 # So "success" here means: the control plane accepted the requested image and
-# echoes it back, nothing reported a known failure state, and the app answers
-# /health with the exact expected body. The step-1 snapshot is rollback data,
-# not part of that determination. See docs/ci-cd.md section 11 for the gap
-# this leaves under single revision mode (open item 14).
+# echoes it back, nothing reported a known failure state, the produced
+# revision became the latest READY revision, and the app answers /health with
+# the exact expected body. Besides runningState and latestReadyRevisionName,
+# no other revision field is read (`active` and `provisioningState` are not);
+# the step-1 snapshot is rollback data, not part of that determination.
+# docs/ci-cd.md section 11 records how the pre-3b gap was found and closed.
 #
 # There is NO automatic rollback. On any failure after step 2, this script
 # prints the manual rollback command built from the step-1 snapshot -- and if
