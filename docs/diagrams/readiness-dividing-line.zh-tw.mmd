@@ -7,7 +7,7 @@ flowchart TB
     req --> q
 
     subgraph codeside["程式的一個性質"]
-        cmd["✅ 後面掛一條可執行指令<br/>明確 pass／fail、違反時 exit 非零<br/>而且這一輪真的跑過"]
+        cmd["✅ 後面掛一條可執行 assertion<br/>通過條件＝要求本身、違反時 exit 非零<br/>而且這一輪真的跑過"]
         live["⚑ 驗得到，但要一個<br/>部署中的 app 才驗得到"]
     end
 
@@ -29,7 +29,7 @@ flowchart TB
     na["不適用——<br/>全表僅 on-call 這一條"]
     q -->|"（罕見）"| oos --> na
 
-    cmd -.- warn["沒有含糊的中間態：<br/>沒跑過的指令<br/>不准冒充可機器驗"]
+    cmd -.- warn["指令只是候選證據：<br/>沒跑過的不准冒充可機器驗；<br/>會被不想要的狀態滿足的<br/>檢查不是 gate"]
 
     style cmd fill:#d3f0d8,stroke:#2e7d32
     style good fill:#d3e5f0,stroke:#1565c0

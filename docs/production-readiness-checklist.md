@@ -12,10 +12,22 @@ carry to another backend — with **this lab's answer**, which is one of:
 
 ## How the two layers are separated
 
-A line is machine-checkable **if and only if a runnable command follows it**.
-There is no `[verifiable]` tag, because a tag is a claim and a command is a
-check. Every command below was run on 2026-08-24 against this tree; where a
-line has no command, it has a question you have to answer yourself instead.
+A line is machine-checkable **only if a runnable command follows it** — and a
+command is only *candidate* evidence. There is no `[verifiable]` tag, because
+a tag is a claim; but a command is not automatically a check either. It counts
+only when its pass condition says the same thing the requirement says, and a
+plausible unwanted state makes it exit non-zero. This page contains its own
+counterexample: the three deploy checks under [Rollback](#rollback) were each
+real, executed commands — and both injected failures passed all three. Two
+softer versions of the same trap live here too: a listing or count that stays
+exit 0 whatever it prints is a printout, not an assertion (every absence check
+below is therefore written with `!`, so the unwanted state fails), and a green
+command can prove a *mechanism* exists while the requirement asks whether it
+has been *used* (the two incident-response commands are labeled accordingly).
+Every command below was run on 2026-08-25 against this tree — except the one
+`az` read-back, which needs a deployed app and carries its own dated result;
+where a line has no command, it has a question you have to answer yourself
+instead.
 
 The split does not follow the topic. It follows whether the requirement is a
 **property of the code** or a **decision made by a person**:
@@ -123,7 +135,7 @@ Every control, with the file that implements it:
 - [ ] **There is a load test, or at least a documented basis for the capacity
       ceiling.** This lab: **Not present.**
       ```bash
-      ls tests/            # unit, integration, bdd -- no load or soak suite
+      ! ls tests | grep -qiE "load|soak"   # fails the moment a load/soak suite appears
       ```
 
 ---
@@ -184,7 +196,7 @@ Every control, with the file that implements it:
       subscription budget alert — a delayed cost notification — and no
       application alert rule of any kind.
       ```bash
-      grep -rlE "az monitor (metrics|scheduled-query) alert" infra/scripts/ | wc -l   # 0
+      ! grep -rqE "az monitor (metrics|scheduled-query) alert" infra/scripts/
       ```
       This deployment has traces, an audit trail and a dashboard's worth of
       data, and **nothing that would wake anyone up.**
@@ -286,7 +298,7 @@ Every control, with the file that implements it:
       document makes no retention promise: the trail is JSON lines on stderr,
       and retention is whatever the hosting log pipeline does.
       ```bash
-      grep -rniE "retention" src/azgenai_lab/core/config.py | wc -l   # 0
+      ! grep -qiE "retention" src/azgenai_lab/core/config.py
       ```
       *You have to answer: what is your retention period, who approved it, and
       on what date?* No amount of code will answer that one — which is the
@@ -301,8 +313,8 @@ Every control, with the file that implements it:
 - [ ] **A deletion request has an execution path.** This lab: **Not present.**
       There is no delete endpoint and no persistent datastore to delete from.
       ```bash
-      grep -rn "def delete" src/azgenai_lab/api/ | wc -l                    # 0
-      grep -rniE "sqlalchemy|asyncpg|psycopg|pymongo|redis" src/ | wc -l    # 0
+      ! grep -rqE "def delete" src/azgenai_lab/api/
+      ! grep -rqiE "sqlalchemy|asyncpg|psycopg|pymongo|redis" src/
       ```
 
 - [ ] **The model provider's data-processing terms were reviewed.** This lab:
@@ -318,17 +330,22 @@ Every control, with the file that implements it:
       there is no operations team here. This is the only out-of-scope line on
       this page.
 
-- [ ] **An audit trail answers who did what, when.** This lab: one terminal
-      event per classified request ([audit-logging.md](audit-logging.md)), with
-      its limits stated in the same document: not durable, not tamper-evident,
-      a process crash between outcome and flush loses the event.
+- [ ] **An audit trail exists that can answer who did what, when.** This lab:
+      one terminal event per classified request
+      ([audit-logging.md](audit-logging.md)), with its limits stated in the
+      same document: not durable, not tamper-evident, a process crash between
+      outcome and flush loses the event. The command below proves the
+      *mechanism*; whether the trail has been read during a real incident is
+      the drill line's question, not this one's.
       ```bash
       uv run pytest tests/unit/test_audit_emitter.py
       ```
 
 - [ ] **You can follow one request from the edge to the upstream call.**
       This lab: `correlation_id` joins the stage lines, the `llm usage` line and
-      the audit event; Day 27 carries it onto spans.
+      the audit event; Day 27 carries it onto spans. Green here means the join
+      *exists* — not that anyone has followed a request under incident
+      pressure.
       ```bash
       uv run pytest tests/unit/test_telemetry_rag.py::test_rag_spans_carry_the_correlation_id
       ```

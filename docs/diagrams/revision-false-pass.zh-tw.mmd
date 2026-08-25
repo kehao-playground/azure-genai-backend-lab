@@ -6,23 +6,24 @@ flowchart TB
         c1["template image 讀回 ✓<br/>回報的是「你要求了什麼」"]
         c2["runningState＝Activating ✓<br/>不是已知失敗態，放行"]
         c3["/health 200，body 逐位元組正確 ✓"]
-        ok["exit 0：「Verified」<br/>而部署從未跑起來"]
+        ok["exit 0：「Verified」<br/>而新 revision 從未 ready"]
         c1 --> c2 --> c3 --> ok
     end
 
     subgraph data["資料面（single revision mode）"]
-        newrev["新 revision（壞）<br/>traffic 100<br/>拉不到 image 或 crash loop<br/>console log：零筆或只有 crash"]
         oldrev["舊 revision<br/>traffic 0<br/>仍在服務"]
+        newrev["新 revision（壞）<br/>traffic 100<br/>拉不到 image 或 crash loop<br/>console log：零筆或只有 crash"]
     end
 
     c3 -. "誰回答的？<br/>（console log 的 RevisionName_s）" .-> oldrev
 
     subgraph control["控制面"]
-        f1["latestRevisionName＝壞的那個"]
-        f2["latestReadyRevisionName＝舊的那個<br/>唯一分得出差別的欄位——<br/>而沒有任何東西在讀它"]
+        f1["latestRevisionName<br/>＝壞的那個"]
+        f2["latestReadyRevisionName<br/>＝舊的那個——唯一分得出<br/>差別的欄位，而沒有東西在讀它"]
     end
 
-    fix["step 3b（修法）：對 latestReadyRevisionName 有界輪詢<br/>是輪詢不是單次讀回——健康的部署上<br/>這個欄位本來就會晚一步才跟上"]
+    fix["step 3b（修法）：有界輪詢，直到<br/>latestReadyRevisionName＝這次更新產生的 revision<br/>——是輪詢不是單次讀回，健康的部署上<br/>這個欄位本來就會晚一步才跟上"]
+    f1 --> fix
     f2 --> fix
 
     style ok fill:#fde2e0,stroke:#c62828
