@@ -13,11 +13,12 @@ flowchart TB
     subgraph Backend["FastAPI Backend (reachable only via the gateway)"]
         direction TB
         APIL["API layer<br/>require_principal (401 unauthorized / 403 insufficient_scope<br/>+ WWW-Authenticate) · validation · rate limit · correlation ID"]
-        Orch["Orchestration layer (deterministic)<br/>conversation state (tenant-scoped) · prompt assembly · RAG/Agent routing"]
-        subgraph Adapters["Adapter layer (cage for nondeterminism)"]
+        Orch["Orchestration services (deterministic, in services/)<br/>conversation · rag · agent_turn — parallel, not stacked<br/>conversation state (tenant-scoped) · prompt assembly · routing<br/>budget admission + ledger commit · audit attribution"]
+        subgraph Adapters["Adapters (same package, cage for nondeterminism)"]
             direction LR
             LLMA["LLM adapter<br/>timeout · retry"]
             RetA["Retrieval adapter<br/>principal required, no default —<br/>builds the ACL filter, never an unfiltered query"]
+            AgtA["Agent adapter (AgentService Protocol)<br/>runtime behind an app-owned contract"]
         end
         APIL --> Orch --> Adapters
     end
@@ -27,15 +28,19 @@ flowchart TB
     APIL -->|OIDC discovery / JWKS| Entra["Microsoft Entra ID"]
     LLMA --> AOAI["Azure OpenAI"]
     RetA --> Search[("Azure AI Search<br/>shared index, logical isolation —<br/>tenant_id + allowed_groups filter per query")]
-    Orch --> State[("Conversation state store<br/>keyed by (tenant_id, conversation_id)")]
+    Orch --> State[("Conversation state store<br/>keyed by (tenant_id, conversation_id)<br/>system of record for content · token ledger")]
+    AgtA --> Runtime["Agent runtime<br/>(Microsoft Agent Framework)"]
 
-    Obs["Observability plane: Application Insights<br/>correlation ID · tenant_id · token usage · latency"]
+    Obs["Observability plane: Application Insights<br/>single assembly point (core/telemetry.py)<br/>correlation ID authoritative · trace id is baggage<br/>tenant_id · token usage · latency"]
+    Aud["Audit plane: one terminal event per validated request<br/>ids · counts · outcome — never content<br/>closed schema, validated at the emission boundary"]
     APIL -.-> Obs
     Orch -.-> Obs
     Adapters -.-> Obs
+    APIL -.-> Aud
+    Orch -.-> Aud
 ```
 
-Solid arrows: runtime request flow. Dotted arrows: telemetry.
+Solid arrows: runtime request flow. Dotted arrows: telemetry and audit — two planes, not one. Telemetry answers *how did this behave*; audit answers *what happened, and to whom it is attributable*. Audit records ids, counts, and outcomes only: the content system of record is the conversation store. See [observability.md](../observability.md) and [audit-logging.md](../audit-logging.md).
 
 **Trust boundary (Day 15, extended Day 19).** Two mutually exclusive identity sources sit behind
 one dependency, chosen once at startup from `AUTH_MODE`.
