@@ -36,7 +36,7 @@ Failures before the stream starts keep their HTTP status codes (the envelope app
 
 ## Conversation state
 
-The LLM API is stateless (`store=False` upstream); conversation history is owned by this application behind the `ConversationStore` protocol (Day 7):
+This application calls the LLM with `store=False`, so upstream keeps no conversation state on its behalf — a project configuration, not a property of the API surface, which does offer server-side state. Conversation history is owned by this application behind the `ConversationStore` protocol (Day 7):
 
 - `POST /api/v1/chat` and `POST /api/v1/chat/stream` accept an optional `conversation_id`. Omitting it starts a new conversation; the id comes back in the JSON body (`/chat`) or in the `X-Conversation-Id` response header (`/chat/stream` — a header because SSE clients need it at response time, not from an event). On a first streaming turn that header id is **provisional**: it becomes real only with a keepable terminal (`message.done` completed or `max_output_tokens`); after `error`, `content_filter`/`other`, or a disconnect the client must discard it.
 - Unknown ids are rejected with `404 conversation_not_found` through the envelope. "Unknown" covers never-issued, expired, and lost-on-restart ids alike; the client reaction is the same — start a new conversation.

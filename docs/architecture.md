@@ -12,7 +12,7 @@ See the [reference architecture diagram](diagrams/reference-architecture.md).
 
 ### API layer (`api/`)
 
-Authentication, input validation, rate limiting, and the `X-Correlation-Id` middleware. Its single job: **the public API contract must be more stable than the model.** Models, prompts, and retrieval strategies change; the request/response schemas and the error envelope (`{"error": {"code", "message"}, "correlation_id"}`) do not. Input length limits live here — the first cost gate.
+Authentication, input validation, rate limiting, and the `X-Correlation-Id` middleware. Its single job: **the public API contract must be more stable than the model.** Models, prompts, and retrieval strategies change; the request/response schemas and the error envelope (`{"error": {"code", "message"}, "correlation_id"}`) do not. Input length limits are the first cost gate, but they are not uniformly an API-layer concern in this tree: `/rag` caps the question at the API (`max_length=2000`), the agent path caps the task at 4,000 UTF-8 bytes inside the service (`validate_task`), and `/chat` has no explicit maximum message length at all.
 
 ### Orchestration services (`services/`, with DTOs in `models/` and prompt assets in `prompts/`)
 
