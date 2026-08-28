@@ -53,6 +53,8 @@ def test_rag_answered_maps_hits_to_numbered_sources(client: TestClient) -> None:
             hits=(hit,),
             usage=usage,
             incomplete_reason=None,
+            cited_source_count=1,
+            stripped_citation_count=0,
         )
     )
 
@@ -239,6 +241,8 @@ def test_answered_rag_response_rejects_empty_sources() -> None:
             usage=None,
             incomplete_reason=None,
             correlation_id="c",
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
 
 
@@ -439,3 +443,48 @@ def test_provider_context_overflow_is_server_owned_on_rag(
     assert complete_record.correlation_id == "cid-provider-overflow"
     for record in caplog.records:
         assert "does alpha pair with beta?" not in record.getMessage()
+
+
+def test_rag_answered_body_carries_citation_counts(client: TestClient) -> None:
+    hit = SearchHit(
+        chunk_id="chunk-1",
+        parent_id="doc-1",
+        title="Doc Title",
+        heading_path="Doc Title > Section",
+        content="some content",
+        score=1.5,
+    )
+    override_with(
+        RagAnswer(
+            status="answered",
+            answer="The answer is [1].",
+            hits=(hit,),
+            usage=None,
+            incomplete_reason=None,
+            cited_source_count=1,
+            stripped_citation_count=2,
+        )
+    )
+
+    response = client.post("/api/v1/rag", json={"question": "what is it?"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cited_source_count"] == 1
+    assert body["stripped_citation_count"] == 2
+
+
+def test_rag_no_answer_body_has_null_citation_counts(client: TestClient) -> None:
+    # Present but null, like usage and incomplete_reason: a client reading the
+    # key always finds it, and null is not 0. Zero citations in an answer and
+    # no answer at all are different facts.
+    override_with(
+        RagAnswer(status="no_answer", answer=None, hits=(), usage=None, incomplete_reason=None)
+    )
+
+    response = client.post("/api/v1/rag", json={"question": "anything?"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cited_source_count"] is None
+    assert body["stripped_citation_count"] is None

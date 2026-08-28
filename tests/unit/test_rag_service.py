@@ -23,6 +23,7 @@ from azgenai_lab.services.rag import (
     RagContextOverflowError,
     RagService,
     _default_nonce,
+    _validate_citations,
     render_sources,
     render_user_message,
 )
@@ -585,3 +586,143 @@ async def test_answer_keeps_valid_citations_and_logs_zero_invalid(
         if r.name == "azgenai_lab.services.rag" and "citation_validation" in r.getMessage()
     )
     assert "invalid_citation_count=0" in record.getMessage()
+
+
+# --- Citation counts (Bonus 6) -------------------------------------------
+#
+# Two counts with deliberately different semantics: cited_source_count is a
+# *set* cardinality (distinct in-range numbers surviving in the cleaned
+# answer), stripped_citation_count is an *event* count (how many markers were
+# removed, duplicates included). Both are syntactic: a legal number is still
+# no evidence that the cited source supports the sentence it sits after.
+
+
+@pytest.mark.parametrize(
+    ("answer", "included", "cleaned", "cited", "stripped"),
+    [
+        # Both semantics at once: the repeated [1] collapses to one distinct
+        # source, the repeated [99] counts as two strip events. A case using
+        # only distinct numbers proves the set half and leaves the event half
+        # unpinned.
+        ("[1][1][99][99]", 1, "[1][1]", 1, 2),
+        # Regression guard for the scan order. The pattern matches the *inner*
+        # [99]; removing it splices the leftover "[1" and "]" into a valid [1]
+        # that the substitution callback never saw. Collecting valid numbers
+        # inside the callback would report 0 here and contradict the text
+        # actually returned.
+        ("[1[99]]", 1, "[1]", 1, 1),
+        # Both out-of-range sides: 0 below, N+1 above.
+        ("[0][4]", 3, "", 0, 2),
+        # No markers at all -- zero cited is not the same fact as zero
+        # stripped, and only both together separate the causes.
+        ("no citations here", 2, "no citations here", 0, 0),
+        ("[1] and [2] and [1]", 2, "[1] and [2] and [1]", 2, 0),
+    ],
+)
+def test_validate_citations_reports_distinct_valid_and_stripped_counts(
+    answer: str, included: int, cleaned: str, cited: int, stripped: int
+) -> None:
+    result = _validate_citations(answer, included)
+
+    assert result.answer == cleaned
+    assert result.cited_source_count == cited
+    assert result.stripped_citation_count == stripped
+
+
+async def test_answer_carries_citation_counts_to_the_caller() -> None:
+    chat = _RecordingChatService(message="ok [1] [1] [99]")
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5), chat
+    )
+
+    result = await service.answer("alpha", PRINCIPAL)
+
+    assert result.status == "answered"
+    assert result.cited_source_count == 1
+    assert result.stripped_citation_count == 1
+
+
+async def test_no_answer_leaves_citation_counts_unset() -> None:
+    # The short-circuit branch has no answer text, so a count of 0 would be a
+    # fact about nothing. None says "not applicable" instead.
+    service = RagService(
+        Retriever(FakeEmbeddingClient(), FakeSearchClient([DOC]), top=5),
+        _RecordingChatService(),
+    )
+
+    result = await service.answer("nothing matches this phrase", PRINCIPAL)
+
+    assert result.status == "no_answer"
+    assert result.cited_source_count is None
+    assert result.stripped_citation_count is None
+
+
+def test_rag_answer_rejects_answered_status_with_negative_cited_count() -> None:
+    # int, not a constrained type: nothing below this guard would reject a
+    # negative. An invariant no test pins is a comment.
+    with pytest.raises(ValueError, match="cited_source_count"):
+        RagAnswer(
+            status="answered",
+            answer="text",
+            hits=(HIT,),
+            usage=None,
+            incomplete_reason=None,
+            cited_source_count=-1,
+            stripped_citation_count=0,
+        )
+
+
+def test_rag_answer_rejects_answered_status_with_negative_stripped_count() -> None:
+    with pytest.raises(ValueError, match="stripped_citation_count"):
+        RagAnswer(
+            status="answered",
+            answer="text",
+            hits=(HIT,),
+            usage=None,
+            incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=-1,
+        )
+
+
+def test_rag_answer_rejects_cited_count_above_hit_count() -> None:
+    with pytest.raises(ValueError, match="cited_source_count"):
+        RagAnswer(
+            status="answered",
+            answer="text",
+            hits=(HIT,),
+            usage=None,
+            incomplete_reason=None,
+            cited_source_count=2,
+            stripped_citation_count=0,
+        )
+
+
+@pytest.mark.parametrize("field", ["cited_source_count", "stripped_citation_count"])
+def test_rag_answer_rejects_answered_status_with_unset_counts(field: str) -> None:
+    fields: dict[str, object] = {
+        "status": "answered",
+        "answer": "text",
+        "hits": (HIT,),
+        "usage": None,
+        "incomplete_reason": None,
+        "cited_source_count": 0,
+        "stripped_citation_count": 0,
+    }
+    fields[field] = None
+    with pytest.raises(ValueError, match=field):
+        RagAnswer(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["cited_source_count", "stripped_citation_count"])
+def test_rag_answer_rejects_no_answer_status_with_counts(field: str) -> None:
+    fields: dict[str, object] = {
+        "status": "no_answer",
+        "answer": None,
+        "hits": (),
+        "usage": None,
+        "incomplete_reason": None,
+    }
+    fields[field] = 0
+    with pytest.raises(ValueError, match=field):
+        RagAnswer(**fields)  # type: ignore[arg-type]

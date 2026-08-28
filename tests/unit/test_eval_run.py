@@ -1670,6 +1670,8 @@ async def test_run_judged_layer_pass_a_pass_b_sources_disagreement_is_inconclusi
             hits=(fabricated_hit,),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     generation = _StaticChatService(
@@ -1705,6 +1707,8 @@ async def test_run_judged_layer_pass_b_upstream_error_is_inconclusive_with_zero_
             hits=(_hit(tenant="acme", doc_id="returns-policy"),),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     generation = _StaticChatService(UpstreamTimeoutError("pass B generation timed out"))
@@ -1740,6 +1744,8 @@ async def test_run_judged_layer_upstream_error_text_never_reaches_the_report(
             hits=(_hit(tenant="acme", doc_id="returns-policy"),),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     generation = _StaticChatService(
@@ -1783,6 +1789,8 @@ async def test_run_judged_layer_pass_b_structural_no_answer_is_inconclusive_with
             hits=(_hit(tenant="acme", doc_id="returns-policy"),),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     pass_b_service = _CannedAnswerService(
@@ -1847,6 +1855,8 @@ async def test_sources_mismatch_still_records_the_billed_pass_b_provenance(
                 hits=mismatched,
                 usage=pass_b_usage,
                 incomplete_reason=None,
+                cited_source_count=0,
+                stripped_citation_count=0,
             )
 
         async def aclose(self) -> None:
@@ -1906,6 +1916,8 @@ async def test_run_judged_layer_attaches_pass_b_usage_and_sources_to_the_result(
                 hits=pass_a.hits,
                 usage=pass_b_usage,
                 incomplete_reason=None,
+                cited_source_count=0,
+                stripped_citation_count=0,
             )
 
         async def aclose(self) -> None:
@@ -3122,6 +3134,8 @@ async def test_a_transcript_is_emitted_on_the_sources_mismatch_branch(
                 hits=mismatched,
                 usage=None,
                 incomplete_reason=None,
+                cited_source_count=0,
+                stripped_citation_count=0,
             )
 
         async def aclose(self) -> None:
@@ -3265,6 +3279,8 @@ async def test_no_transcript_when_pass_b_raises_upstream(monkeypatch: pytest.Mon
             hits=(_hit(tenant="acme", doc_id="returns-policy"),),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     generation = _StaticChatService(UpstreamTimeoutError("pass B generation timed out"))
@@ -3298,6 +3314,8 @@ async def test_no_transcript_when_pass_b_no_answers(monkeypatch: pytest.MonkeyPa
             hits=(_hit(tenant="acme", doc_id="returns-policy"),),
             usage=None,
             incomplete_reason=None,
+            cited_source_count=0,
+            stripped_citation_count=0,
         )
     )
     pass_b_service = _CannedAnswerService(

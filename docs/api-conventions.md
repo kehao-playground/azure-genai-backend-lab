@@ -215,13 +215,18 @@ call exactly as it caps a `/chat` turn.
     }
   ],
   "usage": { "input_tokens": 812, "output_tokens": 96, "total_tokens": 908, "reasoning_tokens": null },
+  "cited_source_count": 1,
+  "stripped_citation_count": 0,
   "correlation_id": "5f0d2c9e-..."
 }
 ```
 
-`incomplete_reason` and `usage` are always present in the response body — never omitted — but
-their value is nullable: both are `null` on the `"no_answer"` short-circuit and on a fully
-completed generation; `usage` is `null` only if the provider omitted its usage block.
+`incomplete_reason`, `usage`, `cited_source_count`, and `stripped_citation_count` are always
+present in the response body — never omitted — but their value is nullable. `incomplete_reason` and
+`usage` are both `null` on the `"no_answer"` short-circuit and on a fully completed generation;
+`usage` is `null` only if the provider omitted its usage block. The two citation counts are `null`
+on `"no_answer"` and integers on `"answered"` — `null` rather than `0`, because that branch has no
+answer text for a count to describe, and `0` would read as "an answer that cited nothing".
 
 - `status` is `"answered"` or `"no_answer"`. `"no_answer"` is a structural
   short-circuit — retrieval returned zero hits, so the request never reaches the
@@ -233,9 +238,14 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   gate is instructional, not structural: the `rag_answer` prompt tells the model
   to cite sources and to say plainly when the sources don't cover the question,
   but a model-level refusal is still a successful generation from the pipeline's
-  view and comes back as `"answered"`. Clients that need to tell "cited answer"
-  from "polite refusal" apart must inspect `answer` and `sources`, not `status`
-  alone.
+  view and comes back as `"answered"`. `status` alone still does not separate a
+  cited answer from a polite refusal, but a client no longer has to parse the
+  answer prose to get the syntactic half of that question: `cited_source_count`
+  and `stripped_citation_count` report it directly (below). What stays
+  undecidable is which cause produced `cited_source_count: 0` — a model refusal,
+  an answer that simply cited nothing, or one whose citations were all invented
+  and stripped. The API does not guess between them, and it does not reclassify
+  `status` to pretend it can.
 - `sources` is the ranked hit list the model was given, numbered to match the
   `[1]`/`[2]` citation markers the prompt asks the model to use; `score` and
   `reranker_score` follow the [two-scores contract](rag-retrieval.md#two-scores-and-only-one-of-them-has-a-rubric) — hybrid mode never populates `reranker_score`.
@@ -263,7 +273,16 @@ completed generation; `usage` is `null` only if the provider omitted its usage b
   out-of-range or invented `[n]` is stripped, logged by
   number only, and never fails the request or changes `status`; this proves
   the citation *points somewhere real*, not that the cited text actually
-  supports the sentence it is attached to.
+  supports the sentence it is attached to. Both counts that pass reports are
+  returned to the caller, and they are deliberately different kinds of
+  quantity: `cited_source_count` is the number of **distinct** in-range
+  numbers left in the cleaned answer (a set cardinality), while
+  `stripped_citation_count` is the number of markers **removed** (an
+  occurrence count — the same invalid number twice counts twice). Only the
+  second one separates "the model cited nothing" from "the model cited
+  numbers that do not exist". Both inherit the boundary stated above
+  unchanged: a legal number is still no evidence that the source supports the
+  sentence it sits after.
 - Errors follow the standard envelope; `incomplete_reason` mirrors the `/chat`
   vocabulary (`max_output_tokens`, `content_filter`, `other`) for the same
   client rules (keep/discard/treat-as-unusable) — it only ever appears when
