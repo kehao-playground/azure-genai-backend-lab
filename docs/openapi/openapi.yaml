@@ -499,6 +499,23 @@ components:
             - other
           - type: 'null'
           title: Incomplete Reason
+        cited_source_count:
+          type: integer
+          title: Cited Source Count
+          description: 'How many DISTINCT source numbers in 1..len(sources) appear
+            as [n] markers in the returned answer. Syntactic only: it proves a citation
+            points at a source that was really in context, NOT that the source supports
+            the sentence it is attached to. 0 does not mean the model refused -- it
+            cannot be told apart from an answer that simply cited nothing, or one
+            whose citations were all invented and stripped.'
+        stripped_citation_count:
+          type: integer
+          title: Stripped Citation Count
+          description: 'How many [n] markers were removed because their number fell
+            outside 1..len(sources). An occurrence count, not a distinct one: the
+            same invalid number twice counts twice. Greater than 0 is the only signal
+            separating ''the model cited nothing'' from ''the model cited numbers
+            that do not exist''.'
         correlation_id:
           type: string
           title: Correlation Id
@@ -509,6 +526,8 @@ components:
       - sources
       - usage
       - incomplete_reason
+      - cited_source_count
+      - stripped_citation_count
       - correlation_id
       title: AnsweredRagResponse
     ChatRequest:
@@ -641,6 +660,12 @@ components:
         incomplete_reason:
           type: 'null'
           title: Incomplete Reason
+        cited_source_count:
+          type: 'null'
+          title: Cited Source Count
+        stripped_citation_count:
+          type: 'null'
+          title: Stripped Citation Count
         correlation_id:
           type: string
           title: Correlation Id

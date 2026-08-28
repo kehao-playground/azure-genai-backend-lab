@@ -120,6 +120,12 @@ class RagAnswer:
     hits: tuple[SearchHit, ...]
     usage: TokenUsage | None
     incomplete_reason: IncompleteReason | None
+    # Syntactic citation facts about `answer`, both None on the no-answer
+    # branch (there is no answer text for them to describe). Neither says
+    # anything about whether a cited source supports the sentence it is
+    # attached to -- see `_validate_citations`.
+    cited_source_count: int | None = None
+    stripped_citation_count: int | None = None
 
     def __post_init__(self) -> None:
         # Domain-level consistency guard (Task 12): the two RagStatus branches
@@ -131,6 +137,20 @@ class RagAnswer:
                 raise ValueError("status='answered' requires answer to be set")
             if not self.hits:
                 raise ValueError("status='answered' requires at least one hit")
+            if self.cited_source_count is None:
+                raise ValueError("status='answered' requires cited_source_count to be set")
+            if self.stripped_citation_count is None:
+                raise ValueError(
+                    "status='answered' requires stripped_citation_count to be set"
+                )
+            # `int` is not a constrained type: without these two checks a
+            # negative would travel all the way to the response body.
+            if not 0 <= self.cited_source_count <= len(self.hits):
+                raise ValueError(
+                    "status='answered' requires 0 <= cited_source_count <= len(hits)"
+                )
+            if self.stripped_citation_count < 0:
+                raise ValueError("status='answered' requires stripped_citation_count >= 0")
         elif self.status == "no_answer":
             if self.answer is not None:
                 raise ValueError("status='no_answer' requires answer to be None")
@@ -141,6 +161,12 @@ class RagAnswer:
             if self.incomplete_reason is not None:
                 raise ValueError(
                     "status='no_answer' requires incomplete_reason to be None"
+                )
+            if self.cited_source_count is not None:
+                raise ValueError("status='no_answer' requires cited_source_count to be None")
+            if self.stripped_citation_count is not None:
+                raise ValueError(
+                    "status='no_answer' requires stripped_citation_count to be None"
                 )
 
 
@@ -248,8 +274,27 @@ def _select_within_budget(
 _CITATION_PATTERN = re.compile(r"\[(\d+)\]")
 
 
-def _validate_citations(answer: str, included_hit_count: int) -> str:
-    """Strip citation markers whose number is outside 1..included_hit_count.
+@dataclass(frozen=True)
+class ValidatedCitations:
+    """The cleaned answer plus the two counts the cleaning pass can prove.
+
+    The two counts are deliberately different kinds of quantity, and the
+    field names carry that: `cited_source_count` is a **set** cardinality
+    (how many distinct source numbers the reader ends up seeing), while
+    `stripped_citation_count` is an **event** count (how many markers were
+    removed, duplicates included). Collapsing them into one number would
+    lose the only signal that separates "the model cited nothing" from "the
+    model cited numbers that were all invented".
+    """
+
+    answer: str
+    cited_source_count: int
+    stripped_citation_count: int
+
+
+def _validate_citations(answer: str, included_hit_count: int) -> ValidatedCitations:
+    """Strip citation markers whose number is outside 1..included_hit_count,
+    and report what the answer is left with.
 
     Syntactic only (Task 11): this never fails the request and never
     reclassifies `status` -- a citation number the model invented (or that
@@ -257,6 +302,18 @@ def _validate_citations(answer: str, included_hit_count: int) -> str:
     gap, not a request failure, so the answer is cleaned and returned rather
     than rejected. Only numbers are logged; the answer text itself is not
     (consistent with this module's redaction discipline elsewhere).
+
+    Syntactic also bounds what the counts mean. A surviving `[n]` proves the
+    number points at a source that was really in context; it is no evidence
+    that the source supports the sentence it sits after. Nothing in this
+    pipeline checks that (`docs/rag-overview.md`, Day 15 debts).
+
+    The valid numbers are counted by re-scanning the **cleaned** answer, not
+    by collecting them in the substitution callback. Stripping can splice
+    surviving characters into a marker the callback never matched:
+    `_validate_citations("[1[99]]", 1)` matches the inner `[99]`, and
+    removing it leaves `[1]`. Counting inside the callback would report zero
+    citations for text that visibly carries one.
     """
     invalid: list[int] = []
 
@@ -273,7 +330,16 @@ def _validate_citations(answer: str, included_hit_count: int) -> str:
         len(invalid),
         ",".join(str(number) for number in invalid),
     )
-    return cleaned
+    cited = {
+        number
+        for number in (int(match.group(1)) for match in _CITATION_PATTERN.finditer(cleaned))
+        if 1 <= number <= included_hit_count
+    }
+    return ValidatedCitations(
+        answer=cleaned,
+        cited_source_count=len(cited),
+        stripped_citation_count=len(invalid),
+    )
 
 
 class RagService:
@@ -429,7 +495,8 @@ class RagService:
                     ),
                 ))
             raise
-        validated_answer = _validate_citations(result.message, len(included))
+        validated = _validate_citations(result.message, len(included))
+        validated_answer = validated.answer
         logger.info(
             "rag stage=complete total_ms=%.1f status=answered outcome=success",
             (time.perf_counter() - total_started) * 1000,
@@ -452,6 +519,8 @@ class RagService:
             hits=tuple(included),
             usage=result.usage,
             incomplete_reason=result.incomplete_reason,
+            cited_source_count=validated.cited_source_count,
+            stripped_citation_count=validated.stripped_citation_count,
         )
 
     async def aclose(self) -> None:

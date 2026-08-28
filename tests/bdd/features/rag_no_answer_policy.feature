@@ -25,3 +25,19 @@ Feature: RAG no-answer policy
     When I ask the RAG endpoint a whitespace-only question
     Then the response status code should be 422
     And the response JSON should contain error "validation_error"
+
+  Scenario: An invented citation is stripped and both counts reach the caller
+    Given an indexed corpus that covers the question
+    And a model answer citing one real source and one invented source
+    When I ask the RAG endpoint the question
+    Then the response status code should be 200
+    And the RAG status should be "answered"
+    And the response should report 1 distinct cited source
+    And the response should report 1 stripped citation
+
+  Scenario: A no-answer response carries no citation counts
+    Given retrieval that returns zero hits
+    When I ask the RAG endpoint the question
+    Then the response status code should be 200
+    And the RAG status should be "no_answer"
+    And both citation counts should be null

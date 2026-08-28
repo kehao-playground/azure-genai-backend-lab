@@ -36,10 +36,13 @@ class StubChatService:
         """No-op: this stub owns no resources to release."""
 
 
-def _override_rag_service(documents: Sequence[dict[str, str]], context) -> None:  # type: ignore[no-untyped-def]
+def _override_rag_service(  # type: ignore[no-untyped-def]
+    documents: Sequence[dict[str, str]], context, answer: str = _STUBBED_ANSWER
+) -> None:
+    context.rag_documents = documents
     search_client = FakeSearchClient(documents)
     retriever = Retriever(FakeEmbeddingClient(), search_client, top=5)
-    chat = StubChatService()
+    chat = StubChatService(answer)
     context.rag_chat_spy = chat
     # StubChatService never actually sends the rag_answer prompt (it returns
     # a fixed answer, independent of any prompt text), but the answered-path
@@ -77,6 +80,16 @@ def step_retrieval_returns_zero_hits(context) -> None:  # type: ignore[no-untype
     # relying on lexical non-matching. The contract under test is purely
     # structural (zero hits -> no_answer, no LLM call), not semantic.
     _override_rag_service([], context)
+
+
+@given("a model answer citing one real source and one invented source")
+def step_answer_with_invented_citation(context) -> None:  # type: ignore[no-untyped-def]
+    # [7] cannot exist: the corpus above yields exactly one source. Same
+    # fixed, input-independent stub as the scenario above, with an
+    # out-of-range marker added.
+    _override_rag_service(
+        context.rag_documents, context, answer="Alpha pairs with beta [1], and [7]."
+    )
 
 
 @when("I ask the RAG endpoint the question")
@@ -123,3 +136,24 @@ def step_citations_reference_sources(context) -> None:  # type: ignore[no-untype
     # returned sources. This is not a semantic-entailment claim.
     assert citation_numbers, "expected at least one [n] citation marker in the answer"
     assert citation_numbers <= set(range(1, len(sources) + 1))
+
+
+@then("the response should report {count:d} distinct cited source")
+@then("the response should report {count:d} distinct cited sources")
+def step_cited_source_count(context, count: int) -> None:  # type: ignore[no-untyped-def]
+    assert context.response.json()["cited_source_count"] == count
+
+
+@then("the response should report {count:d} stripped citation")
+@then("the response should report {count:d} stripped citations")
+def step_stripped_citation_count(context, count: int) -> None:  # type: ignore[no-untyped-def]
+    assert context.response.json()["stripped_citation_count"] == count
+
+
+@then("both citation counts should be null")
+def step_citation_counts_null(context) -> None:  # type: ignore[no-untyped-def]
+    # Null, not 0: there is no answer text for a count to describe, and 0
+    # would read as "an answer that cited nothing".
+    body = context.response.json()
+    assert body["cited_source_count"] is None
+    assert body["stripped_citation_count"] is None

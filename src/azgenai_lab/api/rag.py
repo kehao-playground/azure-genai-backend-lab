@@ -121,6 +121,24 @@ class AnsweredRagResponse(BaseModel):
         description="Provider may omit usage even when answered."
     )
     incomplete_reason: Literal["max_output_tokens", "content_filter", "other"] | None
+    cited_source_count: int = Field(
+        description=(
+            "How many DISTINCT source numbers in 1..len(sources) appear as [n] markers "
+            "in the returned answer. Syntactic only: it proves a citation points at a "
+            "source that was really in context, NOT that the source supports the "
+            "sentence it is attached to. 0 does not mean the model refused -- it cannot "
+            "be told apart from an answer that simply cited nothing, or one whose "
+            "citations were all invented and stripped."
+        )
+    )
+    stripped_citation_count: int = Field(
+        description=(
+            "How many [n] markers were removed because their number fell outside "
+            "1..len(sources). An occurrence count, not a distinct one: the same invalid "
+            "number twice counts twice. Greater than 0 is the only signal separating "
+            "'the model cited nothing' from 'the model cited numbers that do not exist'."
+        )
+    )
     correlation_id: str
 
 
@@ -132,6 +150,8 @@ class NoAnswerRagResponse(BaseModel):
     )
     usage: None = None
     incomplete_reason: None = None
+    cited_source_count: None = None
+    stripped_citation_count: None = None
     correlation_id: str
 
 
@@ -162,12 +182,17 @@ async def rag(
         )
         for number, hit in enumerate(result.hits, start=1)
     ]
-    assert result.answer is not None  # guaranteed by RagAnswer.__post_init__
+    # All three guaranteed by RagAnswer.__post_init__ on the answered branch.
+    assert result.answer is not None
+    assert result.cited_source_count is not None
+    assert result.stripped_citation_count is not None
     return AnsweredRagResponse(
         status="answered",
         answer=result.answer,
         sources=sources,
         usage=result.usage,
         incomplete_reason=result.incomplete_reason,
+        cited_source_count=result.cited_source_count,
+        stripped_citation_count=result.stripped_citation_count,
         correlation_id=correlation_id,
     )
