@@ -726,3 +726,28 @@ def test_rag_answer_rejects_no_answer_status_with_counts(field: str) -> None:
     fields[field] = 0
     with pytest.raises(ValueError, match=field):
         RagAnswer(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("state", "answer", "included", "cited", "stripped"),
+    [
+        ("no markers", "no citations here", 2, 0, 0),
+        ("all invalid", "[0][4]", 3, 0, 2),
+        ("all valid", "[1] and [2]", 2, 2, 0),
+        ("mixed", "[1][99]", 1, 1, 1),
+    ],
+)
+def test_the_two_counts_resolve_four_distinct_states(
+    state: str, answer: str, included: int, cited: int, stripped: int
+) -> None:
+    """Pins why there are two fields rather than one.
+
+    The pair is two independent axes. Either alone collapses the square:
+    cited_source_count cannot separate "no markers" from "all invalid",
+    stripped_citation_count cannot separate "no markers" from "all valid".
+    Only together do the four states above stay distinguishable -- and the
+    one thing neither settles is whether a (0, 0) answer was a refusal.
+    """
+    result = _validate_citations(answer, included)
+
+    assert (result.cited_source_count, result.stripped_citation_count) == (cited, stripped), state

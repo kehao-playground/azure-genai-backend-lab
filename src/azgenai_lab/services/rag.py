@@ -282,9 +282,27 @@ class ValidatedCitations:
     field names carry that: `cited_source_count` is a **set** cardinality
     (how many distinct source numbers the reader ends up seeing), while
     `stripped_citation_count` is an **event** count (how many markers were
-    removed, duplicates included). Collapsing them into one number would
-    lose the only signal that separates "the model cited nothing" from "the
-    model cited numbers that were all invented".
+    removed, duplicates included).
+
+    They are two independent axes, and the pair resolves four syntactic
+    states a caller may want to handle differently:
+
+        cited  stripped   state
+        0      0          no markers at all
+        0      >0         every marker was invalid and got stripped
+        >0     0          every marker was valid
+        >0     >0         some valid, some invalid
+
+    Either field alone collapses that square onto one axis and loses a
+    distinction: `cited_source_count` alone cannot separate "no markers"
+    from "all invalid", and `stripped_citation_count` alone cannot separate
+    "no markers" from "all valid". That is the reason there are two, not
+    that one of them is individually blind.
+
+    What the pair still cannot decide is the (0, 0) case: a model refusal
+    and an ordinary answer that simply cited nothing look identical here,
+    and nothing syntactic can tell them apart. Semantic support is never
+    decided by either count -- see `_validate_citations`.
     """
 
     answer: str
