@@ -241,11 +241,12 @@ answer text for a count to describe, and `0` would read as "an answer that cited
   view and comes back as `"answered"`. `status` alone still does not separate a
   cited answer from a polite refusal, but a client no longer has to parse the
   answer prose to get the syntactic half of that question: `cited_source_count`
-  and `stripped_citation_count` report it directly (below). What stays
-  undecidable is which cause produced `cited_source_count: 0` — a model refusal,
-  an answer that simply cited nothing, or one whose citations were all invented
-  and stripped. The API does not guess between them, and it does not reclassify
-  `status` to pretend it can.
+  and `stripped_citation_count` report it directly (below). Read as a pair
+  they resolve four states: `(0, 0)` no markers, `(0, >0)` all markers invalid,
+  `(>0, 0)` all valid, `(>0, >0)` mixed. What stays undecidable is the `(0, 0)`
+  cell — a model refusal and an ordinary answer that simply cited nothing are
+  identical there. The API does not guess between them, and it does not
+  reclassify `status` to pretend it can.
 - `sources` is the ranked hit list the model was given, numbered to match the
   `[1]`/`[2]` citation markers the prompt asks the model to use; `score` and
   `reranker_score` follow the [two-scores contract](rag-retrieval.md#two-scores-and-only-one-of-them-has-a-rubric) — hybrid mode never populates `reranker_score`.
@@ -278,9 +279,11 @@ answer text for a count to describe, and `0` would read as "an answer that cited
   quantity: `cited_source_count` is the number of **distinct** in-range
   numbers left in the cleaned answer (a set cardinality), while
   `stripped_citation_count` is the number of markers **removed** (an
-  occurrence count — the same invalid number twice counts twice). Only the
-  second one separates "the model cited nothing" from "the model cited
-  numbers that do not exist". Both inherit the boundary stated above
+  occurrence count — the same invalid number twice counts twice). They are two
+  independent axes, and either one alone collapses the square: `cited_source_count`
+  alone cannot separate "no markers" from "all invalid", and
+  `stripped_citation_count` alone cannot separate "no markers" from "all valid".
+  Both inherit the boundary stated above
   unchanged: a legal number is still no evidence that the source supports the
   sentence it sits after.
 - Errors follow the standard envelope; `incomplete_reason` mirrors the `/chat`

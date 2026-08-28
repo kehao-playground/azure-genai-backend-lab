@@ -505,17 +505,19 @@ components:
           description: 'How many DISTINCT source numbers in 1..len(sources) appear
             as [n] markers in the returned answer. Syntactic only: it proves a citation
             points at a source that was really in context, NOT that the source supports
-            the sentence it is attached to. 0 does not mean the model refused -- it
-            cannot be told apart from an answer that simply cited nothing, or one
-            whose citations were all invented and stripped.'
+            the sentence it is attached to. Read it together with stripped_citation_count:
+            0 with 0 stripped means no markers at all, while 0 with some stripped
+            means every marker was invalid. 0 alone never means the model refused
+            -- a refusal and an ordinary uncited answer both land on (0, 0) and nothing
+            syntactic separates them.'
         stripped_citation_count:
           type: integer
           title: Stripped Citation Count
           description: 'How many [n] markers were removed because their number fell
             outside 1..len(sources). An occurrence count, not a distinct one: the
-            same invalid number twice counts twice. Greater than 0 is the only signal
-            separating ''the model cited nothing'' from ''the model cited numbers
-            that do not exist''.'
+            same invalid number twice counts twice. It is the axis cited_source_count
+            cannot see: (0, 0) is an answer with no markers, (0, >0) is one whose
+            markers were all invented, and those call for different handling.'
         correlation_id:
           type: string
           title: Correlation Id
