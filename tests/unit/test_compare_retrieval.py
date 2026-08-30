@@ -91,7 +91,7 @@ def test_expected_chunk_ids_derives_rather_than_stores() -> None:
     assert ids == (make_chunk_id(make_parent_id("acme", "service-sla"), 3),)
 
 
-def _hit(chunk_id: str, score: float) -> SearchHit:
+def make_hit(chunk_id: str, score: float = 1.0) -> SearchHit:
     """A hit whose only load-bearing field is its id — rank comes from position."""
     return SearchHit(
         chunk_id=chunk_id,
@@ -123,7 +123,7 @@ def test_absent_means_present_and_not_retrieved() -> None:
 def test_rank_is_reported_from_the_full_hit_list() -> None:
     ref = ExpectedChunkRef("service-sla", 3, "Service SLA", frozenset(Generation))
     (target,) = expected_chunk_ids("acme", (ref,))
-    hits = [_hit(f"filler-{i}", 1.0) for i in range(379)] + [_hit(target, 0.1)]
+    hits = [make_hit(f"filler-{i}", 1.0) for i in range(379)] + [make_hit(target, 0.1)]
     states = dict(rank_states(hits=hits, refs=(ref,), generation=Generation.G1, tenant_id="acme"))
     assert states[target] == "380"
 
@@ -139,7 +139,10 @@ def test_a_retrieved_chunk_declared_outside_the_generation_raises() -> None:
     (target,) = expected_chunk_ids("acme", (only_g3,))
     with pytest.raises(ValueError) as excinfo:
         rank_states(
-            hits=[_hit(target, 1.0)], refs=(only_g3,), generation=Generation.G1, tenant_id="acme"
+            hits=[make_hit(target, 1.0)],
+            refs=(only_g3,),
+            generation=Generation.G1,
+            tenant_id="acme",
         )
     message = str(excinfo.value)
     assert target in message
@@ -172,3 +175,12 @@ def test_the_control_arm_is_not_translated() -> None:
     globex = QUERIES_BY_TENANT["globex"]
     assert len(globex) == 5
     assert {query.language for query in globex} == {"en"}
+
+
+def test_truncation_keeps_the_rank_and_marks_the_table() -> None:
+    from tools.compare_retrieval import _detail_rows
+
+    hits = [make_hit(f"c{i}") for i in range(500)]
+    rows, note = _detail_rows(hits, max_recorded_hits=10)
+    assert len(rows) == 10
+    assert "490" in note and "500" in note

@@ -576,6 +576,33 @@ def _ranks(hits: Sequence[SearchHit], expected: tuple[str, ...]) -> str:
     return "; ".join(f"`{chunk_id}`={positions.get(chunk_id, 'absent')}" for chunk_id in expected)
 
 
+def _hit_row(rank: int, hit: SearchHit) -> str:
+    """One detail-table row for a single hit, rank already 1-based."""
+    reranker = "-" if hit.reranker_score is None else f"{hit.reranker_score:.3f}"
+    return f"| {rank} | `{hit.chunk_id}` | {hit.score:.6f} | {reranker} |"
+
+
+def _detail_rows(
+    hits: Sequence[SearchHit], *, max_recorded_hits: int
+) -> tuple[list[str], str]:
+    """Render at most N hit rows, and say so when there were more.
+
+    Only the rendering is capped. Every pre-registered chunk's rank is
+    computed by `rank_states`/`_ranks` from the complete hit list before this
+    runs, so a gold chunk at rank 380 is recorded as 380 even when ten rows
+    are shown. A file that quietly showed ten rows of five hundred would be
+    indistinguishable from a run that only returned ten.
+    """
+    shown = list(hits[:max_recorded_hits])
+    rows = [_hit_row(rank, hit) for rank, hit in enumerate(shown, start=1)]
+    if len(hits) <= max_recorded_hits:
+        return rows, ""
+    return rows, (
+        f"_{len(hits) - max_recorded_hits} of {len(hits)} hit rows omitted; "
+        "pre-registered ranks above are computed from the full list._"
+    )
+
+
 async def _run(
     client: AzureSearchClient,
     evidence: Evidence,
@@ -589,6 +616,7 @@ async def _run(
     top: int,
     vector_k: int,
     search_endpoint: str | None,
+    max_recorded_hits: int,
 ) -> list[str]:
     """One call, one set of table rows.
 
@@ -629,7 +657,7 @@ async def _run(
             raw_detail = str(exc) or exc.__class__.__name__
         detail = _scrub(raw_detail, search_endpoint, "[search-service]")[:160].replace("|", "\\|")
         row = (
-            f"| {label} | **{status}** | {request_id} | {latency} | — | — | "
+            f"| {label} | **{status}** | {request_id} | {latency} | — | — | — | "
             f"FAILED: {detail} | — | — |"
         )
         if isinstance(exc, ConfigurationError):
@@ -649,21 +677,22 @@ async def _run(
     found = _ranks(result.hits, expected_ids)
     shared = (
         f"| {label} | {diagnostics.status} | {diagnostics.request_id} "
-        f"| {diagnostics.latency_ms:.1f} | {found} "
+        f"| {diagnostics.latency_ms:.1f} | {len(result.hits)} | {found} "
     )
     if not result.hits:
         return [shared + "| — | (no results) | — | — |"]
-    rows = []
-    for rank, hit in enumerate(result.hits, start=1):
-        reranker = "-" if hit.reranker_score is None else f"{hit.reranker_score:.3f}"
-        rows.append(shared + f"| {rank} | `{hit.chunk_id}` | {hit.score:.6f} | {reranker} |")
+    detail_rows, note = _detail_rows(result.hits, max_recorded_hits=max_recorded_hits)
+    rows = [shared + detail_row for detail_row in detail_rows]
+    if note:
+        rows.append(note)
     return rows
 
 
 HEADER = (
-    "| run | status | request id | ms | expected chunk ranks | rank | chunk_id | score | reranker |"
+    "| run | status | request id | ms | hits_total | expected chunk ranks "
+    "| rank | chunk_id | score | reranker |"
 )
-DIVIDER = "|---|---|---|---|---|---|---|---|---|"
+DIVIDER = "|---|---|---|---|---|---|---|---|---|---|"
 
 
 async def main() -> None:
@@ -686,6 +715,16 @@ async def main() -> None:
         action="append",
         default=[],
         help="repeatable; a query gated behind allowed_groups needs its group here",
+    )
+    parser.add_argument(
+        "--max-recorded-hits",
+        type=int,
+        default=10,
+        help=(
+            "caps rendered hit rows per table; does not affect --top or the "
+            "recorded rank of a pre-registered chunk, which is always read "
+            "from the full response"
+        ),
     )
     arguments = parser.parse_args()
 
@@ -810,6 +849,7 @@ async def _compare(
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
                 search_endpoint=settings.azure_search_endpoint,
+                max_recorded_hits=arguments.max_recorded_hits,
             )
             evidence.add(*rows)
             evidence.flush()
@@ -838,6 +878,7 @@ async def _compare(
                 top=arguments.top,
                 vector_k=vector_k,
                 search_endpoint=settings.azure_search_endpoint,
+                max_recorded_hits=arguments.max_recorded_hits,
             )
             evidence.add(*rows)
             evidence.flush()
@@ -866,6 +907,7 @@ async def _compare(
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
                 search_endpoint=settings.azure_search_endpoint,
+                max_recorded_hits=arguments.max_recorded_hits,
             )
             evidence.add(*rows)
             evidence.flush()
