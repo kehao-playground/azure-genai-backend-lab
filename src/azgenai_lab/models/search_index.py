@@ -91,7 +91,7 @@ def _text_field(
     return field
 
 
-def to_index_definition() -> dict[str, Any]:
+def to_index_definition(index_name: str = INDEX_NAME) -> dict[str, Any]:
     """The index schema, as the Create-or-Update Index REST body expects it.
 
     One chunk is one search document. ``parent_id`` is what makes a document's
@@ -106,7 +106,7 @@ def to_index_definition() -> dict[str, Any]:
     added or updated at any time, with no rebuild and no document reloaded.
     """
     return {
-        "name": INDEX_NAME,
+        "name": index_name,
         "fields": [
             # sortable is here for cursor paging, not presentation: stale
             # enumeration pages with `orderby chunk_id asc` and a `gt` range

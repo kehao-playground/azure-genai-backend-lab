@@ -140,13 +140,13 @@ def plan_batches(
         yield IndexingBatch(_OPEN + b",".join(batch) + _CLOSE, tuple(keys), action)
 
 
-def index_url(endpoint: str) -> str:
-    return f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}?api-version={SEARCH_API_VERSION}"
+def index_url(endpoint: str, index_name: str = INDEX_NAME) -> str:
+    return f"{endpoint.rstrip('/')}/indexes/{index_name}?api-version={SEARCH_API_VERSION}"
 
 
-def documents_url(endpoint: str) -> str:
+def documents_url(endpoint: str, index_name: str = INDEX_NAME) -> str:
     return (
-        f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}/docs/index"
+        f"{endpoint.rstrip('/')}/indexes/{index_name}/docs/index"
         f"?api-version={SEARCH_API_VERSION}"
     )
 
@@ -184,17 +184,24 @@ def parse_indexing_results(payload: object) -> list[IndexingResult]:
 class SearchDataPlane:
     """Index management plus the indexing and enumeration calls."""
 
-    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client: httpx.AsyncClient | None = None,
+        index_name: str = INDEX_NAME,
+    ) -> None:
         if not settings.azure_search_endpoint or not settings.azure_search_admin_key:
             raise ConfigurationError(
                 "azure_search_endpoint and azure_search_admin_key are required"
             )
         endpoint = settings.azure_search_endpoint
-        self._index_url = index_url(endpoint)
-        self._documents_url = documents_url(endpoint)
+        self._index_name = index_name
+        self._index_url = index_url(endpoint, index_name)
+        self._documents_url = documents_url(endpoint, index_name)
         # Same URL shape the query-side client builds — `search_url()` is the
         # one owner of it, imported rather than duplicated here.
-        self._search_url = search_url(endpoint)
+        self._search_url = search_url(endpoint, index_name)
         self._headers = {
             "api-key": settings.azure_search_admin_key.get_secret_value(),
             "content-type": "application/json",
@@ -232,22 +239,22 @@ class SearchDataPlane:
         response = await self._send(
             "PUT",
             self._index_url,
-            json=to_index_definition(),
+            json=to_index_definition(self._index_name),
             extra_headers={"Prefer": "return=representation"},
         )
         if response.status_code >= 400:
             raise self._error(response)
-        logger.info("index created or updated name=%s", INDEX_NAME)
+        logger.info("index created or updated name=%s", self._index_name)
 
     async def delete_index(self) -> None:
         """Idempotent: an index that is already gone is a successful teardown."""
         response = await self._send("DELETE", self._index_url)
         if response.status_code == 404:
-            logger.info("index already absent name=%s", INDEX_NAME)
+            logger.info("index already absent name=%s", self._index_name)
             return
         if response.status_code >= 400:
             raise self._error(response)
-        logger.info("index deleted name=%s", INDEX_NAME)
+        logger.info("index deleted name=%s", self._index_name)
 
     async def post_batch(self, batch: IndexingBatch) -> list[IndexingResult]:
         """Send one planned batch and read its per-document verdicts.
