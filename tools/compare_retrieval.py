@@ -39,40 +39,56 @@ rather than with bytes assumed to be the same. Generating and querying are two
 separate invocations of the same command: the first writes the file and
 queries nothing.
 
-Six things stop the run before it can spend anything, in the order they fire:
-a ``--manifest-sha256`` value that is neither a digest nor the literal
-``none`` (rejected while parsing), an index name carrying a generation token
-that contradicts ``--generation``, a ``--generation``/``--manifest-sha256``
-pair that contradicts itself (``g1`` paired with a digest, or ``g2``/``g3``
-paired with ``none``), a worktree that is not clean, fake embeddings, and a
-vectors file that is not the frozen one this query set needs — either its
-keys are not exactly these questions, or a stored vector does not match its
-own digest. Each one would otherwise produce an evidence file that looks
-complete and either cannot be reproduced or is labelled with something it did
-not measure.
+Seven things stop the run before it can spend anything, in the order they
+fire: a ``--top`` outside the service's own page-size bounds and a
+``--manifest-sha256`` value that is neither a digest nor the literal ``none``
+(both rejected while parsing), an index name carrying a generation token that
+contradicts ``--generation`` or left at the base index for a generation that
+does not live there, a ``--generation``/``--manifest-sha256`` pair that
+contradicts itself (``g1`` paired with a digest, or ``g2``/``g3`` paired with
+``none``), a worktree that is not clean, fake embeddings, and a vectors file
+that is not the frozen one this query set needs — either its keys are not
+exactly these questions, or a stored vector does not match its own digest.
+Each one would otherwise produce an evidence file that looks complete and
+either cannot be reproduced or is labelled with something it did not measure.
 
 Usage:
     # First: writes the vectors file, queries nothing.
     # Then: the same command again, which reads it and runs.
     uv run python tools/compare_retrieval.py \
-        --top 25 --out ../drafts/assets/day-34/g1-acme.md \
+        --top 14 --out ../drafts/assets/day-34/g1-acme.md \
         --tenant-id acme --user-id lab-operator \
         --vectors ../drafts/assets/day-34/vectors-acme.json \
         --generation g1 --index-name azgenai-lab-chunks-g1 \
         --manifest-sha256 none
 
-    # g2/g3 carry a distractor corpus and pin its manifest instead:
-    #     --generation g2 --manifest-sha256 "$(cat corpora/g2/manifest.json.sha256)"
+    # Four arguments change between generations, not two. g2:
+    #     --top 156 \
+    #     --generation g2 --index-name azgenai-lab-chunks-g2 \
+    #     --manifest-sha256 "$(cat /tmp/bonus7/g2/manifest.json.sha256)"
+    # and g3:
+    #     --top 774 \
+    #     --generation g3 --index-name azgenai-lab-chunks-g3 \
+    #     --manifest-sha256 "$(cat /tmp/bonus7/g3/manifest.json.sha256)"
+    # The corpora live outside this repository on purpose: building them in
+    # the worktree makes `git status --porcelain` non-empty, which the
+    # pre-run cleanliness check below refuses.
 
 `--baseline-only` records the four-mode survey and neither experiment: the
 control arm, whose corpus does not grow, is surveyed rather than experimented
 on, at four calls per query instead of nine.
 
-`top` must be at least the corpus chunk count. Below it, a chunk that was
-generated as a candidate but truncated out of the response is indistinguishable
-from one that was never a candidate — which is the distinction the candidate
-generation experiment exists to measure. The output filename names the tier,
-because nothing inside the file records which one produced it.
+``top`` must be **strictly greater** than the visible corpus's chunk count —
+14 / 156 / 774 for the measured g1 / g2 / g3 counts of 13 / 155 / 773. Below
+the count, a chunk that was generated as a candidate but truncated out of the
+response is indistinguishable from one that was never a candidate, which is
+the distinction the candidate generation experiment exists to measure. *At*
+the count the ambiguity survives in a subtler form: a query matching every
+chunk fills the page legitimately, so ``len(hits) == top`` no longer means
+anything. One above it, a full page cannot be legitimate, which is what makes
+the refusal in ``_run`` sound — it fires on the first call rather than after
+all 108 are spent. The output filename names the tier, because nothing inside
+the file records which one produced it.
 """
 
 import argparse
@@ -94,7 +110,13 @@ from azgenai_lab.core.errors import ConfigurationError, UpstreamError
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
-from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
+from azgenai_lab.models.search import (
+    DEFAULT_VECTOR_K,
+    MAX_TOP,
+    MIN_BOUND,
+    SearchHit,
+    SearchMode,
+)
 from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.embeddings import EmbeddingClient, build_embedding_client
@@ -791,6 +813,63 @@ def _detail_rows(
     )
 
 
+def _abort(evidence: Evidence, reason: str) -> None:
+    """Write why the run stops, then flush, before the abort propagates.
+
+    The published artifact is the Markdown; the exception text is stderr,
+    which nobody reads afterwards. A file that stops mid-table with a footer
+    counter below total and no stated cause tells a reader that something
+    went wrong and nothing about what, so every abort leaves this line. The
+    blank line first is not cosmetic: a bare paragraph glued to the last row
+    of a Markdown table is parsed as part of the table.
+    """
+    evidence.add("", f"**Aborted: {reason}**")
+    evidence.flush()
+
+
+def _reject_full_page(
+    evidence: Evidence,
+    label: str,
+    query: Query,
+    *,
+    mode: SearchMode,
+    top: int,
+    hits: int,
+) -> None:
+    """Refuse a response that exactly fills the page.
+
+    ``top`` is prescribed strictly above the visible corpus's chunk count, so
+    a full page cannot be a corpus that merely ended on the boundary — it is
+    the service saying there was more and it stopped. Which is precisely the
+    reading the three-state rank vocabulary must never have to guess at: past
+    the cut every pre-registered chunk records ``absent``, defined as a recall
+    failure, and nothing in the finished file would reveal that no such
+    failure happened.
+
+    It fires on the first call of the run, before the other 107 are spent, and
+    the operator's fix is a run parameter rather than a re-freeze — so this
+    costs one call and no correction to any frozen artifact.
+    """
+    if hits != top:
+        return
+    _abort(
+        evidence,
+        f"{label} returned exactly --top ({top}) hits for {query.text!r} in "
+        f"mode {mode.value}. A response that fills the page cannot be told "
+        "apart from one the page truncated, and that distinction is what "
+        "this experiment measures.",
+    )
+    raise SystemExit(
+        f"{label}: the search returned exactly --top ({top}) hits for "
+        f"{query.text!r} in mode {mode.value}. A full page is either the whole "
+        "corpus or a truncated one, and this run cannot tell which — every "
+        "pre-registered chunk past the cut would be recorded as `absent`, "
+        "which the rank vocabulary defines as a recall failure. Re-run with "
+        "--top strictly greater than this generation's visible chunk count "
+        "(14 / 156 / 774 for g1 / g2 / g3) and discard this evidence file."
+    )
+
+
 async def _run(
     client: AzureSearchClient,
     evidence: Evidence,
@@ -825,6 +904,11 @@ async def _run(
     try/except below, deliberately — inside it, a bug in the frozen table
     would be caught by the ``ValueError`` arm meant for a rejected request and
     filed as a failed search call, which is the one thing it is not.
+
+    A third: a response holding exactly ``top`` hits. See ``_reject_full_page``.
+    Every one of the three writes its own explanation into the Markdown before
+    it propagates. Aborting must not leave a reader a half-written table, a
+    footer counter below total, and no stated cause.
     """
     try:
         result = await client.search(
@@ -870,18 +954,23 @@ async def _run(
     assert diagnostics is not None  # set on every completed round trip
     evidence.record_request(label, diagnostics.request_body)
 
+    _reject_full_page(evidence, label, query, mode=mode, top=top, hits=len(result.hits))
+
     try:
         states = rank_states(
             result.hits, refs, generation=generation, tenant_id=principal.tenant_id
         )
-    except ValueError:
+    except ValueError as exc:
         # This call was paid for and its request is recorded but not yet
-        # written. Flush before the abort propagates, for the same reason the
-        # ConfigurationError arm above does: aborting must not discard the
-        # evidence of the call it is aborting on. The exception is re-raised
-        # unchanged — it is a bug in the frozen ref table, and nothing here
-        # turns it into a table row.
-        evidence.flush()
+        # written. Write the reason and flush before the abort propagates, for
+        # the same reason the ConfigurationError arm above does: aborting must
+        # not discard the evidence of the call it is aborting on — and here
+        # the evidence *is* the reason, since no row can be rendered from a
+        # contradiction. Without this line the artifact stops mid-table with
+        # nothing saying why, because the exception text goes to stderr, which
+        # is not published. The exception is re-raised unchanged: it is a bug
+        # in the frozen ref table, and nothing here turns it into a table row.
+        _abort(evidence, _scrub(str(exc), search_endpoint, "[search-service]"))
         raise
     found = _render_rank_states(states)
     shared = (
@@ -942,6 +1031,32 @@ def _manifest_digest(raw: str) -> str:
     return candidate
 
 
+def _top(raw: str) -> int:
+    """Bound ``--top`` by the service's own page-size limits while parsing.
+
+    ``validate_search_arguments`` enforces the same bounds, but it enforces
+    them per call: an out-of-range ``top`` is caught there as a rejected
+    request, recorded as a ``FAILED`` row, and the loop carries on to write
+    108 of them under a ``**Run complete**`` footer. Nothing is spent, so the
+    cost is not money — it is an evidence file that looks like a measurement
+    and is a typo. Both bounds are knowable from argv alone, so this is where
+    they belong; an exit 2 says so in one line.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {raw!r}") from None
+    if not MIN_BOUND <= value <= MAX_TOP:
+        raise argparse.ArgumentTypeError(
+            f"--top must be between {MIN_BOUND} and {MAX_TOP} (the service's "
+            f"documented maximum page size), got {value}. A larger value is "
+            "not rejected by the service, it is silently honoured as "
+            f"{MAX_TOP} -- which is why this experiment cannot measure a "
+            f"visible corpus above {MAX_TOP} chunks at all."
+        )
+    return value
+
+
 def _manifest_header_line(manifest_sha256: str) -> str:
     """Render the corpus-manifest evidence line, honest about an absent one.
 
@@ -986,13 +1101,44 @@ def _reject_index_generation_mismatch(index_name: str, generation: Generation) -
     checked, so a name carrying two of them cannot pass by agreeing with the
     first.
 
-    A name with no generation token — the default, or anything the convention
-    does not cover — passes silently, and so does one where ``gN`` is not a
-    whole segment (``azgenai-g2lab``). The tool has no basis for an opinion
-    about those: which corpus an index really holds is pinned by
-    ``--manifest-sha256``, not by a string, and guessing from the string would
-    turn a rename into an outage.
+    One name is refused despite carrying no token at all: ``INDEX_NAME``
+    itself, under ``g2`` or ``g3``. That is the index every earlier day's
+    runbook creates, from the unmodified sample corpus and with no
+    ``--index-name`` argument anywhere in the series — so it is provably not
+    where a distractor generation lives, and it is also what omitting
+    ``--index-name`` here silently selects. Omission, not contradiction, is
+    the hole: a session that ran any smoke check first leaves that index
+    populated, and 108 paid calls then return g1-shaped numbers under a g2 or
+    g3 label, with the correct manifest digest printed beside them. By the
+    time this guard runs the tool already knows ``--generation`` is not
+    ``g1``, so nothing has to be guessed.
+
+    Every other name with no generation token passes silently, and so does
+    one where ``gN`` is not a whole segment (``azgenai-g2lab``). The tool has
+    no basis for an opinion about those: for ``g2``/``g3``, which corpus an
+    index really holds is pinned by ``--manifest-sha256``, not by a string,
+    and guessing from the string would turn a rename into an outage.
+
+    That pin does not exist for ``g1``, whose manifest is ``none`` by design
+    (``_reject_generation_manifest_mismatch``) because it has no distractor
+    corpus to have a manifest for. On a ``g1`` run neither argument pins the
+    corpus: what anchors it is the base-corpus digest recorded in the
+    research doc alongside the evidence, which this tool neither takes nor
+    checks. ``g1`` is the one generation whose target index is legitimately
+    the default, which is why the refusal above cannot cover it.
     """
+    if generation is not Generation.G1 and index_name == INDEX_NAME:
+        raise SystemExit(
+            f"--generation {generation.value} with --index-name "
+            f"{INDEX_NAME!r} (the default, so this is also what omitting "
+            "--index-name selects): that is the base index every earlier "
+            "day's runbook builds from the unmodified sample corpus, and it "
+            f"is provably not where {generation.value}'s distractor corpus "
+            "lives. If it happens to be populated, this run completes and "
+            "labels g1-shaped numbers as "
+            f"{generation.value}. Name the index this generation was built "
+            f"into (the convention is azgenai-lab-chunks-{generation.value})."
+        )
     contradicting = [
         token for token in _GENERATION_SEGMENT.findall(index_name) if token != generation.value
     ]
@@ -1046,7 +1192,15 @@ def _reject_generation_manifest_mismatch(generation: Generation, manifest_sha256
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--top", type=int, required=True, help="frozen for every run")
+    parser.add_argument(
+        "--top",
+        type=_top,
+        required=True,
+        help=(
+            "frozen for every run of one generation, and strictly greater "
+            "than that generation's visible chunk count (14 / 156 / 774)"
+        ),
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--tenant-id",
@@ -1339,6 +1493,13 @@ async def _compare(
                 "",
                 "Fixed: query, vector, principal (filter derived from it), top, "
                 "vector_k=50, index generation.",
+                "",
+                "The semantic ranker reorders the **top 50** of the merged set and "
+                "nothing below it (`docs/rag-retrieval.md`). Wherever `top` exceeds "
+                "50, a rank past 50 in the `hybrid_semantic` column is a position "
+                "the ranker never touched, identical in form to one it did. "
+                "Comparing two such ranks compares two pre-rerank orderings, so a "
+                "difference between them is not a reranking effect.",
                 "",
                 HEADER,
                 DIVIDER,
