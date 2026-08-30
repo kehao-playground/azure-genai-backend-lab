@@ -202,24 +202,30 @@ def test_chinese_globs_match_the_file_name_at_any_depth(tmp_path: Path) -> None:
     ]
 
 
-def test_chinese_globs_default_to_every_markdown_file(tmp_path: Path) -> None:
+def test_a_chinese_root_without_globs_is_refused(tmp_path: Path) -> None:
+    # Failing open here would index every unpublished draft in the root. An
+    # omitted filter is a mistake, never a request for "all of them".
     from tools.build_distractor_corpus import build
 
     chinese = tmp_path / "zh-tw"
-    _write(chinese / "notes.md", "# Notes\n\nBody.\n")
+    _write(chinese / "day-01-a.md", "# One\n\nBody.\n")
+    _write(chinese / "day-27-unpublished.md", "# Unpublished\n\nBody.\n")
     english = tmp_path / "docs"
-    english.mkdir()
+    _write(english / "clean.md", "# Clean\n\nBody.\n")
+    out_dir = tmp_path / "out"
 
-    manifest = build(
-        english_root=english,
-        chinese_root=chinese,
-        out_dir=tmp_path / "out",
-        tenant_id="acme",
-        effective_date="2026-08-30",
-        limit=None,
-    )
-
-    assert manifest.data["document_count"] == 1
+    for globs in (None, ()):
+        with pytest.raises(SystemExit, match="--chinese-glob is required"):
+            build(
+                english_root=english,
+                chinese_root=chinese,
+                out_dir=out_dir,
+                tenant_id="acme",
+                effective_date="2026-08-30",
+                limit=None,
+                chinese_globs=globs,
+            )
+    assert not out_dir.exists()
 
 
 def test_english_root_is_never_glob_filtered(tmp_path: Path) -> None:
@@ -269,6 +275,7 @@ def test_written_documents_load_back_through_the_real_loader(tmp_path: Path) -> 
         tenant_id="acme",
         effective_date="2026-08-30",
         limit=None,
+        chinese_globs=("day-0*.md",),
     )
 
     documents = {document.doc_id: document for document in load_documents(tmp_path / "out")}
@@ -354,6 +361,7 @@ def test_limit_cuts_the_interleaved_list_so_a_smaller_run_is_a_prefix(tmp_path: 
             tenant_id="acme",
             effective_date="2026-08-30",
             limit=limit,
+            chinese_globs=("c*.md",),
         )
         return [document["doc_id"] for document in manifest.data["documents"]]
 
@@ -451,3 +459,112 @@ def test_a_non_positive_limit_aborts(tmp_path: Path) -> None:
             effective_date="2026-08-30",
             limit=-1,
         )
+
+
+def test_a_document_with_no_body_aborts(tmp_path: Path) -> None:
+    # An empty document indexes as a chunkless, unretrievable member of the
+    # corpus: it inflates the document count without adding a distractor.
+    from tools.build_distractor_corpus import build
+
+    english = tmp_path / "docs"
+    _write(english / "clean.md", "# Clean\n\nBody.\n")
+    _write(english / "stub.md", "---\nday: 1\n---\n")
+
+    with pytest.raises(SystemExit, match="no body"):
+        build(
+            english_root=english,
+            chinese_root=None,
+            out_dir=tmp_path / "out",
+            tenant_id="acme",
+            effective_date="2026-08-30",
+            limit=None,
+        )
+
+
+def test_main_builds_a_corpus_from_the_command_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The operator's actual surface. `action="append"` / `dest` / `default`
+    # are wiring that a build()-only test cannot see: a defect there hands
+    # build() a None, which is exactly the fail-open case above.
+    import json
+
+    from tools.build_distractor_corpus import main
+
+    english = tmp_path / "docs"
+    _write(english / "architecture.md", "# Architecture\n\nEnglish body.\n")
+    chinese = tmp_path / "zh-tw"
+    _write(chinese / "day-01-a.md", "# One\n\nBody one.\n")
+    _write(chinese / "day-13-b.md", "# Thirteen\n\nBody thirteen.\n")
+    _write(chinese / "day-27-unpublished.md", "# Unpublished\n\nBody.\n")
+    _write(chinese / "notes.md", "# Notes\n\nBody.\n")
+    out_dir = tmp_path / "out"
+
+    main(
+        [
+            "--english-root", str(english),
+            "--chinese-root", str(chinese),
+            "--chinese-glob", "day-0*.md",
+            "--chinese-glob", "day-1*.md",
+            "--tenant-id", "acme",
+            "--effective-date", "2026-08-30",
+            "--out-dir", str(out_dir),
+        ]
+    )
+
+    assert sorted(path.name for path in (out_dir / "acme").iterdir()) == [
+        "draft-day-01-a.md",
+        "draft-day-13-b.md",
+        "labdocs-architecture.md",
+    ]
+    data = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    # Both patterns arrived, in order: proof the repeatable flag appends.
+    assert data["source_roots"][1]["name_globs"] == ["day-0*.md", "day-1*.md"]
+    assert data["document_count"] == 3
+    assert "documents: 3" in capsys.readouterr().out
+
+
+def test_main_refuses_a_chinese_root_without_a_glob(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tools.build_distractor_corpus import main
+
+    english = tmp_path / "docs"
+    _write(english / "clean.md", "# Clean\n\nBody.\n")
+    chinese = tmp_path / "zh-tw"
+    _write(chinese / "day-27-unpublished.md", "# Unpublished\n\nBody.\n")
+    out_dir = tmp_path / "out"
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "--english-root", str(english),
+                "--chinese-root", str(chinese),
+                "--tenant-id", "acme",
+                "--effective-date", "2026-08-30",
+                "--out-dir", str(out_dir),
+            ]
+        )
+
+    assert excinfo.value.code == 2
+    assert "--chinese-glob" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+
+def test_main_without_a_chinese_root_needs_no_glob(tmp_path: Path) -> None:
+    from tools.build_distractor_corpus import main
+
+    english = tmp_path / "docs"
+    _write(english / "clean.md", "# Clean\n\nBody.\n")
+    out_dir = tmp_path / "out"
+
+    main(
+        [
+            "--english-root", str(english),
+            "--tenant-id", "acme",
+            "--effective-date", "2026-08-30",
+            "--out-dir", str(out_dir),
+        ]
+    )
+
+    assert [path.name for path in (out_dir / "acme").iterdir()] == ["labdocs-clean.md"]
