@@ -568,9 +568,10 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             self, settings: Any, *, client: Any = None, index_name: str = INDEX_NAME
         ) -> None:
             constructed.append(index_name)
-            self.last_diagnostics = SimpleNamespace(
+            self._round_trip = SimpleNamespace(
                 request_body={"search": "x"}, status=200, request_id="rid", latency_ms=1.5
             )
+            self.last_diagnostics: Any = None
 
         async def __aenter__(self) -> "FakeClient":
             return self
@@ -588,12 +589,18 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             principal: Any,
             vector_k: int,
         ) -> Any:
+            # Cleared before validation can raise, and set again only once a
+            # call has notionally landed -- the order the real adapter uses
+            # (`services/azure_search.py`), so a rejected call cannot be
+            # written up carrying the previous one's status and request id.
+            self.last_diagnostics = None
             # The real adapter routes every call through this validator, so
             # a double that skips it accepts calls the service rejects --
             # the fake-fidelity gap this repository tracks as a watchpoint.
             validate_search_arguments(
                 query_text, query_vector, mode=mode, top=top, vector_k=vector_k
             )
+            self.last_diagnostics = self._round_trip
             searched.append((query_text, mode, query_vector))
             return SearchResult(hits=(), mode=mode, vector_k=vector_k)
 
@@ -737,9 +744,10 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
         def __init__(
             self, settings: Any, *, client: Any = None, index_name: str = INDEX_NAME
         ) -> None:
-            self.last_diagnostics = SimpleNamespace(
+            self._round_trip = SimpleNamespace(
                 request_body={"search": "x"}, status=200, request_id="rid", latency_ms=1.5
             )
+            self.last_diagnostics: Any = None
 
         async def __aenter__(self) -> "FakeClient":
             return self
@@ -757,10 +765,13 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
             principal: Any,
             vector_k: int,
         ) -> Any:
-            # Same contract as the real adapter; see the fake above.
+            # Same contract, and the same clear-then-set order, as the real
+            # adapter; see the fake above.
+            self.last_diagnostics = None
             validate_search_arguments(
                 query_text, query_vector, mode=mode, top=top, vector_k=vector_k
             )
+            self.last_diagnostics = self._round_trip
             return SearchResult(hits=(), mode=mode, vector_k=vector_k)
 
     class StubEmbeddings:
@@ -847,12 +858,15 @@ class PageClient:
 
     `search()` runs `validate_search_arguments` for the reason that
     validator's own docstring gives: a double that accepts a call the service
-    would reject turns a green suite into a live-run failure.
+    would reject turns a green suite into a live-run failure. It clears
+    `last_diagnostics` before validating for the reason the real adapter
+    gives: a rejected call must not be written up with the previous call's
+    body, status and request id.
     """
 
     def __init__(self, hits: Any) -> None:
         self._hits = tuple(hits)
-        self.last_diagnostics = _diagnostics()
+        self.last_diagnostics: Any = None
 
     async def search(
         self,
@@ -866,9 +880,11 @@ class PageClient:
     ) -> Any:
         from azgenai_lab.models.search import SearchResult, validate_search_arguments
 
+        self.last_diagnostics = None
         validate_search_arguments(
             query_text, query_vector, mode=mode, top=top, vector_k=vector_k
         )
+        self.last_diagnostics = _diagnostics()
         return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
 
 
@@ -906,8 +922,9 @@ def _run_one(
 
 def test_a_response_that_exactly_fills_the_page_aborts_the_run(tmp_path: Path) -> None:
     """`hits == top` cannot be told from a truncated page, and that is the
-    distinction the candidate-generation experiment exists to measure. It is
-    available on the first call, before the other 107 are spent."""
+    distinction the candidate-generation experiment exists to measure. The
+    refusal happens inside the call that observes the full page, before the
+    next one is issued."""
     evidence = compare_retrieval.Evidence(tmp_path / "evidence.md", total_queries=1)
     client = PageClient(make_hit(f"c{i}") for i in range(5))
 
@@ -1050,3 +1067,27 @@ class _AsyncPageClient(PageClient):
 
     async def __aexit__(self, *exception: object) -> None:
         return None
+
+
+def test_a_rejected_call_is_not_written_up_with_the_last_call_s_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """The real adapter clears `last_diagnostics` before validation can raise
+    (`services/azure_search.py`), precisely so a rejected call cannot be
+    written up carrying the previous call's body, status and request id. A
+    double that keeps them renders a FAILED row claiming a 200 and a request
+    id for a call that was never sent -- misattributed evidence no checksum
+    can catch, because the file is intact and simply describes the wrong
+    request.
+    """
+    evidence = compare_retrieval.Evidence(tmp_path / "evidence.md", total_queries=1)
+    client = PageClient([])
+
+    # One call that lands, so there is a diagnostics record available to borrow.
+    _run_one(client, evidence, top=25)
+    # Then one the validator rejects before anything is sent.
+    (row,) = _run_one(client, evidence, top=25, text="   ")
+
+    assert "FAILED" in row
+    assert "200" not in row and "rid" not in row
+    assert "no response" in row
