@@ -10,7 +10,10 @@ test is what catches that: it re-chunks the current corpus and asserts every
 authored heading_path still matches what that ordinal actually is.
 """
 
+import argparse
+import asyncio
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
@@ -20,6 +23,7 @@ import pytest
 
 from azgenai_lab.models.rag import Chunk, make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
+from azgenai_lab.models.search_index import INDEX_NAME
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 
@@ -184,3 +188,171 @@ def test_truncation_keeps_the_rank_and_marks_the_table() -> None:
     rows, note = _detail_rows(hits, max_recorded_hits=10)
     assert len(rows) == 10
     assert "490" in note and "500" in note
+
+
+def make_query(number: int, text: str) -> Any:
+    """A Query whose only load-bearing field is its text — the vector key."""
+    return compare_retrieval.Query(
+        number, text, "kind", base_refs=(), expansion_refs=(), language="en"
+    )
+
+
+def test_vectors_file_is_written_then_read_without_embedding(tmp_path: Path) -> None:
+    from tools.compare_retrieval import load_or_create_vectors
+
+    calls = []
+
+    class Recorder:
+        async def embed(self, texts: Any) -> list[list[float]]:
+            calls.append(tuple(texts))
+            return [[0.5] * 1536 for _ in texts]
+
+    path = tmp_path / "vectors.json"
+    queries = (make_query(1, "alpha"), make_query(2, "beta"))
+
+    first = asyncio.run(load_or_create_vectors(path, queries, Recorder()))
+    assert first is None  # written, then the caller must stop
+    assert len(calls) == 1
+
+    second = asyncio.run(load_or_create_vectors(path, queries, Recorder()))
+    assert set(second) == {"alpha", "beta"}
+    assert len(calls) == 1  # the second call embedded nothing
+
+
+def test_vector_hash_mismatch_aborts(tmp_path: Path) -> None:
+    from tools.compare_retrieval import load_or_create_vectors
+
+    path = tmp_path / "vectors.json"
+    payload = {"alpha": {"vector": [0.5] * 1536, "sha256": "0" * 64}}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="vector hash mismatch"):
+        asyncio.run(load_or_create_vectors(path, (make_query(1, "alpha"),), None))
+
+
+def test_vectors_frozen_for_a_different_query_set_abort(tmp_path: Path) -> None:
+    # The freeze is only worth having if it covers *this* run's questions. A
+    # file written before a question was reworded still answers for every
+    # other one, so a partial read would query with frozen vectors for most
+    # of the set and freshly-diverged ones for the rest — the exact
+    # unrecorded variable the freeze exists to remove.
+    from tools.compare_retrieval import load_or_create_vectors
+
+    digest = compare_retrieval._vector_digest([0.5] * 4)
+    path = tmp_path / "vectors.json"
+    path.write_text(
+        json.dumps(
+            {
+                "alpha": {"vector": [0.5] * 4, "sha256": digest},
+                "beta": {"vector": [0.5] * 4, "sha256": digest},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # An entry the run never asks for: the query set shrank, or a question was
+    # reworded, and this file predates it.
+    with pytest.raises(SystemExit, match="beta"):
+        asyncio.run(load_or_create_vectors(path, (make_query(1, "alpha"),), None))
+
+    # A question the file has no entry for.
+    with pytest.raises(SystemExit, match="gamma"):
+        asyncio.run(
+            load_or_create_vectors(
+                path, (make_query(1, "alpha"), make_query(2, "gamma")), None
+            )
+        )
+
+
+def test_dirty_worktree_refuses_to_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools import compare_retrieval as mod
+
+    monkeypatch.setattr(mod, "_git", lambda *a: " M src/azgenai_lab/main.py")
+    with pytest.raises(SystemExit, match="worktree is not clean"):
+        mod.pre_run_lab_sha()
+
+
+def test_clean_worktree_returns_the_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools import compare_retrieval as mod
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(*args: str) -> str:
+        calls.append(args)
+        return "" if args[0] == "status" else "a" * 40 + "\n"
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    assert mod.pre_run_lab_sha() == "a" * 40
+    # Plain `--porcelain`: untracked files count as dirty too. An untracked
+    # file changes what runs (a stray corpus document, a shadowing module),
+    # so a check that declared such a tree clean would certify a commit that
+    # does not describe the code that ran.
+    assert ("status", "--porcelain") in calls
+
+
+def test_no_answer_expected_still_renders_a_reason() -> None:
+    # Q6's whole point is that the corpus has no answer. An empty state list
+    # rendered as an empty string would leave that row blank in paid evidence.
+    assert compare_retrieval._render_rank_states([]) == "n/a (no answer expected)"
+
+
+def test_all_three_rank_states_reach_the_row() -> None:
+    rendered = compare_retrieval._render_rank_states(
+        [("a", "3"), ("b", "absent"), ("c", "not_in_generation")]
+    )
+    assert rendered == "`a`=3; `b`=absent; `c`=not_in_generation"
+
+
+def test_the_generation_blind_renderer_is_gone() -> None:
+    # `_positions` was extracted so two renderers could not drift on ranking;
+    # the durable fix is that there is only one renderer left to drift.
+    assert not hasattr(compare_retrieval, "_ranks")
+
+
+def test_baseline_only_drops_both_experiments() -> None:
+    # The globex control arm runs baseline modes only: 4 calls per query, not
+    # 9. The difference is 75 semantic-tier queries the budget was never
+    # cleared for.
+    assert compare_retrieval._experiment_sweeps(baseline_only=True) == ((), ())
+    vector_ks, reranking_modes = compare_retrieval._experiment_sweeps(baseline_only=False)
+    assert len(compare_retrieval.BASELINE_MODES) == 4
+    assert len(compare_retrieval.BASELINE_MODES) + len(vector_ks) + len(reranking_modes) == 9
+
+
+def test_manifest_digest_strips_whitespace_and_rejects_anything_else() -> None:
+    # `manifest.json.sha256` is written with a trailing newline, per
+    # sha256sum convention. Handing the 65-character string straight through
+    # would record a digest that matches nothing.
+    assert compare_retrieval._manifest_digest("  " + "a" * 64 + "\n") == "a" * 64
+    for bad in ("A" * 64, "a" * 63, "a" * 65, "g" * 64, "", "not a digest"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            compare_retrieval._manifest_digest(bad)
+
+
+def _run_arguments(**overrides: str) -> list[str]:
+    required = {
+        "--top": "25",
+        "--out": "out.md",
+        "--tenant-id": "acme",
+        "--user-id": "u",
+        "--vectors": "vectors.json",
+        "--generation": "g2",
+        "--manifest-sha256": "b" * 64,
+    }
+    required.update(overrides)
+    return [token for pair in required.items() for token in pair]
+
+
+def test_a_run_must_name_its_vectors_generation_and_manifest() -> None:
+    parser = compare_retrieval._build_parser()
+    arguments = parser.parse_args(_run_arguments(**{"--manifest-sha256": "b" * 64 + "\n"}))
+    assert arguments.generation is Generation.G2
+    assert arguments.manifest_sha256 == "b" * 64
+    assert arguments.baseline_only is False
+    assert arguments.index_name == INDEX_NAME
+
+    for omitted in ("--vectors", "--generation", "--manifest-sha256"):
+        tokens = _run_arguments()
+        position = tokens.index(omitted)
+        del tokens[position : position + 2]
+        with pytest.raises(SystemExit):
+            parser.parse_args(tokens)
