@@ -274,12 +274,25 @@ class ExpectedChunkRef:
     three; a ref that names a document only some generations carry has to say
     so, or a generation that never held it would be scored as having missed
     it.
+
+    ``allowed_groups`` mirrors the document's own ACL front-matter, with
+    ``services/acl.py``'s semantics exactly: empty means tenant-wide
+    readable, non-empty requires an intersection with the querying
+    principal's groups. It is here rather than on ``Query`` because the ACL
+    belongs to the document, not to the question. Before it existed the
+    requirement lived in a prose ``kind`` string — legible to an operator
+    reading the source, invisible to the code — and the 2026-08-30 live
+    session spent a service discovering what that costs: the filter removes
+    the document before scoring, every mode records ``absent``, which the
+    rank vocabulary defines as a recall failure, and the run writes
+    ``**Run complete**`` over the top of it.
     """
 
     doc_id: str
     ordinal: int
     heading_path: str
     generations: frozenset[Generation] = ALL_GENERATIONS
+    allowed_groups: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -672,7 +685,14 @@ QUERIES_BY_TENANT: dict[str, tuple[Query, ...]] = {
             5,
             "how do I escalate a Sev 1 outage at 3am?",
             "requires the oncall group — run with --group-id oncall",
-            base_refs=(ExpectedChunkRef("oncall-runbook", 3, "On-Call Runbook > Escalation path"),),
+            base_refs=(
+                ExpectedChunkRef(
+                    "oncall-runbook",
+                    3,
+                    "On-Call Runbook > Escalation path",
+                    allowed_groups=("oncall",),
+                ),
+            ),
             expansion_refs=_NO_REFS,
             language="en",
         ),
@@ -826,6 +846,54 @@ def _abort(evidence: Evidence, reason: str) -> None:
     """
     evidence.add("", f"**Aborted: {reason}**")
     evidence.flush()
+
+
+def _reject_unreadable_refs(
+    queries: Sequence["Query"],
+    principal: Principal,
+) -> None:
+    """Refuse a run whose principal cannot read what the run is scoring.
+
+    ``services/acl.py``: a document with a non-empty ``allowed_groups`` is
+    readable only by a principal sharing one of those groups. The filter is
+    applied by the service before scoring, so a pre-registered chunk behind a
+    group the principal lacks is not merely hard to retrieve — it is not a
+    candidate in any mode. Every mode then records ``absent``, which this
+    project's rank vocabulary defines as a recall failure, and the finished
+    file says ``**Run complete**``.
+
+    That is the same defect as a full page, arriving from the other side: an
+    artifact whose form is perfect and whose measurement was structurally
+    impossible. Unlike the full-page guard this one is free and total — it is
+    decided from the frozen query set and the command line alone, so it fires
+    before the worktree check, before the settings are read, and before the
+    embedding call that generating the query vectors would cost.
+    """
+    unreadable = [
+        (query, ref)
+        for query in queries
+        for ref in query.base_refs + query.expansion_refs
+        if ref.allowed_groups and not set(ref.allowed_groups) & set(principal.group_ids)
+    ]
+    if not unreadable:
+        return
+    lines = [
+        f"  Q{query.number} ({query.language}) needs "
+        f"{' or '.join(sorted(ref.allowed_groups))} to read {ref.doc_id}"
+        for query, ref in unreadable
+    ]
+    missing = sorted({group for _, ref in unreadable for group in ref.allowed_groups})
+    raise SystemExit(
+        "this principal cannot read every pre-registered chunk it would be "
+        "scored against:\n"
+        + "\n".join(lines)
+        + "\n\nThe ACL filter removes those documents before scoring, so every "
+        "mode would record `absent` — which this tool's rank vocabulary defines "
+        "as a recall failure — and the run would still finish and claim to be "
+        "complete. Re-run with "
+        + " ".join(f"--group-id {group}" for group in missing)
+        + ", or with a principal that carries the group."
+    )
 
 
 def _reject_full_page(
@@ -1296,6 +1364,17 @@ async def main() -> None:
     _reject_index_generation_mismatch(arguments.index_name, arguments.generation)
     _reject_generation_manifest_mismatch(arguments.generation, arguments.manifest_sha256)
 
+    # Still argv-only, and still free: whether this principal can read what it
+    # is about to be scored against is decided by the frozen query set and the
+    # command line, with nothing read and nothing spent.
+    principal = Principal(
+        tenant_id=arguments.tenant_id,
+        user_id=arguments.user_id,
+        group_ids=tuple(arguments.group_id),
+    )
+    queries = QUERIES_BY_TENANT[arguments.tenant_id]
+    _reject_unreadable_refs(queries, principal)
+
     # Then, before the settings are read, before a client exists, before
     # anything can be spent: the tree this evidence will name has to be one a
     # reader can check out.
@@ -1311,15 +1390,9 @@ async def main() -> None:
             "USE_FAKE_EMBEDDINGS=false and provide real Azure OpenAI "
             "embedding credentials before running this tool."
         )
-    principal = Principal(
-        tenant_id=arguments.tenant_id,
-        user_id=arguments.user_id,
-        group_ids=tuple(arguments.group_id),
-    )
     configure_logging(settings.log_level)
     embedding_client = build_embedding_client(settings)
 
-    queries = QUERIES_BY_TENANT[arguments.tenant_id]
     vectors = await load_or_create_vectors(arguments.vectors, queries, embedding_client)
     if vectors is None:
         # Generating and spending are never one step. Nothing was queried and
