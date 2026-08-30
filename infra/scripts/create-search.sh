@@ -32,13 +32,18 @@ if [ -n "$AZ_SEARCH_SEMANTIC" ]; then
 fi
 
 echo "Creating $AZ_SEARCH_SKU search service '$AZ_SEARCH_NAME' in $AZ_LOCATION"
+# The "${arr[@]+"${arr[@]}"}" expansion below is deliberately verbose: a
+# plain "${semantic_args[@]}" on an empty array is an "unbound variable"
+# error under `set -u` on bash < 4.4 (e.g. macOS's stock /bin/bash 3.2),
+# which this script hits on its default, AZ_SEARCH_SEMANTIC-unset path when
+# invoked via its own shebang. Do not simplify this back.
 az search service create \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --name "$AZ_SEARCH_NAME" \
   --location "$AZ_LOCATION" \
   --sku "$AZ_SEARCH_SKU" \
-  "${semantic_args[@]}"
+  "${semantic_args[@]+"${semantic_args[@]}"}"
 
 echo "Service properties (record these in the evidence file):"
 az search service show \
