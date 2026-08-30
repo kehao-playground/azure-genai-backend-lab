@@ -185,10 +185,10 @@ def _collect(root: Path, label: str, globs: Sequence[str] | None = None) -> list
 
     ``globs`` filters by **file name** -- not by the relative path, so a
     pattern never has to know how deep a file sits -- and a file is admitted
-    when it matches at least one pattern. ``None`` admits every markdown
-    file; that is the right default for a root whose every file is
-    publishable, and the wrong one for the drafts root, where published and
-    unpublished articles are neighbours.
+    when it matches at least one pattern. ``None`` means no filter at all,
+    and only the English root may be collected that way -- every file in the
+    lab's docs tree is publishable. ``build`` refuses a Chinese root with no
+    patterns rather than falling back to this.
     """
     return [
         SourceFile(label, path.relative_to(root))
@@ -231,10 +231,11 @@ def build(
     generation is a prefix of a larger one at the same language mix.
 
     ``chinese_globs`` selects which drafts are eligible, matched against each
-    file's **name** (see ``_collect``); the default admits every markdown
-    file under the root. The English root is never filtered this way -- every
-    file in the lab's docs tree is already public, while the drafts root
-    holds unpublished articles that must not reach a search service.
+    file's **name** (see ``_collect``). It is required whenever
+    ``chinese_root`` is given and there is deliberately no permissive
+    default: the English root needs no filter because every file in the
+    lab's docs tree is already public, while the drafts root holds
+    unpublished articles that must not reach a search service.
     """
     validate_identifier(tenant_id, field="tenant_id")
     parsed_date = date.fromisoformat(effective_date)
@@ -253,7 +254,16 @@ def build(
         if root_path is not None and not root_path.is_dir():
             raise SystemExit(f"{root_path} is not a directory")
 
-    globs = tuple(chinese_globs) if chinese_globs is not None else ("*.md",)
+    if chinese_root is not None and not chinese_globs:
+        # Fail closed. An omitted filter is a mistake, never a request for
+        # every draft: the drafts root holds published and unpublished
+        # articles side by side, and this is the only thing standing between
+        # the unpublished ones and a cloud search index.
+        raise SystemExit(
+            "--chinese-glob is required with --chinese-root: an unfiltered "
+            "drafts root would index unpublished articles"
+        )
+    globs = tuple(chinese_globs) if chinese_globs is not None else ()
     english = _collect(english_root, ENGLISH_LABEL)
     chinese = _collect(chinese_root, CHINESE_LABEL, globs) if chinese_root is not None else []
 
@@ -347,7 +357,7 @@ def build(
             {
                 "label": CHINESE_LABEL,
                 "path": chinese_root.as_posix() if chinese_root is not None else None,
-                "name_globs": list(globs),
+                "name_globs": list(globs) if chinese_root is not None else None,
                 "files_seen": len(chinese),
             },
         ],
@@ -405,7 +415,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chinese-root",
         type=Path,
         default=None,
-        help="root of the Chinese source tree (see --chinese-glob); optional",
+        help=(
+            "root of the Chinese source tree; optional, but requires at "
+            "least one --chinese-glob when given"
+        ),
     )
     parser.add_argument(
         "--chinese-glob",
@@ -415,9 +428,10 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATTERN",
         help=(
             "repeatable file-NAME pattern selecting which drafts are "
-            "eligible; a file must match at least one. Omitting it admits "
-            "every markdown file under --chinese-root, which for a drafts "
-            "root means unpublished articles too."
+            "eligible; a file must match at least one. Required whenever "
+            "--chinese-root is given -- there is no permissive default, "
+            "because an unfiltered drafts root would index unpublished "
+            "articles."
         ),
     )
     parser.add_argument(
@@ -451,7 +465,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    arguments = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    arguments = parser.parse_args(argv)
+    if arguments.chinese_root is not None and not arguments.chinese_globs:
+        # argparse exits 2 here, before the out-dir is created: an operator
+        # who forgets the filter gets a usage error, not a corpus with
+        # unpublished drafts in it.
+        parser.error("--chinese-root requires at least one --chinese-glob")
     manifest = build(
         english_root=arguments.english_root,
         chinese_root=arguments.chinese_root,
