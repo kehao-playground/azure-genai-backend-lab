@@ -108,10 +108,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--corpus-dir",
         type=Path,
-        default=SAMPLE_DOCS_DIR,
+        default=None,
         help=(
-            "directory of <tenant>/<doc_id>.md source documents "
-            "(default: the checked-in sample corpus)"
+            "directory of <tenant>/<doc_id>.md source documents (default: "
+            "the SAMPLE_DOCS_DIR setting if one is configured, otherwise "
+            "the checked-in sample corpus)"
         ),
     )
     parser.add_argument(
@@ -151,8 +152,28 @@ async def main() -> None:
             create_index=arguments.create_index,
             recreate_index=arguments.recreate_index,
             tenant_id=arguments.tenant_id,
-            corpus_dir=arguments.corpus_dir,
+            corpus_dir=_resolve_corpus_dir(arguments.corpus_dir, settings),
         )
+
+
+def _resolve_corpus_dir(explicit: Path | None, settings: Settings) -> Path:
+    """Which corpus this run indexes: the argument, the setting, or the default.
+
+    ``--corpus-dir`` wins, so a run that names its corpus cannot be
+    redirected by an environment variable -- the retrieval experiment pins
+    its generation directory that way on purpose. Absent the argument, this
+    honours ``SAMPLE_DOCS_DIR``, which is a documented setting
+    (``core/config.py``, ``docs/docker.md``, ``docs/container-apps.md``) that
+    ``services/agent_tools.py`` and ``tools/eval_run.py`` both read. A tool
+    that silently stopped honouring it would index a different corpus from
+    the rest of the lab in the same checkout, and say nothing.
+
+    The fallback is resolved here rather than as an argparse default because
+    the parser is built before the settings are read.
+    """
+    if explicit is not None:
+        return explicit
+    return Path(settings.sample_docs_dir or SAMPLE_DOCS_DIR)
 
 
 def _apply_tenant_override(

@@ -92,14 +92,45 @@ def test_apply_tenant_override_replaces_every_documents_tenant_id() -> None:
 
 
 def test_corpus_dir_and_index_name_default_to_the_built_ins() -> None:
-    from tools.index_corpus import _build_parser
+    from tools.index_corpus import _build_parser, _resolve_corpus_dir
 
+    from azgenai_lab.core.config import Settings
     from azgenai_lab.models.search_index import INDEX_NAME
     from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
 
     arguments = _build_parser().parse_args([])
-    assert arguments.corpus_dir == SAMPLE_DOCS_DIR
+    # Unset at the parser, because the fallback below needs settings the
+    # parser is built before reading.
+    assert arguments.corpus_dir is None
     assert arguments.index_name == INDEX_NAME
+    assert _resolve_corpus_dir(arguments.corpus_dir, Settings()) == SAMPLE_DOCS_DIR
+
+
+def test_an_unset_corpus_dir_still_honours_the_sample_docs_dir_setting(
+    tmp_path: Path,
+) -> None:
+    """`SAMPLE_DOCS_DIR` is a documented setting (`docs/docker.md`,
+    `docs/container-apps.md`) that `services/agent_tools.py` and
+    `tools/eval_run.py` both honour. A tool that quietly stopped reading it
+    would index a different corpus than the rest of the lab, with nothing
+    saying so.
+    """
+    from tools.index_corpus import _resolve_corpus_dir
+
+    from azgenai_lab.core.config import Settings
+
+    assert _resolve_corpus_dir(None, Settings(sample_docs_dir=tmp_path)) == tmp_path
+
+
+def test_an_explicit_corpus_dir_wins_over_the_setting(tmp_path: Path) -> None:
+    # The experiment pins its corpus with an argument on purpose; an
+    # environment variable must not be able to redirect a named one.
+    from tools.index_corpus import _resolve_corpus_dir
+
+    from azgenai_lab.core.config import Settings
+
+    other = tmp_path / "elsewhere"
+    assert _resolve_corpus_dir(other, Settings(sample_docs_dir=tmp_path)) == other
 
 
 def test_corpus_dir_and_index_name_are_overridable(tmp_path) -> None:

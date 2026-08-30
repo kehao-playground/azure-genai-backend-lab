@@ -22,7 +22,22 @@ Usage:
     uv run python tools/build_distractor_corpus.py \\
         --english-root docs --chinese-root ../drafts/zh-tw \\
         --chinese-glob 'day-0*.md' \\
-        --tenant-id acme --effective-date 2026-08-30 --out-dir /tmp/g3
+        --tenant-id acme --effective-date 2026-08-30 --out-dir /tmp/bonus7/g3
+
+    # Then, and this step is not optional: copy the base corpus in beside
+    # the distractors, because an index generation is base corpus *plus*
+    # distractors and this tool writes only the distractors.
+    cp -R data/sample-docs/* /tmp/bonus7/g3/
+
+    # It cannot be done first: `--out-dir` must be absent or empty, so a
+    # directory already holding the base corpus is refused. Skipping it is
+    # silent -- `index_corpus.py --corpus-dir /tmp/bonus7/g3` succeeds, and
+    # every pre-registered chunk then reads `absent` with no error anywhere.
+
+The output directory belongs outside the repository (``/tmp/bonus7/`` is what
+the measured run used). Building it inside the worktree makes
+``git status --porcelain`` non-empty, and ``compare_retrieval.py`` refuses to
+spend a run against a tree it cannot name a commit for.
 """
 
 import argparse

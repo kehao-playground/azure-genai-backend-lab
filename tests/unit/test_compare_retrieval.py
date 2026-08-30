@@ -29,7 +29,7 @@ import pytest
 
 from azgenai_lab.models.rag import Chunk, make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
-from azgenai_lab.models.search_index import INDEX_NAME
+from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS, INDEX_NAME
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 
@@ -460,12 +460,14 @@ def test_an_index_name_that_agrees_or_says_nothing_is_left_alone() -> None:
     for index_name in (
         "azgenai-lab-chunks-g2",  # agrees
         "azgenai-lab-chunks-g2-retry",  # agrees, and not in the last segment
-        INDEX_NAME,  # the default, which carries no generation token
-        "azgenai-lab-chunks",
         "some-other-index",
         "azgenai-g2lab",  # `g2` is not a whole segment here
     ):
         compare_retrieval._reject_index_generation_mismatch(index_name, Generation.G2)
+    # The default carries no generation token either, but it is the one
+    # token-less name with a known content: the base corpus, which *is* g1.
+    # See `test_a_defaulted_index_name_is_refused_for_a_distractor_generation`.
+    compare_retrieval._reject_index_generation_mismatch(INDEX_NAME, Generation.G1)
 
 
 def _freeze_vectors(path: Path, queries: Any) -> dict[str, list[float]]:
@@ -475,8 +477,15 @@ def _freeze_vectors(path: Path, queries: Any) -> dict[str, list[float]]:
     query's frozen vector reached the wire" indistinguishable from "some
     query's frozen vector did" — a lookup that returned the same entry for
     every question would satisfy the weaker claim.
+
+    They are `EMBEDDING_DIMENSIONS` wide because the real client rejects any
+    other width. A narrower vector would prove the frozen bytes reach the
+    wire, but not that they reach it in a shape the wire accepts.
     """
-    expected = {query.text: [float(n)] * 4 for n, query in enumerate(queries, start=1)}
+    expected = {
+        query.text: [float(n)] * EMBEDDING_DIMENSIONS
+        for n, query in enumerate(queries, start=1)
+    }
     payload = {
         text: {"vector": vector, "sha256": compare_retrieval._vector_digest(vector)}
         for text, vector in expected.items()
@@ -526,10 +535,13 @@ def test_main_refuses_a_generation_manifest_contradiction_before_any_spend(
             "--user-id", "operator",
             "--vectors", "vectors.json",
             "--generation", "g2",
+            # Named, so the index guard ahead of this one has nothing to say
+            # and the manifest pairing is what refuses the run.
+            "--index-name", "azgenai-lab-chunks-g2",
             "--manifest-sha256", "none",
         ],
     )
-    with pytest.raises(SystemExit, match="g2"):
+    with pytest.raises(SystemExit, match="has a manifest to"):
         asyncio.run(mod.main())
 
 
@@ -542,7 +554,11 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
     from tools import compare_retrieval as mod
 
     from azgenai_lab.core.config import Settings
-    from azgenai_lab.models.search import SearchMode, SearchResult
+    from azgenai_lab.models.search import (
+        SearchMode,
+        SearchResult,
+        validate_search_arguments,
+    )
 
     constructed: list[str] = []
     searched: list[Any] = []
@@ -572,6 +588,12 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             principal: Any,
             vector_k: int,
         ) -> Any:
+            # The real adapter routes every call through this validator, so
+            # a double that skips it accepts calls the service rejects --
+            # the fake-fidelity gap this repository tracks as a watchpoint.
+            validate_search_arguments(
+                query_text, query_vector, mode=mode, top=top, vector_k=vector_k
+            )
             searched.append((query_text, mode, query_vector))
             return SearchResult(hits=(), mode=mode, vector_k=vector_k)
 
@@ -652,7 +674,7 @@ def test_the_vectors_file_is_written_and_nothing_is_queried(
 
     class Recorder:
         async def embed(self, texts: Any) -> list[list[float]]:
-            return [[0.25] * 4 for _ in texts]
+            return [[0.25] * EMBEDDING_DIMENSIONS for _ in texts]
 
     def refuse(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("no search client may be built on the write path")
@@ -709,7 +731,7 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
     from tools import compare_retrieval as mod
 
     from azgenai_lab.core.config import Settings
-    from azgenai_lab.models.search import SearchResult
+    from azgenai_lab.models.search import SearchResult, validate_search_arguments
 
     class FakeClient:
         def __init__(
@@ -735,6 +757,10 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
             principal: Any,
             vector_k: int,
         ) -> Any:
+            # Same contract as the real adapter; see the fake above.
+            validate_search_arguments(
+                query_text, query_vector, mode=mode, top=top, vector_k=vector_k
+            )
             return SearchResult(hits=(), mode=mode, vector_k=vector_k)
 
     class StubEmbeddings:
@@ -808,3 +834,219 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
     # and "no answer" stays distinguishable from "answer, but not yet".
     assert f"- pre-registered chunk(s): `{present_id}`" in written
     assert "- pre-registered chunk(s): none (no answer)" in written
+
+
+def _diagnostics() -> SimpleNamespace:
+    return SimpleNamespace(
+        request_body={"search": "x"}, status=200, request_id="rid", latency_ms=1.5
+    )
+
+
+class PageClient:
+    """A search client that returns a fixed page, and validates like the real one.
+
+    `search()` runs `validate_search_arguments` for the reason that
+    validator's own docstring gives: a double that accepts a call the service
+    would reject turns a green suite into a live-run failure.
+    """
+
+    def __init__(self, hits: Any) -> None:
+        self._hits = tuple(hits)
+        self.last_diagnostics = _diagnostics()
+
+    async def search(
+        self,
+        query_text: str,
+        query_vector: Any = None,
+        *,
+        mode: Any,
+        top: int,
+        principal: Any,
+        vector_k: int,
+    ) -> Any:
+        from azgenai_lab.models.search import SearchResult, validate_search_arguments
+
+        validate_search_arguments(
+            query_text, query_vector, mode=mode, top=top, vector_k=vector_k
+        )
+        return SearchResult(hits=self._hits, mode=mode, vector_k=vector_k)
+
+
+def _run_one(
+    client: Any,
+    evidence: Any,
+    *,
+    top: int,
+    refs: Any = (),
+    generation: Any = None,
+    text: str = "alpha",
+) -> list[str]:
+    from azgenai_lab.models.principal import Principal
+    from azgenai_lab.models.search import SearchMode
+    from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+
+    return asyncio.run(
+        compare_retrieval._run(
+            client,
+            evidence,
+            "Q1 en baseline vector",
+            make_query(1, text),
+            refs,
+            [0.5] * EMBEDDING_DIMENSIONS,
+            Principal(tenant_id="acme", user_id="u", group_ids=()),
+            generation=generation or Generation.G1,
+            mode=SearchMode.VECTOR,
+            top=top,
+            vector_k=50,
+            search_endpoint=None,
+            max_recorded_hits=10,
+        )
+    )
+
+
+def test_a_response_that_exactly_fills_the_page_aborts_the_run(tmp_path: Path) -> None:
+    """`hits == top` cannot be told from a truncated page, and that is the
+    distinction the candidate-generation experiment exists to measure. It is
+    available on the first call, before the other 107 are spent."""
+    evidence = compare_retrieval.Evidence(tmp_path / "evidence.md", total_queries=1)
+    client = PageClient(make_hit(f"c{i}") for i in range(5))
+
+    with pytest.raises(SystemExit) as excinfo:
+        _run_one(client, evidence, top=5)
+
+    message = str(excinfo.value)
+    assert "vector" in message, "the refusal must name the mode"
+    assert "alpha" in message, "the refusal must name the query"
+    assert "5" in message, "the refusal must name --top"
+    assert "--top" in message, "the refusal must say what to do about it"
+
+    written = (tmp_path / "evidence.md").read_text(encoding="utf-8")
+    assert "**Aborted:" in written, "the artifact must explain its own abort"
+    assert "alpha" in written
+
+
+def test_a_response_short_of_the_page_is_not_refused(tmp_path: Path) -> None:
+    # One hit short of `top` is the ordinary case: the corpus ended before
+    # the page did, which is exactly what the prescribed `top` buys.
+    evidence = compare_retrieval.Evidence(tmp_path / "evidence.md", total_queries=1)
+    client = PageClient(make_hit(f"c{i}") for i in range(5))
+    rows = _run_one(client, evidence, top=6)
+    assert rows and all("Aborted" not in row for row in rows)
+
+
+def test_the_frozen_ref_abort_says_why_in_the_artifact(tmp_path: Path) -> None:
+    """The one abort meaning "the frozen ref table is wrong". Its cause must
+    survive into the published artifact, not only into stderr."""
+    only_g3 = ExpectedChunkRef(
+        "labdocs-observability", 1, "Observability", frozenset({Generation.G3})
+    )
+    (target,) = expected_chunk_ids("acme", (only_g3,))
+    evidence = compare_retrieval.Evidence(tmp_path / "evidence.md", total_queries=1)
+    client = PageClient([make_hit(target)])
+
+    with pytest.raises(ValueError):
+        _run_one(client, evidence, top=25, refs=(only_g3,), generation=Generation.G1)
+
+    written = (tmp_path / "evidence.md").read_text(encoding="utf-8")
+    assert "**Aborted:" in written
+    assert target in written
+    assert "g3" in written
+
+
+def test_top_is_bounded_by_the_service_ceiling_while_parsing() -> None:
+    # `MAX_TOP` is parse-time knowable. Left to the request validator it
+    # costs a complete-looking evidence file of FAILED rows instead of an
+    # exit 2.
+    from azgenai_lab.models.search import MAX_TOP
+
+    parser = compare_retrieval._build_parser()
+    assert parser.parse_args(_run_arguments(**{"--top": str(MAX_TOP)})).top == MAX_TOP
+    for bad in (str(MAX_TOP + 1), "0", "-1", "seven"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(_run_arguments(**{"--top": bad}))
+
+
+def test_a_defaulted_index_name_is_refused_for_a_distractor_generation() -> None:
+    # Omitting --index-name leaves the base index every earlier day's runbook
+    # creates. It carries no generation token, so the token scan says nothing
+    # about it -- and a populated base index returns g1-shaped numbers under
+    # a g2/g3 label, at full price.
+    for generation in (Generation.G2, Generation.G3):
+        with pytest.raises(SystemExit, match="provably not"):
+            compare_retrieval._reject_index_generation_mismatch(INDEX_NAME, generation)
+    # g1 *is* the base corpus, so the default index is the right target there.
+    compare_retrieval._reject_index_generation_mismatch(INDEX_NAME, Generation.G1)
+
+
+def test_experiment_two_states_the_reranking_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At g2/g3 `top` exceeds 50, so a rank past 50 is a position the
+    semantic ranker never touched. Two such ranks compared against each other
+    are two pre-rerank orderings, and the artifact has to say so."""
+    from tools import compare_retrieval as mod
+
+    from azgenai_lab.core.config import Settings
+    from azgenai_lab.models.search_index import EMBEDDING_DIMENSIONS
+
+    class StubEmbeddings:
+        async def embed(self, texts: Any) -> list[list[float]]:
+            raise AssertionError("the read path must not embed anything")
+
+    queries = (Query(1, "only question", "k", base_refs=(), expansion_refs=(), language="en"),)
+    monkeypatch.setattr(mod, "QUERIES_BY_TENANT", {"globex": queries})
+
+    vectors = tmp_path / "vectors.json"
+    _freeze_vectors(vectors, queries)
+    out = tmp_path / "evidence.md"
+
+    monkeypatch.setattr(mod, "_git", lambda *a: "" if a[0] == "status" else "c" * 40 + "\n")
+    monkeypatch.setattr(
+        mod,
+        "get_settings",
+        lambda: Settings(
+            azure_search_endpoint="https://example.search.windows.net",
+            azure_search_admin_key="k",
+            use_fake_search=False,
+            use_fake_embeddings=False,
+        ),
+    )
+    monkeypatch.setattr(mod, "configure_logging", lambda level: None)
+    monkeypatch.setattr(mod, "build_embedding_client", lambda settings: StubEmbeddings())
+    monkeypatch.setattr(
+        mod,
+        "AzureSearchClient",
+        lambda settings, index_name=INDEX_NAME: _AsyncPageClient([]),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", str(out),
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", str(vectors),
+            "--generation", "g2",
+            "--index-name", "azgenai-lab-chunks-g2",
+            "--manifest-sha256", "d" * 64,
+        ],
+    )
+    assert EMBEDDING_DIMENSIONS  # the frozen vectors above are this wide
+
+    asyncio.run(mod.main())
+
+    written = out.read_text(encoding="utf-8")
+    assert "### Experiment 2" in written
+    assert "top 50" in written and "never touched" in written
+
+
+class _AsyncPageClient(PageClient):
+    """`PageClient` as an async context manager, for the `main()` path."""
+
+    async def __aenter__(self) -> "_AsyncPageClient":
+        return self
+
+    async def __aexit__(self, *exception: object) -> None:
+        return None
