@@ -11,6 +11,8 @@
 # Optional env vars:
 #   AZ_LOCATION        - defaults to japaneast
 #   AZ_SEARCH_SKU      - defaults to free
+#   AZ_SEARCH_SEMANTIC - semantic ranker plan: disabled|free|standard.
+#                         Unset means the flag is not sent at all.
 set -euo pipefail
 
 : "${AZ_SUBSCRIPTION_ID:?Set AZ_SUBSCRIPTION_ID}"
@@ -19,13 +21,24 @@ set -euo pipefail
 AZ_LOCATION="${AZ_LOCATION:-japaneast}"
 AZ_SEARCH_SKU="${AZ_SEARCH_SKU:-free}"
 
+# Optional: semantic ranker plan. Unset means the flag is not sent at all,
+# so existing behaviour is byte-identical. az 2.89.1 allows
+# disabled|free|standard; hybrid_semantic queries need free or standard.
+AZ_SEARCH_SEMANTIC="${AZ_SEARCH_SEMANTIC:-}"
+
+semantic_args=()
+if [ -n "$AZ_SEARCH_SEMANTIC" ]; then
+  semantic_args=(--semantic-search "$AZ_SEARCH_SEMANTIC")
+fi
+
 echo "Creating $AZ_SEARCH_SKU search service '$AZ_SEARCH_NAME' in $AZ_LOCATION"
 az search service create \
   --subscription "$AZ_SUBSCRIPTION_ID" \
   --resource-group "$AZ_RESOURCE_GROUP" \
   --name "$AZ_SEARCH_NAME" \
   --location "$AZ_LOCATION" \
-  --sku "$AZ_SEARCH_SKU"
+  --sku "$AZ_SEARCH_SKU" \
+  "${semantic_args[@]}"
 
 echo "Service properties (record these in the evidence file):"
 az search service show \
