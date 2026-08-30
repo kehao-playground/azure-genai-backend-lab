@@ -86,9 +86,10 @@ the distinction the candidate generation experiment exists to measure. *At*
 the count the ambiguity survives in a subtler form: a query matching every
 chunk fills the page legitimately, so ``len(hits) == top`` no longer means
 anything. One above it, a full page cannot be legitimate, which is what makes
-the refusal in ``_run`` sound — it fires on the first call rather than after
-all 108 are spent. The output filename names the tier, because nothing inside
-the file records which one produced it.
+the refusal in ``_run`` sound — it fires inside the call that observes a full
+page, before the next one is issued, so the run stops at the observation
+rather than at the end of a pass. The output filename names the tier, because
+nothing inside the file records which one produced it.
 """
 
 import argparse
@@ -846,9 +847,12 @@ def _reject_full_page(
     failure, and nothing in the finished file would reveal that no such
     failure happened.
 
-    It fires on the first call of the run, before the other 107 are spent, and
-    the operator's fix is a run parameter rather than a re-freeze — so this
-    costs one call and no correction to any frozen artifact.
+    It fires inside the call that observes a full page, before the next one
+    is issued — not necessarily the run's first call, but never later than
+    the first observation, which is the property that bounds the spend. The
+    operator's fix is a run parameter rather than a re-freeze, so what a
+    misjudged ``top`` costs is the calls made up to that point and no
+    correction to any frozen artifact.
     """
     if hits != top:
         return

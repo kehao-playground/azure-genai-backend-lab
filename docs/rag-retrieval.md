@@ -105,15 +105,18 @@ path applies the documented default window is not something that page states, wh
 unestablished here rather than guessed in either direction. It governs the BM25 leg *of a hybrid
 query*, the one feeding RRF, so it is `HYBRID` and `HYBRID_SEMANTIC` territory; a pure `KEYWORD`
 query's response is bounded by `top` instead, which means the same leg sits under different
-ceilings depending on the mode. And the largest single-tenant corpus this series measures is 773
-chunks, below 1,000, so the documented default window would not bite even if the stable path
-applies it — inoperative here for the same structural reason the vector cutoff is inoperative
-below `k`, but on a much thinner margin. It is 1.3× rather than the 20× separating 1,000 from
-`DEFAULT_VECTOR_K = 50`, and it is a margin that a corpus a third larger would spend. Read the
-claim as bounded to the corpus sizes stated, not as a safety factor. The asymmetry between the
-legs is unaffected — the two ceilings differ by a factor of twenty, one is this repository's own
-constant and the other a service default this repository cannot set, and what actually excludes
-on the keyword leg here is lexical overlap.
+ceilings depending on the mode. And the largest index this series builds holds 794 chunks across
+its three tenants — the whole index rather than any one tenant's visible share, because whether
+the documented recall window applies before or after the ACL filter is not something that page
+establishes, and a claim resting on the smaller number would rest on that open question. 794 is
+below 1,000, so the documented default window would not bite even if the stable path applies it —
+inoperative here for the same structural reason the vector cutoff is inoperative below `k`, but on
+a much thinner margin. It is 1.26× rather than the 20× separating 1,000 from
+`DEFAULT_VECTOR_K = 50`, and it is a margin a corpus a third larger would spend. Read the claim as
+bounded to the corpus sizes stated, not as a safety factor. The asymmetry between the legs is
+unaffected — the two ceilings differ by a factor of twenty, one is this repository's own constant
+and the other a service default this repository cannot set, and what actually excludes on the
+keyword leg here is lexical overlap.
 
 That the two legs exclude for different reasons is a statement about mechanism and stops there.
 Whether they fail together on a given query is something a per-query, per-mode hit table is read
