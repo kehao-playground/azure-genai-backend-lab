@@ -17,6 +17,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -356,3 +357,190 @@ def test_a_run_must_name_its_vectors_generation_and_manifest() -> None:
         del tokens[position : position + 2]
         with pytest.raises(SystemExit):
             parser.parse_args(tokens)
+
+
+def test_an_index_named_for_another_generation_is_refused() -> None:
+    # Not an enforcement of the naming convention -- INDEX_NAME itself carries
+    # no suffix, so demanding one would reject the tool's own default. What is
+    # refused is the pair that contradicts itself, which no operator meant.
+    with pytest.raises(SystemExit, match="disagree about which generation"):
+        compare_retrieval._reject_index_generation_mismatch(
+            "azgenai-lab-chunks-g3", Generation.G2
+        )
+
+
+def test_an_index_name_that_agrees_or_says_nothing_is_left_alone() -> None:
+    for index_name in (
+        "azgenai-lab-chunks-g2",  # agrees
+        INDEX_NAME,  # the default, which carries no generation token
+        "azgenai-lab-chunks",
+        "azgenai-lab-chunks-g2-retry",  # token not in the suffix position
+        "some-other-index",
+    ):
+        compare_retrieval._reject_index_generation_mismatch(index_name, Generation.G2)
+
+
+def _freeze_vectors(path: Path, queries: Any) -> None:
+    """Write a vectors file the read path accepts for exactly this query set."""
+    payload = {
+        query.text: {
+            "vector": [0.5] * 4,
+            "sha256": compare_retrieval._vector_digest([0.5] * 4),
+        }
+        for query in queries
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def test_the_index_name_reaches_the_client_not_only_the_header(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name that reaches the header but not the query is the failure --
+    a green run and a paid evidence file labelled with an index it never hit.
+    """
+    from tools import compare_retrieval as mod
+
+    from azgenai_lab.core.config import Settings
+    from azgenai_lab.models.search import SearchResult
+
+    constructed: list[str] = []
+    searched: list[Any] = []
+
+    class FakeClient:
+        def __init__(
+            self, settings: Any, *, client: Any = None, index_name: str = INDEX_NAME
+        ) -> None:
+            constructed.append(index_name)
+            self.last_diagnostics = SimpleNamespace(
+                request_body={"search": "x"}, status=200, request_id="rid", latency_ms=1.5
+            )
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *exception: object) -> None:
+            return None
+
+        async def search(
+            self,
+            query_text: str,
+            query_vector: Any = None,
+            *,
+            mode: Any,
+            top: int,
+            principal: Any,
+            vector_k: int,
+        ) -> Any:
+            searched.append((query_text, mode))
+            return SearchResult(hits=(), mode=mode, vector_k=vector_k)
+
+    class StubEmbeddings:
+        async def embed(self, texts: Any) -> list[list[float]]:
+            raise AssertionError("the read path must not embed anything")
+
+    vectors = tmp_path / "vectors.json"
+    _freeze_vectors(vectors, QUERIES_BY_TENANT["globex"])
+    out = tmp_path / "evidence.md"
+
+    monkeypatch.setattr(mod, "_git", lambda *a: "" if a[0] == "status" else "c" * 40 + "\n")
+    monkeypatch.setattr(
+        mod,
+        "get_settings",
+        lambda: Settings(
+            azure_search_endpoint="https://example.search.windows.net",
+            azure_search_admin_key="k",
+            use_fake_search=False,
+            use_fake_embeddings=False,
+        ),
+    )
+    monkeypatch.setattr(mod, "configure_logging", lambda level: None)
+    monkeypatch.setattr(mod, "build_embedding_client", lambda settings: StubEmbeddings())
+    monkeypatch.setattr(mod, "AzureSearchClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", str(out),
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", str(vectors),
+            "--generation", "g2",
+            "--index-name", "azgenai-lab-chunks-g2",
+            "--manifest-sha256", "d" * 64,
+            "--baseline-only",
+        ],
+    )
+
+    asyncio.run(mod.main())
+
+    # The point of the test: the parsed name reached the constructor, not just
+    # the header line below.
+    assert constructed == ["azgenai-lab-chunks-g2"]
+    # Four baseline modes per query, and neither experiment.
+    assert len(searched) == 4 * len(QUERIES_BY_TENANT["globex"])
+
+    written = out.read_text(encoding="utf-8")
+    assert f"- pre-run lab commit: `{'c' * 40}`" in written
+    assert "- generation: `g2` (index `azgenai-lab-chunks-g2`)" in written
+    assert f"- corpus manifest sha256: `{'d' * 64}`" in written
+    assert "### Experiment 1" not in written and "### Experiment 2" not in written
+    # Q6 has no expected chunk in any generation; its row must still say why.
+    assert "n/a (no answer expected)" in written
+    assert "**Run complete — all 5 queries finished.**" in written
+
+
+def test_the_vectors_file_is_written_and_nothing_is_queried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generating and spending are never one step: the write run builds no client."""
+    from tools import compare_retrieval as mod
+
+    from azgenai_lab.core.config import Settings
+
+    class Recorder:
+        async def embed(self, texts: Any) -> list[list[float]]:
+            return [[0.25] * 4 for _ in texts]
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no search client may be built on the write path")
+
+    vectors = tmp_path / "nested" / "vectors.json"
+    out = tmp_path / "evidence.md"
+
+    monkeypatch.setattr(mod, "_git", lambda *a: "" if a[0] == "status" else "c" * 40 + "\n")
+    monkeypatch.setattr(
+        mod,
+        "get_settings",
+        lambda: Settings(
+            azure_search_endpoint="https://example.search.windows.net",
+            azure_search_admin_key="k",
+            use_fake_search=False,
+            use_fake_embeddings=False,
+        ),
+    )
+    monkeypatch.setattr(mod, "configure_logging", lambda level: None)
+    monkeypatch.setattr(mod, "build_embedding_client", lambda settings: Recorder())
+    monkeypatch.setattr(mod, "AzureSearchClient", refuse)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", str(out),
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", str(vectors),
+            "--generation", "g2",
+            "--index-name", "azgenai-lab-chunks-g2",
+            "--manifest-sha256", "d" * 64,
+        ],
+    )
+
+    asyncio.run(mod.main())
+
+    assert not out.exists(), "no evidence file may exist for a run that queried nothing"
+    stored = json.loads(vectors.read_text(encoding="utf-8"))
+    assert set(stored) == {query.text for query in QUERIES_BY_TENANT["globex"]}

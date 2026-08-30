@@ -899,6 +899,40 @@ def _manifest_digest(raw: str) -> str:
     return candidate
 
 
+_GENERATION_SUFFIX = re.compile(rf"-({'|'.join(g.value for g in Generation)})$")
+
+
+def _reject_index_generation_mismatch(index_name: str, generation: Generation) -> None:
+    """Refuse a command line that contradicts itself, and stay quiet otherwise.
+
+    The run's convention is ``azgenai-lab-chunks-<generation>``, but this does
+    not enforce that convention: ``INDEX_NAME`` itself carries no suffix, so a
+    tool that demanded one would reject its own default. What it rejects is
+    narrower and not a matter of taste — an index name that ends in a
+    generation token *other* than the one ``--generation`` names. There is no
+    reading of ``--generation g2 --index-name ...-g3`` that anyone meant: one
+    of the two is a typo, and either way the run would label a paid evidence
+    file with a generation it did not query. That is the same false-label
+    failure the three-state rank vocabulary exists to prevent, and it is
+    cheaper to catch here than to notice afterwards.
+
+    A name with no generation token — the default, or anything the convention
+    does not cover — passes silently. The tool has no basis for an opinion
+    about it: which corpus an index really holds is pinned by
+    ``--manifest-sha256``, not by a string, and guessing from the string would
+    turn a rename into an outage.
+    """
+    match = _GENERATION_SUFFIX.search(index_name)
+    if match is None or match.group(1) == generation.value:
+        return
+    raise SystemExit(
+        f"--generation {generation.value} but --index-name {index_name!r} ends "
+        f"in -{match.group(1)}: the two disagree about which generation this "
+        "run queries, and the evidence header would carry whichever one is "
+        "wrong. Fix the command line before spending a run."
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, required=True, help="frozen for every run")
@@ -984,9 +1018,14 @@ def _build_parser() -> argparse.ArgumentParser:
 async def main() -> None:
     arguments = _build_parser().parse_args()
 
-    # Before the settings are read, before a client exists, before anything
-    # can be spent: the tree this evidence will name has to be one a reader
-    # can check out.
+    # Cheapest and most local first: a command line that contradicts itself is
+    # the operator's typo, and reporting it before telling them to go commit
+    # their work saves a round trip.
+    _reject_index_generation_mismatch(arguments.index_name, arguments.generation)
+
+    # Then, before the settings are read, before a client exists, before
+    # anything can be spent: the tree this evidence will name has to be one a
+    # reader can check out.
     lab_sha = pre_run_lab_sha()
 
     settings = get_settings()
