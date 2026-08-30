@@ -89,3 +89,24 @@ def test_apply_tenant_override_replaces_every_documents_tenant_id() -> None:
             if field.name == "tenant_id":
                 continue
             assert getattr(overridden, field.name) == getattr(original, field.name)
+
+
+def test_corpus_dir_and_index_name_default_to_the_built_ins() -> None:
+    from tools.index_corpus import _build_parser
+
+    from azgenai_lab.models.search_index import INDEX_NAME
+    from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR
+
+    arguments = _build_parser().parse_args([])
+    assert arguments.corpus_dir == SAMPLE_DOCS_DIR
+    assert arguments.index_name == INDEX_NAME
+
+
+def test_corpus_dir_and_index_name_are_overridable(tmp_path) -> None:
+    from tools.index_corpus import _build_parser
+
+    arguments = _build_parser().parse_args(
+        ["--corpus-dir", str(tmp_path), "--index-name", "azgenai-lab-chunks-g3"]
+    )
+    assert arguments.corpus_dir == tmp_path
+    assert arguments.index_name == "azgenai-lab-chunks-g3"
