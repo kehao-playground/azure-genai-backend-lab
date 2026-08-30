@@ -11,9 +11,12 @@ authored heading_path still matches what that ordinal actually is.
 """
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from azgenai_lab.models.rag import Chunk, make_chunk_id, make_parent_id
 from azgenai_lab.models.search import SearchHit
@@ -35,6 +38,12 @@ expected_chunk_ids = compare_retrieval.expected_chunk_ids
 ExpectedChunkRef = compare_retrieval.ExpectedChunkRef
 Generation = compare_retrieval.Generation
 rank_states = compare_retrieval.rank_states
+
+# CJK Unified Ideographs. Nothing mechanical can check that a translation is
+# faithful, but "is the zh member Chinese at all" is one regex, and it
+# catches the accident faithfulness never would: a paste error, a
+# half-finished edit that leaves English text on both sides of a pair.
+_HAN = re.compile(r"[\u4e00-\u9fff]")
 
 CHUNK_MAX_CHARS = 2000
 CHUNK_OVERLAP_CHARS = 500
@@ -119,6 +128,26 @@ def test_rank_is_reported_from_the_full_hit_list() -> None:
     assert states[target] == "380"
 
 
+def test_a_retrieved_chunk_declared_outside_the_generation_raises() -> None:
+    # The one case where the frozen ref table and the live index contradict
+    # each other. Resolving it either way — as `not_in_generation`, which
+    # discards a real hit, or as a rank, which keeps a `generations` set just
+    # shown to be false — puts the disagreement into the recall numbers.
+    only_g3 = ExpectedChunkRef(
+        "labdocs-observability", 1, "Observability", frozenset({Generation.G3})
+    )
+    (target,) = expected_chunk_ids("acme", (only_g3,))
+    with pytest.raises(ValueError) as excinfo:
+        rank_states(
+            hits=[_hit(target, 1.0)], refs=(only_g3,), generation=Generation.G1, tenant_id="acme"
+        )
+    message = str(excinfo.value)
+    assert target in message
+    assert "rank 1" in message
+    assert "g1" in message
+    assert "g3" in message
+
+
 def test_chinese_and_english_counterparts_share_one_label_set() -> None:
     by_number: dict[int, list[Any]] = {}
     for query in QUERIES_BY_TENANT["acme"]:
@@ -135,10 +164,8 @@ def test_chinese_and_english_counterparts_share_one_label_set() -> None:
         # plain paraphrase would still share its refs, so refs alone do not pin
         # the pair.
         assert english.kind == chinese.kind, f"Q{number} kind differs"
-        assert english.text != chinese.text, f"Q{number} was not translated"
-        assert expected_chunk_ids("acme", english.base_refs) == expected_chunk_ids(
-            "acme", chinese.base_refs
-        )
+        assert _HAN.search(chinese.text), f"Q{number} zh member carries no Chinese"
+        assert not _HAN.search(english.text), f"Q{number} en member carries Chinese"
 
 
 def test_the_control_arm_is_not_translated() -> None:

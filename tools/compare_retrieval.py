@@ -218,6 +218,17 @@ def expected_chunk_ids(tenant_id: str, refs: Sequence[ExpectedChunkRef]) -> tupl
     return tuple(make_chunk_id(make_parent_id(tenant_id, ref.doc_id), ref.ordinal) for ref in refs)
 
 
+def _positions(hits: Sequence[SearchHit]) -> dict[str, int]:
+    """Chunk id -> 1-based rank in the returned order.
+
+    One definition, because two renderers read it. A second copy of this
+    comprehension could drift from the first — an off-by-one in one of them
+    would make two tables built from the same response disagree about where a
+    chunk landed, with nothing to say which was right.
+    """
+    return {hit.chunk_id: rank for rank, hit in enumerate(hits, start=1)}
+
+
 def rank_states(
     hits: Sequence[SearchHit],
     refs: Sequence[ExpectedChunkRef],
@@ -232,15 +243,40 @@ def rank_states(
     — the document was not there to be found. Reporting them with one token
     would put a failure that could not have happened into paid evidence, and
     then into a recall count.
+
+    A chunk that comes back while its ref says its document is not in this
+    generation is neither state: the frozen ref table and the live index
+    contradict each other, and one of them is wrong. That raises ``ValueError``
+    rather than resolving in either direction. Recording it as
+    ``not_in_generation`` would silently discard a real observation, and
+    recording it as a rank would keep a ``generations`` set that has just been
+    shown to be false. Every recall number from the run would rest on the
+    disagreement either way. Evidence is checkpointed after every call, so
+    aborting loses nothing already paid for.
+
+    Callers must invoke this *outside* the try/except that wraps a search
+    call. This ``ValueError`` is a bug in the frozen table, not a rejected
+    request, and recording it as a failed call would file it under the one
+    thing it is not.
     """
-    positions = {hit.chunk_id: rank for rank, hit in enumerate(hits, start=1)}
+    positions = _positions(hits)
     states: list[tuple[str, str]] = []
     for ref in refs:
         (chunk_id,) = expected_chunk_ids(tenant_id, (ref,))
+        rank = positions.get(chunk_id)
         if generation not in ref.generations:
+            if rank is not None:
+                declared = ", ".join(sorted(g.value for g in ref.generations)) or "none"
+                raise ValueError(
+                    f"{chunk_id} came back at rank {rank} from generation "
+                    f"{generation.value}, but its pre-registered ref declares it "
+                    f"present only in [{declared}]. The frozen ref table and the "
+                    "index this run queried disagree; re-freeze the refs against "
+                    "the corpus this generation was actually built from before "
+                    "spending another run."
+                )
             states.append((chunk_id, "not_in_generation"))
             continue
-        rank = positions.get(chunk_id)
         states.append((chunk_id, str(rank) if rank is not None else "absent"))
     return states
 
@@ -280,14 +316,40 @@ _ACME_Q6_KIND = "absent from corpus"
 # tenant B's tuple, not in a shared one.
 #
 # The acme set is paired: every question is asked once in English and once in
-# Traditional Chinese, with the same `kind` and the same refs, so the pair
-# isolates the language. The Chinese strings are experimental data — the
-# cross-language arm cannot exist without them — and are the only non-English
-# text in this repository. Note that the index's `content` field pins
-# `analyzer: "en.microsoft"`, so a Chinese question is tokenised by an English
-# analyser. Whatever a Chinese query scores on the lexical side is bounded by
-# that, and a `kind` that depends on matching an English literal cannot be
-# reproduced on the Chinese side at all.
+# Traditional Chinese, with the same `kind` and the same refs, so the pair is
+# meant to isolate the language. The Chinese strings are experimental data —
+# the cross-language arm cannot exist without them — and are the only
+# non-English text in this module.
+#
+# The pairing is not clean, and these four declared asymmetries say where. The
+# index's `content` field is the only analyzed one and pins
+# `analyzer: "en.microsoft"`, so every Chinese question is tokenised by an
+# English analyser; three of the four follow from that. An undeclared
+# asymmetry is what would make a result unreadable; a declared one is a
+# property of the experiment.
+#
+#   1. Q1's `kind` is "exact literal", and the literal is English source text.
+#      `99.9%` survives as a numeral and nothing else does, so the zh side
+#      matches no literal in any other token. Q1 compares a literal match
+#      against a numeral match plus whatever the vector side contributes.
+#   2. Q4's `kind` is "lexical decoy", and the decoy is English vocabulary
+#      ("customer", "system", "configur*") occurring outside the Exclusions
+#      section. A Chinese query shares no surface tokens with any of it, so on
+#      the lexical side there is nothing left to be decoyed by; Q4-zh is a
+#      vector-side question wearing a lexical-decoy label.
+#   3. Q5-zh keeps `Sev 1` as a Latin token, which is how Taiwanese ops write
+#      it — so it is the one Chinese query carrying a lexical anchor the
+#      English analyser can tokenise. Five of the six have essentially no
+#      lexical contribution and one has some, so any aggregate over "the
+#      Chinese arm" mixes two regimes.
+#   4. Q3's `kind` is cross-document ambiguity. In English one polysemous noun
+#      ("credit") reaches both the SLA and the returns policy. Traditional
+#      Chinese has no equally polysemous noun, and the phrasing chosen for the
+#      zh side asks when the customer gets money back — which is what a refund
+#      is, whereas an SLA service credit is applied to the account rather than
+#      returned. The zh side therefore leans toward the returns policy: this
+#      pair varies ambiguity strength as well as language, and a Q3 difference
+#      must not be read as a pure language effect.
 #
 # globex is the control arm and is deliberately not translated: if the paired
 # arm moves and the untranslated one does not, the pairing is the difference.
@@ -510,7 +572,7 @@ def _ranks(hits: Sequence[SearchHit], expected: tuple[str, ...]) -> str:
     """Report every pre-registered chunk separately: its rank, or 'absent'."""
     if not expected:
         return "n/a (no answer expected)"
-    positions = {hit.chunk_id: rank for rank, hit in enumerate(hits, start=1)}
+    positions = _positions(hits)
     return "; ".join(f"`{chunk_id}`={positions.get(chunk_id, 'absent')}" for chunk_id in expected)
 
 
