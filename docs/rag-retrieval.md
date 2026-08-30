@@ -84,17 +84,37 @@ not which mode ranks best but which leg dropped the answer.
 
 - **The keyword leg excludes by lexical overlap.** BM25 returns documents sharing terms with the
   query, so what decides how much it excludes is the overlap between the query's terms and the
-  indexed text. There is no fixed-`k` threshold on this leg. Adding documents can introduce new
-  lexical matches at any corpus size, so the candidate set does grow with the corpus — but a
-  larger candidate set is not the same claim as the answer chunk being inside it.
+  indexed text. There is no fixed-`k` threshold on this leg that this repository sets or that
+  operates at this scale. Adding documents can introduce new lexical matches at any corpus size,
+  so the candidate set does grow with the corpus — but a larger candidate set is not the same
+  claim as the answer chunk being inside it.
 - **The vector leg excludes by rank cutoff.** It offers the `vector_k` nearest neighbours and
   nothing else, so what decides how much it excludes is the size of the visible corpus relative
   to `vector_k`, independent of vocabulary. While the visible corpus is at or below `vector_k`,
   this failure is structurally impossible: there is no (k+1)-th neighbour to drop.
 
+That qualification on the keyword leg is load-bearing, because "no threshold" is not true of the
+service in general. Azure documents a `maxTextRecallSize` parameter that "specifies the number of
+BM25-ranked results to provide to the Reciprocal Rank Fusion (RRF) ranker used in hybrid queries.
+The default is 1,000. The maximum is 10,000" ([create a hybrid
+query](https://learn.microsoft.com/en-us/azure/search/hybrid-search-how-to-query), page updated
+2026-08-06, checked 2026-08). Three things keep it off this document's critical path. It is a
+preview parameter, settable only on preview API versions, while this repository pins the stable
+`2026-04-01` (`models/search_index.py`) — so this codebase cannot set it, and whether the stable
+path applies the documented default window is not something that page states, which is left
+unestablished here rather than guessed in either direction. It governs the BM25 leg *of a hybrid
+query*, the one feeding RRF, so it is `HYBRID` and `HYBRID_SEMANTIC` territory; a pure `KEYWORD`
+query's response is bounded by `top` instead, which means the same leg sits under different
+ceilings depending on the mode. And 1,000 is roughly twenty times `DEFAULT_VECTOR_K = 50`: a
+corpus only just large enough to make the vector leg's cutoff bite is still an order of magnitude
+short of it, so it is inoperative here for the same structural reason the vector cutoff is
+inoperative below k. The asymmetry between the legs is unaffected — the two ceilings differ by a
+factor of twenty, one is this repository's own constant and the other a service default this
+repository cannot set, and what actually excludes on the keyword leg here is lexical overlap.
+
 That the two legs exclude for different reasons is a statement about mechanism and stops there.
-Whether they fail together on a given query is something a per-query matrix is read for
-afterwards, not something the difference in mechanism entitles anyone to assume in advance.
+Whether they fail together on a given query is something a per-query, per-mode hit table is read
+for afterwards, not something the difference in mechanism entitles anyone to assume in advance.
 
 Crossing `vector_k` **adds** the rank-cutoff failure to the vector leg. It does not switch the
 four modes from returning one shared set to returning different sets: the sets differ below
@@ -109,8 +129,8 @@ make from the other direction. So it rescues neither failure: a chunk that never
 lexical candidate set and a chunk pushed past `vector_k` are both absent from the list the ranker
 is handed.
 
-Every statement here about lexical matching is bounded to one analyzer configuration. `content`
-is the only field in this index carrying an explicit analyzer assignment, and it pins
+Every statement here about lexical matching is bounded to this index's analyzer configuration.
+`content` is the only field in this index carrying an explicit analyzer assignment, and it pins
 `en.microsoft` ([index schema](rag-indexing.md#index-schema)); `title` and `heading_path` are
 searchable under the service default. What counts as "shares a term with the query" is that
 analyzer's verdict, so an observation about which chunks the keyword leg admitted is an
@@ -121,7 +141,7 @@ not into a ranking of the four modes:
 
 | Diagnostic | The question | What its failure looks like | Response to a growing corpus |
 |---|---|---|---|
-| Keyword leg | Did the answer chunk enter the lexical candidate set? | The query's terms overlap the chunk too little, so it was never on the list at all | No `k` threshold. Expansion adds new lexical matches at any size and the candidate set grows — which is not the same as the answer getting in |
+| Keyword leg | Did the answer chunk enter the lexical candidate set? | The query's terms overlap the chunk too little, so it was never on the list at all | No `k` threshold this repository sets or that operates at this scale (`maxTextRecallSize` above). Expansion adds new lexical matches at any size and the candidate set grows — which is not the same as the answer getting in |
 | Vector leg | Was the answer chunk pushed past `vector_k`? | It was scored as a neighbour but fell outside the top `k` | Structurally impossible while the visible corpus is at or below `vector_k`; possible only once the corpus exceeds it |
 
 Each answer names a different repair: the query text or the analyzer on one side, `vector_k` on
