@@ -799,7 +799,7 @@ def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
     # state, so the run records that the chunk was never there to be found.
     assert (
         "- pre-registered chunk(s): none in this generation "
-        "(1 pre-registered for a later one)"
+        "(1 pre-registered for another one)"
     ) in written
     assert f"pre-registered chunk(s): `{late_id}`" not in written
     assert f"`{late_id}`=not_in_generation" in written

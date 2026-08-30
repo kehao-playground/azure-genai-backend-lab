@@ -438,11 +438,12 @@ _NO_REFS: tuple[ExpectedChunkRef, ...] = ()
 # against all twelve acme questions and found no chunk that answers one. The
 # distractor corpus is Azure/GenAI engineering prose; the questions ask about
 # uptime targets, refund windows, service credits, SLA exclusions and Sev 1
-# escalation. Three near-misses were read in full and ruled out on the
-# record — see `drafts/research/bonus-7-retrieval-mode-selection.md`, section
-# "預先登錄" — the strongest being a *fabricated* return window inside a
-# chunking tutorial, which contradicts the policy it resembles and would have
-# scored a wrong answer as a hit.
+# escalation. Four near-misses were read in full and ruled out on the
+# record — see section 8.4 ("preregistration record") of
+# `drafts/research/bonus-7-retrieval-mode-selection.md` in the planning repo
+# — the strongest being a *fabricated* return window inside a chunking
+# tutorial, which contradicts the policy it resembles and would have scored a
+# wrong answer as a hit.
 #
 # Q6 therefore stays "absent from corpus" at all three generations, in both
 # languages. This table is frozen: adding or removing a ref after the run
@@ -1255,13 +1256,16 @@ async def _compare(
         vector = vectors[query.text]
 
         # Two ways to have nothing to announce, and they are not the same
-        # claim: the corpus has no answer at all, or it has one that arrives
-        # with a later generation than this run's.
+        # claim: the corpus has no answer at all, or it has one that lives in
+        # a generation other than this run's. "another" rather than "a later
+        # one" because nothing here enforces that a narrowed ref points
+        # forward — under a different corpus design a ref could be narrowed to
+        # {G1, G2}, and the sentence would then be backwards.
         if expected_ids:
             expected = ", ".join(f"`{c}`" for c in expected_ids)
         elif refs:
             expected = (
-                f"none in this generation ({len(refs)} pre-registered for a later one)"
+                f"none in this generation ({len(refs)} pre-registered for another one)"
             )
         else:
             expected = "none (no answer)"
