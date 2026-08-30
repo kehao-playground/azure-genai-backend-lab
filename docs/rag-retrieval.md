@@ -76,6 +76,63 @@ so neither can accept a call the other refuses — a fake that is more permissiv
 turns a green suite into a production failure, and one that is stricter is a fake nobody can
 develop against.
 
+## Choosing a retrieval mode
+
+Candidate generation is one stage with two legs, and the legs exclude for different reasons. The
+reasons do not respond to a growing corpus the same way, which is why the answerable question is
+not which mode ranks best but which leg dropped the answer.
+
+- **The keyword leg excludes by lexical overlap.** BM25 returns documents sharing terms with the
+  query, so what decides how much it excludes is the overlap between the query's terms and the
+  indexed text. There is no fixed-`k` threshold on this leg. Adding documents can introduce new
+  lexical matches at any corpus size, so the candidate set does grow with the corpus — but a
+  larger candidate set is not the same claim as the answer chunk being inside it.
+- **The vector leg excludes by rank cutoff.** It offers the `vector_k` nearest neighbours and
+  nothing else, so what decides how much it excludes is the size of the visible corpus relative
+  to `vector_k`, independent of vocabulary. While the visible corpus is at or below `vector_k`,
+  this failure is structurally impossible: there is no (k+1)-th neighbour to drop.
+
+That the two legs exclude for different reasons is a statement about mechanism and stops there.
+Whether they fail together on a given query is something a per-query matrix is read for
+afterwards, not something the difference in mechanism entitles anyone to assume in advance.
+
+Crossing `vector_k` **adds** the rank-cutoff failure to the vector leg. It does not switch the
+four modes from returning one shared set to returning different sets: the sets differ below
+`vector_k` too. This repository's Day 13 capture shows it directly — a visible corpus of 25
+chunks, half the default `vector_k` of 50, and one query returned 4 rows under `KEYWORD` against
+25 under each of `VECTOR` and `HYBRID`. The vector leg had excluded nothing, and BM25 had already
+excluded 21. Membership differed with no cutoff anywhere in play.
+
+The semantic ranker changes neither leg's candidate set — it reorders what candidate generation
+already produced, which is the same point the [three stages](#retrieval-is-three-stages-that-fail-separately)
+make from the other direction. So it rescues neither failure: a chunk that never entered the
+lexical candidate set and a chunk pushed past `vector_k` are both absent from the list the ranker
+is handed.
+
+Every statement here about lexical matching is bounded to one analyzer configuration. `content`
+is the only field in this index carrying an explicit analyzer assignment, and it pins
+`en.microsoft` ([index schema](rag-indexing.md#index-schema)); `title` and `heading_path` are
+searchable under the service default. What counts as "shares a term with the query" is that
+analyzer's verdict, so an observation about which chunks the keyword leg admitted is an
+observation about this index, not about lexical retrieval generally.
+
+So "which mode should I use?" resolves into two questions answered independently of each other,
+not into a ranking of the four modes:
+
+| Diagnostic | The question | What its failure looks like | Response to a growing corpus |
+|---|---|---|---|
+| Keyword leg | Did the answer chunk enter the lexical candidate set? | The query's terms overlap the chunk too little, so it was never on the list at all | No `k` threshold. Expansion adds new lexical matches at any size and the candidate set grows — which is not the same as the answer getting in |
+| Vector leg | Was the answer chunk pushed past `vector_k`? | It was scored as a neighbour but fell outside the top `k` | Structurally impossible while the visible corpus is at or below `vector_k`; possible only once the corpus exceeds it |
+
+Each answer names a different repair: the query text or the analyzer on one side, `vector_k` on
+the other.
+
+"The corpus is larger than `vector_k`" is not one of those two questions and does not substitute
+for either. Crossing `vector_k` makes truncation *possible*, not actual. Below it you can be
+certain truncation did not happen; above it, the only thing that answers the question is that
+query's rank for the answer chunk. Corpus size on its own never establishes that anything was
+truncated.
+
 ## Two scores, and only one of them has a rubric
 
 `SearchHit` carries `score` and `reranker_score` separately and never normalizes them.
