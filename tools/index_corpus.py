@@ -35,12 +35,14 @@ import argparse
 import asyncio
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
 
 from azgenai_lab.core.config import Settings, get_settings
 from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.core.telemetry import configure_telemetry
 from azgenai_lab.models.principal import validate_identifier
 from azgenai_lab.models.rag import Chunk, IndexingAction, SourceDocument, make_parent_id
+from azgenai_lab.models.search_index import INDEX_NAME
 from azgenai_lab.services.chunking import chunk_markdown
 from azgenai_lab.services.document_loader import SAMPLE_DOCS_DIR, load_documents
 from azgenai_lab.services.embeddings import build_embedding_client, embed_chunks
@@ -103,6 +105,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "never as a default."
         ),
     )
+    parser.add_argument(
+        "--corpus-dir",
+        type=Path,
+        default=SAMPLE_DOCS_DIR,
+        help=(
+            "directory of <tenant>/<doc_id>.md source documents "
+            "(default: the checked-in sample corpus)"
+        ),
+    )
+    parser.add_argument(
+        "--index-name",
+        default=INDEX_NAME,
+        help="target index (default: the single lab index)",
+    )
     return parser
 
 
@@ -128,13 +144,14 @@ async def main() -> None:
 
     # The data plane owns its connection pool here, so it is closed on the way
     # out — including when a SystemExit below aborts the run partway.
-    async with SearchDataPlane(settings) as plane:
+    async with SearchDataPlane(settings, index_name=arguments.index_name) as plane:
         await _index(
             plane,
             settings,
             create_index=arguments.create_index,
             recreate_index=arguments.recreate_index,
             tenant_id=arguments.tenant_id,
+            corpus_dir=arguments.corpus_dir,
         )
 
 
@@ -191,6 +208,7 @@ async def _index(
     create_index: bool,
     recreate_index: bool,
     tenant_id: str | None = None,
+    corpus_dir: Path = SAMPLE_DOCS_DIR,
 ) -> None:
     await _rebuild_schema(plane, create_index=create_index, recreate_index=recreate_index)
 
@@ -232,9 +250,7 @@ async def _index(
 
     replacer = DocumentReplacer(plan_batches, measured_post, plane.list_chunk_ids)
 
-    documents_to_index = _apply_tenant_override(
-        load_documents(settings.sample_docs_dir or SAMPLE_DOCS_DIR), tenant_id
-    )
+    documents_to_index = _apply_tenant_override(load_documents(corpus_dir), tenant_id)
 
     total_documents = 0
     for source in documents_to_index:
