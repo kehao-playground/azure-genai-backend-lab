@@ -151,9 +151,9 @@ class SearchClient(Protocol):
     async def aclose(self) -> None: ...
 
 
-def search_url(endpoint: str) -> str:
+def search_url(endpoint: str, index_name: str = INDEX_NAME) -> str:
     return (
-        f"{endpoint.rstrip('/')}/indexes/{INDEX_NAME}/docs/search"
+        f"{endpoint.rstrip('/')}/indexes/{index_name}/docs/search"
         f"?api-version={SEARCH_API_VERSION}"
     )
 
@@ -280,13 +280,19 @@ def map_search_status(status: int, detail: str, request_id: str | None) -> Upstr
 class AzureSearchClient:
     """Query adapter over the stable data-plane REST API."""
 
-    def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client: httpx.AsyncClient | None = None,
+        index_name: str = INDEX_NAME,
+    ) -> None:
         if not settings.azure_search_endpoint or not settings.azure_search_admin_key:
             raise ConfigurationError(
                 "azure_search_endpoint and azure_search_admin_key are required "
                 "when use_fake_search is false"
             )
-        self._url = search_url(settings.azure_search_endpoint)
+        self._url = search_url(settings.azure_search_endpoint, index_name)
         self._headers = {
             "api-key": settings.azure_search_admin_key.get_secret_value(),
             "content-type": "application/json",
