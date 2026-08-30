@@ -39,14 +39,17 @@ rather than with bytes assumed to be the same. Generating and querying are two
 separate invocations of the same command: the first writes the file and
 queries nothing.
 
-Five things stop the run before it can spend anything, in the order they
-fire: a corpus manifest digest that is not a digest (rejected while parsing),
-an index name carrying a generation token that contradicts ``--generation``,
-a worktree that is not clean, fake embeddings, and a vectors file that is not
-the frozen one this query set needs — either its keys are not exactly these
-questions, or a stored vector does not match its own digest. Each one would
-otherwise produce an evidence file that looks complete and either cannot be
-reproduced or is labelled with something it did not measure.
+Six things stop the run before it can spend anything, in the order they fire:
+a ``--manifest-sha256`` value that is neither a digest nor the literal
+``none`` (rejected while parsing), an index name carrying a generation token
+that contradicts ``--generation``, a ``--generation``/``--manifest-sha256``
+pair that contradicts itself (``g1`` paired with a digest, or ``g2``/``g3``
+paired with ``none``), a worktree that is not clean, fake embeddings, and a
+vectors file that is not the frozen one this query set needs — either its
+keys are not exactly these questions, or a stored vector does not match its
+own digest. Each one would otherwise produce an evidence file that looks
+complete and either cannot be reproduced or is labelled with something it did
+not measure.
 
 Usage:
     # First: writes the vectors file, queries nothing.
@@ -56,7 +59,10 @@ Usage:
         --tenant-id acme --user-id lab-operator \
         --vectors ../drafts/assets/day-34/vectors-acme.json \
         --generation g1 --index-name azgenai-lab-chunks-g1 \
-        --manifest-sha256 "$(cat corpora/g1/manifest.json.sha256)"
+        --manifest-sha256 none
+
+    # g2/g3 carry a distractor corpus and pin its manifest instead:
+    #     --generation g2 --manifest-sha256 "$(cat corpora/g2/manifest.json.sha256)"
 
 `--baseline-only` records the four-mode survey and neither experiment: the
 control arm, whose corpus does not grow, is surveyed rather than experimented
@@ -882,25 +888,52 @@ DIVIDER = "|---|---|---|---|---|---|---|---|---|---|"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+# `g1` is the unchanged sample corpus: no distractor documents, and
+# `build_distractor_corpus.py` refuses to produce a zero-document manifest
+# for it. So `g1` has no manifest to pin, by design rather than by omission.
+# This is the one value `_manifest_digest` accepts besides a digest, and the
+# one value `_reject_generation_manifest_mismatch` accepts for `g1`.
+NO_MANIFEST = "none"
+
+
 def _manifest_digest(raw: str) -> str:
-    """Accept a corpus manifest digest, or reject it here rather than in the evidence.
+    """Accept a corpus manifest digest or the no-manifest sentinel.
 
     `build_distractor_corpus.py` writes `manifest.json.sha256` in sha256sum's
     convention, digest plus a trailing newline. A caller that reads that file
     without stripping hands this a 65-character string, which would be
     recorded verbatim and match nothing a reader later computes — a
     discrepancy with no visible cause, in a file that is otherwise correct.
-    Strip, then insist on exactly the 64 lowercase hex characters, so a
-    whitespace slip is a loud argparse error at the boundary instead.
+    Strip, then insist on exactly the 64 lowercase hex characters or the
+    literal ``none``, so a whitespace slip -- or a base-corpus digest smuggled
+    in for a generation that has no manifest at all -- is a loud argparse
+    error at the boundary instead of a false label in paid evidence.
     """
     candidate = raw.strip()
+    if candidate == NO_MANIFEST:
+        return candidate
     if not _SHA256.fullmatch(candidate):
         raise argparse.ArgumentTypeError(
-            f"expected 64 lowercase hex characters, got {raw!r} -- pass the "
-            "contents of the corpus's manifest.json.sha256 with surrounding "
-            "whitespace stripped"
+            f"expected 64 lowercase hex characters or the literal "
+            f"{NO_MANIFEST!r}, got {raw!r} -- pass the contents of the "
+            "corpus's manifest.json.sha256 with surrounding whitespace "
+            f"stripped, or {NO_MANIFEST!r} for a generation with no "
+            "distractor corpus"
         )
     return candidate
+
+
+def _manifest_header_line(manifest_sha256: str) -> str:
+    """Render the corpus-manifest evidence line, honest about an absent one.
+
+    Printing the sentinel verbatim, or an empty value, would read as a digest
+    computation that silently failed. The absence is by design -- `g1` has no
+    distractor corpus to have a manifest for -- so the line says that instead
+    of leaving a reader to guess why the field looks empty.
+    """
+    if manifest_sha256 == NO_MANIFEST:
+        return "- corpus manifest sha256: none -- this generation has no distractor corpus"
+    return f"- corpus manifest sha256: `{manifest_sha256}`"
 
 
 # A generation token occupying a whole dash-delimited segment, anywhere in the
@@ -953,6 +986,43 @@ def _reject_index_generation_mismatch(index_name: str, generation: Generation) -
         "queries, and the evidence header would carry whichever one is wrong. "
         "Fix the command line before spending a run."
     )
+
+
+def _reject_generation_manifest_mismatch(generation: Generation, manifest_sha256: str) -> None:
+    """Refuse a ``--generation``/``--manifest-sha256`` pair that contradicts itself.
+
+    ``g1`` is definitionally the no-distractor generation in this experiment
+    -- the base corpus alone, with `build_distractor_corpus.py` refusing to
+    build it a manifest for zero documents. So there are exactly two illegal
+    pairings: ``g1`` with an actual digest, and ``g2``/``g3`` -- which do have
+    a distractor corpus, and therefore a manifest -- with the ``none``
+    sentinel. Either one would make ``_manifest_header_line`` print a label
+    that does not match what the run actually queried: a manifest digest
+    claimed for a generation that has none, or "no distractor corpus" claimed
+    for one that has one. That is the same false-label failure
+    ``_reject_index_generation_mismatch`` exists to catch on the other
+    argument, so it is refused here on the same terms and before the same
+    point -- a command line an operator did not mean, caught before it can
+    spend anything.
+    """
+    is_none = manifest_sha256 == NO_MANIFEST
+    if generation is Generation.G1 and not is_none:
+        raise SystemExit(
+            f"--generation g1 --manifest-sha256 {manifest_sha256!r}: g1 is the "
+            "baseline generation and has no distractor corpus, so it has no "
+            f"manifest to pin. Pass --manifest-sha256 {NO_MANIFEST!r} for g1, "
+            "or fix --generation if this run is meant to query a generation "
+            "that does have a distractor corpus."
+        )
+    if generation is not Generation.G1 and is_none:
+        raise SystemExit(
+            f"--generation {generation.value} --manifest-sha256 "
+            f"{NO_MANIFEST!r}: {generation.value} has a distractor corpus "
+            "built by build_distractor_corpus.py, so it has a manifest to "
+            "pin. Pass the contents of that corpus's manifest.json.sha256, "
+            "or fix --generation if this run is meant to query the baseline "
+            "generation."
+        )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1022,7 +1092,9 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "digest of the corpus manifest this generation was built from, "
-            "pinning at query time which corpus produced these numbers"
+            "pinning at query time which corpus produced these numbers; "
+            "'none' for g1, which has no distractor corpus and therefore no "
+            "manifest"
         ),
     )
     parser.add_argument(
@@ -1042,8 +1114,10 @@ async def main() -> None:
 
     # Cheapest and most local first: a command line that contradicts itself is
     # the operator's typo, and reporting it before telling them to go commit
-    # their work saves a round trip.
+    # their work saves a round trip. Same reasoning, same moment, on the
+    # other argument that can disagree with --generation.
     _reject_index_generation_mismatch(arguments.index_name, arguments.generation)
+    _reject_generation_manifest_mismatch(arguments.generation, arguments.manifest_sha256)
 
     # Then, before the settings are read, before a client exists, before
     # anything can be spent: the tree this evidence will name has to be one a
@@ -1122,7 +1196,7 @@ async def _compare(
         f"- top (frozen for every run): {arguments.top}",
         f"- pre-run lab commit: `{lab_sha}`",
         f"- generation: `{arguments.generation.value}` (index `{arguments.index_name}`)",
-        f"- corpus manifest sha256: `{arguments.manifest_sha256}`",
+        _manifest_header_line(arguments.manifest_sha256),
         f"- query vectors: `{arguments.vectors.name}` "
         f"sha256=`{hashlib.sha256(arguments.vectors.read_bytes()).hexdigest()}` "
         "(frozen once; every generation queries these same bytes)",

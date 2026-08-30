@@ -324,9 +324,52 @@ def test_manifest_digest_strips_whitespace_and_rejects_anything_else() -> None:
     # sha256sum convention. Handing the 65-character string straight through
     # would record a digest that matches nothing.
     assert compare_retrieval._manifest_digest("  " + "a" * 64 + "\n") == "a" * 64
-    for bad in ("A" * 64, "a" * 63, "a" * 65, "g" * 64, "", "not a digest"):
+    for bad in ("A" * 64, "a" * 63, "a" * 65, "g" * 64, "", "not a digest", "None", "NONE", "non"):
         with pytest.raises(argparse.ArgumentTypeError):
             compare_retrieval._manifest_digest(bad)
+
+
+def test_manifest_digest_accepts_the_no_manifest_sentinel() -> None:
+    # `g1` has no distractor corpus and the builder refuses to produce a
+    # zero-document one, so `g1` has no manifest to pin. The literal `none`
+    # says that on purpose, rather than forcing the base corpus's digest
+    # into a field labelled "corpus manifest".
+    assert compare_retrieval._manifest_digest("none") == "none"
+    assert compare_retrieval._manifest_digest("  none\n") == "none"
+
+
+def test_manifest_header_line_renders_digest_and_sentinel_honestly() -> None:
+    assert (
+        compare_retrieval._manifest_header_line("a" * 64)
+        == f"- corpus manifest sha256: `{'a' * 64}`"
+    )
+    # An empty value or a bare `none` with no explanation would read as a
+    # digest computation that silently failed. The absence is by design and
+    # the line has to say so.
+    line = compare_retrieval._manifest_header_line("none")
+    assert "none" in line
+    assert "no distractor corpus" in line
+    assert "``" not in line
+
+
+def test_generation_manifest_pairing_contradictions_are_refused() -> None:
+    # g1 is definitionally the no-distractor generation in this experiment;
+    # a digest for it, or `none` for g2/g3, is the same false-label defect
+    # the index-name guard exists to prevent, mirrored onto this argument.
+    with pytest.raises(SystemExit, match="g1") as g1_digest:
+        compare_retrieval._reject_generation_manifest_mismatch(Generation.G1, "b" * 64)
+    assert "b" * 64 in str(g1_digest.value)
+
+    for generation in (Generation.G2, Generation.G3):
+        with pytest.raises(SystemExit, match=generation.value) as none_for_distractor:
+            compare_retrieval._reject_generation_manifest_mismatch(generation, "none")
+        assert "none" in str(none_for_distractor.value)
+
+
+def test_generation_manifest_pairing_that_agrees_is_left_alone() -> None:
+    compare_retrieval._reject_generation_manifest_mismatch(Generation.G1, "none")
+    for generation in (Generation.G2, Generation.G3):
+        compare_retrieval._reject_generation_manifest_mismatch(generation, "b" * 64)
 
 
 def _run_arguments(**overrides: str) -> list[str]:
@@ -405,6 +448,54 @@ def _freeze_vectors(path: Path, queries: Any) -> dict[str, list[float]]:
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return expected
+
+
+def test_main_refuses_a_generation_manifest_contradiction_before_any_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard fires from argv, ahead of the worktree check, the settings
+    read, and the embedding client -- nothing here is mocked because nothing
+    here should run before the SystemExit does.
+    """
+    from tools import compare_retrieval as mod
+
+    def refuse_git(*args: str) -> str:
+        raise AssertionError("a self-contradictory command line must not reach git")
+
+    monkeypatch.setattr(mod, "_git", refuse_git)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", "out.md",
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", "vectors.json",
+            "--generation", "g1",
+            "--manifest-sha256", "b" * 64,
+        ],
+    )
+    with pytest.raises(SystemExit, match="g1"):
+        asyncio.run(mod.main())
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", "out.md",
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", "vectors.json",
+            "--generation", "g2",
+            "--manifest-sha256", "none",
+        ],
+    )
+    with pytest.raises(SystemExit, match="g2"):
+        asyncio.run(mod.main())
 
 
 def test_the_index_name_reaches_the_client_not_only_the_header(
