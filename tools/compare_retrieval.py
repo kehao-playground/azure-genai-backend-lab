@@ -39,10 +39,14 @@ rather than with bytes assumed to be the same. Generating and querying are two
 separate invocations of the same command: the first writes the file and
 queries nothing.
 
-Four conditions stop the run before it can spend anything: fake embeddings, a
-worktree that is not clean, a vectors file frozen for a different query set,
-and a corpus manifest digest that is not a digest. Each one would otherwise
-produce an evidence file that looks complete and cannot be reproduced.
+Five things stop the run before it can spend anything, in the order they
+fire: a corpus manifest digest that is not a digest (rejected while parsing),
+an index name carrying a generation token that contradicts ``--generation``,
+a worktree that is not clean, fake embeddings, and a vectors file that is not
+the frozen one this query set needs — either its keys are not exactly these
+questions, or a stored vector does not match its own digest. Each one would
+otherwise produce an evidence file that looks complete and either cannot be
+reproduced or is labelled with something it did not measure.
 
 Usage:
     # First: writes the vectors file, queries nothing.
@@ -899,16 +903,22 @@ def _manifest_digest(raw: str) -> str:
     return candidate
 
 
-_GENERATION_SUFFIX = re.compile(rf"-({'|'.join(g.value for g in Generation)})$")
+# A generation token occupying a whole dash-delimited segment, anywhere in the
+# name. Anchored with ``\A``/``\Z`` rather than ``^``/``$``, for the reason
+# ``_manifest_digest`` gives: ``$`` also matches before a trailing newline,
+# and a module should not contain its own counterexample.
+_GENERATION_SEGMENT = re.compile(
+    rf"(?:\A|-)({'|'.join(g.value for g in Generation)})(?=-|\Z)"
+)
 
 
 def _reject_index_generation_mismatch(index_name: str, generation: Generation) -> None:
     """Refuse a command line that contradicts itself, and stay quiet otherwise.
 
     The run's convention is ``azgenai-lab-chunks-<generation>``, but this does
-    not enforce that convention: ``INDEX_NAME`` itself carries no suffix, so a
-    tool that demanded one would reject its own default. What it rejects is
-    narrower and not a matter of taste — an index name that ends in a
+    not enforce that convention: ``INDEX_NAME`` itself carries no generation
+    token, so a tool that demanded one would reject its own default. What it
+    rejects is narrower and not a matter of taste — a name carrying a
     generation token *other* than the one ``--generation`` names. There is no
     reading of ``--generation g2 --index-name ...-g3`` that anyone meant: one
     of the two is a typo, and either way the run would label a paid evidence
@@ -916,20 +926,32 @@ def _reject_index_generation_mismatch(index_name: str, generation: Generation) -
     failure the three-state rank vocabulary exists to prevent, and it is
     cheaper to catch here than to notice afterwards.
 
+    The token is matched as a whole ``-gN-`` segment anywhere in the name, not
+    only at the end. ``azgenai-lab-chunks-g3-retry`` is exactly as
+    self-contradictory under ``--generation g2`` as ``...-g3`` is, and this
+    project has already been forced onto Free-tier retries twice, so a name
+    that is not the last segment is not a hypothetical. Every token is
+    checked, so a name carrying two of them cannot pass by agreeing with the
+    first.
+
     A name with no generation token — the default, or anything the convention
-    does not cover — passes silently. The tool has no basis for an opinion
-    about it: which corpus an index really holds is pinned by
+    does not cover — passes silently, and so does one where ``gN`` is not a
+    whole segment (``azgenai-g2lab``). The tool has no basis for an opinion
+    about those: which corpus an index really holds is pinned by
     ``--manifest-sha256``, not by a string, and guessing from the string would
     turn a rename into an outage.
     """
-    match = _GENERATION_SUFFIX.search(index_name)
-    if match is None or match.group(1) == generation.value:
+    contradicting = [
+        token for token in _GENERATION_SEGMENT.findall(index_name) if token != generation.value
+    ]
+    if not contradicting:
         return
+    named = ", ".join(f"-{token}" for token in contradicting)
     raise SystemExit(
-        f"--generation {generation.value} but --index-name {index_name!r} ends "
-        f"in -{match.group(1)}: the two disagree about which generation this "
-        "run queries, and the evidence header would carry whichever one is "
-        "wrong. Fix the command line before spending a run."
+        f"--generation {generation.value} but --index-name {index_name!r} "
+        f"carries {named}: the two disagree about which generation this run "
+        "queries, and the evidence header would carry whichever one is wrong. "
+        "Fix the command line before spending a run."
     )
 
 
@@ -1091,8 +1113,11 @@ async def _compare(
         "",
         f"- checked: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}",
         _principal_header_line(principal),
-        f"- embedding client: {embedding_client.__class__.__name__} "
-        f"deployment={settings.azure_openai_embedding_deployment}",
+        f"- embedding client configured for this run: "
+        f"{embedding_client.__class__.__name__} "
+        f"deployment={settings.azure_openai_embedding_deployment} "
+        "— this run embedded nothing; the query vectors were frozen by an "
+        "earlier invocation and are identified by the digest below",
         f"- data-plane API version: `{SEARCH_API_VERSION}`",
         f"- top (frozen for every run): {arguments.top}",
         f"- pre-run lab commit: `{lab_sha}`",
