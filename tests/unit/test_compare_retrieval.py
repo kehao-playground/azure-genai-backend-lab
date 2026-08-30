@@ -8,6 +8,11 @@ the same ordinal while shifting which section it belongs to (a heading
 inserted or removed upstream of it) would still resolve to *a* chunk. This
 test is what catches that: it re-chunks the current corpus and asserts every
 authored heading_path still matches what that ordinal actually is.
+
+That check covers `base_refs`, the layer this repository's corpus can answer
+for. `expansion_refs` names chunks of a distractor corpus built outside the
+repository, so it is held to a different assertion — that it is empty, which
+is what the 2026-08-30 preregistration freeze concluded.
 """
 
 import argparse
@@ -42,6 +47,7 @@ QUERIES_BY_TENANT = compare_retrieval.QUERIES_BY_TENANT
 expected_chunk_ids = compare_retrieval.expected_chunk_ids
 ExpectedChunkRef = compare_retrieval.ExpectedChunkRef
 Generation = compare_retrieval.Generation
+Query = compare_retrieval.Query
 rank_states = compare_retrieval.rank_states
 
 # CJK Unified Ideographs. Nothing mechanical can check that a translation is
@@ -65,11 +71,40 @@ def _current_chunks() -> dict[str, Chunk]:
     return chunks
 
 
+def test_no_expansion_ref_was_pre_registered() -> None:
+    """The preregistration freeze concluded the distractor corpus answers nothing.
+
+    This is the reason the heading-path check below is scoped to `base_refs`.
+    `SAMPLE_DOCS_DIR` is the base corpus and the only one this test can see —
+    the distractor corpus is built into a scratch directory by
+    `tools/build_distractor_corpus.py` and is not in the repository — so an
+    expansion ref could not be validated here even in principle.
+
+    Scoping alone would leave a silent hole, so the scope is paired with this
+    assertion: an expansion ref appearing later fails *here*, loudly, instead
+    of slipping past a check that never looked at it. Should a future corpus
+    genuinely contain a relevant distractor, this test is where the change is
+    made deliberately — teach it the distractor corpus, and re-freeze the
+    whole experiment rather than editing one ref into a frozen table.
+    """
+    for tenant_id, queries in QUERIES_BY_TENANT.items():
+        for query in queries:
+            assert query.expansion_refs == (), (
+                f"Q{query.number} ({tenant_id}, {query.language}) declares "
+                f"{len(query.expansion_refs)} expansion ref(s). The 2026-08-30 "
+                "freeze recorded none: no admitted distractor document answers "
+                "any frozen question. A ref added after that freeze changes the "
+                "relevance labels of an experiment that has already been "
+                "measured against them"
+            )
+
+
 def test_every_expected_ref_resolves_to_the_authored_heading_path() -> None:
     current = _current_chunks()
     for tenant_id, queries in QUERIES_BY_TENANT.items():
         for query in queries:
-            for ref in query.base_refs + query.expansion_refs:
+            # `base_refs` only: see `test_no_expansion_ref_was_pre_registered`.
+            for ref in query.base_refs:
                 derived_id = make_chunk_id(make_parent_id(tenant_id, ref.doc_id), ref.ordinal)
                 resolved = current.get(derived_id)
                 assert resolved is not None, (
@@ -660,3 +695,116 @@ def test_the_vectors_file_is_written_and_nothing_is_queried(
     assert not out.exists(), "no evidence file may exist for a run that queried nothing"
     stored = json.loads(vectors.read_text(encoding="utf-8"))
     assert set(stored) == {query.text for query in QUERIES_BY_TENANT["globex"]}
+
+
+def test_the_header_announces_only_this_generation_s_pre_registered_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The header is filtered by generation; the refs passed to the table are not.
+
+    An unfiltered header would name a chunk as pre-registered for a run whose
+    own table says `not_in_generation` on the same page, and a reader would
+    have to guess which of the two lines was lying.
+    """
+    from tools import compare_retrieval as mod
+
+    from azgenai_lab.core.config import Settings
+    from azgenai_lab.models.search import SearchResult
+
+    class FakeClient:
+        def __init__(
+            self, settings: Any, *, client: Any = None, index_name: str = INDEX_NAME
+        ) -> None:
+            self.last_diagnostics = SimpleNamespace(
+                request_body={"search": "x"}, status=200, request_id="rid", latency_ms=1.5
+            )
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *exception: object) -> None:
+            return None
+
+        async def search(
+            self,
+            query_text: str,
+            query_vector: Any = None,
+            *,
+            mode: Any,
+            top: int,
+            principal: Any,
+            vector_k: int,
+        ) -> Any:
+            return SearchResult(hits=(), mode=mode, vector_k=vector_k)
+
+    class StubEmbeddings:
+        async def embed(self, texts: Any) -> list[list[float]]:
+            raise AssertionError("the read path must not embed anything")
+
+    later = ExpectedChunkRef("late-doc", 0, "Late Doc", generations=frozenset({Generation.G3}))
+    present = ExpectedChunkRef(
+        "billing-faq", 1, "Billing FAQ > Invoices",
+        generations=frozenset({Generation.G2, Generation.G3}),
+    )
+    queries = (
+        Query(1, "arrives later", "k", base_refs=(), expansion_refs=(later,), language="en"),
+        Query(2, "here already", "k", base_refs=(present,), expansion_refs=(), language="en"),
+        Query(3, "no answer at all", "k", base_refs=(), expansion_refs=(), language="en"),
+    )
+    monkeypatch.setattr(mod, "QUERIES_BY_TENANT", {"globex": queries})
+
+    vectors = tmp_path / "vectors.json"
+    _freeze_vectors(vectors, queries)
+    out = tmp_path / "evidence.md"
+
+    monkeypatch.setattr(mod, "_git", lambda *a: "" if a[0] == "status" else "c" * 40 + "\n")
+    monkeypatch.setattr(
+        mod,
+        "get_settings",
+        lambda: Settings(
+            azure_search_endpoint="https://example.search.windows.net",
+            azure_search_admin_key="k",
+            use_fake_search=False,
+            use_fake_embeddings=False,
+        ),
+    )
+    monkeypatch.setattr(mod, "configure_logging", lambda level: None)
+    monkeypatch.setattr(mod, "build_embedding_client", lambda settings: StubEmbeddings())
+    monkeypatch.setattr(mod, "AzureSearchClient", FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "25",
+            "--out", str(out),
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", str(vectors),
+            "--generation", "g2",
+            "--index-name", "azgenai-lab-chunks-g2",
+            "--manifest-sha256", "d" * 64,
+            "--baseline-only",
+        ],
+    )
+
+    asyncio.run(mod.main())
+
+    written = out.read_text(encoding="utf-8")
+    late_id = make_chunk_id(make_parent_id("globex", "late-doc"), 0)
+    present_id = make_chunk_id(make_parent_id("globex", "billing-faq"), 1)
+
+    # Q1's only ref arrives with g3. The header must not claim it for this run
+    # -- and the table on the same page must still carry it, as the third
+    # state, so the run records that the chunk was never there to be found.
+    assert (
+        "- pre-registered chunk(s): none in this generation "
+        "(1 pre-registered for a later one)"
+    ) in written
+    assert f"pre-registered chunk(s): `{late_id}`" not in written
+    assert f"`{late_id}`=not_in_generation" in written
+
+    # Unfiltered rendering is still exactly right for a ref this generation has,
+    # and "no answer" stays distinguishable from "answer, but not yet".
+    assert f"- pre-registered chunk(s): `{present_id}`" in written
+    assert "- pre-registered chunk(s): none (no answer)" in written

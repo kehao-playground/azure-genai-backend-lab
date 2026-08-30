@@ -432,6 +432,24 @@ def rank_states(
 
 _NO_REFS: tuple[ExpectedChunkRef, ...] = ()
 
+# Every `expansion_refs` below is `_NO_REFS`, and that is a finding, not an
+# omission. Before the first query was issued, the author read all 77
+# admitted distractor documents (773 acme-visible chunks at g3, 155 at g2)
+# against all twelve acme questions and found no chunk that answers one. The
+# distractor corpus is Azure/GenAI engineering prose; the questions ask about
+# uptime targets, refund windows, service credits, SLA exclusions and Sev 1
+# escalation. Three near-misses were read in full and ruled out on the
+# record — see `drafts/research/bonus-7-retrieval-mode-selection.md`, section
+# "預先登錄" — the strongest being a *fabricated* return window inside a
+# chunking tutorial, which contradicts the policy it resembles and would have
+# scored a wrong answer as a hit.
+#
+# Q6 therefore stays "absent from corpus" at all three generations, in both
+# languages. This table is frozen: adding or removing a ref after the run
+# would make the comparison unfalsifiable, because nothing afterwards could
+# tell "froze the labels, then measured" from "measured, then chose labels".
+# `tests/unit/test_compare_retrieval.py` holds the emptiness as an assertion.
+
 # One refs tuple and one `kind` string per question, referenced by both
 # members of an English/Chinese pair. Sharing the objects rather than
 # repeating the literals is what makes "the pair differs only in language"
@@ -1214,7 +1232,17 @@ async def _compare(
 
     for query in queries:
         refs = query.base_refs + query.expansion_refs
-        expected_ids = expected_chunk_ids(principal.tenant_id, refs)
+        # The header announces what *this* generation pre-registered, so it
+        # is filtered by generation while `refs` is not. `rank_states` still
+        # receives the full tuple below — it needs the narrowed refs to print
+        # `not_in_generation` — but announcing one of them here would put a
+        # chunk in the header of a run whose own table correctly says the
+        # document was never in that corpus, and a reader comparing the two
+        # would have to guess which line was lying.
+        expected_ids = expected_chunk_ids(
+            principal.tenant_id,
+            tuple(ref for ref in refs if arguments.generation in ref.generations),
+        )
         # The query set now holds two questions per number, one per
         # language. Headings and run labels carry the language so a pair's
         # two halves stay distinguishable in the evidence and the sidecar.
@@ -1226,7 +1254,17 @@ async def _compare(
         # or to fail.
         vector = vectors[query.text]
 
-        expected = ", ".join(f"`{c}`" for c in expected_ids) or "none (no answer)"
+        # Two ways to have nothing to announce, and they are not the same
+        # claim: the corpus has no answer at all, or it has one that arrives
+        # with a later generation than this run's.
+        if expected_ids:
+            expected = ", ".join(f"`{c}`" for c in expected_ids)
+        elif refs:
+            expected = (
+                f"none in this generation ({len(refs)} pre-registered for a later one)"
+            )
+        else:
+            expected = "none (no answer)"
         evidence.add(
             f"## Q{query.number} ({query.language}) — {query.kind}",
             "",
