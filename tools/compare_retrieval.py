@@ -33,13 +33,30 @@ the pair cannot silently drift. Anything written from an upstream error has
 the search service's name and host redacted first, because those bodies name
 the resource and this evidence is published.
 
-Two conditions stop the run before it can spend anything: fake embeddings, and
-pre-registered chunk ids left as placeholders. Either one produces an evidence
-file that looks complete and measures nothing.
+The query vectors are frozen into a JSON file on the first invocation and only
+ever read afterwards, so the three generations are queried with the same bytes
+rather than with bytes assumed to be the same. Generating and querying are two
+separate invocations of the same command: the first writes the file and
+queries nothing.
+
+Four conditions stop the run before it can spend anything: fake embeddings, a
+worktree that is not clean, a vectors file frozen for a different query set,
+and a corpus manifest digest that is not a digest. Each one would otherwise
+produce an evidence file that looks complete and cannot be reproduced.
 
 Usage:
+    # First: writes the vectors file, queries nothing.
+    # Then: the same command again, which reads it and runs.
     uv run python tools/compare_retrieval.py \
-        --top 25 --out ../drafts/assets/day-13/comparison-free.md
+        --top 25 --out ../drafts/assets/day-34/g1-acme.md \
+        --tenant-id acme --user-id lab-operator \
+        --vectors ../drafts/assets/day-34/vectors-acme.json \
+        --generation g1 --index-name azgenai-lab-chunks-g1 \
+        --manifest-sha256 "$(cat corpora/g1/manifest.json.sha256)"
+
+`--baseline-only` records the four-mode survey and neither experiment: the
+control arm, whose corpus does not grow, is surveyed rather than experimented
+on, at four calls per query instead of nine.
 
 `top` must be at least the corpus chunk count. Below it, a chunk that was
 generated as a candidate but truncated out of the response is indistinguishable
@@ -53,6 +70,7 @@ import asyncio
 import hashlib
 import json
 import re
+import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -67,9 +85,62 @@ from azgenai_lab.core.logging import configure_logging
 from azgenai_lab.models.principal import Principal
 from azgenai_lab.models.rag import make_chunk_id, make_parent_id
 from azgenai_lab.models.search import DEFAULT_VECTOR_K, SearchHit, SearchMode
-from azgenai_lab.models.search_index import SEARCH_API_VERSION
+from azgenai_lab.models.search_index import INDEX_NAME, SEARCH_API_VERSION
 from azgenai_lab.services.azure_search import AzureSearchClient
 from azgenai_lab.services.embeddings import EmbeddingClient, build_embedding_client
+
+# tools/ sits at the repository root, so the tree this run is anchored to is
+# resolved from the module's own location rather than from the working
+# directory a run happens to be launched from.
+_LAB_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _git(*args: str) -> str:
+    """Run one git command against the lab tree and return its stdout.
+
+    ``check=True`` would raise a ``CalledProcessError`` whose message is an
+    exit code and whose captured stderr is never printed — git's own
+    explanation would be swallowed at the one moment it is needed.
+    """
+    completed = subprocess.run(
+        ("git", *args), cwd=_LAB_ROOT, capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise SystemExit(f"`git {' '.join(args)}` failed: {completed.stderr.strip()}")
+    return completed.stdout
+
+
+def pre_run_lab_sha() -> str:
+    """The commit the evidence anchors to, refusing an unreproducible tree.
+
+    A paid run is worth what a reader can redo. The header's commit is the
+    only thing that says which code produced these numbers, and a SHA read
+    from a dirty tree names a commit that does not describe that code — there
+    is no way to write down "HEAD plus these uncommitted edits" that anyone
+    can check out. The failure is otherwise silent: nothing in the finished
+    artifact would reveal it, and by then the money is spent. Committing
+    first costs seconds.
+
+    ``--porcelain`` with no ``--untracked-files`` override, so untracked
+    files count as dirty as well. An untracked file changes what runs — a
+    stray document under the sample corpus, a module that shadows an import
+    — and a check that called such a tree clean would certify the commit
+    anyway. Evidence artifacts belong outside this repo (``--out`` already
+    points into the planning repo's ``drafts/assets/``); the vectors file
+    should go there too rather than be left untracked here.
+    """
+    dirty = _git("status", "--porcelain")
+    if dirty.strip():
+        entries = dirty.splitlines()
+        listed = "\n".join(entries[:10])
+        if len(entries) > 10:
+            listed += f"\n... and {len(entries) - 10} more"
+        raise SystemExit(
+            "worktree is not clean -- a paid run whose evidence anchors a tree "
+            "that never existed cannot be replayed. Commit, stash, or move "
+            "these out of the repo first:\n" + listed
+        )
+    return _git("rev-parse", "HEAD").strip()
 
 
 def _scrub(text: str, endpoint: str | None, placeholder: str) -> str:
@@ -216,6 +287,74 @@ class Query:
 def expected_chunk_ids(tenant_id: str, refs: Sequence[ExpectedChunkRef]) -> tuple[str, ...]:
     """Derive chunk ids for ``refs`` under ``tenant_id`` — never stored, always computed."""
     return tuple(make_chunk_id(make_parent_id(tenant_id, ref.doc_id), ref.ordinal) for ref in refs)
+
+
+def _vector_digest(vector: Sequence[float]) -> str:
+    """A digest of the vector as Python renders its floats.
+
+    ``repr`` of a float round-trips exactly through ``json``, which is what
+    makes this survive the write/read cycle: the digest computed before the
+    file is written equals the one computed after it is parsed back. Anything
+    that reformatted the numbers -- rounding for readability, a different
+    serializer -- would make every stored digest disagree with its own vector.
+    """
+    return hashlib.sha256(repr([float(value) for value in vector]).encode("utf-8")).hexdigest()
+
+
+async def load_or_create_vectors(
+    path: Path, queries: Sequence[Query], embedding_client: EmbeddingClient | None
+) -> dict[str, list[float]] | None:
+    """Generate once, then only ever read.
+
+    Three index generations must be queried with the same vector bytes.
+    Re-embedding per run leaves an unrecorded variable beside the treatment:
+    the vectors are probably identical, and probably is not a measurement.
+    Returning None means the file was just written and the caller must exit
+    without querying, so that generating and spending are never one step.
+
+    The stored keys must be exactly this run's questions. A file written
+    before a question was reworded still answers for every other one, so a
+    partial read would query most of the set with frozen vectors and the rest
+    with freshly diverged ones -- the precise unrecorded variable the freeze
+    exists to remove, and invisible in the finished evidence. Both directions
+    of the mismatch abort.
+    """
+    if not path.exists():
+        if embedding_client is None:
+            raise SystemExit(
+                f"{path} does not exist and no embedding client was supplied to write it"
+            )
+        texts = [query.text for query in queries]
+        vectors = await embedding_client.embed(texts)
+        payload = {
+            text: {"vector": list(vector), "sha256": _vector_digest(vector)}
+            for text, vector in zip(texts, vectors, strict=True)
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return None
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    wanted = {query.text for query in queries}
+    if set(stored) != wanted:
+        missing = sorted(wanted - set(stored))
+        extra = sorted(set(stored) - wanted)
+        raise SystemExit(
+            f"{path} was frozen for a different query set -- "
+            f"no entry for {missing!r}; entries this run never asks for {extra!r}. "
+            "Delete it and re-freeze, or point --vectors at the file this "
+            "query set was frozen into."
+        )
+    result: dict[str, list[float]] = {}
+    for query in queries:
+        entry = stored[query.text]
+        vector = [float(value) for value in entry["vector"]]
+        if _vector_digest(vector) != entry["sha256"]:
+            raise SystemExit(f"vector hash mismatch for: {query.text!r}")
+        result[query.text] = vector
+    return result
 
 
 def _positions(hits: Sequence[SearchHit]) -> dict[str, int]:
@@ -508,6 +647,21 @@ BASELINE_MODES = (
 RERANKING_MODES = (SearchMode.HYBRID, SearchMode.HYBRID_SEMANTIC)
 
 
+def _experiment_sweeps(*, baseline_only: bool) -> tuple[tuple[int, ...], tuple[SearchMode, ...]]:
+    """Which sweeps run beyond the four-mode baseline survey.
+
+    The control arm is surveyed, not experimented on: it exists to show what
+    the treated arm's corpus growth did *not* do to it, and both experiments
+    would answer a question nobody asked of it. Nine calls per query instead
+    of four is not free: the extra five are semantic-tier queries against a
+    capped budget, which is why this is a flag the run has to be given rather
+    than a step in a runbook someone has to remember.
+    """
+    if baseline_only:
+        return (), ()
+    return VECTOR_K_SWEEP, RERANKING_MODES
+
+
 @dataclass
 class Evidence:
     """Accumulates Markdown and raw request bodies, flushing after every call."""
@@ -568,12 +722,17 @@ class Evidence:
         self.out.write_text("\n".join(self.lines + footer) + "\n", encoding="utf-8")
 
 
-def _ranks(hits: Sequence[SearchHit], expected: tuple[str, ...]) -> str:
-    """Report every pre-registered chunk separately: its rank, or 'absent'."""
-    if not expected:
+def _render_rank_states(states: Sequence[tuple[str, str]]) -> str:
+    """One cell per pre-registered chunk: its rank, `absent`, or `not_in_generation`.
+
+    ``rank_states`` expresses "this query has no expected answer" as an empty
+    list. Joining that would render an empty string, leaving Q6's row — the
+    query whose whole point is that the corpus cannot answer it — blank in
+    paid evidence, indistinguishable from a bug in this renderer.
+    """
+    if not states:
         return "n/a (no answer expected)"
-    positions = _positions(hits)
-    return "; ".join(f"`{chunk_id}`={positions.get(chunk_id, 'absent')}" for chunk_id in expected)
+    return "; ".join(f"`{chunk_id}`={state}" for chunk_id, state in states)
 
 
 def _hit_row(rank: int, hit: SearchHit) -> str:
@@ -588,9 +747,9 @@ def _detail_rows(
     """Render at most N hit rows, and say so when there were more.
 
     Only the rendering is capped. Every pre-registered chunk's rank is
-    computed by `rank_states`/`_ranks` from the complete hit list before this
-    runs, so a gold chunk at rank 380 is recorded as 380 even when ten rows
-    are shown. A file that quietly showed ten rows of five hundred would be
+    computed by `rank_states` from the complete hit list before this runs, so
+    a gold chunk at rank 380 is recorded as 380 even when ten rows are shown.
+    A file that quietly showed ten rows of five hundred would be
     indistinguishable from a run that only returned ten.
     """
     shown = list(hits[:max_recorded_hits])
@@ -608,10 +767,11 @@ async def _run(
     evidence: Evidence,
     label: str,
     query: Query,
-    expected_ids: tuple[str, ...],
+    refs: Sequence[ExpectedChunkRef],
     vector: list[float],
     principal: Principal,
     *,
+    generation: Generation,
     mode: SearchMode,
     top: int,
     vector_k: int,
@@ -620,15 +780,22 @@ async def _run(
 ) -> list[str]:
     """One call, one set of table rows.
 
-    Never raises: a failed call — including argument validation that rejects
-    the request before it is ever sent — is evidence, not an error. The one
-    exception is ``ConfigurationError`` (a bad key, a missing index): our own
-    deployment is broken, every remaining call in this run would fail
-    identically, so this still records the one row that call produced —
-    aborting the run must not discard the diagnostic it is aborting because
-    of — flushes it, and then re-raises so the caller can abort instead of
-    spending a paid run collecting N copies of the same error — the same rule
-    the query-embedding failure path in ``main()`` applies.
+    A failed call — including argument validation that rejects the request
+    before it is ever sent — is evidence, not an error, and is returned as a
+    row rather than raised. Two things do propagate.
+
+    ``ConfigurationError`` (a bad key, a missing index): our own deployment is
+    broken, every remaining call in this run would fail identically, so this
+    still records the one row that call produced — aborting the run must not
+    discard the diagnostic it is aborting because of — flushes it, and then
+    re-raises so the caller can abort instead of spending a paid run
+    collecting N copies of the same error.
+
+    ``ValueError`` from ``rank_states``: the frozen ref table and the index
+    this run queried contradict each other. It is raised *after* the
+    try/except below, deliberately — inside it, a bug in the frozen table
+    would be caught by the ``ValueError`` arm meant for a rejected request and
+    filed as a failed search call, which is the one thing it is not.
     """
     try:
         result = await client.search(
@@ -674,7 +841,20 @@ async def _run(
     assert diagnostics is not None  # set on every completed round trip
     evidence.record_request(label, diagnostics.request_body)
 
-    found = _ranks(result.hits, expected_ids)
+    try:
+        states = rank_states(
+            result.hits, refs, generation=generation, tenant_id=principal.tenant_id
+        )
+    except ValueError:
+        # This call was paid for and its request is recorded but not yet
+        # written. Flush before the abort propagates, for the same reason the
+        # ConfigurationError arm above does: aborting must not discard the
+        # evidence of the call it is aborting on. The exception is re-raised
+        # unchanged — it is a bug in the frozen ref table, and nothing here
+        # turns it into a table row.
+        evidence.flush()
+        raise
+    found = _render_rank_states(states)
     shared = (
         f"| {label} | {diagnostics.status} | {diagnostics.request_id} "
         f"| {diagnostics.latency_ms:.1f} | {len(result.hits)} | {found} "
@@ -695,7 +875,31 @@ HEADER = (
 DIVIDER = "|---|---|---|---|---|---|---|---|---|---|"
 
 
-async def main() -> None:
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _manifest_digest(raw: str) -> str:
+    """Accept a corpus manifest digest, or reject it here rather than in the evidence.
+
+    `build_distractor_corpus.py` writes `manifest.json.sha256` in sha256sum's
+    convention, digest plus a trailing newline. A caller that reads that file
+    without stripping hands this a 65-character string, which would be
+    recorded verbatim and match nothing a reader later computes — a
+    discrepancy with no visible cause, in a file that is otherwise correct.
+    Strip, then insist on exactly the 64 lowercase hex characters, so a
+    whitespace slip is a loud argparse error at the boundary instead.
+    """
+    candidate = raw.strip()
+    if not _SHA256.fullmatch(candidate):
+        raise argparse.ArgumentTypeError(
+            f"expected 64 lowercase hex characters, got {raw!r} -- pass the "
+            "contents of the corpus's manifest.json.sha256 with surrounding "
+            "whitespace stripped"
+        )
+    return candidate
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", type=int, required=True, help="frozen for every run")
     parser.add_argument("--out", type=Path, required=True)
@@ -726,7 +930,64 @@ async def main() -> None:
             "from the full response"
         ),
     )
-    arguments = parser.parse_args()
+    parser.add_argument(
+        "--vectors",
+        type=Path,
+        required=True,
+        help=(
+            "the frozen query vectors. Written and nothing else on the first "
+            "run; read and nothing else on every run after, so all three "
+            "generations are queried with the same bytes"
+        ),
+    )
+    parser.add_argument(
+        "--generation",
+        type=Generation,
+        choices=list(Generation),
+        required=True,
+        help=(
+            "which index generation this run queries; recorded in the header "
+            "and used to tell a recall failure from a document that was never "
+            "in this corpus"
+        ),
+    )
+    parser.add_argument(
+        "--index-name",
+        default=INDEX_NAME,
+        help=(
+            "the index this generation lives in; the three generations "
+            "coexist on one service, so a run against any index other than "
+            "the default has to name it"
+        ),
+    )
+    parser.add_argument(
+        "--manifest-sha256",
+        type=_manifest_digest,
+        required=True,
+        help=(
+            "digest of the corpus manifest this generation was built from, "
+            "pinning at query time which corpus produced these numbers"
+        ),
+    )
+    parser.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help=(
+            "run the four-mode baseline survey and neither experiment -- the "
+            "control arm, whose corpus does not grow, is surveyed rather than "
+            "experimented on (4 calls per query instead of 9)"
+        ),
+    )
+    return parser
+
+
+async def main() -> None:
+    arguments = _build_parser().parse_args()
+
+    # Before the settings are read, before a client exists, before anything
+    # can be spent: the tree this evidence will name has to be one a reader
+    # can check out.
+    lab_sha = pre_run_lab_sha()
 
     settings = get_settings()
     if settings.use_fake_embeddings:
@@ -746,10 +1007,31 @@ async def main() -> None:
     configure_logging(settings.log_level)
     embedding_client = build_embedding_client(settings)
 
+    queries = QUERIES_BY_TENANT[arguments.tenant_id]
+    vectors = await load_or_create_vectors(arguments.vectors, queries, embedding_client)
+    if vectors is None:
+        # Generating and spending are never one step. Nothing was queried and
+        # no evidence file exists yet; the same command run again reads what
+        # was just written.
+        print(
+            f"wrote {arguments.vectors} — nothing was queried. Review it, then "
+            "run the same command again to query with those frozen vectors."
+        )
+        return
+
     # The client owns its connection pool here, so it is closed on the way out
     # — including when a ConfigurationError below aborts the run partway.
-    async with AzureSearchClient(settings) as client:
-        await _compare(client, embedding_client, settings, arguments, principal)
+    async with AzureSearchClient(settings, index_name=arguments.index_name) as client:
+        await _compare(
+            client,
+            embedding_client,
+            settings,
+            arguments,
+            principal,
+            queries=queries,
+            vectors=vectors,
+            lab_sha=lab_sha,
+        )
 
 
 async def _compare(
@@ -758,8 +1040,11 @@ async def _compare(
     settings: Settings,
     arguments: argparse.Namespace,
     principal: Principal,
+    *,
+    queries: Sequence[Query],
+    vectors: dict[str, list[float]],
+    lab_sha: str,
 ) -> None:
-    queries = QUERIES_BY_TENANT[arguments.tenant_id]
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     evidence = Evidence(arguments.out, total_queries=len(queries))
     evidence.add(
@@ -771,6 +1056,12 @@ async def _compare(
         f"deployment={settings.azure_openai_embedding_deployment}",
         f"- data-plane API version: `{SEARCH_API_VERSION}`",
         f"- top (frozen for every run): {arguments.top}",
+        f"- pre-run lab commit: `{lab_sha}`",
+        f"- generation: `{arguments.generation.value}` (index `{arguments.index_name}`)",
+        f"- corpus manifest sha256: `{arguments.manifest_sha256}`",
+        f"- query vectors: `{arguments.vectors.name}` "
+        f"sha256=`{hashlib.sha256(arguments.vectors.read_bytes()).hexdigest()}` "
+        "(frozen once; every generation queries these same bytes)",
         "- region / SKU / semanticSearch plan: paste the projected fields "
         "`infra/scripts/create-search.sh` prints (`sku`/`location`/"
         "`semanticSearch` only) — never the unprojected `az search service "
@@ -779,46 +1070,23 @@ async def _compare(
     )
     evidence.flush()
 
+    vector_k_sweep, reranking_modes = _experiment_sweeps(
+        baseline_only=arguments.baseline_only
+    )
+
     for query in queries:
-        expected_ids = expected_chunk_ids(
-            principal.tenant_id, query.base_refs + query.expansion_refs
-        )
+        refs = query.base_refs + query.expansion_refs
+        expected_ids = expected_chunk_ids(principal.tenant_id, refs)
         # The query set now holds two questions per number, one per
         # language. Headings and run labels carry the language so a pair's
         # two halves stay distinguishable in the evidence and the sidecar.
         label_prefix = f"Q{query.number} {query.language}"
         evidence.start_query()
-        started = time.perf_counter()
-        try:
-            vector = (await embedding_client.embed([query.text]))[0]
-        except ConfigurationError:
-            # A broken key or deployment name fails identically on every
-            # remaining query; continuing would just spend a paid run
-            # collecting N copies of the same error instead of one.
-            raise
-        except UpstreamError as exc:
-            embed_ms = (time.perf_counter() - started) * 1000
-            detail = _scrub(
-                exc.upstream_detail or exc.message,
-                settings.azure_openai_endpoint,
-                "[openai-service]",
-            )[:160].replace("|", "\\|")
-            evidence.add(
-                f"## Q{query.number} ({query.language}) — {query.kind}",
-                "",
-                f"> {query.text}",
-                "",
-                f"**embedding FAILED** after {embed_ms:.1f} ms "
-                f"({exc.__class__.__name__}): {detail}",
-                "",
-                "No search calls were attempted for this query — every mode "
-                "compared here needs the query vector. This row means the "
-                "embedding call failed, not that retrieval found nothing.",
-                "",
-            )
-            evidence.flush()
-            continue
-        embed_ms = (time.perf_counter() - started) * 1000
+        # Read, never computed: `load_or_create_vectors` has already checked
+        # that every question in this set has an entry and that the entry
+        # matches its own digest, so there is no embedding call here to time
+        # or to fail.
+        vector = vectors[query.text]
 
         expected = ", ".join(f"`{c}`" for c in expected_ids) or "none (no answer)"
         evidence.add(
@@ -827,8 +1095,6 @@ async def _compare(
             f"> {query.text}",
             "",
             f"- pre-registered chunk(s): {expected}",
-            f"- query embedding latency: {embed_ms:.1f} ms "
-            "(measured separately, never folded into search latency)",
             "",
             "### Baseline survey — all four modes (varies more than one thing)",
             "",
@@ -842,9 +1108,10 @@ async def _compare(
                 evidence,
                 f"{label_prefix} baseline {mode.value}",
                 query,
-                expected_ids,
+                refs,
                 vector,
                 principal,
+                generation=arguments.generation,
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
@@ -854,26 +1121,28 @@ async def _compare(
             evidence.add(*rows)
             evidence.flush()
 
-        evidence.add(
-            "",
-            "### Experiment 1 — candidate generation (vector_k is the only variable)",
-            "",
-            "Fixed: query, vector, principal (filter derived from it), top, "
-            "index generation. Mode = VECTOR.",
-            "",
-            HEADER,
-            DIVIDER,
-        )
-        evidence.flush()
-        for vector_k in VECTOR_K_SWEEP:
+        if vector_k_sweep:
+            evidence.add(
+                "",
+                "### Experiment 1 — candidate generation (vector_k is the only variable)",
+                "",
+                "Fixed: query, vector, principal (filter derived from it), top, "
+                "index generation. Mode = VECTOR.",
+                "",
+                HEADER,
+                DIVIDER,
+            )
+            evidence.flush()
+        for vector_k in vector_k_sweep:
             rows = await _run(
                 client,
                 evidence,
                 f"{label_prefix} k={vector_k}",
                 query,
-                expected_ids,
+                refs,
                 vector,
                 principal,
+                generation=arguments.generation,
                 mode=SearchMode.VECTOR,
                 top=arguments.top,
                 vector_k=vector_k,
@@ -883,26 +1152,28 @@ async def _compare(
             evidence.add(*rows)
             evidence.flush()
 
-        evidence.add(
-            "",
-            "### Experiment 2 — reranking (mode is the only variable)",
-            "",
-            "Fixed: query, vector, principal (filter derived from it), top, "
-            "vector_k=50, index generation.",
-            "",
-            HEADER,
-            DIVIDER,
-        )
-        evidence.flush()
-        for mode in RERANKING_MODES:
+        if reranking_modes:
+            evidence.add(
+                "",
+                "### Experiment 2 — reranking (mode is the only variable)",
+                "",
+                "Fixed: query, vector, principal (filter derived from it), top, "
+                "vector_k=50, index generation.",
+                "",
+                HEADER,
+                DIVIDER,
+            )
+            evidence.flush()
+        for mode in reranking_modes:
             rows = await _run(
                 client,
                 evidence,
                 f"{label_prefix} rerank {mode.value}",
                 query,
-                expected_ids,
+                refs,
                 vector,
                 principal,
+                generation=arguments.generation,
                 mode=mode,
                 top=arguments.top,
                 vector_k=DEFAULT_VECTOR_K,
