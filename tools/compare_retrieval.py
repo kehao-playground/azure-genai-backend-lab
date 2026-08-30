@@ -12,7 +12,9 @@ only variable" was varying the candidate generator too.
 
 Everything else (query, vector, filter, top, index generation) is held fixed,
 and the observable is declared before the run: for each pre-registered chunk
-id, its rank or its absence.
+id, its rank, its absence, or the fact that its document is not in this
+generation's corpus at all — three states, because collapsing the last two
+would record a recall failure that could not have happened.
 
 Evidence is checkpointed to disk after every call. A live session that dies on
 query four must not lose queries one to three, and the failing call is usually
@@ -54,6 +56,7 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -133,6 +136,22 @@ def _redact_request_body(body: dict[str, Any] | None) -> dict[str, Any] | None:
     return redacted
 
 
+class Generation(StrEnum):
+    """Which index generation a corpus, and therefore a chunk, belongs to.
+
+    The same base corpus is indexed three times, each time with more
+    distractor documents alongside it. A generation names one of those three
+    indexes, not a version of this code.
+    """
+
+    G1 = "g1"
+    G2 = "g2"
+    G3 = "g3"
+
+
+ALL_GENERATIONS = frozenset(Generation)
+
+
 @dataclass(frozen=True)
 class ExpectedChunkRef:
     """One author-recorded expectation: which document, which ordinal, which
@@ -145,33 +164,53 @@ class ExpectedChunkRef:
     but shifts which section it belongs to (a heading inserted or removed
     upstream of it). The id would still resolve; the heading path would not
     match, and that mismatch is the drift signal.
+
+    ``generations`` is which of the three indexes actually contain the
+    document. It defaults to all three because the base corpus is in all
+    three; a ref that names a document only some generations carry has to say
+    so, or a generation that never held it would be scored as having missed
+    it.
     """
 
     doc_id: str
     ordinal: int
     heading_path: str
+    generations: frozenset[Generation] = ALL_GENERATIONS
 
 
 @dataclass(frozen=True)
 class Query:
     """Frozen before the run, from a local chunker run against the live corpus.
 
-    ``expected_refs`` holds structured references, not raw chunk ids: the id
-    is *derived* from ``(tenant_id, doc_id, ordinal)`` via
+    ``base_refs`` and ``expansion_refs`` hold structured references, not raw
+    chunk ids: the id is *derived* from ``(tenant_id, doc_id, ordinal)`` via
     ``expected_chunk_ids()`` at run time, never hand-typed and never stored.
     A hand-typed id copy could drift from the id-derivation scheme silently;
     a derived one cannot.
 
-    An empty tuple means the corpus genuinely has no answer. Two or more
-    entries mean several chunks are legitimately relevant, and every one of
-    them is reported separately — stopping at the first would hide whether the
-    second was retrieved at all.
+    The two layers are kept apart because they answer to different corpora.
+    ``base_refs`` names chunks of the base corpus, which every generation
+    indexes; ``expansion_refs`` names chunks that only arrive with a later
+    generation's added documents. Merging them would lose the one fact that
+    tells a genuine recall failure apart from a document that was not there
+    to be found.
+
+    An empty pair of tuples means the corpus genuinely has no answer. Two or
+    more entries mean several chunks are legitimately relevant, and every one
+    of them is reported separately — stopping at the first would hide whether
+    the second was retrieved at all.
+
+    ``language`` is ``"en"`` or ``"zh"``. A Chinese counterpart carries the
+    same ``kind`` and the same refs as its English pair, so the pair differs
+    in exactly one thing: the language the question is asked in.
     """
 
     number: int
     text: str
     kind: str
-    expected_refs: tuple[ExpectedChunkRef, ...]
+    base_refs: tuple[ExpectedChunkRef, ...]
+    expansion_refs: tuple[ExpectedChunkRef, ...]
+    language: str
 
 
 def expected_chunk_ids(tenant_id: str, refs: Sequence[ExpectedChunkRef]) -> tuple[str, ...]:
@@ -179,87 +218,219 @@ def expected_chunk_ids(tenant_id: str, refs: Sequence[ExpectedChunkRef]) -> tupl
     return tuple(make_chunk_id(make_parent_id(tenant_id, ref.doc_id), ref.ordinal) for ref in refs)
 
 
+def rank_states(
+    hits: Sequence[SearchHit],
+    refs: Sequence[ExpectedChunkRef],
+    *,
+    generation: Generation,
+    tenant_id: str,
+) -> list[tuple[str, str]]:
+    """Three states, because two would lie about one of them.
+
+    ``absent`` is a recall failure: the chunk was in this generation's corpus
+    and did not come back. ``not_in_generation`` is not an observation at all
+    — the document was not there to be found. Reporting them with one token
+    would put a failure that could not have happened into paid evidence, and
+    then into a recall count.
+    """
+    positions = {hit.chunk_id: rank for rank, hit in enumerate(hits, start=1)}
+    states: list[tuple[str, str]] = []
+    for ref in refs:
+        (chunk_id,) = expected_chunk_ids(tenant_id, (ref,))
+        if generation not in ref.generations:
+            states.append((chunk_id, "not_in_generation"))
+            continue
+        rank = positions.get(chunk_id)
+        states.append((chunk_id, str(rank) if rank is not None else "absent"))
+    return states
+
+
+_NO_REFS: tuple[ExpectedChunkRef, ...] = ()
+
+# One refs tuple and one `kind` string per question, referenced by both
+# members of an English/Chinese pair. Sharing the objects rather than
+# repeating the literals is what makes "the pair differs only in language"
+# true by construction: there is no second copy for a later hand-edit to
+# change on one side only.
+_ACME_Q1_REFS = (
+    ExpectedChunkRef("service-sla", 3, "Service SLA > Availability targets > Premium tier"),
+)
+_ACME_Q2_REFS = (
+    ExpectedChunkRef("returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"),
+)
+_ACME_Q3_REFS = (
+    ExpectedChunkRef("service-sla", 2, "Service SLA > Availability targets > Standard tier"),
+    ExpectedChunkRef("returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"),
+)
+_ACME_Q4_REFS = (ExpectedChunkRef("service-sla", 5, "Service SLA > Exclusions"),)
+_ACME_Q5_REFS = (ExpectedChunkRef("service-sla", 4, "Service SLA > Response times"),)
+
+_ACME_Q1_KIND = "exact literal"
+_ACME_Q2_KIND = "paraphrase"
+_ACME_Q3_KIND = "cross-document ambiguity (both relevant)"
+_ACME_Q4_KIND = "lexical decoy"
+_ACME_Q5_KIND = "acme has no runbook — only its own SLA response-time section is relevant"
+_ACME_Q6_KIND = "absent from corpus"
+
 # Filled in from a local chunker run against the live corpus, before any
 # query is issued. Choosing an expected ordinal/heading after seeing rankings
 # would make the whole comparison unfalsifiable — freeze first, run second.
 # Split by tenant: a query issued with tenant A's principal can only ever see
 # tenant A's chunks, so a query authored against tenant B's corpus belongs in
 # tenant B's tuple, not in a shared one.
+#
+# The acme set is paired: every question is asked once in English and once in
+# Traditional Chinese, with the same `kind` and the same refs, so the pair
+# isolates the language. The Chinese strings are experimental data — the
+# cross-language arm cannot exist without them — and are the only non-English
+# text in this repository. Note that the index's `content` field pins
+# `analyzer: "en.microsoft"`, so a Chinese question is tokenised by an English
+# analyser. Whatever a Chinese query scores on the lexical side is bounded by
+# that, and a `kind` that depends on matching an English literal cannot be
+# reproduced on the Chinese side at all.
+#
+# globex is the control arm and is deliberately not translated: if the paired
+# arm moves and the untranslated one does not, the pairing is the difference.
 QUERIES_BY_TENANT: dict[str, tuple[Query, ...]] = {
     "acme": (
         Query(
             1,
             "99.9% monthly uptime",
-            "exact literal",
-            (
-                ExpectedChunkRef(
-                    "service-sla", 3, "Service SLA > Availability targets > Premium tier"
-                ),
-            ),
+            _ACME_Q1_KIND,
+            base_refs=_ACME_Q1_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
+        Query(
+            1,
+            "99.9% 的每月可用率",
+            _ACME_Q1_KIND,
+            base_refs=_ACME_Q1_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
         ),
         Query(
             2,
             "How long do I have to send something back if I bought it on sale?",
-            "paraphrase",
-            (
-                ExpectedChunkRef(
-                    "returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"
-                ),
-            ),
+            _ACME_Q2_KIND,
+            base_refs=_ACME_Q2_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
+        Query(
+            2,
+            "特價買的東西還有多久可以退回去？",
+            _ACME_Q2_KIND,
+            base_refs=_ACME_Q2_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
         ),
         Query(
             3,
             "when do customers get credit?",
-            "cross-document ambiguity (both relevant)",
-            (
-                ExpectedChunkRef(
-                    "service-sla", 2, "Service SLA > Availability targets > Standard tier"
-                ),
-                ExpectedChunkRef(
-                    "returns-policy", 2, "Returns Policy > Refund window > Promotional purchases"
-                ),
-            ),
+            _ACME_Q3_KIND,
+            base_refs=_ACME_Q3_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
+        Query(
+            3,
+            "客戶什麼時候可以拿回錢？",
+            _ACME_Q3_KIND,
+            base_refs=_ACME_Q3_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
         ),
         Query(
             4,
             "what happens if the customer misconfigured their own system?",
-            "lexical decoy",
-            (ExpectedChunkRef("service-sla", 5, "Service SLA > Exclusions"),),
+            _ACME_Q4_KIND,
+            base_refs=_ACME_Q4_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
+        Query(
+            4,
+            "如果是客戶自己把系統設定弄錯了會怎樣？",
+            _ACME_Q4_KIND,
+            base_refs=_ACME_Q4_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
         ),
         Query(
             5,
             "how do I escalate a Sev 1 outage at 3am?",
-            "acme has no runbook — only its own SLA response-time section is relevant",
-            (ExpectedChunkRef("service-sla", 4, "Service SLA > Response times"),),
+            _ACME_Q5_KIND,
+            base_refs=_ACME_Q5_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
         ),
-        Query(6, "What is the parental leave policy?", "absent from corpus", ()),
+        Query(
+            5,
+            "凌晨三點發生 Sev 1 中斷要怎麼往上升級？",
+            _ACME_Q5_KIND,
+            base_refs=_ACME_Q5_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
+        ),
+        Query(
+            6,
+            "What is the parental leave policy?",
+            _ACME_Q6_KIND,
+            base_refs=_NO_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
+        Query(
+            6,
+            "育嬰假的規定是什麼？",
+            _ACME_Q6_KIND,
+            base_refs=_NO_REFS,
+            expansion_refs=_NO_REFS,
+            language="zh",
+        ),
     ),
     "globex": (
         Query(
             1,
             "how are invoices delivered?",
             "exact literal",
-            (ExpectedChunkRef("billing-faq", 1, "Billing FAQ > Invoices"),),
+            base_refs=(ExpectedChunkRef("billing-faq", 1, "Billing FAQ > Invoices"),),
+            expansion_refs=_NO_REFS,
+            language="en",
         ),
         Query(
             2,
             "what cards can I pay with?",
             "paraphrase",
-            (ExpectedChunkRef("billing-faq", 2, "Billing FAQ > Payment methods"),),
+            base_refs=(ExpectedChunkRef("billing-faq", 2, "Billing FAQ > Payment methods"),),
+            expansion_refs=_NO_REFS,
+            language="en",
         ),
         Query(
             3,
             "how do I dispute a charge?",
             "lexical decoy",
-            (ExpectedChunkRef("billing-faq", 3, "Billing FAQ > Disputes"),),
+            base_refs=(ExpectedChunkRef("billing-faq", 3, "Billing FAQ > Disputes"),),
+            expansion_refs=_NO_REFS,
+            language="en",
         ),
         Query(
             5,
             "how do I escalate a Sev 1 outage at 3am?",
             "requires the oncall group — run with --group-id oncall",
-            (ExpectedChunkRef("oncall-runbook", 3, "On-Call Runbook > Escalation path"),),
+            base_refs=(ExpectedChunkRef("oncall-runbook", 3, "On-Call Runbook > Escalation path"),),
+            expansion_refs=_NO_REFS,
+            language="en",
         ),
-        Query(6, "What is the parental leave policy?", "absent from corpus", ()),
+        Query(
+            6,
+            "What is the parental leave policy?",
+            "absent from corpus",
+            base_refs=_NO_REFS,
+            expansion_refs=_NO_REFS,
+            language="en",
+        ),
     ),
 }
 
@@ -508,7 +679,13 @@ async def _compare(
     evidence.flush()
 
     for query in queries:
-        expected_ids = expected_chunk_ids(principal.tenant_id, query.expected_refs)
+        expected_ids = expected_chunk_ids(
+            principal.tenant_id, query.base_refs + query.expansion_refs
+        )
+        # The query set now holds two questions per number, one per
+        # language. Headings and run labels carry the language so a pair's
+        # two halves stay distinguishable in the evidence and the sidecar.
+        label_prefix = f"Q{query.number} {query.language}"
         evidence.start_query()
         started = time.perf_counter()
         try:
@@ -526,7 +703,7 @@ async def _compare(
                 "[openai-service]",
             )[:160].replace("|", "\\|")
             evidence.add(
-                f"## Q{query.number} — {query.kind}",
+                f"## Q{query.number} ({query.language}) — {query.kind}",
                 "",
                 f"> {query.text}",
                 "",
@@ -544,7 +721,7 @@ async def _compare(
 
         expected = ", ".join(f"`{c}`" for c in expected_ids) or "none (no answer)"
         evidence.add(
-            f"## Q{query.number} — {query.kind}",
+            f"## Q{query.number} ({query.language}) — {query.kind}",
             "",
             f"> {query.text}",
             "",
@@ -562,7 +739,7 @@ async def _compare(
             rows = await _run(
                 client,
                 evidence,
-                f"Q{query.number} baseline {mode.value}",
+                f"{label_prefix} baseline {mode.value}",
                 query,
                 expected_ids,
                 vector,
@@ -590,7 +767,7 @@ async def _compare(
             rows = await _run(
                 client,
                 evidence,
-                f"Q{query.number} k={vector_k}",
+                f"{label_prefix} k={vector_k}",
                 query,
                 expected_ids,
                 vector,
@@ -618,7 +795,7 @@ async def _compare(
             rows = await _run(
                 client,
                 evidence,
-                f"Q{query.number} rerank {mode.value}",
+                f"{label_prefix} rerank {mode.value}",
                 query,
                 expected_ids,
                 vector,
