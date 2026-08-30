@@ -634,6 +634,9 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             "--top", "25",
             "--out", str(out),
             "--tenant-id", "globex",
+            # Q5 is gated behind the oncall group; without it the run is
+            # refused before anything is read (_reject_unreadable_refs).
+            "--group-id", "oncall",
             "--user-id", "operator",
             "--vectors", str(vectors),
             "--generation", "g2",
@@ -711,6 +714,9 @@ def test_the_vectors_file_is_written_and_nothing_is_queried(
             "--top", "25",
             "--out", str(out),
             "--tenant-id", "globex",
+            # Q5 is gated behind the oncall group; without it the run is
+            # refused before anything is read (_reject_unreadable_refs).
+            "--group-id", "oncall",
             "--user-id", "operator",
             "--vectors", str(vectors),
             "--generation", "g2",
@@ -1091,3 +1097,110 @@ def test_a_rejected_call_is_not_written_up_with_the_last_call_s_diagnostics(
     assert "FAILED" in row
     assert "200" not in row and "rid" not in row
     assert "no response" in row
+
+
+def test_a_ref_the_principal_cannot_read_is_refused() -> None:
+    """A group-gated ref under a principal without the group is not a recall
+    failure -- it is a measurement that could not have happened.
+
+    The ACL filter removes the document before scoring, so every mode records
+    `absent`, which this project's rank vocabulary defines as a recall
+    failure. The run then finishes and writes `**Run complete**` over the top
+    of it. Same class as the full-page guard: a well-formed artifact for a
+    measurement that was structurally impossible. Live session 2026-08-30
+    spent a service on exactly this.
+    """
+    gated = compare_retrieval.Query(
+        5,
+        "how do I escalate a Sev 1 outage at 3am?",
+        "requires the oncall group",
+        base_refs=(
+            compare_retrieval.ExpectedChunkRef(
+                "oncall-runbook", 3, "On-Call Runbook > Escalation path",
+                allowed_groups=("oncall",),
+            ),
+        ),
+        expansion_refs=(),
+        language="en",
+    )
+    ungated = compare_retrieval.Query(
+        1,
+        "how are invoices delivered?",
+        "exact literal",
+        base_refs=(
+            compare_retrieval.ExpectedChunkRef(
+                "billing-faq", 1, "Billing FAQ > Delivery"
+            ),
+        ),
+        expansion_refs=(),
+        language="en",
+    )
+
+    from azgenai_lab.models.principal import Principal
+
+    without = Principal(tenant_id="globex", user_id="operator", group_ids=())
+    with pytest.raises(SystemExit) as excinfo:
+        compare_retrieval._reject_unreadable_refs((gated, ungated), without)
+    message = str(excinfo.value)
+    # It has to name the query, the group and the flag -- an operator who
+    # reads only this line must be able to fix the command.
+    assert "Q5" in message
+    assert "oncall" in message
+    assert "--group-id" in message
+
+    # The group present: allowed. And a query set with no gated ref at all is
+    # allowed under a principal carrying no groups, which is the ordinary case.
+    with_group = Principal(
+        tenant_id="globex", user_id="operator", group_ids=("oncall",)
+    )
+    compare_retrieval._reject_unreadable_refs((gated, ungated), with_group)
+    compare_retrieval._reject_unreadable_refs((ungated,), without)
+
+
+def test_the_frozen_globex_set_still_declares_its_oncall_gate() -> None:
+    """The requirement used to live only in a prose `kind` string, where the
+    code could not see it. This asserts it stays structured: drop the
+    annotation and the guard silently stops guarding.
+    """
+    globex = compare_retrieval.QUERIES_BY_TENANT["globex"]
+    gated = [
+        (query.number, ref)
+        for query in globex
+        for ref in query.base_refs + query.expansion_refs
+        if ref.allowed_groups
+    ]
+    assert [(number, ref.doc_id, ref.allowed_groups) for number, ref in gated] == [
+        (5, "oncall-runbook", ("oncall",))
+    ]
+
+
+def test_main_refuses_an_unreadable_ref_before_any_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ahead of the embedding client, so the guard costs nothing -- generating
+    the query vectors is itself a paid call.
+    """
+    from tools import compare_retrieval as mod
+
+    def refuse_git(*args: str) -> str:
+        raise AssertionError("an unreadable ref must not reach git")
+
+    monkeypatch.setattr(mod, "_git", refuse_git)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "compare_retrieval.py",
+            "--top", "13",
+            "--out", "out.md",
+            "--tenant-id", "globex",
+            "--user-id", "operator",
+            "--vectors", "vectors.json",
+            "--generation", "g1",
+            "--index-name", "azgenai-lab-chunks-g1",
+            "--manifest-sha256", "none",
+            "--baseline-only",
+        ],
+    )
+    with pytest.raises(SystemExit, match="--group-id"):
+        asyncio.run(mod.main())
