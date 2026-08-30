@@ -363,33 +363,48 @@ def test_an_index_named_for_another_generation_is_refused() -> None:
     # Not an enforcement of the naming convention -- INDEX_NAME itself carries
     # no suffix, so demanding one would reject the tool's own default. What is
     # refused is the pair that contradicts itself, which no operator meant.
-    with pytest.raises(SystemExit, match="disagree about which generation"):
-        compare_retrieval._reject_index_generation_mismatch(
-            "azgenai-lab-chunks-g3", Generation.G2
-        )
+    for index_name in (
+        "azgenai-lab-chunks-g3",
+        # A generation token anywhere as a whole segment, not only at the end.
+        # This project has been forced onto a Free-tier retry twice, so a
+        # `-retry` suffix on a mislabelled index is not hypothetical.
+        "azgenai-lab-chunks-g3-retry",
+        "g3-chunks",
+        # Every token is checked: agreeing with the first must not buy a pass
+        # for the rest.
+        "azgenai-lab-chunks-g2-g3",
+    ):
+        with pytest.raises(SystemExit, match="disagree about which generation"):
+            compare_retrieval._reject_index_generation_mismatch(index_name, Generation.G2)
 
 
 def test_an_index_name_that_agrees_or_says_nothing_is_left_alone() -> None:
     for index_name in (
         "azgenai-lab-chunks-g2",  # agrees
+        "azgenai-lab-chunks-g2-retry",  # agrees, and not in the last segment
         INDEX_NAME,  # the default, which carries no generation token
         "azgenai-lab-chunks",
-        "azgenai-lab-chunks-g2-retry",  # token not in the suffix position
         "some-other-index",
+        "azgenai-g2lab",  # `g2` is not a whole segment here
     ):
         compare_retrieval._reject_index_generation_mismatch(index_name, Generation.G2)
 
 
-def _freeze_vectors(path: Path, queries: Any) -> None:
-    """Write a vectors file the read path accepts for exactly this query set."""
+def _freeze_vectors(path: Path, queries: Any) -> dict[str, list[float]]:
+    """Write a vectors file the read path accepts for exactly this query set.
+
+    Every question gets a *distinct* vector. A shared value would make "this
+    query's frozen vector reached the wire" indistinguishable from "some
+    query's frozen vector did" — a lookup that returned the same entry for
+    every question would satisfy the weaker claim.
+    """
+    expected = {query.text: [float(n)] * 4 for n, query in enumerate(queries, start=1)}
     payload = {
-        query.text: {
-            "vector": [0.5] * 4,
-            "sha256": compare_retrieval._vector_digest([0.5] * 4),
-        }
-        for query in queries
+        text: {"vector": vector, "sha256": compare_retrieval._vector_digest(vector)}
+        for text, vector in expected.items()
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return expected
 
 
 def test_the_index_name_reaches_the_client_not_only_the_header(
@@ -401,7 +416,7 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
     from tools import compare_retrieval as mod
 
     from azgenai_lab.core.config import Settings
-    from azgenai_lab.models.search import SearchResult
+    from azgenai_lab.models.search import SearchMode, SearchResult
 
     constructed: list[str] = []
     searched: list[Any] = []
@@ -431,7 +446,7 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             principal: Any,
             vector_k: int,
         ) -> Any:
-            searched.append((query_text, mode))
+            searched.append((query_text, mode, query_vector))
             return SearchResult(hits=(), mode=mode, vector_k=vector_k)
 
     class StubEmbeddings:
@@ -439,7 +454,7 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
             raise AssertionError("the read path must not embed anything")
 
     vectors = tmp_path / "vectors.json"
-    _freeze_vectors(vectors, QUERIES_BY_TENANT["globex"])
+    expected_vectors = _freeze_vectors(vectors, QUERIES_BY_TENANT["globex"])
     out = tmp_path / "evidence.md"
 
     monkeypatch.setattr(mod, "_git", lambda *a: "" if a[0] == "status" else "c" * 40 + "\n")
@@ -480,6 +495,16 @@ def test_the_index_name_reaches_the_client_not_only_the_header(
     assert constructed == ["azgenai-lab-chunks-g2"]
     # Four baseline modes per query, and neither experiment.
     assert len(searched) == 4 * len(QUERIES_BY_TENANT["globex"])
+    # The vector that reached the wire is the frozen one for *that* question,
+    # byte for byte. "nothing was embedded" is a weaker claim: a run sending
+    # zeros, or sending question one's vector for every question, would also
+    # embed nothing. KEYWORD alone sends no vector.
+    for query_text, mode, query_vector in searched:
+        if mode is SearchMode.KEYWORD:
+            assert query_vector is None
+        else:
+            assert query_vector == expected_vectors[query_text]
+    assert len(set(map(tuple, expected_vectors.values()))) == len(expected_vectors)
 
     written = out.read_text(encoding="utf-8")
     assert f"- pre-run lab commit: `{'c' * 40}`" in written
